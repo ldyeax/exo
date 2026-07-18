@@ -69,10 +69,26 @@ class _CardCache:
         self.cc: dict[tuple[ModelId, HuggingFaceRevision], "ModelCard"] = {}
 
     def get(
-        self, model_id: ModelId, revision: HuggingFaceRevision = "main"
+        self, model_id: ModelId, revision: HuggingFaceRevision | None = None
     ) -> "ModelCard | None":
-        revision = validate_hugging_face_revision(revision)
-        return self.cc.get((model_id, revision))
+        if revision is not None:
+            revision = validate_hugging_face_revision(revision)
+            return self.cc.get((model_id, revision))
+
+        matching_cards = [
+            card for (cached_id, _), card in self.cc.items() if cached_id == model_id
+        ]
+        if not matching_cards:
+            return None
+        if main_card := self.cc.get((model_id, "main")):
+            return main_card
+        if len(matching_cards) == 1:
+            return matching_cards[0]
+        revisions = sorted(card.revision for card in matching_cards)
+        raise ValueError(
+            f"Multiple revisions are registered for {model_id}: {revisions}. "
+            "Specify an exact revision."
+        )
 
     def add_to_memory(self, card: "ModelCard") -> None:
         self.cc[(card.model_id, card.revision)] = card
@@ -280,15 +296,18 @@ class ModelCard(FrozenModel):
     # Is it okay that model card.load defaults to network access if the card doesn't exist? do we want to be more explicit here?
     @staticmethod
     async def load(
-        model_id: ModelId, revision: HuggingFaceRevision = "main"
+        model_id: ModelId, revision: HuggingFaceRevision | None = None
     ) -> "ModelCard":
-        revision = validate_hugging_face_revision(revision)
-        if card_cache.get(model_id, revision) is None:
+        if revision is not None:
+            revision = validate_hugging_face_revision(revision)
+        card = card_cache.get(model_id, revision)
+        if card is None:
             await card_cache.refresh()
-        if (mc := card_cache.get(model_id, revision)) is not None:
-            return mc
+            card = card_cache.get(model_id, revision)
+        if card is not None:
+            return card
 
-        mc = await ModelCard.fetch_from_hf(model_id, revision)
+        mc = await ModelCard.fetch_from_hf(model_id, revision or "main")
         await mc.save_to_custom_dir()
         return mc
 
