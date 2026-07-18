@@ -117,8 +117,8 @@ def configure_runner_environment(
     bound_instance: BoundInstance,
     infiniband_devices_path: Path = DEFAULT_INFINIBAND_DEVICES_PATH,
 ) -> None:
+    compute_resource_ids = bound_instance.bound_compute_resource_ids
     if isinstance(bound_instance.instance, MlxNcclInstance):
-        compute_resource_ids = bound_instance.bound_compute_resource_ids
         if compute_resource_ids:
             if len(compute_resource_ids) != 1:
                 raise ValueError(
@@ -134,6 +134,14 @@ def configure_runner_environment(
         ):
             os.environ.setdefault("NCCL_GIN_ENABLE", "0")
             os.environ.setdefault("NCCL_GIN_TYPE", "0")
+    elif compute_resource_ids:
+        if len(compute_resource_ids) != 1:
+            raise ValueError(
+                "Resource-bound non-NCCL runners require exactly one compute resource"
+            )
+        os.environ["CUDA_VISIBLE_DEVICES"] = compute_resource_ids[
+            0
+        ].nvidia_device_uuid()
 
 
 def entrypoint(

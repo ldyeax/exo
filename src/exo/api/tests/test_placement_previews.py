@@ -196,6 +196,79 @@ async def test_all_resource_preview_reports_policy_and_rank_weighted_memory() ->
     }
 
 
+async def test_previews_and_direct_create_count_retiring_resources() -> None:
+    node_a = NodeId("node-a")
+    node_b = NodeId("node-b")
+    topology, node_network = _two_node_topology_and_network(node_a, node_b)
+    model_card = ModelCard(
+        model_id=ModelId("retiring-preview-model"),
+        storage_size=Memory.from_bytes(9),
+        n_layers=2,
+        hidden_size=32,
+        supports_tensor=True,
+        num_key_value_heads=2,
+        tasks=[ModelTask.TextGeneration],
+        backends=[Backend.MlxCuda],
+    )
+    node_memory = {node_a: _memory(), node_b: _memory()}
+    node_backends = {node_a: [Backend.MlxCuda], node_b: [Backend.MlxCuda]}
+    node_compute_resources = {
+        node_a: [_gpu_resource(1)],
+        node_b: [_gpu_resource(2)],
+    }
+    ring_placements = place_instance(
+        PlaceInstance(
+            command_id=CommandId("retiring-preview-ring"),
+            model_card=model_card,
+            sharding=Sharding.Pipeline,
+            instance_meta=InstanceMeta.MlxRing,
+            min_nodes=2,
+        ),
+        topology,
+        {},
+        node_memory,
+        node_network,
+        node_backends,
+        node_compute_resources=node_compute_resources,
+    )
+    ring_instance = next(iter(ring_placements.values()))
+    retiring_compute_resources = {
+        resource.resource_id: RunnerId(f"retiring-{node_id}")
+        for node_id, resources in node_compute_resources.items()
+        for resource in resources
+    }
+    api = object.__new__(API)
+    api.state = State(
+        topology=topology,
+        node_memory=node_memory,
+        node_network=node_network,
+        node_backends=node_backends,
+        node_compute_resources=node_compute_resources,
+        retiring_compute_resources=retiring_compute_resources,
+    )
+
+    with patch.object(ModelCard, "load", AsyncMock(return_value=model_card)):
+        result = await api.get_placement_previews(model_card.model_id)
+
+    tensor_nccl_preview = next(
+        preview
+        for preview in result.previews
+        if preview.instance_meta == InstanceMeta.MlxNccl
+        and preview.sharding == Sharding.Tensor
+    )
+    assert tensor_nccl_preview.instance is None
+    assert tensor_nccl_preview.error is not None
+    assert "available NVIDIA GPU" in tensor_nccl_preview.error
+
+    with (
+        patch.object(api, "_send", AsyncMock()) as send,
+        pytest.raises(HTTPException, match="already occupied"),
+    ):
+        await api.create_instance(CreateInstanceParams(instance=ring_instance))
+
+    send.assert_not_awaited()
+
+
 async def test_create_instance_rejects_legacy_nccl_with_live_gpu_inventory() -> None:
     node_a = NodeId("node-a")
     node_b = NodeId("node-b")

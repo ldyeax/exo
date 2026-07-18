@@ -57,7 +57,11 @@ from exo.shared.types.tasks import (
 )
 from exo.shared.types.topology import Connection, RDMAConnection
 from exo.shared.types.worker.downloads import DownloadProgress
-from exo.shared.types.worker.instances import Instance, InstanceId
+from exo.shared.types.worker.instances import (
+    Instance,
+    InstanceId,
+    instance_compute_resource_runners,
+)
 from exo.shared.types.worker.runners import (
     RunnerId,
     RunnerReady,
@@ -379,6 +383,18 @@ def apply_instance_created(event: InstanceCreated, state: State) -> State:
 
 
 def apply_instance_deleted(event: InstanceDeleted, state: State) -> State:
+    retiring_compute_resources = dict(state.retiring_compute_resources)
+    deleted_instance = state.instances.get(event.instance_id)
+    if deleted_instance is not None:
+        for resource_id, runner_id in instance_compute_resource_runners(
+            deleted_instance, state.node_compute_resources
+        ).items():
+            runner_status = state.runners.get(runner_id)
+            if runner_status is not None and not isinstance(
+                runner_status, RunnerShutdown
+            ):
+                retiring_compute_resources.setdefault(resource_id, runner_id)
+
     new_instances: Mapping[InstanceId, Instance] = {
         iid: inst for iid, inst in state.instances.items() if iid != event.instance_id
     }
@@ -397,7 +413,11 @@ def apply_instance_deleted(event: InstanceDeleted, state: State) -> State:
                 update={"prefill_instances": prefill, "decode_instances": decode}
             )
     return state.model_copy(
-        update={"instances": new_instances, "instance_links": new_links}
+        update={
+            "instances": new_instances,
+            "instance_links": new_links,
+            "retiring_compute_resources": retiring_compute_resources,
+        }
     )
 
 
@@ -426,8 +446,17 @@ def apply_runner_status_updated(event: RunnerStatusUpdated, state: State) -> Sta
             for rid, p in state.prefill_server_ports.items()
             if rid != event.runner_id
         }
+        retiring_compute_resources = {
+            resource_id: runner_id
+            for resource_id, runner_id in state.retiring_compute_resources.items()
+            if runner_id != event.runner_id
+        }
         return state.model_copy(
-            update={"runners": new_runners, "prefill_server_ports": new_ports}
+            update={
+                "runners": new_runners,
+                "prefill_server_ports": new_ports,
+                "retiring_compute_resources": retiring_compute_resources,
+            }
         )
     new_runners = {
         **state.runners,
@@ -485,6 +514,15 @@ def apply_node_timed_out(event: NodeTimedOut, state: State) -> State:
         for key, value in state.node_compute_resources.items()
         if key != event.node_id
     }
+    timed_out_resource_ids = {
+        resource.resource_id
+        for resource in state.node_compute_resources.get(event.node_id, ())
+    }
+    retiring_compute_resources = {
+        resource_id: runner_id
+        for resource_id, runner_id in state.retiring_compute_resources.items()
+        if resource_id not in timed_out_resource_ids
+    }
     # Only recompute cycles if the leaving node had TB bridge enabled
     leaving_node_status = state.node_thunderbolt_bridge.get(event.node_id)
     leaving_node_had_tb_enabled = (
@@ -508,6 +546,7 @@ def apply_node_timed_out(event: NodeTimedOut, state: State) -> State:
             "node_thunderbolt_bridge": node_thunderbolt_bridge,
             "node_rdma_ctl": node_rdma_ctl,
             "node_compute_resources": node_compute_resources,
+            "retiring_compute_resources": retiring_compute_resources,
             "thunderbolt_bridge_cycles": thunderbolt_bridge_cycles,
         }
     )

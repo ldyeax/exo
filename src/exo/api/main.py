@@ -464,6 +464,7 @@ class API:
                 instance,
                 self.state.node_compute_resources,
                 self.state.instances,
+                self.state.retiring_compute_resources,
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -514,6 +515,7 @@ class API:
                 download_status=self.state.downloads,
                 node_rdma_ctl=self.state.node_rdma_ctl,
                 node_compute_resources=self.state.node_compute_resources,
+                retiring_compute_resources=self.state.retiring_compute_resources,
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -586,6 +588,7 @@ class API:
                     download_status=self.state.downloads,
                     node_rdma_ctl=self.state.node_rdma_ctl,
                     node_compute_resources=self.state.node_compute_resources,
+                    retiring_compute_resources=self.state.retiring_compute_resources,
                 )
             except ValueError as exc:
                 error_identity = (

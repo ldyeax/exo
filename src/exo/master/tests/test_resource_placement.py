@@ -20,13 +20,20 @@ from exo.shared.types.commands import CreateInstance, PlaceInstance
 from exo.shared.types.common import CommandId, NodeId
 from exo.shared.types.compute_resources import (
     ComputeResource,
+    ComputeResourceId,
     NvidiaGpuComputeResource,
 )
 from exo.shared.types.memory import Memory
 from exo.shared.types.profiling import NetworkInterfaceInfo, NodeNetworkInfo
 from exo.shared.types.topology import Connection
-from exo.shared.types.worker.instances import InstanceMeta, MlxNcclInstance
-from exo.shared.types.worker.runners import ShardAssignments
+from exo.shared.types.worker.instances import (
+    Instance,
+    InstanceId,
+    InstanceMeta,
+    MlxNcclInstance,
+    MlxRingInstance,
+)
+from exo.shared.types.worker.runners import RunnerId, ShardAssignments
 from exo.shared.types.worker.shards import Sharding
 
 
@@ -84,6 +91,38 @@ def _two_node_topology(
         ),
     }
     return topology, node_network
+
+
+def _place_cuda_runtime(
+    instance_meta: InstanceMeta,
+    *,
+    topology: Topology,
+    node_network: dict[NodeId, NodeNetworkInfo],
+    resources: dict[NodeId, Sequence[ComputeResource]],
+    current_instances: dict[InstanceId, Instance] | None = None,
+    retiring_compute_resources: dict[ComputeResourceId, RunnerId] | None = None,
+) -> dict[InstanceId, Instance]:
+    node_memory = {node_id: create_node_memory(2 * 1024**3) for node_id in resources}
+    return place_instance(
+        PlaceInstance(
+            command_id=CommandId(f"place-{instance_meta.value}"),
+            model_card=_model_card(hidden_size=2048),
+            sharding=(
+                Sharding.Tensor
+                if instance_meta == InstanceMeta.MlxNccl
+                else Sharding.Pipeline
+            ),
+            instance_meta=instance_meta,
+            min_nodes=2,
+        ),
+        topology,
+        current_instances or {},
+        node_memory,
+        node_network,
+        {node_id: [Backend.MlxCuda] for node_id in resources},
+        node_compute_resources=resources,
+        retiring_compute_resources=retiring_compute_resources,
+    )
 
 
 def test_tensor_assignments_expand_each_gpu_into_a_rank() -> None:
@@ -310,6 +349,178 @@ def test_legacy_nccl_instance_reserves_all_gpus_on_its_nodes() -> None:
             node_backends,
             node_compute_resources=resources,
         )
+
+
+def test_resource_less_ring_blocks_nccl_placement() -> None:
+    node_a = NodeId("dwagon")
+    node_b = NodeId("fwuff")
+    topology, node_network = _two_node_topology(node_a, node_b)
+    resources: dict[NodeId, Sequence[ComputeResource]] = {
+        node_a: [_gpu_resource(1)],
+        node_b: [_gpu_resource(2)],
+    }
+    ring_placements = _place_cuda_runtime(
+        InstanceMeta.MlxRing,
+        topology=topology,
+        node_network=node_network,
+        resources=resources,
+    )
+    assert isinstance(next(iter(ring_placements.values())), MlxRingInstance)
+
+    with pytest.raises(ValueError, match="available NVIDIA GPU"):
+        _place_cuda_runtime(
+            InstanceMeta.MlxNccl,
+            topology=topology,
+            node_network=node_network,
+            resources=resources,
+            current_instances=ring_placements,
+        )
+
+
+def test_resource_bound_nccl_blocks_ring_placement() -> None:
+    node_a = NodeId("dwagon")
+    node_b = NodeId("fwuff")
+    topology, node_network = _two_node_topology(node_a, node_b)
+    resources: dict[NodeId, Sequence[ComputeResource]] = {
+        node_a: [_gpu_resource(1)],
+        node_b: [_gpu_resource(2)],
+    }
+    nccl_placements = _place_cuda_runtime(
+        InstanceMeta.MlxNccl,
+        topology=topology,
+        node_network=node_network,
+        resources=resources,
+    )
+
+    with pytest.raises(ValueError, match="already occupied"):
+        _place_cuda_runtime(
+            InstanceMeta.MlxRing,
+            topology=topology,
+            node_network=node_network,
+            resources=resources,
+            current_instances=nccl_placements,
+        )
+
+
+def test_direct_creation_rejects_ring_nccl_collisions_in_both_orders() -> None:
+    node_a = NodeId("dwagon")
+    node_b = NodeId("fwuff")
+    topology, node_network = _two_node_topology(node_a, node_b)
+    resources: dict[NodeId, Sequence[ComputeResource]] = {
+        node_a: [_gpu_resource(1)],
+        node_b: [_gpu_resource(2)],
+    }
+    ring_placements = _place_cuda_runtime(
+        InstanceMeta.MlxRing,
+        topology=topology,
+        node_network=node_network,
+        resources=resources,
+    )
+    nccl_placements = _place_cuda_runtime(
+        InstanceMeta.MlxNccl,
+        topology=topology,
+        node_network=node_network,
+        resources=resources,
+    )
+    ring_instance = next(iter(ring_placements.values()))
+    nccl_instance = next(iter(nccl_placements.values()))
+
+    with pytest.raises(ValueError, match="already occupied"):
+        add_instance_to_placements(
+            CreateInstance(instance=nccl_instance),
+            topology,
+            ring_placements,
+            resources,
+        )
+    with pytest.raises(ValueError, match="already occupied"):
+        add_instance_to_placements(
+            CreateInstance(instance=ring_instance),
+            topology,
+            nccl_placements,
+            resources,
+        )
+
+
+def test_retiring_compute_resources_block_placement_and_direct_creation() -> None:
+    node_a = NodeId("dwagon")
+    node_b = NodeId("fwuff")
+    topology, node_network = _two_node_topology(node_a, node_b)
+    resources: dict[NodeId, Sequence[ComputeResource]] = {
+        node_a: [_gpu_resource(1)],
+        node_b: [_gpu_resource(2)],
+    }
+    ring_instance = next(
+        iter(
+            _place_cuda_runtime(
+                InstanceMeta.MlxRing,
+                topology=topology,
+                node_network=node_network,
+                resources=resources,
+            ).values()
+        )
+    )
+    retiring_compute_resources = {
+        resource.resource_id: RunnerId(f"retiring-{node_id}")
+        for node_id, node_resources in resources.items()
+        for resource in node_resources
+    }
+
+    with pytest.raises(ValueError, match="available NVIDIA GPU"):
+        _place_cuda_runtime(
+            InstanceMeta.MlxNccl,
+            topology=topology,
+            node_network=node_network,
+            resources=resources,
+            retiring_compute_resources=retiring_compute_resources,
+        )
+    with pytest.raises(ValueError, match="already occupied"):
+        add_instance_to_placements(
+            CreateInstance(instance=ring_instance),
+            topology,
+            {},
+            resources,
+            retiring_compute_resources,
+        )
+
+
+@pytest.mark.parametrize("backend", [Backend.MlxCpu, Backend.MlxMetal])
+def test_resource_less_ring_does_not_collide_without_nvidia_inventory(
+    backend: Backend,
+) -> None:
+    node_id = NodeId(f"{backend.value}-node")
+    topology = Topology()
+    topology.add_node(node_id)
+    model_card = _model_card().model_copy(update={"backends": [backend]})
+    command = PlaceInstance(
+        command_id=CommandId(f"place-{backend.value}"),
+        model_card=model_card,
+        sharding=Sharding.Pipeline,
+        instance_meta=InstanceMeta.MlxRing,
+        min_nodes=1,
+    )
+    placement_arguments = (
+        command,
+        topology,
+    )
+    first_placements = place_instance(
+        *placement_arguments,
+        {},
+        {node_id: create_node_memory(2 * 1024**3)},
+        {node_id: NodeNetworkInfo()},
+        {node_id: [backend]},
+        node_compute_resources={node_id: []},
+    )
+
+    second_placements = place_instance(
+        *placement_arguments,
+        first_placements,
+        {node_id: create_node_memory(2 * 1024**3)},
+        {node_id: NodeNetworkInfo()},
+        {node_id: [backend]},
+        node_compute_resources={node_id: []},
+    )
+
+    assert len(second_placements) == 2
 
 
 def test_default_nccl_placement_skips_gpu_that_cannot_fit_rank_estimate() -> None:

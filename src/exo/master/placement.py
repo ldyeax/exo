@@ -47,7 +47,9 @@ from exo.shared.types.worker.instances import (
     MlxJacclInstance,
     MlxNcclInstance,
     MlxRingInstance,
+    instance_compute_resource_runners,
 )
+from exo.shared.types.worker.runners import RunnerId
 from exo.shared.types.worker.shards import Sharding
 from exo.utils.ports import random_ephemeral_port
 
@@ -102,27 +104,16 @@ def _occupied_compute_resource_ids(
     *,
     excluding_instance_id: InstanceId | None = None,
     node_compute_resources: Mapping[NodeId, Sequence[ComputeResource]] | None = None,
+    retiring_compute_resources: Mapping[ComputeResourceId, RunnerId] | None = None,
 ) -> set[ComputeResourceId]:
-    occupied_resource_ids = {
+    occupied_resource_ids = set(retiring_compute_resources or {})
+    occupied_resource_ids.update(
         resource_id
         for instance_id, instance in instances.items()
         if instance_id != excluding_instance_id
-        for resource_id in instance.shard_assignments.compute_resource_to_runner
-    }
-    if node_compute_resources is None:
-        return occupied_resource_ids
-    legacy_nccl_node_ids = {
-        node_id
-        for instance_id, instance in instances.items()
-        if instance_id != excluding_instance_id
-        and isinstance(instance, MlxNcclInstance)
-        and not instance.shard_assignments.compute_resource_to_runner
-        for node_id in instance.shard_assignments.node_to_runner
-    }
-    occupied_resource_ids.update(
-        resource.resource_id
-        for node_id in legacy_nccl_node_ids
-        for resource in node_compute_resources.get(node_id, ())
+        for resource_id in instance_compute_resource_runners(
+            instance, node_compute_resources or {}
+        )
     )
     return occupied_resource_ids
 
@@ -131,6 +122,7 @@ def validate_instance_compute_resources(
     instance: Instance,
     node_compute_resources: Mapping[NodeId, Sequence[ComputeResource]],
     current_instances: Mapping[InstanceId, Instance] | None = None,
+    retiring_compute_resources: Mapping[ComputeResourceId, RunnerId] | None = None,
 ) -> None:
     assignments = instance.shard_assignments
     resource_assignments = assignments.compute_resource_to_runner
@@ -143,25 +135,28 @@ def validate_instance_compute_resources(
             "New MlxNccl instances require explicit compute resource bindings "
             "when live GPU inventory is available"
         )
+    inventory = _compute_resource_inventory_by_id(node_compute_resources)
+    requested_resource_ids = set(
+        instance_compute_resource_runners(instance, node_compute_resources)
+    )
+    occupied_resource_ids = _occupied_compute_resource_ids(
+        current_instances or {},
+        excluding_instance_id=instance.instance_id,
+        node_compute_resources=node_compute_resources,
+        retiring_compute_resources=retiring_compute_resources,
+    )
+    conflicting_resource_ids = requested_resource_ids & occupied_resource_ids
+    if conflicting_resource_ids:
+        raise ValueError(
+            "Compute resources are already occupied by another instance: "
+            f"{sorted(conflicting_resource_ids)}"
+        )
     if not resource_assignments:
         return
     resource_owners = assignments.compute_resource_to_node
     if not resource_owners:
         raise ValueError(
             "Resource-bound instances require explicit compute resource ownership"
-        )
-
-    inventory = _compute_resource_inventory_by_id(node_compute_resources)
-    occupied_resource_ids = _occupied_compute_resource_ids(
-        current_instances or {},
-        excluding_instance_id=instance.instance_id,
-        node_compute_resources=node_compute_resources,
-    )
-    conflicting_resource_ids = set(resource_assignments) & occupied_resource_ids
-    if conflicting_resource_ids:
-        raise ValueError(
-            "Compute resources are already occupied by another instance: "
-            f"{sorted(conflicting_resource_ids)}"
         )
 
     world_size = len(assignments.runner_to_shard)
@@ -196,6 +191,7 @@ def add_instance_to_placements(
     topology: Topology,
     current_instances: Mapping[InstanceId, Instance],
     node_compute_resources: Mapping[NodeId, Sequence[ComputeResource]] | None = None,
+    retiring_compute_resources: Mapping[ComputeResourceId, RunnerId] | None = None,
 ) -> Mapping[InstanceId, Instance]:
     # TODO: validate against topology
 
@@ -204,6 +200,7 @@ def add_instance_to_placements(
             command.instance,
             node_compute_resources,
             current_instances,
+            retiring_compute_resources,
         )
 
     return {**current_instances, command.instance.instance_id: command.instance}
@@ -260,6 +257,7 @@ def place_instance(
     download_status: Mapping[NodeId, Sequence[DownloadProgress]] | None = None,
     node_rdma_ctl: Mapping[NodeId, NodeRdmaCtlStatus] | None = None,
     node_compute_resources: Mapping[NodeId, Sequence[ComputeResource]] | None = None,
+    retiring_compute_resources: Mapping[ComputeResourceId, RunnerId] | None = None,
 ) -> dict[InstanceId, Instance]:
     if (
         command.instance_meta == InstanceMeta.MlxNccl
@@ -297,6 +295,7 @@ def place_instance(
         occupied_resource_ids = _occupied_compute_resource_ids(
             current_instances,
             node_compute_resources=node_compute_resources,
+            retiring_compute_resources=retiring_compute_resources,
         )
         placement_compute_resources = {
             node_id: [
@@ -593,6 +592,7 @@ def place_instance(
             target_instances[instance_id],
             node_compute_resources,
             current_instances,
+            retiring_compute_resources,
         )
 
     return target_instances
