@@ -3,10 +3,11 @@ from collections.abc import Generator
 from typing import Annotated, Any, Literal, get_args
 from uuid import uuid4
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from exo.shared.models.model_cards import HuggingFaceRevision, ModelCard, ModelId
 from exo.shared.types.common import CommandId, NodeId
+from exo.shared.types.compute_resources import ComputeResourceId
 from exo.shared.types.memory import Memory
 from exo.shared.types.text_generation import ReasoningDialect, ReasoningEffort
 from exo.shared.types.worker.instances import Instance, InstanceId, InstanceMeta
@@ -274,6 +275,32 @@ class PlaceInstanceParams(BaseModel):
     instance_meta: InstanceMeta = InstanceMeta.MlxRing
     min_nodes: int = 1
     use_all_compute_resources: bool = False
+    # Nonempty order is the tensor device-rank order (rank zero first).
+    requested_compute_resource_ids: tuple[ComputeResourceId, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_compute_resource_policy(self) -> "PlaceInstanceParams":
+        requested_resource_ids = self.requested_compute_resource_ids
+        if len(requested_resource_ids) != len(set(requested_resource_ids)):
+            raise ValueError("Requested compute resource IDs must be unique")
+        if not requested_resource_ids:
+            return self
+        if self.use_all_compute_resources:
+            raise ValueError(
+                "Explicit compute resource selection is incompatible with "
+                "use_all_compute_resources"
+            )
+        if (
+            self.instance_meta != InstanceMeta.MlxNccl
+            or self.sharding != Sharding.Tensor
+        ):
+            raise ValueError(
+                "Explicit compute resource selection currently requires MlxNccl "
+                "with Tensor sharding"
+            )
+        for resource_id in requested_resource_ids:
+            _ = resource_id.nvidia_device_uuid()
+        return self
 
 
 class CreateInstanceParams(BaseModel):
@@ -285,6 +312,7 @@ class PlacementPreview(BaseModel):
     sharding: Sharding
     instance_meta: InstanceMeta
     use_all_compute_resources: bool = False
+    requested_compute_resource_ids: tuple[ComputeResourceId, ...] = ()
     instance: Instance | None = None
     # Keys are NodeId strings, values are additional bytes that would be used on that node
     memory_delta_by_node: dict[str, int] | None = None

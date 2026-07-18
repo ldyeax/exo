@@ -47,7 +47,10 @@ def _gpu_resource(index: int, *, total_memory_gb: int = 24) -> NvidiaGpuComputeR
 
 
 def _model_card(
-    *, hidden_size: int = 30, storage_size: Memory | None = None
+    *,
+    hidden_size: int = 30,
+    storage_size: Memory | None = None,
+    num_key_value_heads: int | None = None,
 ) -> ModelCard:
     return ModelCard(
         model_id=ModelId("resource-placement-model"),
@@ -55,6 +58,7 @@ def _model_card(
         n_layers=2,
         hidden_size=hidden_size,
         supports_tensor=True,
+        num_key_value_heads=num_key_value_heads,
         tasks=[ModelTask.TextGeneration],
         backends=[Backend.MlxCuda],
     )
@@ -664,6 +668,685 @@ def test_place_instance_resource_policy_roundtrip() -> None:
         instance_meta=InstanceMeta.MlxNccl,
         min_nodes=2,
     ).use_all_compute_resources
+
+
+def test_place_instance_explicit_resource_policy_roundtrip_and_validation() -> None:
+    first_resource_id = _gpu_resource(2).resource_id
+    second_resource_id = _gpu_resource(3).resource_id
+    command = PlaceInstance(
+        command_id=CommandId("place-requested-resources"),
+        model_card=_model_card(),
+        sharding=Sharding.Tensor,
+        instance_meta=InstanceMeta.MlxNccl,
+        min_nodes=2,
+        requested_compute_resource_ids=(first_resource_id, second_resource_id),
+    )
+
+    restored = PlaceInstance.model_validate_json(command.model_dump_json())
+
+    assert restored.requested_compute_resource_ids == (
+        first_resource_id,
+        second_resource_id,
+    )
+    with pytest.raises(ValueError, match="must be unique"):
+        PlaceInstance(
+            model_card=_model_card(),
+            sharding=Sharding.Tensor,
+            instance_meta=InstanceMeta.MlxNccl,
+            min_nodes=2,
+            requested_compute_resource_ids=(first_resource_id, first_resource_id),
+        )
+    with pytest.raises(ValueError, match="incompatible"):
+        PlaceInstance(
+            model_card=_model_card(),
+            sharding=Sharding.Tensor,
+            instance_meta=InstanceMeta.MlxNccl,
+            min_nodes=2,
+            use_all_compute_resources=True,
+            requested_compute_resource_ids=(first_resource_id, second_resource_id),
+        )
+    with pytest.raises(ValueError, match="requires MlxNccl with Tensor"):
+        PlaceInstance(
+            model_card=_model_card(),
+            sharding=Sharding.Tensor,
+            instance_meta=InstanceMeta.MlxRing,
+            min_nodes=2,
+            requested_compute_resource_ids=(first_resource_id, second_resource_id),
+        )
+    with pytest.raises(ValueError, match="not an NVIDIA GPU"):
+        PlaceInstance(
+            model_card=_model_card(),
+            sharding=Sharding.Tensor,
+            instance_meta=InstanceMeta.MlxNccl,
+            min_nodes=2,
+            requested_compute_resource_ids=(
+                ComputeResourceId("other-backend:resource"),
+            ),
+        )
+
+
+def test_explicit_selection_uses_exact_gpus_and_request_order_for_ranks() -> None:
+    node_a = NodeId("dwagon")
+    node_b = NodeId("fwuff")
+    topology, node_network = _two_node_topology(node_a, node_b)
+    first_dwagon_gpu = _gpu_resource(1)
+    requested_dwagon_gpu = _gpu_resource(2)
+    fwuff_gpu = _gpu_resource(3)
+    resources: dict[NodeId, Sequence[ComputeResource]] = {
+        node_a: [first_dwagon_gpu, requested_dwagon_gpu],
+        node_b: [fwuff_gpu],
+    }
+    requested_resource_ids = (
+        fwuff_gpu.resource_id,
+        requested_dwagon_gpu.resource_id,
+    )
+
+    placements = place_instance(
+        PlaceInstance(
+            model_card=_model_card(hidden_size=32, num_key_value_heads=2),
+            sharding=Sharding.Tensor,
+            instance_meta=InstanceMeta.MlxNccl,
+            min_nodes=2,
+            requested_compute_resource_ids=requested_resource_ids,
+        ),
+        topology,
+        {},
+        {
+            node_a: create_node_memory(1024**3),
+            node_b: create_node_memory(1024**3),
+        },
+        node_network,
+        {node_a: [Backend.MlxCuda], node_b: [Backend.MlxCuda]},
+        node_compute_resources=resources,
+    )
+
+    instance = next(iter(placements.values()))
+    assert isinstance(instance, MlxNcclInstance)
+    assignments = instance.shard_assignments
+    assert tuple(assignments.compute_resource_to_runner) == requested_resource_ids
+    assert first_dwagon_gpu.resource_id not in assignments.compute_resource_to_runner
+    assert [
+        assignments.runner_to_shard[
+            assignments.compute_resource_to_runner[resource_id]
+        ].device_rank
+        for resource_id in requested_resource_ids
+    ] == [0, 1]
+    assert (
+        assignments.node_to_runner[node_b]
+        == assignments.compute_resource_to_runner[fwuff_gpu.resource_id]
+    )
+    assert instance.nccl_coordinator.ip == "169.254.0.2"
+
+
+def test_explicit_selection_projects_hosts_from_a_larger_common_cycle() -> None:
+    node_a = NodeId("dwagon")
+    transit_node = NodeId("transit")
+    node_b = NodeId("fwuff")
+    topology = Topology()
+    topology.add_connection(
+        Connection(source=node_a, sink=transit_node, edge=create_socket_connection(2))
+    )
+    topology.add_connection(
+        Connection(source=transit_node, sink=node_b, edge=create_socket_connection(3))
+    )
+    topology.add_connection(
+        Connection(source=node_b, sink=node_a, edge=create_socket_connection(1))
+    )
+    dwagon_gpu = _gpu_resource(1)
+    fwuff_gpu = _gpu_resource(2)
+
+    placements = place_instance(
+        PlaceInstance(
+            model_card=_model_card(hidden_size=32, num_key_value_heads=2),
+            sharding=Sharding.Tensor,
+            instance_meta=InstanceMeta.MlxNccl,
+            min_nodes=2,
+            requested_compute_resource_ids=(
+                dwagon_gpu.resource_id,
+                fwuff_gpu.resource_id,
+            ),
+        ),
+        topology,
+        {},
+        {
+            node_a: create_node_memory(1024**3),
+            node_b: create_node_memory(1024**3),
+        },
+        {
+            node_a: NodeNetworkInfo(),
+            node_b: NodeNetworkInfo(),
+        },
+        {node_a: [Backend.MlxCuda], node_b: [Backend.MlxCuda]},
+        node_compute_resources={node_a: [dwagon_gpu], node_b: [fwuff_gpu]},
+    )
+
+    instance = next(iter(placements.values()))
+    assert isinstance(instance, MlxNcclInstance)
+    assert set(instance.shard_assignments.node_to_runner) == {node_a, node_b}
+    assert transit_node not in instance.shard_assignments.node_to_runner
+    assert instance.nccl_coordinator.ip == "169.254.0.1"
+
+    with pytest.raises(
+        ValueError,
+        match="rank-0 coordinator must have one IPv4 address reachable",
+    ):
+        place_instance(
+            PlaceInstance(
+                model_card=_model_card(hidden_size=32, num_key_value_heads=2),
+                sharding=Sharding.Tensor,
+                instance_meta=InstanceMeta.MlxNccl,
+                min_nodes=2,
+                requested_compute_resource_ids=(
+                    fwuff_gpu.resource_id,
+                    dwagon_gpu.resource_id,
+                ),
+            ),
+            topology,
+            {},
+            {
+                node_a: create_node_memory(1024**3),
+                node_b: create_node_memory(1024**3),
+            },
+            {
+                node_a: NodeNetworkInfo(),
+                node_b: NodeNetworkInfo(),
+            },
+            {node_a: [Backend.MlxCuda], node_b: [Backend.MlxCuda]},
+            node_compute_resources={node_a: [dwagon_gpu], node_b: [fwuff_gpu]},
+        )
+
+
+def test_explicit_tp2_accepts_two_kv_heads_while_all_resource_tp3_rejects() -> None:
+    node_a = NodeId("dwagon")
+    node_b = NodeId("fwuff")
+    topology, node_network = _two_node_topology(node_a, node_b)
+    resources: dict[NodeId, Sequence[ComputeResource]] = {
+        node_a: [_gpu_resource(1), _gpu_resource(2)],
+        node_b: [_gpu_resource(3)],
+    }
+    model_card = _model_card(hidden_size=32, num_key_value_heads=2)
+
+    exact_placements = place_instance(
+        PlaceInstance(
+            model_card=model_card,
+            sharding=Sharding.Tensor,
+            instance_meta=InstanceMeta.MlxNccl,
+            min_nodes=2,
+            requested_compute_resource_ids=(
+                resources[node_a][1].resource_id,
+                resources[node_b][0].resource_id,
+            ),
+        ),
+        topology,
+        {},
+        {node_a: create_node_memory(1024**3), node_b: create_node_memory(1024**3)},
+        node_network,
+        {node_a: [Backend.MlxCuda], node_b: [Backend.MlxCuda]},
+        node_compute_resources=resources,
+    )
+
+    assert (
+        len(next(iter(exact_placements.values())).shard_assignments.runner_to_shard)
+        == 2
+    )
+    with pytest.raises(ValueError, match="num_key_value_heads=2"):
+        place_instance(
+            PlaceInstance(
+                model_card=model_card,
+                sharding=Sharding.Tensor,
+                instance_meta=InstanceMeta.MlxNccl,
+                min_nodes=2,
+                use_all_compute_resources=True,
+            ),
+            topology,
+            {},
+            {
+                node_a: create_node_memory(1024**3),
+                node_b: create_node_memory(1024**3),
+            },
+            node_network,
+            {node_a: [Backend.MlxCuda], node_b: [Backend.MlxCuda]},
+            node_compute_resources=resources,
+        )
+
+
+def test_explicit_selection_rejects_unknown_occupied_and_retiring_resources() -> None:
+    node_a = NodeId("dwagon")
+    node_b = NodeId("fwuff")
+    topology, node_network = _two_node_topology(node_a, node_b)
+    dwagon_gpu = _gpu_resource(1)
+    fwuff_gpu = _gpu_resource(2)
+    resources: dict[NodeId, Sequence[ComputeResource]] = {
+        node_a: [dwagon_gpu],
+        node_b: [fwuff_gpu],
+    }
+    node_memory = {
+        node_a: create_node_memory(1024**3),
+        node_b: create_node_memory(1024**3),
+    }
+    node_backends = {node_a: [Backend.MlxCuda], node_b: [Backend.MlxCuda]}
+
+    def requested_command(
+        resource_ids: tuple[ComputeResourceId, ...],
+    ) -> PlaceInstance:
+        return PlaceInstance(
+            model_card=_model_card(hidden_size=32, num_key_value_heads=2),
+            sharding=Sharding.Tensor,
+            instance_meta=InstanceMeta.MlxNccl,
+            min_nodes=2,
+            requested_compute_resource_ids=resource_ids,
+        )
+
+    unknown_resource_id = ComputeResourceId.from_nvidia_device_uuid("GPU-unknown")
+    with pytest.raises(ValueError, match="not live"):
+        place_instance(
+            requested_command((dwagon_gpu.resource_id, unknown_resource_id)),
+            topology,
+            {},
+            node_memory,
+            node_network,
+            node_backends,
+            node_compute_resources=resources,
+        )
+
+    first_placements = place_instance(
+        requested_command((dwagon_gpu.resource_id, fwuff_gpu.resource_id)),
+        topology,
+        {},
+        node_memory,
+        node_network,
+        node_backends,
+        node_compute_resources=resources,
+    )
+    with pytest.raises(ValueError, match="already occupied or retiring"):
+        place_instance(
+            requested_command((dwagon_gpu.resource_id, fwuff_gpu.resource_id)),
+            topology,
+            first_placements,
+            node_memory,
+            node_network,
+            node_backends,
+            node_compute_resources=resources,
+        )
+    with pytest.raises(ValueError, match="already occupied or retiring"):
+        place_instance(
+            requested_command((dwagon_gpu.resource_id, fwuff_gpu.resource_id)),
+            topology,
+            {},
+            node_memory,
+            node_network,
+            node_backends,
+            node_compute_resources=resources,
+            retiring_compute_resources={
+                dwagon_gpu.resource_id: RunnerId("retiring-runner")
+            },
+        )
+
+
+def test_explicit_selection_rejects_low_memory_same_node_and_disconnected_gpus() -> (
+    None
+):
+    node_a = NodeId("dwagon")
+    node_b = NodeId("fwuff")
+    connected_topology, node_network = _two_node_topology(node_a, node_b)
+    small_gpu = _gpu_resource(1, total_memory_gb=8)
+    second_dwagon_gpu = _gpu_resource(2)
+    fwuff_gpu = _gpu_resource(3)
+    resources: dict[NodeId, Sequence[ComputeResource]] = {
+        node_a: [small_gpu, second_dwagon_gpu],
+        node_b: [fwuff_gpu],
+    }
+    node_memory = {
+        node_a: create_node_memory(64 * 1024**3),
+        node_b: create_node_memory(64 * 1024**3),
+    }
+    node_backends = {node_a: [Backend.MlxCuda], node_b: [Backend.MlxCuda]}
+
+    with pytest.raises(ValueError, match="Requested GPU selection"):
+        place_instance(
+            PlaceInstance(
+                model_card=_model_card(
+                    hidden_size=32,
+                    storage_size=Memory.from_bytes(16 * 1024**3),
+                    num_key_value_heads=2,
+                ),
+                sharding=Sharding.Tensor,
+                instance_meta=InstanceMeta.MlxNccl,
+                min_nodes=2,
+                requested_compute_resource_ids=(
+                    small_gpu.resource_id,
+                    fwuff_gpu.resource_id,
+                ),
+            ),
+            connected_topology,
+            {},
+            node_memory,
+            node_network,
+            node_backends,
+            node_compute_resources=resources,
+        )
+
+    with pytest.raises(ValueError, match="at least two nodes"):
+        place_instance(
+            PlaceInstance(
+                model_card=_model_card(hidden_size=32, num_key_value_heads=2),
+                sharding=Sharding.Tensor,
+                instance_meta=InstanceMeta.MlxNccl,
+                min_nodes=2,
+                requested_compute_resource_ids=(
+                    small_gpu.resource_id,
+                    second_dwagon_gpu.resource_id,
+                ),
+            ),
+            connected_topology,
+            {},
+            node_memory,
+            node_network,
+            node_backends,
+            node_compute_resources=resources,
+        )
+
+    disconnected_topology = Topology()
+    disconnected_topology.add_node(node_a)
+    disconnected_topology.add_node(node_b)
+    with pytest.raises(ValueError, match="common connectivity cycle"):
+        place_instance(
+            PlaceInstance(
+                model_card=_model_card(hidden_size=32, num_key_value_heads=2),
+                sharding=Sharding.Tensor,
+                instance_meta=InstanceMeta.MlxNccl,
+                min_nodes=2,
+                requested_compute_resource_ids=(
+                    second_dwagon_gpu.resource_id,
+                    fwuff_gpu.resource_id,
+                ),
+            ),
+            disconnected_topology,
+            {},
+            node_memory,
+            node_network,
+            node_backends,
+            node_compute_resources=resources,
+        )
+
+
+def test_explicit_selection_rejects_node_without_mlx_cuda_backend() -> None:
+    node_a = NodeId("dwagon")
+    node_b = NodeId("fwuff")
+    topology, node_network = _two_node_topology(node_a, node_b)
+    dwagon_gpu = _gpu_resource(1)
+    fwuff_gpu = _gpu_resource(2)
+
+    with pytest.raises(ValueError, match="every node supports a backend"):
+        place_instance(
+            PlaceInstance(
+                model_card=_model_card(hidden_size=32, num_key_value_heads=2),
+                sharding=Sharding.Tensor,
+                instance_meta=InstanceMeta.MlxNccl,
+                min_nodes=2,
+                requested_compute_resource_ids=(
+                    dwagon_gpu.resource_id,
+                    fwuff_gpu.resource_id,
+                ),
+            ),
+            topology,
+            {},
+            {
+                node_a: create_node_memory(1024**3),
+                node_b: create_node_memory(1024**3),
+            },
+            node_network,
+            {node_a: [Backend.MlxCuda], node_b: [Backend.MlxMetal]},
+            node_compute_resources={node_a: [dwagon_gpu], node_b: [fwuff_gpu]},
+        )
+
+
+def test_direct_create_validation_rechecks_connectivity_and_cuda_backends() -> None:
+    node_a = NodeId("dwagon")
+    node_b = NodeId("fwuff")
+    topology, node_network = _two_node_topology(node_a, node_b)
+    dwagon_gpu = _gpu_resource(1)
+    fwuff_gpu = _gpu_resource(2)
+    resources: dict[NodeId, Sequence[ComputeResource]] = {
+        node_a: [dwagon_gpu],
+        node_b: [fwuff_gpu],
+    }
+    placements = place_instance(
+        PlaceInstance(
+            model_card=_model_card(hidden_size=32, num_key_value_heads=2),
+            sharding=Sharding.Tensor,
+            instance_meta=InstanceMeta.MlxNccl,
+            min_nodes=2,
+            requested_compute_resource_ids=(
+                dwagon_gpu.resource_id,
+                fwuff_gpu.resource_id,
+            ),
+        ),
+        topology,
+        {},
+        {
+            node_a: create_node_memory(1024**3),
+            node_b: create_node_memory(1024**3),
+        },
+        node_network,
+        {node_a: [Backend.MlxCuda], node_b: [Backend.MlxCuda]},
+        node_compute_resources=resources,
+    )
+    instance = next(iter(placements.values()))
+    assert isinstance(instance, MlxNcclInstance)
+    disconnected_topology = Topology()
+    disconnected_topology.add_node(node_a)
+    disconnected_topology.add_node(node_b)
+
+    with pytest.raises(ValueError, match="requires live topology and node network"):
+        validate_instance_compute_resources(
+            instance,
+            resources,
+            topology=topology,
+            node_backends={node_a: [Backend.MlxCuda], node_b: [Backend.MlxCuda]},
+        )
+    with pytest.raises(ValueError, match="do not share a connectivity cycle"):
+        validate_instance_compute_resources(
+            instance,
+            resources,
+            topology=disconnected_topology,
+            node_backends={node_a: [Backend.MlxCuda], node_b: [Backend.MlxCuda]},
+            node_network=node_network,
+        )
+    with pytest.raises(ValueError, match="do not advertise MlxCuda"):
+        validate_instance_compute_resources(
+            instance,
+            resources,
+            topology=topology,
+            node_backends={node_a: [Backend.MlxCuda], node_b: [Backend.MlxMetal]},
+            node_network=node_network,
+        )
+    with pytest.raises(ValueError, match="placement estimate requires"):
+        validate_instance_compute_resources(
+            instance,
+            {
+                node_a: [_gpu_resource(1, total_memory_gb=1)],
+                node_b: [fwuff_gpu],
+            },
+            topology=topology,
+            node_backends={node_a: [Backend.MlxCuda], node_b: [Backend.MlxCuda]},
+            node_network=node_network,
+        )
+
+    assignments = instance.shard_assignments
+    runner_by_rank = {
+        shard.device_rank: runner_id
+        for runner_id, shard in assignments.runner_to_shard.items()
+    }
+    rank_zero_runner = runner_by_rank[0]
+    rank_one_runner = runner_by_rank[1]
+    reassigned_instance = MlxNcclInstance(
+        instance_id=instance.instance_id,
+        shard_assignments=ShardAssignments(
+            model_id=assignments.model_id,
+            runner_to_shard=assignments.runner_to_shard,
+            node_to_runner={node_a: rank_one_runner, node_b: rank_zero_runner},
+            compute_resource_to_runner={
+                dwagon_gpu.resource_id: rank_one_runner,
+                fwuff_gpu.resource_id: rank_zero_runner,
+            },
+            compute_resource_to_node=assignments.compute_resource_to_node,
+        ),
+        nccl_coordinator=instance.nccl_coordinator,
+    )
+    with pytest.raises(ValueError, match="live rank-zero endpoint"):
+        validate_instance_compute_resources(
+            reassigned_instance,
+            resources,
+            topology=topology,
+            node_backends={node_a: [Backend.MlxCuda], node_b: [Backend.MlxCuda]},
+            node_network=node_network,
+        )
+
+    tampered_coordinator_instance = MlxNcclInstance(
+        instance_id=instance.instance_id,
+        shard_assignments=instance.shard_assignments,
+        nccl_coordinator=instance.nccl_coordinator.model_copy(
+            update={"ip": "203.0.113.99"}
+        ),
+    )
+    with pytest.raises(ValueError, match="live rank-zero endpoint"):
+        validate_instance_compute_resources(
+            tampered_coordinator_instance,
+            resources,
+            topology=topology,
+            node_backends={node_a: [Backend.MlxCuda], node_b: [Backend.MlxCuda]},
+            node_network=node_network,
+        )
+
+
+def test_direct_create_validation_rechecks_tensor_divisibility() -> None:
+    node_a = NodeId("dwagon")
+    node_b = NodeId("fwuff")
+    topology, node_network = _two_node_topology(node_a, node_b)
+    resources: dict[NodeId, Sequence[ComputeResource]] = {
+        node_a: [_gpu_resource(1), _gpu_resource(2)],
+        node_b: [_gpu_resource(3)],
+    }
+    placements = place_instance(
+        PlaceInstance(
+            model_card=_model_card(hidden_size=30),
+            sharding=Sharding.Tensor,
+            instance_meta=InstanceMeta.MlxNccl,
+            min_nodes=2,
+            use_all_compute_resources=True,
+        ),
+        topology,
+        {},
+        {
+            node_a: create_node_memory(1024**3),
+            node_b: create_node_memory(1024**3),
+        },
+        node_network,
+        {node_a: [Backend.MlxCuda], node_b: [Backend.MlxCuda]},
+        node_compute_resources=resources,
+    )
+    instance = next(iter(placements.values()))
+    assert isinstance(instance, MlxNcclInstance)
+    incompatible_model_card = _model_card(hidden_size=30, num_key_value_heads=2)
+    incompatible_instance = MlxNcclInstance(
+        instance_id=instance.instance_id,
+        shard_assignments=ShardAssignments(
+            model_id=incompatible_model_card.model_id,
+            runner_to_shard={
+                runner_id: shard.model_copy(
+                    update={"model_card": incompatible_model_card}
+                )
+                for runner_id, shard in instance.shard_assignments.runner_to_shard.items()
+            },
+            node_to_runner=instance.shard_assignments.node_to_runner,
+            compute_resource_to_runner=(
+                instance.shard_assignments.compute_resource_to_runner
+            ),
+            compute_resource_to_node=instance.shard_assignments.compute_resource_to_node,
+        ),
+        nccl_coordinator=instance.nccl_coordinator,
+    )
+
+    with pytest.raises(ValueError, match="incompatible with model dimensions"):
+        validate_instance_compute_resources(
+            incompatible_instance,
+            resources,
+            topology=topology,
+            node_backends={node_a: [Backend.MlxCuda], node_b: [Backend.MlxCuda]},
+            node_network=node_network,
+        )
+
+
+def test_direct_create_validation_handles_malformed_resource_maps() -> None:
+    node_a = NodeId("dwagon")
+    node_b = NodeId("fwuff")
+    topology, node_network = _two_node_topology(node_a, node_b)
+    dwagon_gpu = _gpu_resource(1)
+    fwuff_gpu = _gpu_resource(2)
+    resources: dict[NodeId, Sequence[ComputeResource]] = {
+        node_a: [dwagon_gpu],
+        node_b: [fwuff_gpu],
+    }
+    placements = place_instance(
+        PlaceInstance(
+            model_card=_model_card(hidden_size=32, num_key_value_heads=2),
+            sharding=Sharding.Tensor,
+            instance_meta=InstanceMeta.MlxNccl,
+            min_nodes=2,
+            requested_compute_resource_ids=(
+                dwagon_gpu.resource_id,
+                fwuff_gpu.resource_id,
+            ),
+        ),
+        topology,
+        {},
+        {
+            node_a: create_node_memory(1024**3),
+            node_b: create_node_memory(1024**3),
+        },
+        node_network,
+        {node_a: [Backend.MlxCuda], node_b: [Backend.MlxCuda]},
+        node_compute_resources=resources,
+    )
+    instance = next(iter(placements.values()))
+    assert isinstance(instance, MlxNcclInstance)
+    assignments = instance.shard_assignments
+    incomplete_owners = dict(assignments.compute_resource_to_node)
+    _ = incomplete_owners.pop(dwagon_gpu.resource_id)
+    malformed_assignments = ShardAssignments.model_construct(
+        model_id=assignments.model_id,
+        runner_to_shard=assignments.runner_to_shard,
+        node_to_runner=assignments.node_to_runner,
+        compute_resource_to_runner=assignments.compute_resource_to_runner,
+        compute_resource_to_node=incomplete_owners,
+    )
+    malformed_instance = MlxNcclInstance.model_construct(
+        instance_id=instance.instance_id,
+        shard_assignments=malformed_assignments,
+        nccl_coordinator=instance.nccl_coordinator,
+    )
+
+    with pytest.raises(ValueError, match="ownership for exactly"):
+        validate_instance_compute_resources(malformed_instance, resources)
+
+    unknown_runner_assignments = dict(assignments.compute_resource_to_runner)
+    unknown_runner_assignments[dwagon_gpu.resource_id] = RunnerId("unknown-runner")
+    malformed_assignments = ShardAssignments.model_construct(
+        model_id=assignments.model_id,
+        runner_to_shard=assignments.runner_to_shard,
+        node_to_runner=assignments.node_to_runner,
+        compute_resource_to_runner=unknown_runner_assignments,
+        compute_resource_to_node=assignments.compute_resource_to_node,
+    )
+    malformed_instance = MlxNcclInstance.model_construct(
+        instance_id=instance.instance_id,
+        shard_assignments=malformed_assignments,
+        nccl_coordinator=instance.nccl_coordinator,
+    )
+
+    with pytest.raises(ValueError, match="references unknown runner"):
+        validate_instance_compute_resources(malformed_instance, resources)
 
 
 def test_resource_bound_nccl_instance_rejects_partial_resource_map() -> None:

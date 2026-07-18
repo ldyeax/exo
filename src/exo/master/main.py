@@ -392,6 +392,8 @@ class Master:
                                 self.state.instances,
                                 self.state.node_compute_resources,
                                 self.state.retiring_compute_resources,
+                                self.state.node_backends,
+                                self.state.node_network,
                             )
                             transition_events = get_transition_events(
                                 self.state.instances, placement, self.state.tasks

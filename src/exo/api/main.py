@@ -180,6 +180,7 @@ from exo.shared.types.commands import (
     TextGeneration,
 )
 from exo.shared.types.common import CommandId, Id, NodeId, SystemId
+from exo.shared.types.compute_resources import ComputeResourceId
 from exo.shared.types.events import (
     ChunkGenerated,
     Event,
@@ -438,6 +439,7 @@ class API:
             instance_meta=payload.instance_meta,
             min_nodes=payload.min_nodes,
             use_all_compute_resources=payload.use_all_compute_resources,
+            requested_compute_resource_ids=payload.requested_compute_resource_ids,
         )
         await self._send(command)
 
@@ -466,6 +468,9 @@ class API:
                 self.state.node_compute_resources,
                 self.state.instances,
                 self.state.retiring_compute_resources,
+                topology=self.state.topology,
+                node_backends=self.state.node_backends,
+                node_network=self.state.node_network,
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -496,8 +501,12 @@ class API:
         instance_meta: InstanceMeta = InstanceMeta.MlxRing,
         min_nodes: int = 1,
         use_all_compute_resources: bool = False,
+        requested_compute_resource_ids: Annotated[
+            list[ComputeResourceId] | None, Query()
+        ] = None,
     ) -> Instance:
         model_card = await ModelCard.load(model_id)
+        requested_resource_ids = tuple(requested_compute_resource_ids or ())
 
         try:
             placements = get_instance_placements(
@@ -507,6 +516,7 @@ class API:
                     instance_meta=instance_meta,
                     min_nodes=min_nodes,
                     use_all_compute_resources=use_all_compute_resources,
+                    requested_compute_resource_ids=requested_resource_ids,
                 ),
                 node_memory=self.state.node_memory,
                 node_network=self.state.node_network,
@@ -538,8 +548,21 @@ class API:
         model_id: ModelId,
         node_ids: Annotated[list[NodeId] | None, Query()] = None,
         use_all_compute_resources: bool = False,
+        requested_compute_resource_ids: Annotated[
+            list[ComputeResourceId] | None, Query()
+        ] = None,
     ) -> PlacementPreviewResponse:
-        seen: set[tuple[ModelId, Sharding, InstanceMeta, int, bool]] = set()
+        requested_resource_ids = tuple(requested_compute_resource_ids or ())
+        seen: set[
+            tuple[
+                ModelId,
+                Sharding,
+                InstanceMeta,
+                int,
+                bool,
+                tuple[ComputeResourceId, ...],
+            ]
+        ] = set()
         previews: list[PlacementPreview] = []
         required_nodes = set(node_ids) if node_ids else None
 
@@ -579,6 +602,7 @@ class API:
                         instance_meta=instance_meta,
                         min_nodes=min_nodes,
                         use_all_compute_resources=use_all_compute_resources,
+                        requested_compute_resource_ids=requested_resource_ids,
                     ),
                     node_memory=self.state.node_memory,
                     node_network=self.state.node_network,
@@ -598,6 +622,7 @@ class API:
                     instance_meta,
                     0,
                     use_all_compute_resources,
+                    requested_resource_ids,
                 )
                 if error_identity not in seen:
                     previews.append(
@@ -606,6 +631,7 @@ class API:
                             sharding=sharding,
                             instance_meta=instance_meta,
                             use_all_compute_resources=use_all_compute_resources,
+                            requested_compute_resource_ids=requested_resource_ids,
                             instance=None,
                             error=str(exc),
                         )
@@ -627,6 +653,7 @@ class API:
                     instance_meta,
                     0,
                     use_all_compute_resources,
+                    requested_resource_ids,
                 )
                 if error_identity not in seen:
                     previews.append(
@@ -635,6 +662,7 @@ class API:
                             sharding=sharding,
                             instance_meta=instance_meta,
                             use_all_compute_resources=use_all_compute_resources,
+                            requested_compute_resource_ids=requested_resource_ids,
                             instance=None,
                             error="Expected exactly one new instance from placement",
                         )
@@ -686,6 +714,7 @@ class API:
                 instance_meta,
                 len(placement_node_ids),
                 use_all_compute_resources,
+                requested_resource_ids,
             )
             if preview_identity not in seen:
                 previews.append(
@@ -694,6 +723,7 @@ class API:
                         sharding=sharding,
                         instance_meta=instance_meta,
                         use_all_compute_resources=use_all_compute_resources,
+                        requested_compute_resource_ids=requested_resource_ids,
                         instance=instance,
                         memory_delta_by_node=memory_delta_by_node or None,
                         error=None,

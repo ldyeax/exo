@@ -1,4 +1,6 @@
-from pydantic import Field
+from typing import cast
+
+from pydantic import Field, field_validator, model_validator
 
 from exo.api.types import (
     ImageEditsTaskParams,
@@ -7,6 +9,7 @@ from exo.api.types import (
 from exo.shared.models.model_cards import ModelCard, ModelId
 from exo.shared.types.chunks import InputImageChunk
 from exo.shared.types.common import CommandId, NodeId, SystemId
+from exo.shared.types.compute_resources import ComputeResourceId
 from exo.shared.types.instance_link import InstanceLinkId
 from exo.shared.types.text_generation import TextGenerationTaskParams
 from exo.shared.types.worker.instances import Instance, InstanceId, InstanceMeta
@@ -40,6 +43,37 @@ class PlaceInstance(BaseCommand):
     instance_meta: InstanceMeta
     min_nodes: int
     use_all_compute_resources: bool = False
+    # Nonempty order is the tensor device-rank order (rank zero first).
+    requested_compute_resource_ids: tuple[ComputeResourceId, ...] = ()
+
+    @field_validator("requested_compute_resource_ids", mode="before")
+    @classmethod
+    def deserialize_requested_compute_resource_ids(cls, value: object) -> object:
+        return tuple(cast(list[object], value)) if isinstance(value, list) else value
+
+    @model_validator(mode="after")
+    def validate_compute_resource_policy(self) -> "PlaceInstance":
+        requested_resource_ids = self.requested_compute_resource_ids
+        if len(requested_resource_ids) != len(set(requested_resource_ids)):
+            raise ValueError("Requested compute resource IDs must be unique")
+        if not requested_resource_ids:
+            return self
+        if self.use_all_compute_resources:
+            raise ValueError(
+                "Explicit compute resource selection is incompatible with "
+                "use_all_compute_resources"
+            )
+        if (
+            self.instance_meta != InstanceMeta.MlxNccl
+            or self.sharding != Sharding.Tensor
+        ):
+            raise ValueError(
+                "Explicit compute resource selection currently requires MlxNccl "
+                "with Tensor sharding"
+            )
+        for resource_id in requested_resource_ids:
+            _ = resource_id.nvidia_device_uuid()
+        return self
 
 
 class CreateInstance(BaseCommand):

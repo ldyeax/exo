@@ -246,6 +246,8 @@ def get_shard_assignments_for_tensor_parallel(
     model_card: ModelCard,
     cycle: Cycle,
     node_compute_resources: Mapping[NodeId, Sequence[ComputeResource]] | None = None,
+    *,
+    compute_resource_order: Sequence[ComputeResourceId] | None = None,
 ) -> ShardAssignments:
     total_layers = model_card.n_layers
     runner_to_shard: dict[RunnerId, ShardMetadata] = {}
@@ -255,6 +257,10 @@ def get_shard_assignments_for_tensor_parallel(
 
     targets: list[tuple[NodeId, ComputeResourceId | None]]
     if node_compute_resources is None:
+        if compute_resource_order is not None:
+            raise ValueError(
+                "Compute resource rank order requires resource-bound assignments"
+            )
         targets = [(node_id, None) for node_id in cycle]
     else:
         missing_nodes = [
@@ -265,16 +271,35 @@ def get_shard_assignments_for_tensor_parallel(
                 "Cannot create resource-bound tensor assignments without compute "
                 f"resources for nodes {missing_nodes}"
             )
-        targets = [
-            (node_id, resource.resource_id)
+        targets_by_resource_id = {
+            resource.resource_id: (node_id, resource.resource_id)
             for node_id in cycle
-            for resource in sorted(
-                node_compute_resources[node_id], key=lambda item: item.resource_id
-            )
-        ]
-        resource_ids = [resource_id for _, resource_id in targets]
-        if len(resource_ids) != len(set(resource_ids)):
+            for resource in node_compute_resources[node_id]
+        }
+        resource_count = sum(len(node_compute_resources[node_id]) for node_id in cycle)
+        if len(targets_by_resource_id) != resource_count:
             raise ValueError("Compute resources must be unique across placement nodes")
+        if compute_resource_order is None:
+            targets = [
+                (node_id, resource.resource_id)
+                for node_id in cycle
+                for resource in sorted(
+                    node_compute_resources[node_id], key=lambda item: item.resource_id
+                )
+            ]
+        else:
+            ordered_resource_ids = tuple(compute_resource_order)
+            if len(ordered_resource_ids) != len(set(ordered_resource_ids)):
+                raise ValueError("Compute resource rank order must be unique")
+            if set(ordered_resource_ids) != set(targets_by_resource_id):
+                raise ValueError(
+                    "Compute resource rank order must cover exactly the selected "
+                    "compute resources"
+                )
+            targets = [
+                targets_by_resource_id[resource_id]
+                for resource_id in ordered_resource_ids
+            ]
 
     world_size = len(targets)
 
@@ -314,9 +339,12 @@ def get_shard_assignments(
     node_memory: Mapping[NodeId, MemoryUsage],
     *,
     node_compute_resources: Mapping[NodeId, Sequence[ComputeResource]] | None = None,
+    compute_resource_order: Sequence[ComputeResourceId] | None = None,
 ) -> ShardAssignments:
     match sharding:
         case Sharding.Pipeline:
+            if compute_resource_order is not None:
+                raise ValueError("Compute resource rank order requires Tensor sharding")
             return get_shard_assignments_for_pipeline_parallel(
                 model_card=model_card,
                 cycle=cycle,
@@ -327,6 +355,7 @@ def get_shard_assignments(
                 model_card=model_card,
                 cycle=cycle,
                 node_compute_resources=node_compute_resources,
+                compute_resource_order=compute_resource_order,
             )
 
 

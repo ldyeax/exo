@@ -118,11 +118,25 @@ def _occupied_compute_resource_ids(
     return occupied_resource_ids
 
 
+def _nodes_share_connectivity_cycle(
+    topology: Topology,
+    node_ids: set[NodeId],
+    *,
+    cycles: Sequence[Cycle] | None = None,
+) -> bool:
+    candidate_cycles = cycles if cycles is not None else topology.get_cycles()
+    return any(node_ids.issubset(cycle.node_ids) for cycle in candidate_cycles)
+
+
 def validate_instance_compute_resources(
     instance: Instance,
     node_compute_resources: Mapping[NodeId, Sequence[ComputeResource]],
     current_instances: Mapping[InstanceId, Instance] | None = None,
     retiring_compute_resources: Mapping[ComputeResourceId, RunnerId] | None = None,
+    *,
+    topology: Topology | None = None,
+    node_backends: Mapping[NodeId, Sequence[Backend]] | None = None,
+    node_network: Mapping[NodeId, NodeNetworkInfo] | None = None,
 ) -> None:
     assignments = instance.shard_assignments
     resource_assignments = assignments.compute_resource_to_runner
@@ -151,39 +165,149 @@ def validate_instance_compute_resources(
             "Compute resources are already occupied by another instance: "
             f"{sorted(conflicting_resource_ids)}"
         )
-    if not resource_assignments:
-        return
     resource_owners = assignments.compute_resource_to_node
-    if not resource_owners:
+    world_size = len(assignments.runner_to_shard)
+    if resource_assignments:
+        if not resource_owners:
+            raise ValueError(
+                "Resource-bound instances require explicit compute resource ownership"
+            )
+        if set(resource_owners) != set(resource_assignments):
+            raise ValueError(
+                "Resource-bound instances require ownership for exactly the bound "
+                "compute resources"
+            )
+
+        for resource_id, runner_id in resource_assignments.items():
+            inventory_entry = inventory.get(resource_id)
+            if inventory_entry is None:
+                raise ValueError(f"Compute resource {resource_id} is not live")
+            live_node_id, resource = inventory_entry
+            assigned_node_id = resource_owners.get(resource_id)
+            if assigned_node_id is None:
+                raise ValueError(
+                    f"Compute resource {resource_id} has no explicit node owner"
+                )
+            if live_node_id != assigned_node_id:
+                raise ValueError(
+                    f"Compute resource {resource_id} is assigned to {assigned_node_id} "
+                    f"but advertised by {live_node_id}"
+                )
+            assigned_shard = assignments.runner_to_shard.get(runner_id)
+            if assigned_shard is None:
+                raise ValueError(
+                    f"Compute resource {resource_id} references unknown runner "
+                    f"{runner_id}"
+                )
+            model_storage = assigned_shard.model_card.storage_size
+            required_memory = estimated_gpu_rank_memory_requirement(
+                model_storage,
+                world_size,
+                resource.total_memory,
+            )
+            if required_memory > resource.total_memory:
+                raise ValueError(
+                    f"Compute resource {resource_id} has {resource.total_memory} but "
+                    f"the placement estimate requires {required_memory}: ceil(model "
+                    "storage / world size) + max(1 GiB, 10% GPU VRAM). KV cache and "
+                    "runtime workspace are not modeled"
+                )
+
+    if not isinstance(instance, MlxNcclInstance):
+        return
+
+    shards = tuple(assignments.runner_to_shard.values())
+    if not shards:
+        raise ValueError("MlxNcclInstance requires tensor ranks")
+    model_card = shards[0].model_card
+    if Backend.MlxCuda not in model_card.backends:
+        raise ValueError(f"MlxNccl requires model backend {Backend.MlxCuda.value}")
+    selected_node_ids = (
+        set(resource_owners.values())
+        if resource_assignments
+        else set(assignments.node_to_runner)
+    )
+    if node_backends is not None:
+        incompatible_node_ids = sorted(
+            node_id
+            for node_id in selected_node_ids
+            if Backend.MlxCuda not in node_backends.get(node_id, ())
+        )
+        if incompatible_node_ids:
+            raise ValueError(
+                f"MlxNccl nodes do not advertise MlxCuda: {incompatible_node_ids}"
+            )
+    if topology is None or node_network is None:
         raise ValueError(
-            "Resource-bound instances require explicit compute resource ownership"
+            "MlxNccl coordinator validation requires live topology and node network "
+            "facts"
+        )
+    missing_network_node_ids = sorted(selected_node_ids - set(node_network))
+    if missing_network_node_ids:
+        raise ValueError(
+            "MlxNccl coordinator validation is missing node network facts for: "
+            f"{missing_network_node_ids}"
+        )
+    if not _nodes_share_connectivity_cycle(topology, selected_node_ids):
+        raise ValueError("MlxNccl nodes do not share a connectivity cycle")
+
+    rank_zero_runner_ids = [
+        runner_id
+        for runner_id, shard in assignments.runner_to_shard.items()
+        if shard.device_rank == 0
+    ]
+    if len(rank_zero_runner_ids) != 1:
+        raise ValueError("MlxNccl requires exactly one rank-zero runner")
+    rank_zero_runner_id = rank_zero_runner_ids[0]
+    if resource_assignments:
+        rank_zero_resource_ids = [
+            resource_id
+            for resource_id, runner_id in resource_assignments.items()
+            if runner_id == rank_zero_runner_id
+        ]
+        if len(rank_zero_resource_ids) != 1:
+            raise ValueError(
+                "MlxNccl rank-zero runner requires exactly one compute resource"
+            )
+        rank_zero_node_id = resource_owners.get(rank_zero_resource_ids[0])
+        if rank_zero_node_id is None:
+            raise ValueError("MlxNccl rank-zero compute resource has no node owner")
+    else:
+        rank_zero_node_ids = [
+            node_id
+            for node_id, runner_id in assignments.node_to_runner.items()
+            if runner_id == rank_zero_runner_id
+        ]
+        if len(rank_zero_node_ids) != 1:
+            raise ValueError(
+                "MlxNccl rank-zero runner must map to exactly one participating node"
+            )
+        rank_zero_node_id = rank_zero_node_ids[0]
+    if instance.nccl_coordinator.port == 0:
+        raise ValueError("MlxNccl coordinator port must be nonzero")
+    selected_topology = topology.get_subgraph_from_nodes(sorted(selected_node_ids))
+    expected_coordinator = get_mlx_nccl_coordinator(
+        coordinator=rank_zero_node_id,
+        coordinator_port=instance.nccl_coordinator.port,
+        cycle_digraph=selected_topology,
+        node_network=node_network,
+    )
+    if instance.nccl_coordinator != expected_coordinator:
+        raise ValueError(
+            "MlxNccl coordinator does not match the live rank-zero endpoint: "
+            f"expected {expected_coordinator}, received {instance.nccl_coordinator}"
         )
 
-    world_size = len(assignments.runner_to_shard)
-    for resource_id, runner_id in resource_assignments.items():
-        inventory_entry = inventory.get(resource_id)
-        if inventory_entry is None:
-            raise ValueError(f"Compute resource {resource_id} is not live")
-        live_node_id, resource = inventory_entry
-        assigned_node_id = resource_owners[resource_id]
-        if live_node_id != assigned_node_id:
-            raise ValueError(
-                f"Compute resource {resource_id} is assigned to {assigned_node_id} "
-                f"but advertised by {live_node_id}"
-            )
-        model_storage = assignments.runner_to_shard[runner_id].model_card.storage_size
-        required_memory = estimated_gpu_rank_memory_requirement(
-            model_storage,
-            world_size,
-            resource.total_memory,
+    is_deepseek_v4 = model_card.base_model.startswith("DeepSeek V4")
+    kv_heads = model_card.num_key_value_heads
+    if model_card.hidden_size % world_size != 0 or (
+        not is_deepseek_v4 and kv_heads is not None and kv_heads % world_size != 0
+    ):
+        raise ValueError(
+            "MlxNccl tensor ranks are incompatible with model dimensions: "
+            f"hidden_size={model_card.hidden_size}, "
+            f"num_key_value_heads={kv_heads}, world_size={world_size}"
         )
-        if required_memory > resource.total_memory:
-            raise ValueError(
-                f"Compute resource {resource_id} has {resource.total_memory} but the "
-                f"placement estimate requires {required_memory}: ceil(model storage / "
-                "world size) + max(1 GiB, 10% GPU VRAM). KV cache and runtime "
-                "workspace are not modeled"
-            )
 
 
 def add_instance_to_placements(
@@ -192,15 +316,18 @@ def add_instance_to_placements(
     current_instances: Mapping[InstanceId, Instance],
     node_compute_resources: Mapping[NodeId, Sequence[ComputeResource]] | None = None,
     retiring_compute_resources: Mapping[ComputeResourceId, RunnerId] | None = None,
+    node_backends: Mapping[NodeId, Sequence[Backend]] | None = None,
+    node_network: Mapping[NodeId, NodeNetworkInfo] | None = None,
 ) -> Mapping[InstanceId, Instance]:
-    # TODO: validate against topology
-
     if node_compute_resources is not None:
         validate_instance_compute_resources(
             command.instance,
             node_compute_resources,
             current_instances,
             retiring_compute_resources,
+            topology=topology,
+            node_backends=node_backends,
+            node_network=node_network,
         )
 
     return {**current_instances, command.instance.instance_id: command.instance}
@@ -268,29 +395,96 @@ def place_instance(
             "point-to-point pipeline communication"
         )
 
+    requested_resource_ids = command.requested_compute_resource_ids
+    has_explicit_resource_selection = bool(requested_resource_ids)
     cycles = topology.get_cycles()
     minimum_nodes = (
         max(command.min_nodes, 2)
         if command.instance_meta == InstanceMeta.MlxNccl
         else command.min_nodes
     )
-    candidate_cycles = list(filter(lambda it: len(it) >= minimum_nodes, cycles))
-
-    # Filter to cycles containing all required nodes (subset matching)
-    if required_nodes:
-        candidate_cycles = [
-            cycle
-            for cycle in candidate_cycles
-            if required_nodes.issubset(cycle.node_ids)
+    placement_compute_resources: Mapping[NodeId, Sequence[ComputeResource]] | None = (
+        None
+    )
+    if has_explicit_resource_selection:
+        inventory = _compute_resource_inventory_by_id(node_compute_resources or {})
+        unknown_resource_ids = [
+            resource_id
+            for resource_id in requested_resource_ids
+            if resource_id not in inventory
         ]
+        if unknown_resource_ids:
+            raise ValueError(
+                "Requested compute resources are not live: "
+                f"{sorted(unknown_resource_ids)}"
+            )
+        unavailable_resource_ids = set(requested_resource_ids) & (
+            _occupied_compute_resource_ids(
+                current_instances,
+                node_compute_resources=node_compute_resources,
+                retiring_compute_resources=retiring_compute_resources,
+            )
+        )
+        if unavailable_resource_ids:
+            raise ValueError(
+                "Requested compute resources are already occupied or retiring: "
+                f"{sorted(unavailable_resource_ids)}"
+            )
+
+        selected_node_ids = {
+            inventory[resource_id][0] for resource_id in requested_resource_ids
+        }
+        if len(selected_node_ids) < 2:
+            raise ValueError(
+                "Explicit MlxNccl selection requires compute resources on at least "
+                "two nodes"
+            )
+        if required_nodes and not required_nodes.issubset(selected_node_ids):
+            raise ValueError(
+                "Explicit compute resource selection does not include every required "
+                "node"
+            )
+        selected_nodes_satisfy_minimum = len(selected_node_ids) >= minimum_nodes
+        if not selected_nodes_satisfy_minimum or not _nodes_share_connectivity_cycle(
+            topology, selected_node_ids, cycles=cycles
+        ):
+            raise ValueError(
+                "Requested compute resources do not share a common "
+                "connectivity cycle satisfying min_nodes"
+            )
+        requested_node_order = tuple(
+            dict.fromkeys(
+                inventory[resource_id][0] for resource_id in requested_resource_ids
+            )
+        )
+        candidate_cycles = [Cycle(node_ids=list(requested_node_order))]
+
+        explicit_resources_by_node: dict[NodeId, list[ComputeResource]] = {}
+        for resource_id in requested_resource_ids:
+            node_id, resource = inventory[resource_id]
+            explicit_resources_by_node.setdefault(node_id, []).append(resource)
+        placement_compute_resources = explicit_resources_by_node
+    else:
+        candidate_cycles = list(filter(lambda it: len(it) >= minimum_nodes, cycles))
+
+        # Filter to cycles containing all required nodes (subset matching)
+        if required_nodes:
+            candidate_cycles = [
+                cycle
+                for cycle in candidate_cycles
+                if required_nodes.issubset(cycle.node_ids)
+            ]
     cycles_with_sufficient_memory = filter_cycles_by_memory(
         candidate_cycles, node_memory, command.model_card.storage_size
     )
     if len(cycles_with_sufficient_memory) == 0:
         raise ValueError("No cycles found with sufficient memory")
 
-    placement_compute_resources: dict[NodeId, Sequence[ComputeResource]] | None = None
-    if command.instance_meta == InstanceMeta.MlxNccl and node_compute_resources:
+    if (
+        not has_explicit_resource_selection
+        and command.instance_meta == InstanceMeta.MlxNccl
+        and node_compute_resources
+    ):
         _ = _compute_resource_inventory_by_id(node_compute_resources)
         occupied_resource_ids = _occupied_compute_resource_ids(
             current_instances,
@@ -329,6 +523,20 @@ def place_instance(
             )
             for node_id in cycle
         }
+        if has_explicit_resource_selection:
+            world_size = len(requested_resource_ids)
+            if all(
+                estimated_gpu_rank_memory_requirement(
+                    command.model_card.storage_size,
+                    world_size,
+                    resource.total_memory,
+                )
+                <= resource.total_memory
+                for resources in resources_by_node.values()
+                for resource in resources
+            ):
+                return resources_by_node
+            return None
         if command.use_all_compute_resources:
             world_size = sum(len(resources) for resources in resources_by_node.values())
             if all(
@@ -372,8 +580,13 @@ def place_instance(
             if selected_compute_resources(cycle) is not None
         ]
         if not cycles_with_sufficient_memory:
+            selection_description = (
+                "Requested GPU selection"
+                if has_explicit_resource_selection
+                else "No available GPU selection"
+            )
             raise ValueError(
-                "No available GPU selection satisfies the conservative placement "
+                f"{selection_description} does not satisfy the conservative placement "
                 "estimate: ceil(model storage / world size) + max(1 GiB, 10% GPU "
                 "VRAM). KV cache and runtime workspace are not modeled"
             )
@@ -408,12 +621,15 @@ def place_instance(
             )
         ]
         if not cycles_with_sufficient_memory:
-            resource_policy = (
-                " using all advertised compute resources"
-                if placement_compute_resources is not None
+            if has_explicit_resource_selection:
+                resource_policy = " using explicitly requested compute resources"
+            elif (
+                placement_compute_resources is not None
                 and command.use_all_compute_resources
-                else ""
-            )
+            ):
+                resource_policy = " using all advertised compute resources"
+            else:
+                resource_policy = ""
             raise ValueError(
                 f"No tensor sharding found for model with "
                 f"hidden_size={command.model_card.hidden_size}"
@@ -520,6 +736,9 @@ def place_instance(
         command.sharding,
         node_memory,
         node_compute_resources=selected_compute_resources(selected_cycle),
+        compute_resource_order=(
+            requested_resource_ids if has_explicit_resource_selection else None
+        ),
     )
 
     cycle_digraph: Topology = topology.get_subgraph_from_nodes(selected_cycle.node_ids)
@@ -593,6 +812,9 @@ def place_instance(
             node_compute_resources,
             current_instances,
             retiring_compute_resources,
+            topology=topology,
+            node_backends=node_backends,
+            node_network=node_network,
         )
 
     return target_instances
