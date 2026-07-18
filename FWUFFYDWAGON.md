@@ -136,12 +136,13 @@ If three logical resources cannot be launched reliably, use PP=2/TP=1 with `SGLA
 2. Completed `mlx-community/Llama-3.2-1B-Instruct-4bit` with Tensor=2 and `MlxNccl`. The 730 MB model supports tensor sharding. Both ranks reached `RunnerReady`, both warmups completed, and a deterministic chat request returned a valid completion. Verified model locations:
    - `dwagon:/var/lib/exo/models/mlx-community--Llama-3.2-1B-Instruct-4bit`
    - `fwuff:/mnt/sanic/exo/models/mlx-community--Llama-3.2-1B-Instruct-4bit`
-3. Keep `mlx-community/Qwen3-0.6B-8bit` for single-GPU and Ring/Pipeline regression only. Pipeline over NCCL requires adding `ncclSend`/`ncclRecv` support to MLX first.
-4. Re-run the known Ornith-1.0-35B FP8/MXFP4 workload as an AMX/OSCAR regression baseline.
-5. Validate the hybrid AMX offload path with DeepSeek-V4-Flash (284B total/13B active, mixed FP4/FP8, 1M context support).
-6. Build a tiny deterministic GLM IndexShare fixture and require single-rank versus pipeline output parity.
-7. Start full GLM-5.2 FP8 at 4K, then test 32K, 128K, and finally 245,760 input tokens plus a 16,384-token output reserve.
-8. Tune resident experts at 0/1/2/4, then enable MTP and deferred work independently with correctness and performance A/B tests.
+3. Run `mlx-community/SmolLM2-135M-Instruct-8bit@0f0d9b8218915bc34d401e1a340b8c049d300d5e` with Tensor=3 and `MlxNccl` across dwagon's two GPUs and fwuff's GPU before larger models. Its Llama hidden size 576, 9 attention heads, 3 KV heads, and MLP width 1536 are all divisible by three; the indexed weights are only 142,955,136 bytes. Use this as a scheduler, multi-runner lifecycle, and collective-correctness proof rather than a performance result.
+4. Keep `mlx-community/Qwen3-0.6B-8bit` for single-GPU and Ring/Pipeline regression only. Pipeline over NCCL requires adding `ncclSend`/`ncclRecv` support to MLX first.
+5. Re-run the known Ornith-1.0-35B FP8/MXFP4 workload as an AMX/OSCAR regression baseline.
+6. Validate the hybrid AMX offload path with DeepSeek-V4-Flash (284B total/13B active, mixed FP4/FP8, 1M context support).
+7. Build a tiny deterministic GLM IndexShare fixture and require single-rank versus pipeline output parity.
+8. Start full GLM-5.2 FP8 at 4K, then test 32K, 128K, and finally 245,760 input tokens plus a 16,384-token output reserve.
+9. Tune resident experts at 0/1/2/4, then enable MTP and deferred work independently with correctness and performance A/B tests.
 
 ## AMX Verification Model
 
