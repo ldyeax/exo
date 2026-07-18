@@ -1,4 +1,5 @@
 from collections.abc import Generator, Mapping
+from ipaddress import ip_address
 
 from loguru import logger
 
@@ -428,16 +429,17 @@ def get_mlx_ring_hosts_by_node(
     return hosts_by_node
 
 
-def get_mlx_jaccl_coordinators(
+def get_mlx_coordinator_hosts(
     coordinator: NodeId,
     coordinator_port: int,
     cycle_digraph: Topology,
     node_network: Mapping[NodeId, NodeNetworkInfo],
-) -> dict[NodeId, str]:
-    """Get the coordinator addresses for MLX JACCL (rank 0 device).
+) -> dict[NodeId, Host]:
+    """Get per-node addresses for a rank-0 distributed coordinator.
 
     Select an IP address that each node can reach for the rank 0 node. Returns
-    address in format "X.X.X.X:PORT" per node.
+    a wildcard listen address for rank 0 and a reachable address for every
+    other node.
     """
     logger.debug(f"Selecting coordinator: {coordinator}")
 
@@ -452,10 +454,74 @@ def get_mlx_jaccl_coordinators(
             return ip
 
         raise ValueError(
-            "Current jaccl backend requires all participating devices to be able to communicate"
+            "Distributed coordinator must be reachable by every participating node"
         )
 
     return {
-        n: f"{get_ip_for_node(n)}:{coordinator_port}"
-        for n in cycle_digraph.list_nodes()
+        node_id: Host(ip=get_ip_for_node(node_id), port=coordinator_port)
+        for node_id in cycle_digraph.list_nodes()
+    }
+
+
+def get_mlx_nccl_coordinator(
+    coordinator: NodeId,
+    coordinator_port: int,
+    cycle_digraph: Topology,
+    node_network: Mapping[NodeId, NodeNetworkInfo],
+) -> Host:
+    """Select one rank-0 address reachable by every NCCL peer."""
+    peer_nodes = [
+        node_id for node_id in cycle_digraph.list_nodes() if node_id != coordinator
+    ]
+    if not peer_nodes:
+        raise ValueError("NCCL requires at least two participating nodes")
+
+    reachable_ip_sets: list[set[str]] = [
+        set(_find_connection_ip(node_id, coordinator, cycle_digraph))
+        for node_id in peer_nodes
+    ]
+    shared_ips = reachable_ip_sets[0].intersection(*reachable_ip_sets[1:])
+    shared_ipv4_addresses = {
+        address for address in shared_ips if ip_address(address).version == 4
+    }
+    if not shared_ipv4_addresses:
+        raise ValueError(
+            "NCCL rank-0 coordinator must have one IPv4 address reachable by every "
+            "participating node"
+        )
+
+    coordinator_network = node_network.get(coordinator, NodeNetworkInfo())
+    ip_to_type = {
+        interface.ip_address: interface.interface_type
+        for interface in coordinator_network.interfaces
+    }
+    priority = {
+        "ethernet": 0,
+        "wifi": 1,
+        "unknown": 2,
+        "maybe_ethernet": 3,
+        "thunderbolt": 4,
+    }
+    coordinator_ip = min(
+        shared_ipv4_addresses,
+        key=lambda ip: (priority.get(ip_to_type.get(ip, "unknown"), 2), ip),
+    )
+    return Host(ip=coordinator_ip, port=coordinator_port)
+
+
+def get_mlx_jaccl_coordinators(
+    coordinator: NodeId,
+    coordinator_port: int,
+    cycle_digraph: Topology,
+    node_network: Mapping[NodeId, NodeNetworkInfo],
+) -> dict[NodeId, str]:
+    """Get coordinator addresses in the format expected by MLX JACCL."""
+    return {
+        node_id: str(host)
+        for node_id, host in get_mlx_coordinator_hosts(
+            coordinator=coordinator,
+            coordinator_port=coordinator_port,
+            cycle_digraph=cycle_digraph,
+            node_network=node_network,
+        ).items()
     }

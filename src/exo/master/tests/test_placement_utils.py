@@ -4,6 +4,7 @@ from exo.master.placement_utils import (
     allocate_layers_proportionally,
     filter_cycles_by_memory,
     get_mlx_jaccl_coordinators,
+    get_mlx_nccl_coordinator,
     get_shard_assignments,
     get_shard_assignments_for_pipeline_parallel,
     get_smallest_cycles,
@@ -17,6 +18,7 @@ from exo.shared.topology import Topology
 from exo.shared.types.backends import Backend
 from exo.shared.types.common import NodeId
 from exo.shared.types.memory import Memory
+from exo.shared.types.multiaddr import Multiaddr
 from exo.shared.types.profiling import (
     NetworkInterfaceInfo,
     NodeNetworkInfo,
@@ -384,6 +386,90 @@ def test_get_mlx_jaccl_coordinators():
     assert coordinators[node_c_id] == (
         f"{conn_c_a.edge.sink_multiaddr.ip_address}:5000"
     ), "node_c should use the IP from conn_c_a"
+
+
+def test_get_mlx_nccl_coordinator_uses_reachable_rank_zero_ip():
+    node_a_id = NodeId("node-a")
+    node_b_id = NodeId("node-b")
+    topology = Topology()
+    topology.add_node(node_a_id)
+    topology.add_node(node_b_id)
+    topology.add_connection(
+        Connection(
+            source=node_a_id,
+            sink=node_b_id,
+            edge=create_socket_connection(2),
+        )
+    )
+    topology.add_connection(
+        Connection(
+            source=node_b_id,
+            sink=node_a_id,
+            edge=create_socket_connection(1),
+        )
+    )
+    node_network = {
+        node_a_id: NodeNetworkInfo(
+            interfaces=[
+                NetworkInterfaceInfo(
+                    name="eth0",
+                    ip_address="169.254.0.1",
+                    interface_type="ethernet",
+                )
+            ]
+        ),
+        node_b_id: NodeNetworkInfo(),
+    }
+
+    coordinator = get_mlx_nccl_coordinator(
+        coordinator=node_a_id,
+        coordinator_port=5000,
+        cycle_digraph=topology,
+        node_network=node_network,
+    )
+
+    assert coordinator.ip == "169.254.0.1"
+    assert coordinator.port == 5000
+
+
+def test_get_mlx_nccl_coordinator_ignores_ipv6_candidates():
+    node_a_id = NodeId("node-a")
+    node_b_id = NodeId("node-b")
+    topology = Topology()
+    topology.add_node(node_a_id)
+    topology.add_node(node_b_id)
+    topology.add_connection(
+        Connection(
+            source=node_a_id,
+            sink=node_b_id,
+            edge=create_socket_connection(2),
+        )
+    )
+    topology.add_connection(
+        Connection(
+            source=node_b_id,
+            sink=node_a_id,
+            edge=SocketConnection(
+                sink_multiaddr=Multiaddr(address="/ip6/2001:db8::1/tcp/5000")
+            ),
+        )
+    )
+    topology.add_connection(
+        Connection(
+            source=node_b_id,
+            sink=node_a_id,
+            edge=create_socket_connection(1),
+        )
+    )
+
+    coordinator = get_mlx_nccl_coordinator(
+        coordinator=node_a_id,
+        coordinator_port=5000,
+        cycle_digraph=topology,
+        node_network={},
+    )
+
+    assert coordinator.ip == "169.254.0.1"
 
 
 class TestAllocateLayersProportionally:

@@ -7,6 +7,7 @@ from exo.master.placement_utils import (
     filter_cycles_by_memory,
     get_mlx_jaccl_coordinators,
     get_mlx_jaccl_devices_matrix,
+    get_mlx_nccl_coordinator,
     get_mlx_ring_hosts_by_node,
     get_shard_assignments,
     get_smallest_cycles,
@@ -43,6 +44,7 @@ from exo.shared.types.worker.instances import (
     InstanceId,
     InstanceMeta,
     MlxJacclInstance,
+    MlxNcclInstance,
     MlxRingInstance,
 )
 from exo.shared.types.worker.shards import Sharding
@@ -51,6 +53,7 @@ from exo.utils.ports import random_ephemeral_port
 INSTANCE_META_BACKENDS: dict[InstanceMeta, list[Backend]] = {
     InstanceMeta.MlxRing: [Backend.MlxMetal, Backend.MlxCuda, Backend.MlxCpu],
     InstanceMeta.MlxJaccl: [Backend.MlxMetal],
+    InstanceMeta.MlxNccl: [Backend.MlxCuda],
 }
 
 
@@ -114,8 +117,22 @@ def place_instance(
     download_status: Mapping[NodeId, Sequence[DownloadProgress]] | None = None,
     node_rdma_ctl: Mapping[NodeId, NodeRdmaCtlStatus] | None = None,
 ) -> dict[InstanceId, Instance]:
+    if (
+        command.instance_meta == InstanceMeta.MlxNccl
+        and command.sharding != Sharding.Tensor
+    ):
+        raise ValueError(
+            "MlxNccl requires Tensor sharding because MLX NCCL does not support "
+            "point-to-point pipeline communication"
+        )
+
     cycles = topology.get_cycles()
-    candidate_cycles = list(filter(lambda it: len(it) >= command.min_nodes, cycles))
+    minimum_nodes = (
+        max(command.min_nodes, 2)
+        if command.instance_meta == InstanceMeta.MlxNccl
+        else command.min_nodes
+    )
+    candidate_cycles = list(filter(lambda it: len(it) >= minimum_nodes, cycles))
 
     # Filter to cycles containing all required nodes (subset matching)
     if required_nodes:
@@ -172,8 +189,6 @@ def place_instance(
                 "Pipeline parallelism is not supported for Gemma 4; use tensor parallelism instead."
             )
 
-    smallest_cycles = get_smallest_cycles(cycles_with_sufficient_memory)
-
     required_backends = set(INSTANCE_META_BACKENDS[command.instance_meta]) & set(
         command.model_card.backends
     )
@@ -184,18 +199,19 @@ def place_instance(
             f"{command.instance_meta.value} which requires "
             f"{sorted(b.value for b in INSTANCE_META_BACKENDS[command.instance_meta])}"
         )
-    smallest_cycles = [
+    backend_compatible_cycles = [
         cycle
-        for cycle in smallest_cycles
+        for cycle in cycles_with_sufficient_memory
         if all(
             set(node_backends.get(node_id, [])) & required_backends for node_id in cycle
         )
     ]
-    if not smallest_cycles:
+    if not backend_compatible_cycles:
         raise ValueError(
             f"No cycle where every node supports a backend in "
             f"{sorted(b.value for b in required_backends)} for {command.model_card.model_id}"
         )
+    smallest_cycles = get_smallest_cycles(backend_compatible_cycles)
 
     rdma_ctl_status = node_rdma_ctl or {}
 
@@ -260,22 +276,21 @@ def place_instance(
     instance_id = InstanceId()
     target_instances = dict(deepcopy(current_instances))
 
+    def get_rank_zero_node() -> NodeId:
+        zero_node_ids = [
+            node_id
+            for node_id in selected_cycle.node_ids
+            if shard_assignments.runner_to_shard[
+                shard_assignments.node_to_runner[node_id]
+            ].device_rank
+            == 0
+        ]
+        assert len(zero_node_ids) == 1
+        return zero_node_ids[0]
+
     match command.instance_meta:
         case InstanceMeta.MlxJaccl:
-            # TODO(evan): shard assignments should contain information about ranks, this is ugly
-            def get_device_rank(node_id: NodeId) -> int:
-                runner_id = shard_assignments.node_to_runner[node_id]
-                shard_metadata = shard_assignments.runner_to_shard.get(runner_id)
-                assert shard_metadata is not None
-                return shard_metadata.device_rank
-
-            zero_node_ids = [
-                node_id
-                for node_id in selected_cycle.node_ids
-                if get_device_rank(node_id) == 0
-            ]
-            assert len(zero_node_ids) == 1
-            coordinator_node_id = zero_node_ids[0]
+            coordinator_node_id = get_rank_zero_node()
 
             mlx_jaccl_devices = get_mlx_jaccl_devices_matrix(
                 [node_id for node_id in selected_cycle],
@@ -292,6 +307,19 @@ def place_instance(
                 shard_assignments=shard_assignments,
                 jaccl_devices=mlx_jaccl_devices,
                 jaccl_coordinators=mlx_jaccl_coordinators,
+            )
+        case InstanceMeta.MlxNccl:
+            coordinator_node_id = get_rank_zero_node()
+            nccl_coordinator = get_mlx_nccl_coordinator(
+                coordinator=coordinator_node_id,
+                coordinator_port=random_ephemeral_port(),
+                cycle_digraph=cycle_digraph,
+                node_network=node_network,
+            )
+            target_instances[instance_id] = MlxNcclInstance(
+                instance_id=instance_id,
+                shard_assignments=shard_assignments,
+                nccl_coordinator=nccl_coordinator,
             )
         case InstanceMeta.MlxRing:
             ephemeral_port = random_ephemeral_port()

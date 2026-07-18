@@ -1,18 +1,22 @@
 import os
 import resource
+import sys
 import traceback
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Self, cast
 
 import loguru
 
 from exo.shared.types.events import Event
 from exo.shared.types.tasks import Task, TaskId
-from exo.shared.types.worker.instances import BoundInstance
+from exo.shared.types.worker.instances import BoundInstance, MlxNcclInstance
 from exo.utils.channels import ClosedResourceError, MpReceiver, MpSender
 from exo.worker.engines.base import Builder
 
 logger: "loguru.Logger" = loguru.logger
+
+DEFAULT_INFINIBAND_DEVICES_PATH = Path("/sys/class/infiniband")
 
 
 @dataclass(frozen=True)
@@ -37,6 +41,35 @@ class RunnerTerminationError:
         return f"{self.exception_type}: {self.exception_message}\n{self.traceback}"
 
 
+def _has_mlx4_infiniband_device(infiniband_devices_path: Path) -> bool:
+    try:
+        infiniband_devices = infiniband_devices_path.iterdir()
+    except OSError:
+        return False
+
+    for infiniband_device in infiniband_devices:
+        driver_module_path = infiniband_device / "device" / "driver" / "module"
+        try:
+            driver_module_target = os.readlink(driver_module_path)
+        except OSError:
+            continue
+        if Path(driver_module_target).name == "mlx4_core":
+            return True
+
+    return False
+
+
+def configure_runner_environment(
+    bound_instance: BoundInstance,
+    infiniband_devices_path: Path = DEFAULT_INFINIBAND_DEVICES_PATH,
+) -> None:
+    if isinstance(bound_instance.instance, MlxNcclInstance):
+        os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
+        if _has_mlx4_infiniband_device(infiniband_devices_path):
+            os.environ.setdefault("NCCL_GIN_ENABLE", "0")
+            os.environ.setdefault("NCCL_GIN_TYPE", "0")
+
+
 def entrypoint(
     bound_instance: BoundInstance,
     event_sender: MpSender[Event | RunnerTerminationError],
@@ -47,16 +80,23 @@ def entrypoint(
     global logger
     logger = _logger
 
+    configure_runner_environment(bound_instance)
+    if isinstance(bound_instance.instance, MlxNcclInstance):
+        logger.info(
+            f"NCCL runner CUDA visibility: {os.environ['CUDA_VISIBLE_DEVICES']}"
+        )
+
     soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
     resource.setrlimit(resource.RLIMIT_NOFILE, (min(max(soft, 2048), hard), hard))
 
-    fast_synch_override = os.environ.get("EXO_FAST_SYNCH")
-    if fast_synch_override == "false":
-        os.environ["MLX_METAL_FAST_SYNCH"] = "0"
-    else:
-        os.environ["MLX_METAL_FAST_SYNCH"] = "1"
+    if sys.platform == "darwin":
+        fast_synch_override = os.environ.get("EXO_FAST_SYNCH")
+        if fast_synch_override == "false":
+            os.environ["MLX_METAL_FAST_SYNCH"] = "0"
+        else:
+            os.environ["MLX_METAL_FAST_SYNCH"] = "1"
 
-    logger.info(f"Fast synch flag: {os.environ['MLX_METAL_FAST_SYNCH']}")
+        logger.info(f"Fast synch flag: {os.environ['MLX_METAL_FAST_SYNCH']}")
 
     # Import main after setting global logger - this lets us just import logger from this module
     try:

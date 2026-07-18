@@ -49,6 +49,7 @@ from exo.shared.types.text_generation import ChatTemplateValue, TextGenerationTa
 from exo.shared.types.worker.instances import (
     BoundInstance,
     MlxJacclInstance,
+    MlxNcclInstance,
     MlxRingInstance,
 )
 from exo.shared.types.worker.runner_response import ModelLoadingResponse
@@ -66,6 +67,8 @@ from exo.worker.engines.mlx.auto_parallel import (
 )
 from exo.worker.engines.mlx.types import Model
 from exo.worker.runner.bootstrap import logger
+
+EXO_MLX_DISTRIBUTED_BACKEND = "EXO_MLX_DISTRIBUTED_BACKEND"
 
 
 def get_weights_size(model_shard_meta: ShardMetadata) -> Memory:
@@ -118,6 +121,7 @@ def mlx_distributed_init(
                 # os.environ["MLX_RING_VERBOSE"] = "1"  # NOTE: we don't use it enough to care (turn on again if need to)
 
                 group = mx.distributed.init(backend="ring", strict=True)
+                distributed_backend = "ring"
 
             case MlxJacclInstance(
                 jaccl_devices=jaccl_devices, jaccl_coordinators=jaccl_coordinators
@@ -141,7 +145,22 @@ def mlx_distributed_init(
                 os.environ["MLX_RANK"] = str(rank)
                 os.environ["MLX_JACCL_COORDINATOR"] = jaccl_coordinator
                 group = mx.distributed.init(backend="jaccl", strict=True)
+                distributed_backend = "jaccl"
 
+            case MlxNcclInstance(nccl_coordinator=nccl_coordinator):
+                logger.info(
+                    f"rank {rank} NCCL coordinator: {nccl_coordinator.ip}:{nccl_coordinator.port}"
+                )
+                os.environ["MLX_RANK"] = str(rank)
+                os.environ["MLX_WORLD_SIZE"] = str(
+                    bound_instance.bound_shard.world_size
+                )
+                os.environ["NCCL_HOST_IP"] = nccl_coordinator.ip
+                os.environ["NCCL_PORT"] = str(nccl_coordinator.port)
+                group = mx.distributed.init(backend="nccl", strict=True)
+                distributed_backend = "nccl"
+
+        os.environ[EXO_MLX_DISTRIBUTED_BACKEND] = distributed_backend
         logger.info(f"Rank {rank} mlx distributed initialization complete")
 
         return group
@@ -830,11 +849,19 @@ def mlx_cleanup(
     gc.collect()
 
 
+def _distributed_control_stream() -> mx.Stream | None:
+    if os.environ.get(EXO_MLX_DISTRIBUTED_BACKEND) == "nccl":
+        return None
+    return mx.default_stream(mx.Device(mx.cpu))
+
+
 def mx_any(bool_: bool, group: mx.distributed.Group | None) -> bool:
     if group is None:
         return bool_
     num_true = mx.distributed.all_sum(
-        mx.array(bool_), group=group, stream=mx.default_stream(mx.Device(mx.cpu))
+        mx.array(bool_, dtype=mx.int32),
+        group=group,
+        stream=_distributed_control_stream(),
     )
     mx.eval(num_true)
     return num_true.item() > 0
@@ -845,7 +872,7 @@ def mx_barrier(group: mx.distributed.Group | None):
         return
     mx.eval(
         mx.distributed.all_sum(
-            mx.array(1.0), group=group, stream=mx.default_stream(mx.Device(mx.cpu))
+            mx.array(1.0), group=group, stream=_distributed_control_stream()
         )
     )
 

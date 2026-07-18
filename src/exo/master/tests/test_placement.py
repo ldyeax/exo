@@ -47,6 +47,7 @@ from exo.shared.types.worker.instances import (
     InstanceId,
     InstanceMeta,
     MlxJacclInstance,
+    MlxNcclInstance,
     MlxRingInstance,
 )
 from exo.shared.types.worker.runners import ShardAssignments
@@ -92,6 +93,194 @@ def place_instance_command(model_card: ModelCard) -> PlaceInstance:
         instance_meta=InstanceMeta.MlxRing,
         min_nodes=1,
     )
+
+
+def test_place_mlx_nccl_on_cuda_nodes(model_card: ModelCard):
+    node_a = NodeId("node-a")
+    node_b = NodeId("node-b")
+    topology = Topology()
+    topology.add_node(node_a)
+    topology.add_node(node_b)
+    topology.add_connection(
+        Connection(source=node_a, sink=node_b, edge=create_socket_connection(2))
+    )
+    topology.add_connection(
+        Connection(source=node_b, sink=node_a, edge=create_socket_connection(1))
+    )
+    node_memory = {
+        node_a: create_node_memory(1000 * 1024),
+        node_b: create_node_memory(1000 * 1024),
+    }
+    node_network = {
+        node_a: NodeNetworkInfo(
+            interfaces=[
+                NetworkInterfaceInfo(
+                    name="eth0",
+                    ip_address="169.254.0.1",
+                    interface_type="ethernet",
+                )
+            ]
+        ),
+        node_b: NodeNetworkInfo(
+            interfaces=[
+                NetworkInterfaceInfo(
+                    name="eth0",
+                    ip_address="169.254.0.2",
+                    interface_type="ethernet",
+                )
+            ]
+        ),
+    }
+    cuda_model_card = model_card.model_copy(update={"backends": [Backend.MlxCuda]})
+    command = PlaceInstance(
+        command_id=CommandId(),
+        model_card=cuda_model_card,
+        sharding=Sharding.Tensor,
+        instance_meta=InstanceMeta.MlxNccl,
+        min_nodes=2,
+    )
+
+    placements = place_instance(
+        command,
+        topology,
+        {},
+        node_memory,
+        node_network,
+        {node_a: [Backend.MlxCuda], node_b: [Backend.MlxCuda]},
+    )
+
+    instance = next(iter(placements.values()))
+    assert isinstance(instance, MlxNcclInstance)
+    assert instance.nccl_coordinator.ip in {"169.254.0.1", "169.254.0.2"}
+    assert instance.nccl_coordinator.ip != "0.0.0.0"
+    assert instance.nccl_coordinator.port > 0
+
+
+def test_place_mlx_nccl_rejects_non_cuda_node(model_card: ModelCard):
+    node_a = NodeId("node-a")
+    node_b = NodeId("node-b")
+    topology = Topology()
+    topology.add_node(node_a)
+    topology.add_node(node_b)
+    topology.add_connection(
+        Connection(source=node_a, sink=node_b, edge=create_socket_connection(2))
+    )
+    topology.add_connection(
+        Connection(source=node_b, sink=node_a, edge=create_socket_connection(1))
+    )
+    node_memory = {
+        node_a: create_node_memory(1000 * 1024),
+        node_b: create_node_memory(1000 * 1024),
+    }
+    command = PlaceInstance(
+        command_id=CommandId(),
+        model_card=model_card.model_copy(update={"backends": [Backend.MlxCuda]}),
+        sharding=Sharding.Tensor,
+        instance_meta=InstanceMeta.MlxNccl,
+        min_nodes=2,
+    )
+
+    with pytest.raises(ValueError, match="No cycle where every node supports"):
+        place_instance(
+            command,
+            topology,
+            {},
+            node_memory,
+            {node_a: create_node_network(), node_b: create_node_network()},
+            {node_a: [Backend.MlxCuda], node_b: [Backend.MlxMetal]},
+        )
+
+
+def test_place_mlx_nccl_filters_backends_before_selecting_smallest_cycle(
+    model_card: ModelCard,
+) -> None:
+    metal_nodes = (NodeId("metal-a"), NodeId("metal-b"))
+    cuda_nodes = (NodeId("cuda-a"), NodeId("cuda-b"), NodeId("cuda-c"))
+    topology = Topology()
+    node_ip_suffix = {
+        metal_nodes[0]: 1,
+        metal_nodes[1]: 2,
+        cuda_nodes[0]: 3,
+        cuda_nodes[1]: 4,
+        cuda_nodes[2]: 5,
+    }
+
+    for nodes in (metal_nodes, cuda_nodes):
+        for source in nodes:
+            for sink in nodes:
+                if source != sink:
+                    topology.add_connection(
+                        Connection(
+                            source=source,
+                            sink=sink,
+                            edge=create_socket_connection(node_ip_suffix[sink]),
+                        )
+                    )
+
+    command = PlaceInstance(
+        command_id=CommandId(),
+        model_card=model_card.model_copy(update={"backends": [Backend.MlxCuda]}),
+        sharding=Sharding.Tensor,
+        instance_meta=InstanceMeta.MlxNccl,
+        min_nodes=2,
+    )
+    node_memory = {
+        **{node_id: create_node_memory(600 * 1024) for node_id in metal_nodes},
+        **{node_id: create_node_memory(400 * 1024) for node_id in cuda_nodes},
+    }
+    node_backends = {
+        **{node_id: [Backend.MlxMetal] for node_id in metal_nodes},
+        **{node_id: [Backend.MlxCuda] for node_id in cuda_nodes},
+    }
+
+    placements = place_instance(
+        command,
+        topology,
+        {},
+        node_memory,
+        {node_id: create_node_network() for node_id in node_memory},
+        node_backends,
+    )
+
+    instance = next(iter(placements.values()))
+    assert isinstance(instance, MlxNcclInstance)
+    assert set(instance.shard_assignments.node_to_runner) == set(cuda_nodes)
+
+
+def test_place_mlx_nccl_rejects_pipeline_sharding(model_card: ModelCard):
+    command = PlaceInstance(
+        command_id=CommandId(),
+        model_card=model_card.model_copy(update={"backends": [Backend.MlxCuda]}),
+        sharding=Sharding.Pipeline,
+        instance_meta=InstanceMeta.MlxNccl,
+        min_nodes=2,
+    )
+
+    with pytest.raises(ValueError, match="MlxNccl requires Tensor sharding"):
+        place_instance(command, Topology(), {}, {}, {}, {})
+
+
+def test_place_mlx_nccl_requires_multiple_nodes(model_card: ModelCard):
+    node_id = NodeId("node-a")
+    topology = Topology()
+    topology.add_node(node_id)
+    command = PlaceInstance(
+        command_id=CommandId(),
+        model_card=model_card.model_copy(update={"backends": [Backend.MlxCuda]}),
+        sharding=Sharding.Tensor,
+        instance_meta=InstanceMeta.MlxNccl,
+        min_nodes=1,
+    )
+
+    with pytest.raises(ValueError, match="No cycles found with sufficient memory"):
+        place_instance(
+            command,
+            topology,
+            {},
+            {node_id: create_node_memory(1000 * 1024)},
+            {node_id: create_node_network()},
+            {node_id: [Backend.MlxCuda]},
+        )
 
 
 @pytest.mark.parametrize(
