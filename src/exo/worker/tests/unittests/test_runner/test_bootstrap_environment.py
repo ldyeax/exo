@@ -67,10 +67,12 @@ def _bound_nccl_instance(*, resource_bound: bool = False) -> BoundInstance:
     )
 
 
-def _add_mlx4_infiniband_device(infiniband_devices_path: Path) -> None:
-    driver_path = infiniband_devices_path / "mlx4_0" / "device" / "driver"
+def _add_infiniband_device(
+    infiniband_devices_path: Path, device_name: str, driver_module: str
+) -> None:
+    driver_path = infiniband_devices_path / device_name / "device" / "driver"
     driver_path.mkdir(parents=True)
-    (driver_path / "module").symlink_to("/sys/module/mlx4_core")
+    (driver_path / "module").symlink_to(f"/sys/module/{driver_module}")
 
 
 def test_nccl_runner_defaults_to_first_cuda_device(
@@ -109,7 +111,8 @@ def test_nccl_resource_bound_runner_overrides_parent_cuda_binding(
 def test_nccl_runner_disables_gin_for_mlx4_devices(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    _add_mlx4_infiniband_device(tmp_path)
+    _add_infiniband_device(tmp_path, "mlx4_0", "mlx4_core")
+    monkeypatch.delenv("NCCL_IB_HCA", raising=False)
     monkeypatch.delenv("NCCL_GIN_ENABLE", raising=False)
     monkeypatch.delenv("NCCL_GIN_TYPE", raising=False)
 
@@ -121,10 +124,79 @@ def test_nccl_runner_disables_gin_for_mlx4_devices(
     assert os.environ["NCCL_GIN_TYPE"] == "0"
 
 
+def test_nccl_runner_keeps_gin_available_when_selector_uses_only_mlx5(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _add_infiniband_device(tmp_path, "mlx4_0", "mlx4_core")
+    _add_infiniband_device(tmp_path, "mlx5_0", "mlx5_core")
+    monkeypatch.setenv("NCCL_IB_HCA", "=mlx5_0:1")
+    monkeypatch.delenv("NCCL_GIN_ENABLE", raising=False)
+    monkeypatch.delenv("NCCL_GIN_TYPE", raising=False)
+
+    configure_runner_environment(
+        _bound_nccl_instance(), infiniband_devices_path=tmp_path
+    )
+
+    assert "NCCL_GIN_ENABLE" not in os.environ
+    assert "NCCL_GIN_TYPE" not in os.environ
+
+
+def test_nccl_runner_disables_gin_when_selector_can_use_mlx4(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _add_infiniband_device(tmp_path, "mlx4_0", "mlx4_core")
+    _add_infiniband_device(tmp_path, "mlx5_0", "mlx5_core")
+    monkeypatch.setenv("NCCL_IB_HCA", "mlx")
+    monkeypatch.delenv("NCCL_GIN_ENABLE", raising=False)
+    monkeypatch.delenv("NCCL_GIN_TYPE", raising=False)
+
+    configure_runner_environment(
+        _bound_nccl_instance(), infiniband_devices_path=tmp_path
+    )
+
+    assert os.environ["NCCL_GIN_ENABLE"] == "0"
+    assert os.environ["NCCL_GIN_TYPE"] == "0"
+
+
+def test_nccl_runner_honors_mlx4_exclusion_selector(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _add_infiniband_device(tmp_path, "mlx4_0", "mlx4_core")
+    _add_infiniband_device(tmp_path, "mlx5_0", "mlx5_core")
+    monkeypatch.setenv("NCCL_IB_HCA", "^=mlx4_0")
+    monkeypatch.delenv("NCCL_GIN_ENABLE", raising=False)
+    monkeypatch.delenv("NCCL_GIN_TYPE", raising=False)
+
+    configure_runner_environment(
+        _bound_nccl_instance(), infiniband_devices_path=tmp_path
+    )
+
+    assert "NCCL_GIN_ENABLE" not in os.environ
+    assert "NCCL_GIN_TYPE" not in os.environ
+
+
+def test_nccl_runner_applies_exact_match_to_entire_hca_list(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _add_infiniband_device(tmp_path, "mlx4_10", "mlx4_core")
+    _add_infiniband_device(tmp_path, "mlx5_0", "mlx5_core")
+    monkeypatch.setenv("NCCL_IB_HCA", "=mlx5_0:1,mlx4_1:1")
+    monkeypatch.delenv("NCCL_GIN_ENABLE", raising=False)
+    monkeypatch.delenv("NCCL_GIN_TYPE", raising=False)
+
+    configure_runner_environment(
+        _bound_nccl_instance(), infiniband_devices_path=tmp_path
+    )
+
+    assert "NCCL_GIN_ENABLE" not in os.environ
+    assert "NCCL_GIN_TYPE" not in os.environ
+
+
 def test_nccl_runner_preserves_operator_gin_settings(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    _add_mlx4_infiniband_device(tmp_path)
+    _add_infiniband_device(tmp_path, "mlx4_0", "mlx4_core")
+    monkeypatch.delenv("NCCL_IB_HCA", raising=False)
     monkeypatch.setenv("NCCL_GIN_ENABLE", "1")
     monkeypatch.setenv("NCCL_GIN_TYPE", "CUDA")
 

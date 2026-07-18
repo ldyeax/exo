@@ -41,22 +41,76 @@ class RunnerTerminationError:
         return f"{self.exception_type}: {self.exception_message}\n{self.traceback}"
 
 
-def _has_mlx4_infiniband_device(infiniband_devices_path: Path) -> bool:
+def _infiniband_driver_modules(infiniband_devices_path: Path) -> dict[str, str]:
     try:
         infiniband_devices = infiniband_devices_path.iterdir()
     except OSError:
-        return False
+        return {}
 
+    driver_modules: dict[str, str] = {}
     for infiniband_device in infiniband_devices:
         driver_module_path = infiniband_device / "device" / "driver" / "module"
         try:
             driver_module_target = os.readlink(driver_module_path)
         except OSError:
             continue
-        if Path(driver_module_target).name == "mlx4_core":
-            return True
+        driver_modules[infiniband_device.name] = Path(driver_module_target).name
+    return driver_modules
 
-    return False
+
+def _nccl_hca_pattern_matches(
+    device_name: str, pattern: str, *, exact_match: bool
+) -> bool:
+    exact_match = exact_match or pattern.startswith("=")
+    device_pattern = pattern.removeprefix("=").partition(":")[0]
+    if not device_pattern:
+        return False
+    return (
+        device_name == device_pattern
+        if exact_match
+        else device_name.startswith(device_pattern)
+    )
+
+
+def _has_eligible_mlx4_infiniband_device(
+    infiniband_devices_path: Path,
+    hca_selector: str | None,
+) -> bool:
+    driver_modules = _infiniband_driver_modules(infiniband_devices_path)
+    if not hca_selector:
+        eligible_device_names = set(driver_modules)
+    else:
+        selector = hca_selector.strip()
+        exclusion = selector.startswith("^")
+        selector = selector.removeprefix("^")
+        exact_match = selector.startswith("=")
+        patterns = tuple(
+            pattern.strip()
+            for pattern in selector.removeprefix("=").split(",")
+            if pattern.strip()
+        )
+        matching_device_names = {
+            device_name
+            for device_name in driver_modules
+            if any(
+                _nccl_hca_pattern_matches(
+                    device_name,
+                    pattern,
+                    exact_match=exact_match,
+                )
+                for pattern in patterns
+            )
+        }
+        eligible_device_names = (
+            set(driver_modules) - matching_device_names
+            if exclusion
+            else matching_device_names
+        )
+
+    return any(
+        driver_modules[device_name] == "mlx4_core"
+        for device_name in eligible_device_names
+    )
 
 
 def configure_runner_environment(
@@ -74,7 +128,10 @@ def configure_runner_environment(
             os.environ["CUDA_VISIBLE_DEVICES"] = device_uuid
         else:
             os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
-        if _has_mlx4_infiniband_device(infiniband_devices_path):
+        if _has_eligible_mlx4_infiniband_device(
+            infiniband_devices_path,
+            os.environ.get("NCCL_IB_HCA"),
+        ):
             os.environ.setdefault("NCCL_GIN_ENABLE", "0")
             os.environ.setdefault("NCCL_GIN_TYPE", "0")
 
