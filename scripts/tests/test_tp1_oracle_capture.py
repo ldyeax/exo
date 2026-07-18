@@ -1227,6 +1227,68 @@ def test_strict_config_rejects_source_ports_gpu_and_request_tampering(
             oracle.OracleConfig.model_validate(unpinned)
 
 
+def test_strict_config_accepts_pinned_llama32_3b_oracle_model(
+    tmp_path: Path,
+) -> None:
+    raw = model_data(make_config(tmp_path))
+    model = cast(dict[str, object], raw["model"])
+    model["model_id"] = oracle.LLAMA32_3B_MODEL_ID
+    model["revision"] = oracle.LLAMA32_3B_MODEL_REVISION
+    model["expected_weight_bytes"] = oracle.LLAMA32_3B_MODEL_WEIGHT_BYTES
+    model["local_path"] = (
+        "/models/"
+        f"{oracle.LLAMA32_3B_MODEL_ID.replace('/', '--')}--"
+        f"{oracle.LLAMA32_3B_MODEL_REVISION}"
+    )
+    environment = cast(dict[str, object], raw["environment"])
+    environment["EXO_CHAT_TEMPLATE_DATE"] = oracle.ORACLE_CHAT_TEMPLATE_DATE
+
+    validated = oracle.OracleConfig.model_validate(raw)
+
+    assert validated.model.model_id == oracle.LLAMA32_3B_MODEL_ID
+    assert validated.model.revision == oracle.LLAMA32_3B_MODEL_REVISION
+
+
+def test_strict_llama32_3b_config_requires_pinned_chat_template_date(
+    tmp_path: Path,
+) -> None:
+    raw = model_data(make_config(tmp_path))
+    model = cast(dict[str, object], raw["model"])
+    model["model_id"] = oracle.LLAMA32_3B_MODEL_ID
+    model["revision"] = oracle.LLAMA32_3B_MODEL_REVISION
+    model["expected_weight_bytes"] = oracle.LLAMA32_3B_MODEL_WEIGHT_BYTES
+    model["local_path"] = (
+        "/models/"
+        f"{oracle.LLAMA32_3B_MODEL_ID.replace('/', '--')}--"
+        f"{oracle.LLAMA32_3B_MODEL_REVISION}"
+    )
+
+    with pytest.raises(ValidationError, match="EXO_CHAT_TEMPLATE_DATE"):
+        oracle.OracleConfig.model_validate(raw)
+
+
+@pytest.mark.parametrize(
+    ("field_name", "replacement", "message"),
+    [
+        ("model_id", "mlx-community/unapproved", "model_id must be one of"),
+        ("revision", "f" * 40, "revision for"),
+        ("expected_weight_bytes", 1, "expected_weight_bytes for"),
+    ],
+)
+def test_strict_config_rejects_unapproved_or_mismatched_oracle_model(
+    tmp_path: Path,
+    field_name: str,
+    replacement: object,
+    message: str,
+) -> None:
+    raw = model_data(make_config(tmp_path))
+    model = cast(dict[str, object], raw["model"])
+    model[field_name] = replacement
+
+    with pytest.raises(ValidationError, match=message):
+        oracle.OracleConfig.model_validate(raw)
+
+
 def test_lease_metadata_binds_full_config_request_and_manifest_digest(
     tmp_path: Path,
 ) -> None:

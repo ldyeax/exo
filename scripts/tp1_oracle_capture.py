@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Capture a deterministic single-GPU SmolLM2 oracle under a benchmark lease.
+"""Capture a deterministic single-GPU model oracle under a benchmark lease.
 
 This is a benchmark-lease child, not a lease acquirer. It runs one local Exo
 node, captures only hashes and token metadata from repeated completions, and
@@ -52,9 +52,20 @@ JsonObject: TypeAlias = dict[str, JsonValue]
 MODEL_ID = "mlx-community/SmolLM2-135M-Instruct-8bit"
 MODEL_REVISION = "0f0d9b8218915bc34d401e1a340b8c049d300d5e"
 MODEL_WEIGHT_BYTES = 142_955_136
+LLAMA32_3B_MODEL_ID = "mlx-community/Llama-3.2-3B-Instruct-4bit"
+LLAMA32_3B_MODEL_REVISION = "7f0dc925e0d0afb0322d96f9255cfddf2ba5636e"
+LLAMA32_3B_MODEL_WEIGHT_BYTES = 1_807_423_488
+MODEL_SNAPSHOT_CONTRACTS = {
+    MODEL_ID: (MODEL_REVISION, MODEL_WEIGHT_BYTES),
+    LLAMA32_3B_MODEL_ID: (
+        LLAMA32_3B_MODEL_REVISION,
+        LLAMA32_3B_MODEL_WEIGHT_BYTES,
+    ),
+}
 ORACLE_PROMPT = "Reply with exactly: NCCL proof complete."
 ORACLE_MAX_TOKENS = 32
 ORACLE_SEED = 42
+ORACLE_CHAT_TEMPLATE_DATE = "18 Jul 2026"
 DWAGON_HCA_PORT_IDENTITIES = (
     ("mlx4_0", 1, "fe80::10:e000:166:3a19"),
     ("mlx4_0", 2, "fe80::10:e000:166:3a1a"),
@@ -147,13 +158,19 @@ class ModelSnapshot(StrictModel):
 
     @model_validator(mode="after")
     def validate_snapshot(self) -> "ModelSnapshot":
-        if self.model_id != MODEL_ID:
-            raise ValueError(f"TP1 oracle model_id must be {MODEL_ID}")
-        if self.revision != MODEL_REVISION:
-            raise ValueError(f"TP1 oracle revision must be {MODEL_REVISION}")
-        if self.expected_weight_bytes != MODEL_WEIGHT_BYTES:
+        expected_contract = MODEL_SNAPSHOT_CONTRACTS.get(self.model_id)
+        if expected_contract is None:
+            approved_models = ", ".join(sorted(MODEL_SNAPSHOT_CONTRACTS))
+            raise ValueError(f"TP1 oracle model_id must be one of: {approved_models}")
+        expected_revision, expected_weight_bytes = expected_contract
+        if self.revision != expected_revision:
             raise ValueError(
-                f"TP1 oracle expected_weight_bytes must be {MODEL_WEIGHT_BYTES}"
+                f"TP1 oracle revision for {self.model_id} must be {expected_revision}"
+            )
+        if self.expected_weight_bytes != expected_weight_bytes:
+            raise ValueError(
+                f"TP1 oracle expected_weight_bytes for {self.model_id} must be "
+                f"{expected_weight_bytes}"
             )
         path = Path(self.local_path)
         expected_name = f"{self.model_id.replace('/', '--')}--{self.revision}"
@@ -343,6 +360,8 @@ class OracleConfig(StrictModel):
             "EXO_MLX_VISION_LOADING": "disabled",
             "PYTHONHASHSEED": str(self.request.seed),
         }
+        if self.model.model_id == LLAMA32_3B_MODEL_ID:
+            required["EXO_CHAT_TEMPLATE_DATE"] = ORACLE_CHAT_TEMPLATE_DATE
         for name, expected in required.items():
             if self.environment.get(name) != expected:
                 raise ValueError(f"environment must set {name}={expected}")

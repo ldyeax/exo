@@ -74,6 +74,22 @@ from exo.worker.engines.mlx.vision_policy import get_mlx_vision_loading_mode
 from exo.worker.runner.bootstrap import logger
 
 EXO_MLX_DISTRIBUTED_BACKEND = "EXO_MLX_DISTRIBUTED_BACKEND"
+EXO_CHAT_TEMPLATE_DATE = "EXO_CHAT_TEMPLATE_DATE"
+
+
+def chat_template_date_override() -> str | None:
+    value = os.environ.get(EXO_CHAT_TEMPLATE_DATE)
+    if value is None:
+        return None
+    if (
+        not value
+        or len(value) > 128
+        or any(character.isspace() and character != " " for character in value)
+    ):
+        raise ValueError(
+            f"{EXO_CHAT_TEMPLATE_DATE} must be a nonempty single-line value up to 128 characters"
+        )
+    return value
 
 
 def get_weights_size(model_shard_meta: ShardMetadata) -> Memory:
@@ -622,6 +638,8 @@ def render_chat_template(
                     msg["thinking"] = rc
 
     extra_kwargs: dict[str, Any] = {}
+    if date_string := chat_template_date_override():
+        extra_kwargs["date_string"] = date_string
     if task_params.enable_thinking is not None:
         # Qwen3 and GLM use "enable_thinking"; DeepSeek uses "thinking".
         # Jinja ignores unknown variables, so passing both is safe.
