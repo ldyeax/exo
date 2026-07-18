@@ -48,6 +48,7 @@ def make_host_observation(
     weight_paths = tuple(
         dict.fromkeys(spec.ktransformers_weight_path for spec in host_specs)
     )
+    snapshot_paths = tuple(dict.fromkeys((*model_paths, *weight_paths)))
     rank_zero_spec = next(
         (spec for spec in host_specs if spec.pipeline_rank == 0),
         None,
@@ -58,13 +59,15 @@ def make_host_observation(
         readable_directories=tuple(dict.fromkeys((*model_paths, *weight_paths))),
         model_snapshot_receipts=tuple(
             SglangKtModelSnapshotReceiptObservation(
-                model_path=model_path,
+                model_path=snapshot_path,
                 model_id=first_spec.model_id,
                 revision=first_spec.expected_model_revision,
+                weight_format="safetensors",
+                ktransformers_method=first_spec.ktransformers_method,
                 receipt_verified=True,
                 snapshot_complete=True,
             )
-            for model_path in model_paths
+            for snapshot_path in snapshot_paths
         ),
         gpu_uuids=tuple(spec.gpu_uuid for spec in host_specs),
         cpu_cores=tuple(core for spec in host_specs for core in spec.cpu_cores),
@@ -192,6 +195,7 @@ def test_missing_stage_resources_and_ports_fail_as_one_group() -> None:
         "model_path",
         "ktransformers_weight_path",
         "model_revision_receipt",
+        "ktransformers_weight_revision_receipt",
         "gpu_uuid",
         "cpu_cores",
         "memory_nodes",
@@ -214,10 +218,19 @@ def test_model_receipt_must_match_path_model_revision_and_completeness() -> None
         model_path=specs[0].model_path,
         model_id=ModelId("zai-org/GLM-5-FP8"),
         revision="9" * 40,
+        weight_format="safetensors",
+        ktransformers_method="FP8",
         receipt_verified=False,
         snapshot_complete=False,
     )
-    dwagon = dwagon.model_copy(update={"model_snapshot_receipts": (bad_receipt,)})
+    weight_receipt = next(
+        receipt
+        for receipt in dwagon.model_snapshot_receipts
+        if receipt.model_path == specs[0].ktransformers_weight_path
+    )
+    dwagon = dwagon.model_copy(
+        update={"model_snapshot_receipts": (bad_receipt, weight_receipt)}
+    )
 
     result = evaluate_sglang_kt_preflight(specs, (dwagon, fwuff))
 
@@ -227,15 +240,49 @@ def test_model_receipt_must_match_path_model_revision_and_completeness() -> None
     assert result.failures[0].expected == (
         "zai-org/GLM-5.2-FP8",
         specs[0].expected_model_revision,
+        "safetensors",
+        "FP8",
         "receipt_verified=True",
         "snapshot_complete=True",
     )
     assert result.failures[0].observed == (
         "zai-org/GLM-5-FP8",
         "9" * 40,
+        "safetensors",
+        "FP8",
         "receipt_verified=False",
         "snapshot_complete=False",
     )
+
+
+def test_ktransformers_weight_receipt_must_be_exact_and_compatible() -> None:
+    specs = make_specs()
+    dwagon, fwuff = make_observations(specs)
+    model_receipt = next(
+        receipt
+        for receipt in dwagon.model_snapshot_receipts
+        if receipt.model_path == specs[0].model_path
+    )
+    bad_weight_receipt = SglangKtModelSnapshotReceiptObservation(
+        model_path=specs[0].ktransformers_weight_path,
+        model_id=specs[0].model_id,
+        revision=specs[0].expected_model_revision,
+        weight_format="safetensors",
+        ktransformers_method="BF16",
+        receipt_verified=True,
+        snapshot_complete=True,
+    )
+    dwagon = dwagon.model_copy(
+        update={
+            "model_snapshot_receipts": (model_receipt, bad_weight_receipt),
+        }
+    )
+
+    result = evaluate_sglang_kt_preflight(specs, (dwagon, fwuff))
+
+    assert isinstance(result, SglangKtPreflightFailed)
+    assert checks_for_rank(result, 0) == ("ktransformers_weight_revision_receipt",)
+    assert checks_for_rank(result, 1) == ("ktransformers_weight_revision_receipt",)
 
 
 def test_each_planned_port_requires_an_injected_availability_fact() -> None:
@@ -290,3 +337,15 @@ def test_empty_or_duplicate_process_groups_are_rejected_before_release() -> None
         evaluate_sglang_kt_preflight((specs[0], specs[0]), ())
     with pytest.raises(ValueError, match="ranks must be contiguous"):
         evaluate_sglang_kt_preflight((specs[0], specs[2]), ())
+
+
+def test_process_groups_must_share_one_canonical_launch_plan() -> None:
+    specs = make_specs()
+    other_plan = make_plan().model_copy(update={"model_revision": "7" * 40})
+    other_specs = build_glm_5_2_fp8_process_launch_specs(other_plan, PYTHON_EXECUTABLE)
+
+    with pytest.raises(ValueError, match="share one launch plan"):
+        evaluate_sglang_kt_preflight(
+            (specs[0], other_specs[1], specs[2]),
+            (),
+        )

@@ -8,9 +8,11 @@ from exo.shared.types.worker.sglang_kt import (
     GitRevision,
     GpuUuid,
     HcaDevice,
+    KTransformersMethod,
     NetworkPort,
     ResourceIndex,
     SglangKtLaunchPlan,
+    SglangKtStageSpec,
 )
 from exo.utils.pydantic_ext import FrozenModel
 
@@ -30,27 +32,161 @@ EnvironmentVariable = tuple[str, str]
 class SglangKtProcessLaunchSpec(FrozenModel):
     """One inert process-launch description for an external SGLang runtime."""
 
+    plan: SglangKtLaunchPlan
     pipeline_rank: ResourceIndex
-    start_layer: ResourceIndex
-    end_layer: PositiveInt
-    node_id: NodeId
-    gpu_uuid: GpuUuid
     executable: AbsoluteRuntimePath
-    arguments: tuple[str, ...]
-    environment: tuple[EnvironmentVariable, ...]
-    model_path: AbsoluteRuntimePath
-    ktransformers_weight_path: AbsoluteRuntimePath
-    cpu_cores: tuple[ResourceIndex, ...]
-    memory_nodes: tuple[ResourceIndex, ...]
-    hca_devices: tuple[HcaDevice, ...]
-    service_endpoint: Host
-    distributed_coordinator: Host
-    nccl_port: NetworkPort
-    model_id: ModelId
-    expected_model_revision: GitRevision
-    expected_sglang_revision: GitRevision
-    expected_ktransformers_revision: GitRevision
-    required_transformers_version: str
+
+    @property
+    def stage(self) -> SglangKtStageSpec:
+        return self.plan.stages[self.pipeline_rank]
+
+    @property
+    def start_layer(self) -> ResourceIndex:
+        return self.stage.start_layer
+
+    @property
+    def end_layer(self) -> PositiveInt:
+        return self.stage.end_layer
+
+    @property
+    def node_id(self) -> NodeId:
+        return self.stage.node_id
+
+    @property
+    def gpu_uuid(self) -> GpuUuid:
+        return self.stage.gpu_uuid
+
+    @property
+    def model_path(self) -> AbsoluteRuntimePath:
+        return self.stage.model_path
+
+    @property
+    def ktransformers_weight_path(self) -> AbsoluteRuntimePath:
+        return self.stage.ktransformers_weight_path
+
+    @property
+    def cpu_cores(self) -> tuple[ResourceIndex, ...]:
+        return self.stage.cpu_cores
+
+    @property
+    def memory_nodes(self) -> tuple[ResourceIndex, ...]:
+        return self.stage.memory_nodes
+
+    @property
+    def hca_devices(self) -> tuple[HcaDevice, ...]:
+        return self.stage.hca_devices
+
+    @property
+    def ktransformers_method(self) -> KTransformersMethod:
+        return self.stage.ktransformers_method
+
+    @property
+    def service_endpoint(self) -> Host:
+        return self.stage.service_endpoint
+
+    @property
+    def distributed_coordinator(self) -> Host:
+        return self.plan.distributed_coordinator
+
+    @property
+    def nccl_port(self) -> NetworkPort:
+        return self.stage.nccl_port
+
+    @property
+    def model_id(self) -> ModelId:
+        return self.plan.model_id
+
+    @property
+    def expected_model_revision(self) -> GitRevision:
+        return self.plan.model_revision
+
+    @property
+    def expected_sglang_revision(self) -> GitRevision:
+        return self.plan.sglang_revision
+
+    @property
+    def expected_ktransformers_revision(self) -> GitRevision:
+        return self.plan.ktransformers_revision
+
+    @property
+    def required_transformers_version(self) -> str:
+        return REQUIRED_TRANSFORMERS_VERSION
+
+    @property
+    def arguments(self) -> tuple[str, ...]:
+        stage = self.stage
+        pipeline_size = len(self.plan.stages)
+        return (
+            "-m",
+            "sglang.launch_server",
+            "--model-path",
+            stage.model_path,
+            "--kt-weight-path",
+            stage.ktransformers_weight_path,
+            "--kt-cpuinfer",
+            str(stage.cpu_infer_threads),
+            "--kt-threadpool-count",
+            str(stage.threadpool_count),
+            "--kt-numa-nodes",
+            *(str(memory_node) for memory_node in stage.memory_nodes),
+            "--kt-num-gpu-experts",
+            str(stage.resident_gpu_experts),
+            "--kt-method",
+            stage.ktransformers_method,
+            "--kt-max-deferred-experts-per-token",
+            str(stage.max_deferred_experts_per_token),
+            "--kt-expert-placement-strategy",
+            "uniform",
+            "--pp-size",
+            str(pipeline_size),
+            "--tp-size",
+            "1",
+            "--nnodes",
+            str(pipeline_size),
+            "--node-rank",
+            str(stage.pipeline_rank),
+            "--dist-init-addr",
+            str(self.plan.distributed_coordinator),
+            "--host",
+            stage.service_endpoint.ip,
+            "--port",
+            str(stage.service_endpoint.port),
+            "--nccl-port",
+            str(stage.nccl_port),
+            "--context-length",
+            str(self.plan.context_length),
+            "--max-running-requests",
+            str(self.plan.max_concurrent_requests),
+            "--attention-backend",
+            "nsa",
+            "--kv-cache-dtype",
+            "fp8_e4m3",
+            "--disable-shared-experts-fusion",
+            "--tool-call-parser",
+            "glm47",
+            "--reasoning-parser",
+            "glm45",
+            "--served-model-name",
+            "GLM5.2",
+            "--trust-remote-code",
+        )
+
+    @property
+    def environment(self) -> tuple[EnvironmentVariable, ...]:
+        layer_partition = ",".join(
+            str(layer_count) for layer_count in self.plan.pipeline_layer_partition
+        )
+        return (
+            ("CUDA_VISIBLE_DEVICES", self.stage.gpu_uuid),
+            ("NCCL_NET", "IB"),
+            ("NCCL_IB_HCA", f"={','.join(self.stage.hca_devices)}"),
+            ("NCCL_GIN_ENABLE", "0"),
+            ("NCCL_GIN_TYPE", "0"),
+            ("NCCL_NET_GDR_LEVEL", "LOC"),
+            ("PYTORCH_ALLOC_CONF", "expandable_segments:True"),
+            ("SGLANG_ENABLE_JIT_DEEPGEMM", "0"),
+            ("SGLANG_PP_LAYER_PARTITION", layer_partition),
+        )
 
     @property
     def command(self) -> tuple[str, ...]:
@@ -58,13 +194,9 @@ class SglangKtProcessLaunchSpec(FrozenModel):
 
     @model_validator(mode="after")
     def validate_process_contract(self) -> "SglangKtProcessLaunchSpec":
-        if self.end_layer <= self.start_layer:
-            raise ValueError("SGLang process layer range must be nonempty")
-        if not self.arguments:
-            raise ValueError("SGLang process arguments must be nonempty")
-        environment_names = tuple(name for name, _value in self.environment)
-        if len(set(environment_names)) != len(environment_names):
-            raise ValueError("SGLang process environment names must be unique")
+        _validate_supported_plan(self.plan)
+        if self.pipeline_rank >= len(self.plan.stages):
+            raise ValueError("SGLang process rank is absent from its launch plan")
         return self
 
 
@@ -80,99 +212,13 @@ def build_glm_5_2_fp8_process_launch_specs(
 
     _validate_supported_plan(plan)
 
-    pipeline_size = len(plan.stages)
-    layer_partition = ",".join(
-        str(layer_count) for layer_count in plan.pipeline_layer_partition
-    )
-
     # Each pipeline stage is one logical SGLang node. This permits two logical
     # nodes to share a physical host while satisfying SGLang's world-size rules.
     return tuple(
         SglangKtProcessLaunchSpec(
+            plan=plan,
             pipeline_rank=stage.pipeline_rank,
-            start_layer=stage.start_layer,
-            end_layer=stage.end_layer,
-            node_id=stage.node_id,
-            gpu_uuid=stage.gpu_uuid,
             executable=python_executable,
-            arguments=(
-                "-m",
-                "sglang.launch_server",
-                "--model-path",
-                stage.model_path,
-                "--kt-weight-path",
-                stage.ktransformers_weight_path,
-                "--kt-cpuinfer",
-                str(stage.cpu_infer_threads),
-                "--kt-threadpool-count",
-                str(stage.threadpool_count),
-                "--kt-numa-nodes",
-                *(str(memory_node) for memory_node in stage.memory_nodes),
-                "--kt-num-gpu-experts",
-                str(stage.resident_gpu_experts),
-                "--kt-method",
-                stage.ktransformers_method,
-                "--kt-max-deferred-experts-per-token",
-                str(stage.max_deferred_experts_per_token),
-                "--kt-expert-placement-strategy",
-                "uniform",
-                "--pp-size",
-                str(pipeline_size),
-                "--tp-size",
-                "1",
-                "--nnodes",
-                str(pipeline_size),
-                "--node-rank",
-                str(stage.pipeline_rank),
-                "--dist-init-addr",
-                str(plan.distributed_coordinator),
-                "--host",
-                stage.service_endpoint.ip,
-                "--port",
-                str(stage.service_endpoint.port),
-                "--nccl-port",
-                str(stage.nccl_port),
-                "--context-length",
-                str(plan.context_length),
-                "--max-running-requests",
-                str(plan.max_concurrent_requests),
-                "--attention-backend",
-                "nsa",
-                "--kv-cache-dtype",
-                "fp8_e4m3",
-                "--disable-shared-experts-fusion",
-                "--tool-call-parser",
-                "glm47",
-                "--reasoning-parser",
-                "glm45",
-                "--served-model-name",
-                "GLM5.2",
-                "--trust-remote-code",
-            ),
-            environment=(
-                ("CUDA_VISIBLE_DEVICES", stage.gpu_uuid),
-                ("NCCL_NET", "IB"),
-                ("NCCL_IB_HCA", f"={','.join(stage.hca_devices)}"),
-                ("NCCL_GIN_ENABLE", "0"),
-                ("NCCL_GIN_TYPE", "0"),
-                ("NCCL_NET_GDR_LEVEL", "LOC"),
-                ("PYTORCH_ALLOC_CONF", "expandable_segments:True"),
-                ("SGLANG_ENABLE_JIT_DEEPGEMM", "0"),
-                ("SGLANG_PP_LAYER_PARTITION", layer_partition),
-            ),
-            model_path=stage.model_path,
-            ktransformers_weight_path=stage.ktransformers_weight_path,
-            cpu_cores=stage.cpu_cores,
-            memory_nodes=stage.memory_nodes,
-            hca_devices=stage.hca_devices,
-            service_endpoint=stage.service_endpoint,
-            distributed_coordinator=plan.distributed_coordinator,
-            nccl_port=stage.nccl_port,
-            model_id=plan.model_id,
-            expected_model_revision=plan.model_revision,
-            expected_sglang_revision=plan.sglang_revision,
-            expected_ktransformers_revision=plan.ktransformers_revision,
-            required_transformers_version=REQUIRED_TRANSFORMERS_VERSION,
         )
         for stage in plan.stages
     )

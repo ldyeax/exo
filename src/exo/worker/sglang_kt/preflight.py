@@ -8,6 +8,7 @@ from exo.shared.types.worker.sglang_kt import (
     GitRevision,
     GpuUuid,
     HcaDevice,
+    KTransformersMethod,
     NetworkPort,
     ResourceIndex,
 )
@@ -26,6 +27,7 @@ PreflightCheck = Literal[
     "model_path",
     "ktransformers_weight_path",
     "model_revision_receipt",
+    "ktransformers_weight_revision_receipt",
     "gpu_uuid",
     "cpu_cores",
     "memory_nodes",
@@ -73,6 +75,8 @@ class SglangKtModelSnapshotReceiptObservation(FrozenModel):
     model_path: AbsoluteRuntimePath
     model_id: ModelId
     revision: GitRevision
+    weight_format: Literal["safetensors"]
+    ktransformers_method: KTransformersMethod
     receipt_verified: bool
     snapshot_complete: bool
 
@@ -171,11 +175,16 @@ def evaluate_sglang_kt_preflight(
 
     if not process_specs:
         raise ValueError("SGLang-KT preflight requires process specs")
+    launch_plan = process_specs[0].plan
+    if any(process_spec.plan != launch_plan for process_spec in process_specs):
+        raise ValueError("SGLang-KT preflight specs must share one launch plan")
     pipeline_ranks = tuple(spec.pipeline_rank for spec in process_specs)
     if len(set(pipeline_ranks)) != len(pipeline_ranks):
         raise ValueError("SGLang-KT preflight process ranks must be unique")
     if tuple(sorted(pipeline_ranks)) != tuple(range(len(process_specs))):
         raise ValueError("SGLang-KT preflight process ranks must be contiguous")
+    if len(process_specs) != len(launch_plan.stages):
+        raise ValueError("SGLang-KT preflight requires every launch-plan rank")
 
     observations_by_node: dict[NodeId, list[SglangKtHostPreflightObservation]] = {}
     for observation in host_observations:
@@ -300,11 +309,37 @@ def _evaluate_paths_and_receipt(
             detail="the KTransformers weight path was not verified as readable",
         )
 
+    _evaluate_snapshot_receipt(
+        process_spec,
+        observation,
+        process_spec.model_path,
+        "model_revision_receipt",
+        "the model snapshot lacks an exact, complete revision receipt",
+        failures,
+    )
+    _evaluate_snapshot_receipt(
+        process_spec,
+        observation,
+        process_spec.ktransformers_weight_path,
+        "ktransformers_weight_revision_receipt",
+        "the KTransformers weights lack an exact, compatible revision receipt",
+        failures,
+    )
+
+
+def _evaluate_snapshot_receipt(
+    process_spec: SglangKtProcessLaunchSpec,
+    observation: SglangKtHostPreflightObservation,
+    snapshot_path: AbsoluteRuntimePath,
+    check: Literal["model_revision_receipt", "ktransformers_weight_revision_receipt"],
+    detail: str,
+    failures: list[SglangKtPreflightFailure],
+) -> None:
     receipt = next(
         (
             candidate
             for candidate in observation.model_snapshot_receipts
-            if candidate.model_path == process_spec.model_path
+            if candidate.model_path == snapshot_path
         ),
         None,
     )
@@ -312,6 +347,8 @@ def _evaluate_paths_and_receipt(
         receipt is not None
         and receipt.model_id == process_spec.model_id
         and receipt.revision == process_spec.expected_model_revision
+        and receipt.weight_format == "safetensors"
+        and receipt.ktransformers_method == process_spec.ktransformers_method
         and receipt.receipt_verified
         and receipt.snapshot_complete
     )
@@ -322,6 +359,8 @@ def _evaluate_paths_and_receipt(
             else (
                 str(receipt.model_id),
                 receipt.revision,
+                receipt.weight_format,
+                receipt.ktransformers_method,
                 f"receipt_verified={receipt.receipt_verified}",
                 f"snapshot_complete={receipt.snapshot_complete}",
             )
@@ -329,15 +368,17 @@ def _evaluate_paths_and_receipt(
         _record_failure(
             failures,
             process_spec,
-            "model_revision_receipt",
+            check,
             expected=(
                 str(process_spec.model_id),
                 process_spec.expected_model_revision,
+                "safetensors",
+                process_spec.ktransformers_method,
                 "receipt_verified=True",
                 "snapshot_complete=True",
             ),
             observed=observed,
-            detail="the model snapshot lacks an exact, complete revision receipt",
+            detail=detail,
         )
 
 
