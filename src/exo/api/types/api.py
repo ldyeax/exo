@@ -5,7 +5,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel, Field, field_validator
 
-from exo.shared.models.model_cards import ModelCard, ModelId
+from exo.shared.models.model_cards import HuggingFaceRevision, ModelCard, ModelId
 from exo.shared.types.common import CommandId, NodeId
 from exo.shared.types.memory import Memory
 from exo.shared.types.text_generation import ReasoningDialect, ReasoningEffort
@@ -34,6 +34,7 @@ class ModelListModel(BaseModel):
     object: str = "model"
     created: int = Field(default_factory=lambda: int(time.time()))
     owned_by: str = "exo"
+    revision: HuggingFaceRevision = "main"
     # openwebui fields
     hugging_face_id: str = Field(default="")
     name: str = Field(default="")
@@ -255,6 +256,7 @@ class BenchChatCompletionRequest(ChatCompletionRequest):
 
 class AddCustomModelParams(BaseModel):
     model_id: ModelId
+    revision: HuggingFaceRevision = "main"
 
 
 class HuggingFaceSearchResult(BaseModel):

@@ -142,6 +142,7 @@ from exo.shared.election import ElectionMessage
 from exo.shared.logging import InterceptLogger
 from exo.shared.models import model_cards
 from exo.shared.models.model_cards import (
+    HuggingFaceRevision,
     ModelCard,
     ModelId,
     ModelTask,
@@ -1855,17 +1856,25 @@ class API:
         cards = await model_cards.card_cache.list_all()
 
         if status == "downloaded":
-            downloaded_model_ids: set[str] = set()
+            downloaded_models: set[tuple[ModelId, HuggingFaceRevision]] = set()
             for node_downloads in self.state.downloads.values():
                 for dl in node_downloads:
                     if isinstance(dl, DownloadCompleted):
-                        downloaded_model_ids.add(dl.shard_metadata.model_card.model_id)
-            cards = [c for c in cards if c.model_id in downloaded_model_ids]
+                        downloaded_card = dl.shard_metadata.model_card
+                        downloaded_models.add(
+                            (downloaded_card.model_id, downloaded_card.revision)
+                        )
+            cards = [
+                card
+                for card in cards
+                if (card.model_id, card.revision) in downloaded_models
+            ]
 
         return ModelList(
             data=[
                 ModelListModel(
                     id=card.model_id,
+                    revision=card.revision,
                     hugging_face_id=card.model_id,
                     name=card.model_id.short(),
                     description="",
@@ -1888,7 +1897,7 @@ class API:
     async def add_custom_model(self, payload: AddCustomModelParams) -> ModelListModel:
         """Fetch a model from HuggingFace and save as a custom model card, then sync across the cluster."""
         try:
-            card = await ModelCard.fetch_from_hf(payload.model_id)
+            card = await ModelCard.fetch_from_hf(payload.model_id, payload.revision)
         except Exception as exc:
             raise HTTPException(
                 status_code=400, detail=f"Failed to fetch model: {exc}"
@@ -1907,6 +1916,7 @@ class API:
 
         return ModelListModel(
             id=card.model_id,
+            revision=card.revision,
             hugging_face_id=card.model_id,
             name=card.model_id.short(),
             description="",
