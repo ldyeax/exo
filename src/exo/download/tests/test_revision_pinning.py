@@ -218,6 +218,17 @@ def test_smol_lm_card_is_compatible_with_three_tensor_ranks() -> None:
     assert card.num_key_value_heads % 3 == 0
 
 
+def test_llama32_3b_card_is_tp2_compatible_without_remote_code() -> None:
+    card = _load_builtin_card("mlx-community--Llama-3.2-3B-Instruct-4bit.toml")
+
+    assert card.family == "llama"
+    assert card.supports_tensor
+    assert card.hidden_size % 2 == 0
+    assert card.num_key_value_heads is not None
+    assert card.num_key_value_heads % 2 == 0
+    assert not card.trust_remote_code
+
+
 def test_pinned_qwen35_card_inherits_revision_for_vision_weights() -> None:
     filename = "mlx-community--Qwen3.5-35B-A3B-4bit.toml"
     card = _load_builtin_card(filename)
