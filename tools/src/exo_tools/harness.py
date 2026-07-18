@@ -12,7 +12,7 @@ import contextlib
 import os
 import time
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 
 from loguru import logger
 
@@ -27,6 +27,7 @@ class Sharding(str, Enum):
 class Comm(str, Enum):
     RING = "MlxRing"  # ring all-reduce over network
     JACCL = "MlxJaccl"  # RDMA over Thunderbolt
+    NCCL = "MlxNccl"  # NCCL collectives on CUDA devices
 
 
 _SETTLE_INITIAL_BACKOFF_S = 1.0
@@ -188,7 +189,10 @@ def resolve_model_short_id(
     raise ValueError(f"Model not found in /models: {model_arg}")
 
 
-def placement_filter(instance_meta: str, wanted: str) -> bool:
+def placement_filter(
+    instance_meta: str,
+    wanted: Literal["ring", "jaccl", "nccl", "both"],
+) -> bool:
     s = (instance_meta or "").lower()
     if wanted == "both":
         return ("ring" in s) or ("jaccl" in s)
@@ -498,7 +502,10 @@ def add_common_instance_args(ap: argparse.ArgumentParser) -> None:
         help="Only consider placements using >= this many nodes.",
     )
     ap.add_argument(
-        "--instance-meta", choices=["ring", "jaccl", "both"], default="both"
+        "--instance-meta",
+        choices=["ring", "jaccl", "nccl", "both"],
+        default="both",
+        help="Communication backend to benchmark; 'both' selects Ring and JACCL.",
     )
     ap.add_argument(
         "--sharding", choices=["pipeline", "tensor", "both"], default="both"
