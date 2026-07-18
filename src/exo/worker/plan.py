@@ -139,10 +139,12 @@ def _local_runner_ids(
     local_resource_ids = {
         resource.resource_id for resource in node_compute_resources.get(node_id, ())
     }
+    resource_owners = assignments.compute_resource_to_node
     local_runner_ids = {
         runner_id
         for resource_id, runner_id in assignments.compute_resource_to_runner.items()
         if resource_id in local_resource_ids
+        and (not resource_owners or resource_owners.get(resource_id) == node_id)
     }
     return tuple(
         sorted(

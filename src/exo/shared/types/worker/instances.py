@@ -48,6 +48,7 @@ class MlxNcclInstance(BaseInstance):
         runner_ids = set(shards)
         assigned_runner_ids = set(self.shard_assignments.node_to_runner.values())
         resource_assignments = self.shard_assignments.compute_resource_to_runner
+        resource_owners = self.shard_assignments.compute_resource_to_node
         world_size = len(shards)
 
         try:
@@ -87,6 +88,30 @@ class MlxNcclInstance(BaseInstance):
                 )
             for resource_id in resource_assignments:
                 _ = resource_id.nvidia_device_uuid()
+            if resource_owners:
+                if set(resource_owners.values()) != set(
+                    self.shard_assignments.node_to_runner
+                ):
+                    raise ValueError(
+                        "MlxNcclInstance requires resources owned by every node"
+                    )
+                for (
+                    node_id,
+                    representative_runner_id,
+                ) in self.shard_assignments.node_to_runner.items():
+                    representative_resource_ids = [
+                        resource_id
+                        for resource_id, runner_id in resource_assignments.items()
+                        if runner_id == representative_runner_id
+                    ]
+                    if (
+                        len(representative_resource_ids) != 1
+                        or resource_owners[representative_resource_ids[0]] != node_id
+                    ):
+                        raise ValueError(
+                            "MlxNcclInstance node representative must use a resource "
+                            "owned by that node"
+                        )
         elif (
             assigned_runner_ids != runner_ids
             or len(self.shard_assignments.node_to_runner) != world_size
@@ -145,4 +170,12 @@ class BoundInstance(FrozenModel):
         ), (
             "Bound Instance must be constructed with a runner_id that is in the instances assigned shards"
         )
+        resource_owners = self.instance.shard_assignments.compute_resource_to_node
+        for resource_id in self.bound_compute_resource_ids:
+            owner_node_id = resource_owners.get(resource_id)
+            if owner_node_id is not None and owner_node_id != self.bound_node_id:
+                raise ValueError(
+                    f"Compute resource {resource_id} is owned by {owner_node_id}, not "
+                    f"bound node {self.bound_node_id}"
+                )
         return self

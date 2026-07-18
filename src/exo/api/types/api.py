@@ -282,6 +282,7 @@ class PlacementPreview(BaseModel):
     model_id: ModelId
     sharding: Sharding
     instance_meta: InstanceMeta
+    use_all_compute_resources: bool = False
     instance: Instance | None = None
     # Keys are NodeId strings, values are additional bytes that would be used on that node
     memory_delta_by_node: dict[str, int] | None = None
