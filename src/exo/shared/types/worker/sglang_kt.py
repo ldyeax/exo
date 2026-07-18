@@ -19,6 +19,7 @@ GpuUuid = Annotated[
 ]
 ResourceIndex = Annotated[int, Field(ge=0)]
 NetworkPort = Annotated[int, Field(ge=1, le=65535)]
+StaticMemoryFraction = Annotated[float, Field(gt=0.0, lt=1.0)]
 HcaDevice = Annotated[
     str,
     StringConstraints(pattern=r"^[A-Za-z0-9_.-]+:[0-9]+$"),
@@ -115,6 +116,8 @@ class SglangKtLaunchPlan(FrozenModel):
     ktransformers_revision: GitRevision
     total_layers: PositiveInt
     context_length: PositiveInt
+    max_total_tokens: PositiveInt
+    static_memory_fraction: StaticMemoryFraction
     max_concurrent_requests: PositiveInt
     distributed_coordinator: Host
     rank_zero_endpoint: Host
@@ -163,6 +166,8 @@ class SglangKtLaunchPlan(FrozenModel):
 
         if expected_start_layer != self.total_layers:
             raise ValueError("pipeline layer ranges must cover total_layers exactly")
+        if self.max_total_tokens > self.context_length:
+            raise ValueError("max_total_tokens cannot exceed context_length")
 
         for endpoint_name, endpoint in (
             ("distributed_coordinator", self.distributed_coordinator),

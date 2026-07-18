@@ -66,6 +66,8 @@ def make_runtime_validation_receipt(
         sgl_kernel_build_id="sgl-kernel-test-build",
         deep_gemm_build_id="deep-gemm-test-build",
         kv_cache_dtype="fp8_e4m3",
+        max_total_tokens=spec.plan.max_total_tokens,
+        static_memory_fraction=spec.plan.static_memory_fraction,
         capabilities=(
             "kt_tp_group_local_broadcast_v1",
             "glm52_nsa_sm86_short_forward_v1",
@@ -179,6 +181,7 @@ def test_version_only_runtime_facts_cannot_release_the_process_group() -> None:
         {"gpu_compute_capability": (9, 0)},
         {"cpu_cores": (999,)},
         {"memory_nodes": (999,)},
+        {"max_total_tokens": 8_192},
         {"model_config_sha256": "b" * 64},
         {"sglang_revision": "c" * 40},
         {"transformers_distribution_version": "5.6.0.post2"},

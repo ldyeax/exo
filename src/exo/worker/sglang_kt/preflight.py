@@ -10,6 +10,7 @@ from exo.shared.types.worker.sglang_kt import (
     HcaDevice,
     KTransformersMethod,
     ResourceIndex,
+    StaticMemoryFraction,
 )
 from exo.utils.pydantic_ext import FrozenModel
 from exo.worker.sglang_kt.launch_spec import (
@@ -116,6 +117,8 @@ class SglangKtRuntimeValidationReceiptObservation(FrozenModel):
     sgl_kernel_build_id: ObservedText
     deep_gemm_build_id: ObservedText
     kv_cache_dtype: Literal["fp8_e4m3"]
+    max_total_tokens: PositiveInt
+    static_memory_fraction: StaticMemoryFraction
     capabilities: tuple[SglangKtRuntimeCapability, ...]
 
     @model_validator(mode="after")
@@ -526,6 +529,9 @@ def _evaluate_runtime_validation(
         and validation_receipt.transformers_module_version
         == process_spec.required_transformers_version
         and validation_receipt.kv_cache_dtype == GLM_5_2_KV_CACHE_DTYPE
+        and validation_receipt.max_total_tokens == process_spec.plan.max_total_tokens
+        and validation_receipt.static_memory_fraction
+        == process_spec.plan.static_memory_fraction
         and REQUIRED_RUNTIME_CAPABILITIES.issubset(validation_receipt.capabilities)
     )
     if receipt_matches:
@@ -557,6 +563,8 @@ def _evaluate_runtime_validation(
             validation_receipt.sgl_kernel_build_id,
             validation_receipt.deep_gemm_build_id,
             validation_receipt.kv_cache_dtype,
+            f"max_total_tokens={validation_receipt.max_total_tokens}",
+            "static_memory_fraction=" + str(validation_receipt.static_memory_fraction),
             *validation_receipt.capabilities,
         )
     )
@@ -577,6 +585,8 @@ def _evaluate_runtime_validation(
             process_spec.expected_ktransformers_revision,
             process_spec.required_transformers_version,
             GLM_5_2_KV_CACHE_DTYPE,
+            f"max_total_tokens={process_spec.plan.max_total_tokens}",
+            "static_memory_fraction=" + str(process_spec.plan.static_memory_fraction),
             *tuple(sorted(REQUIRED_RUNTIME_CAPABILITIES)),
         ),
         observed=observed,

@@ -153,6 +153,10 @@ class SglangKtProcessLaunchSpec(FrozenModel):
             str(stage.service_endpoint.port),
             "--context-length",
             str(self.plan.context_length),
+            "--max-total-tokens",
+            str(self.plan.max_total_tokens),
+            "--mem-fraction-static",
+            str(self.plan.static_memory_fraction),
             "--max-running-requests",
             str(self.plan.max_concurrent_requests),
             "--attention-backend",
@@ -185,6 +189,10 @@ class SglangKtProcessLaunchSpec(FrozenModel):
             ("SGLANG_ENABLE_JIT_DEEPGEMM", "0"),
             ("SGLANG_PP_LAYER_PARTITION", layer_partition),
         )
+
+    @property
+    def unset_environment_variables(self) -> tuple[str, ...]:
+        return ("SGLANG_DISTRIBUTED_INIT_METHOD_OVERRIDE",)
 
     @property
     def command(self) -> tuple[str, ...]:

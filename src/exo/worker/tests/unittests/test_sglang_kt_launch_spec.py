@@ -70,6 +70,8 @@ def make_plan(
         ktransformers_revision=ktransformers_revision,
         total_layers=78,
         context_length=262_144,
+        max_total_tokens=4_096,
+        static_memory_fraction=0.8,
         max_concurrent_requests=1,
         distributed_coordinator=Host(ip="192.168.40.248", port=29_500),
         rank_zero_endpoint=Host(ip="192.168.40.248", port=30_000),
@@ -173,6 +175,8 @@ def test_builds_pinned_glm_5_2_ktransformers_arguments() -> None:
     assert argument_value(spec.arguments, "--kt-method") == "FP8"
     assert argument_value(spec.arguments, "--kt-max-deferred-experts-per-token") == "0"
     assert argument_value(spec.arguments, "--context-length") == "262144"
+    assert argument_value(spec.arguments, "--max-total-tokens") == "4096"
+    assert argument_value(spec.arguments, "--mem-fraction-static") == "0.8"
     assert argument_value(spec.arguments, "--max-running-requests") == "1"
     assert argument_value(spec.arguments, "--attention-backend") == "nsa"
     assert argument_value(spec.arguments, "--kv-cache-dtype") == "fp8_e4m3"
@@ -180,6 +184,9 @@ def test_builds_pinned_glm_5_2_ktransformers_arguments() -> None:
     assert argument_value(spec.arguments, "--reasoning-parser") == "glm45"
     assert "--disable-shared-experts-fusion" in spec.arguments
     assert "--trust-remote-code" in spec.arguments
+    assert spec.unset_environment_variables == (
+        "SGLANG_DISTRIBUTED_INIT_METHOD_OVERRIDE",
+    )
 
     assert spec.model_path == plan.stages[1].model_path
     assert spec.ktransformers_weight_path == plan.stages[1].ktransformers_weight_path
@@ -235,6 +242,13 @@ def test_process_launch_spec_rejects_free_form_command_or_environment() -> None:
             {
                 **serialized,
                 "environment": (("CUDA_VISIBLE_DEVICES", "GPU-wrong"),),
+            }
+        )
+    with pytest.raises(ValidationError, match="unset_environment_variables"):
+        SglangKtProcessLaunchSpec.model_validate(
+            {
+                **serialized,
+                "unset_environment_variables": ("UNTRUSTED_VARIABLE",),
             }
         )
 

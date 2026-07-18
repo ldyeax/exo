@@ -134,6 +134,8 @@ def make_runtime_validation_receipt(
         sgl_kernel_build_id="sgl-kernel-test-build",
         deep_gemm_build_id="deep-gemm-test-build",
         kv_cache_dtype="fp8_e4m3",
+        max_total_tokens=spec.plan.max_total_tokens,
+        static_memory_fraction=spec.plan.static_memory_fraction,
         capabilities=(
             "kt_tp_group_local_broadcast_v1",
             "glm52_nsa_sm86_short_forward_v1",

@@ -89,6 +89,8 @@ def make_plan(
         "ktransformers_revision": "3" * 40,
         "total_layers": 78,
         "context_length": 262_144,
+        "max_total_tokens": 4_096,
+        "static_memory_fraction": 0.8,
         "max_concurrent_requests": 1,
         "distributed_coordinator": Host(ip="192.168.40.248", port=29500),
         "rank_zero_endpoint": Host(ip="192.168.40.248", port=30000),
@@ -233,6 +235,8 @@ def test_launch_plan_rejects_invalid_pipeline(
             "rank_zero_endpoint must use a concrete IPv4",
         ),
         ({"model_revision": "main"}, "model_revision"),
+        ({"max_total_tokens": 262_145}, "cannot exceed context_length"),
+        ({"static_memory_fraction": 1.0}, "static_memory_fraction"),
     ],
 )
 def test_launch_plan_rejects_invalid_cluster_fields(
