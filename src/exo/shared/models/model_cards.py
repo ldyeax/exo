@@ -80,11 +80,14 @@ class _CardCache:
         ]
         if not matching_cards:
             return None
-        if main_card := self.cc.get((model_id, "main")):
-            return main_card
-        if len(matching_cards) == 1:
-            return matching_cards[0]
-        revisions = sorted(card.revision for card in matching_cards)
+        pinned_cards = [card for card in matching_cards if card.revision != "main"]
+        # Dynamic discovery may have persisted a stale main card before a curated
+        # pin was installed. A sole exact pin is therefore the implicit default.
+        if len(pinned_cards) == 1:
+            return pinned_cards[0]
+        if not pinned_cards:
+            return self.cc[(model_id, "main")]
+        revisions = sorted(card.revision for card in pinned_cards)
         raise ValueError(
             f"Multiple revisions are registered for {model_id}: {revisions}. "
             "Specify an exact revision."
