@@ -6,6 +6,7 @@ import pytest
 from exo.shared.models.model_cards import ModelCard, ModelId, ModelTask
 from exo.shared.types.backends import Backend
 from exo.shared.types.common import Host, NodeId
+from exo.shared.types.compute_resources import ComputeResourceId
 from exo.shared.types.memory import Memory
 from exo.shared.types.worker.instances import (
     BoundInstance,
@@ -17,7 +18,7 @@ from exo.shared.types.worker.shards import TensorShardMetadata
 from exo.worker.runner.bootstrap import configure_runner_environment
 
 
-def _bound_nccl_instance() -> BoundInstance:
+def _bound_nccl_instance(*, resource_bound: bool = False) -> BoundInstance:
     node_ids = (NodeId("node-a"), NodeId("node-b"))
     runner_ids = (RunnerId("runner-a"), RunnerId("runner-b"))
     model_card = ModelCard(
@@ -46,6 +47,16 @@ def _bound_nccl_instance() -> BoundInstance:
             model_id=model_card.model_id,
             runner_to_shard=shards,
             node_to_runner=dict(zip(node_ids, runner_ids, strict=True)),
+            compute_resource_to_runner=(
+                {
+                    ComputeResourceId.from_nvidia_device_uuid(
+                        f"GPU-00000000-0000-0000-0000-00000000000{rank + 1}"
+                    ): runner_id
+                    for rank, runner_id in enumerate(runner_ids)
+                }
+                if resource_bound
+                else {}
+            ),
         ),
         nccl_coordinator=Host(ip="192.0.2.10", port=5000),
     )
@@ -81,6 +92,18 @@ def test_nccl_runner_preserves_operator_cuda_binding(
     configure_runner_environment(_bound_nccl_instance())
 
     assert os.environ["CUDA_VISIBLE_DEVICES"] == gpu_uuid
+
+
+def test_nccl_resource_bound_runner_overrides_parent_cuda_binding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "GPU-parent-binding")
+
+    configure_runner_environment(_bound_nccl_instance(resource_bound=True))
+
+    assert (
+        os.environ["CUDA_VISIBLE_DEVICES"] == "GPU-00000000-0000-0000-0000-000000000001"
+    )
 
 
 def test_nccl_runner_disables_gin_for_mlx4_devices(

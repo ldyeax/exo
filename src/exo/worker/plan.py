@@ -4,6 +4,7 @@ from collections.abc import Mapping, Sequence
 
 from exo.shared.types.chunks import InputImageChunk
 from exo.shared.types.common import CommandId, ModelId, NodeId
+from exo.shared.types.compute_resources import ComputeResource
 from exo.shared.types.tasks import (
     CancelTask,
     ConnectToGroup,
@@ -56,12 +57,22 @@ def plan(
     image_cache: Mapping[Base64ImageHash, Base64Image],
     instance_backoff: KeyedBackoff[InstanceId],
     download_backoff: KeyedBackoff[ModelId],
+    node_compute_resources: Mapping[NodeId, Sequence[ComputeResource]] | None = None,
+    runner_backoff: KeyedBackoff[RunnerId] | None = None,
 ) -> Task | None:
     # Python short circuiting OR logic should evaluate these sequentially.
     return (
         _cancel_tasks(runners, tasks)
         or _kill_runner(runners, all_runners, instances)
-        or _create_runner(node_id, runners, all_runners, instances, instance_backoff)
+        or _create_runner(
+            node_id,
+            runners,
+            all_runners,
+            instances,
+            instance_backoff,
+            node_compute_resources,
+            runner_backoff,
+        )
         or _model_needs_download(
             node_id, runners, global_download_status, download_backoff
         )
@@ -87,9 +98,7 @@ def _kill_runner(
                 runner_id=runner_id,
             )
 
-        for (
-            global_runner_id
-        ) in runner.bound_instance.instance.shard_assignments.node_to_runner.values():
+        for global_runner_id in _assigned_runner_ids(runner.bound_instance.instance):
             if runner_id == global_runner_id:
                 continue
 
@@ -100,40 +109,89 @@ def _kill_runner(
                 )
 
 
+def _assigned_runner_ids(instance: Instance) -> tuple[RunnerId, ...]:
+    assignments = instance.shard_assignments
+    if assignments.compute_resource_to_runner:
+        return tuple(assignments.runner_to_shard)
+    return tuple(assignments.node_to_runner.values())
+
+
+def _resource_bound_runner_id(
+    instance: Instance, runner_id: RunnerId
+) -> RunnerId | None:
+    if not instance.shard_assignments.compute_resource_to_runner:
+        return None
+    return runner_id
+
+
+def _local_runner_ids(
+    node_id: NodeId,
+    instance: Instance,
+    node_compute_resources: Mapping[NodeId, Sequence[ComputeResource]] | None,
+) -> tuple[RunnerId, ...]:
+    assignments = instance.shard_assignments
+    if not assignments.compute_resource_to_runner:
+        runner_id = assignments.node_to_runner.get(node_id)
+        return () if runner_id is None else (runner_id,)
+
+    if node_compute_resources is None:
+        return ()
+    local_resource_ids = {
+        resource.resource_id for resource in node_compute_resources.get(node_id, ())
+    }
+    local_runner_ids = {
+        runner_id
+        for resource_id, runner_id in assignments.compute_resource_to_runner.items()
+        if resource_id in local_resource_ids
+    }
+    return tuple(
+        sorted(
+            local_runner_ids,
+            key=lambda runner_id: assignments.runner_to_shard[runner_id].device_rank,
+        )
+    )
+
+
 def _create_runner(
     node_id: NodeId,
     runners: Mapping[RunnerId, RunnerSupervisor],
     all_runners: Mapping[RunnerId, RunnerStatus],
     instances: Mapping[InstanceId, Instance],
     instance_backoff: KeyedBackoff[InstanceId],
+    node_compute_resources: Mapping[NodeId, Sequence[ComputeResource]] | None,
+    runner_backoff: KeyedBackoff[RunnerId] | None,
 ) -> CreateRunner | None:
     for instance in instances.values():
-        runner_id = instance.shard_assignments.node_to_runner.get(node_id, None)
-        if runner_id is None:
-            continue
+        for runner_id in _local_runner_ids(node_id, instance, node_compute_resources):
+            if runner_id in runners:
+                continue
 
-        if runner_id in runners:
-            continue
+            # Don't create a fresh runner while a sibling rank is known failed.
+            instance_has_failed_runner = any(
+                isinstance(all_runners.get(remote_runner_id), RunnerFailed)
+                for remote_runner_id in _assigned_runner_ids(instance)
+                if remote_runner_id != runner_id
+            )
+            we_have_failed_before = isinstance(all_runners.get(runner_id), RunnerFailed)
+            if instance_has_failed_runner and not we_have_failed_before:
+                continue
 
-        # don't create runners if any other nodes have runners that have failed - wait for them to fix themselves first.
-        instance_has_failed_runner = any(
-            isinstance(all_runners.get(remote_runner_id), RunnerFailed)
-            for remote_runner_id in instance.shard_assignments.node_to_runner.values()
-            if remote_runner_id != runner_id
-        )
-        we_have_failed_before = isinstance(all_runners.get(runner_id), RunnerFailed)
-        if instance_has_failed_runner and not we_have_failed_before:
-            continue
+            resource_bound = bool(instance.shard_assignments.compute_resource_to_runner)
+            if resource_bound and runner_backoff is not None:
+                creation_allowed = runner_backoff.should_proceed(runner_id)
+            else:
+                creation_allowed = instance_backoff.should_proceed(instance.instance_id)
+            if not creation_allowed:
+                continue
 
-        if not instance_backoff.should_proceed(instance.instance_id):
-            continue
-
-        return CreateRunner(
-            instance_id=instance.instance_id,
-            bound_instance=BoundInstance(
-                instance=instance, bound_runner_id=runner_id, bound_node_id=node_id
-            ),
-        )
+            return CreateRunner(
+                instance_id=instance.instance_id,
+                bound_instance=BoundInstance(
+                    instance=instance,
+                    bound_runner_id=runner_id,
+                    bound_node_id=node_id,
+                ),
+            )
 
 
 def _model_needs_download(
@@ -212,7 +270,10 @@ def _init_distributed_backend(
         if not (accepting_ranks or connecting_rank_ready):
             continue
 
-        return ConnectToGroup(instance_id=instance.instance_id)
+        return ConnectToGroup(
+            instance_id=instance.instance_id,
+            runner_id=_resource_bound_runner_id(instance, runner_id),
+        )
 
     return None
 
@@ -240,7 +301,12 @@ def _load_model(
 
         is_single_node_instance = len(instance.shard_assignments.runner_to_shard) == 1
         if is_single_node_instance and isinstance(runner.status, RunnerIdle):
-            return LoadModel(instance_id=instance.instance_id)
+            return LoadModel(
+                instance_id=instance.instance_id,
+                runner_id=_resource_bound_runner_id(
+                    instance, runner.bound_instance.bound_runner_id
+                ),
+            )
 
         is_runner_waiting = isinstance(runner.status, RunnerConnected)
 
@@ -253,7 +319,12 @@ def _load_model(
         )
 
         if is_runner_waiting and all_ready_for_model:
-            return LoadModel(instance_id=instance.instance_id)
+            return LoadModel(
+                instance_id=instance.instance_id,
+                runner_id=_resource_bound_runner_id(
+                    instance, runner.bound_instance.bound_runner_id
+                ),
+            )
 
     return None
 
@@ -292,7 +363,10 @@ def _ready_to_warmup(
         )
 
         if is_runner_loaded and (accepting_ranks_ready or connecting_rank_ready):
-            return StartWarmup(instance_id=instance.instance_id)
+            return StartWarmup(
+                instance_id=instance.instance_id,
+                runner_id=_resource_bound_runner_id(instance, runner_id),
+            )
 
     return None
 

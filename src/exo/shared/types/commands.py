@@ -39,6 +39,7 @@ class PlaceInstance(BaseCommand):
     sharding: Sharding
     instance_meta: InstanceMeta
     min_nodes: int
+    use_all_compute_resources: bool = False
 
 
 class CreateInstance(BaseCommand):

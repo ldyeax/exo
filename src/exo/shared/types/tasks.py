@@ -45,15 +45,15 @@ class DownloadModel(BaseTask):  # emitted by Worker
 
 
 class LoadModel(BaseTask):  # emitted by Worker
-    pass
+    runner_id: RunnerId | None = None
 
 
 class ConnectToGroup(BaseTask):  # emitted by Worker
-    pass
+    runner_id: RunnerId | None = None
 
 
 class StartWarmup(BaseTask):  # emitted by Worker
-    pass
+    runner_id: RunnerId | None = None
 
 
 class TextGeneration(BaseTask):  # emitted by Master

@@ -70,6 +70,7 @@ def test_plan_starts_warmup_for_accepting_rank_when_all_loaded_or_warming():
 
     assert isinstance(result, StartWarmup)
     assert result.instance_id == INSTANCE_1_ID
+    assert result.runner_id is None
 
 
 def test_plan_starts_warmup_for_rank_zero_after_others_warming():

@@ -1,4 +1,4 @@
-from collections.abc import Generator, Mapping
+from collections.abc import Generator, Mapping, Sequence
 from ipaddress import ip_address
 
 from loguru import logger
@@ -6,6 +6,7 @@ from loguru import logger
 from exo.shared.models.model_cards import ModelCard
 from exo.shared.topology import Topology
 from exo.shared.types.common import Host, NodeId
+from exo.shared.types.compute_resources import ComputeResource, ComputeResourceId
 from exo.shared.types.memory import Memory
 from exo.shared.types.profiling import MemoryUsage, NodeNetworkInfo
 from exo.shared.types.topology import Cycle, RDMAConnection, SocketConnection
@@ -244,16 +245,42 @@ def _get_shard_assignments_for_pure_pipeline(
 def get_shard_assignments_for_tensor_parallel(
     model_card: ModelCard,
     cycle: Cycle,
-):
+    node_compute_resources: Mapping[NodeId, Sequence[ComputeResource]] | None = None,
+) -> ShardAssignments:
     total_layers = model_card.n_layers
-    world_size = len(cycle)
     runner_to_shard: dict[RunnerId, ShardMetadata] = {}
     node_to_runner: dict[NodeId, RunnerId] = {}
+    compute_resource_to_runner: dict[ComputeResourceId, RunnerId] = {}
 
-    for i, node_id in enumerate(cycle):
+    targets: list[tuple[NodeId, ComputeResourceId | None]]
+    if node_compute_resources is None:
+        targets = [(node_id, None) for node_id in cycle]
+    else:
+        missing_nodes = [
+            node_id for node_id in cycle if not node_compute_resources.get(node_id)
+        ]
+        if missing_nodes:
+            raise ValueError(
+                "Cannot create resource-bound tensor assignments without compute "
+                f"resources for nodes {missing_nodes}"
+            )
+        targets = [
+            (node_id, resource.resource_id)
+            for node_id in cycle
+            for resource in sorted(
+                node_compute_resources[node_id], key=lambda item: item.resource_id
+            )
+        ]
+        resource_ids = [resource_id for _, resource_id in targets]
+        if len(resource_ids) != len(set(resource_ids)):
+            raise ValueError("Compute resources must be unique across placement nodes")
+
+    world_size = len(targets)
+
+    for device_rank, (node_id, resource_id) in enumerate(targets):
         shard = TensorShardMetadata(
             model_card=model_card,
-            device_rank=i,
+            device_rank=device_rank,
             world_size=world_size,
             start_layer=0,
             end_layer=total_layers,
@@ -263,12 +290,15 @@ def get_shard_assignments_for_tensor_parallel(
         runner_id = RunnerId()
 
         runner_to_shard[runner_id] = shard
-        node_to_runner[node_id] = runner_id
+        node_to_runner.setdefault(node_id, runner_id)
+        if resource_id is not None:
+            compute_resource_to_runner[resource_id] = runner_id
 
     shard_assignments = ShardAssignments(
         model_id=model_card.model_id,
         runner_to_shard=runner_to_shard,
         node_to_runner=node_to_runner,
+        compute_resource_to_runner=compute_resource_to_runner,
     )
 
     return shard_assignments
@@ -279,6 +309,8 @@ def get_shard_assignments(
     cycle: Cycle,
     sharding: Sharding,
     node_memory: Mapping[NodeId, MemoryUsage],
+    *,
+    node_compute_resources: Mapping[NodeId, Sequence[ComputeResource]] | None = None,
 ) -> ShardAssignments:
     match sharding:
         case Sharding.Pipeline:
@@ -291,6 +323,7 @@ def get_shard_assignments(
             return get_shard_assignments_for_tensor_parallel(
                 model_card=model_card,
                 cycle=cycle,
+                node_compute_resources=node_compute_resources,
             )
 
 

@@ -47,6 +47,7 @@ class MlxNcclInstance(BaseInstance):
         shards = self.shard_assignments.runner_to_shard
         runner_ids = set(shards)
         assigned_runner_ids = set(self.shard_assignments.node_to_runner.values())
+        resource_assignments = self.shard_assignments.compute_resource_to_runner
         world_size = len(shards)
 
         try:
@@ -68,7 +69,25 @@ class MlxNcclInstance(BaseInstance):
 
         if world_size < 2:
             raise ValueError("MlxNcclInstance requires at least two ranks")
-        if (
+        if resource_assignments:
+            resource_runner_ids = list(resource_assignments.values())
+            if (
+                len(resource_assignments) != world_size
+                or len(set(resource_runner_ids)) != world_size
+                or set(resource_runner_ids) != runner_ids
+            ):
+                raise ValueError(
+                    "MlxNcclInstance requires exactly one compute resource per rank"
+                )
+            if len(self.shard_assignments.node_to_runner) < 2:
+                raise ValueError("MlxNcclInstance requires at least two nodes")
+            if len(assigned_runner_ids) != len(self.shard_assignments.node_to_runner):
+                raise ValueError(
+                    "MlxNcclInstance node representatives must be unique runners"
+                )
+            for resource_id in resource_assignments:
+                _ = resource_id.nvidia_device_uuid()
+        elif (
             assigned_runner_ids != runner_ids
             or len(self.shard_assignments.node_to_runner) != world_size
         ):

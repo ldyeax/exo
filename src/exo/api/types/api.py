@@ -271,6 +271,7 @@ class PlaceInstanceParams(BaseModel):
     sharding: Sharding = Sharding.Pipeline
     instance_meta: InstanceMeta = InstanceMeta.MlxRing
     min_nodes: int = 1
+    use_all_compute_resources: bool = False
 
 
 class CreateInstanceParams(BaseModel):
