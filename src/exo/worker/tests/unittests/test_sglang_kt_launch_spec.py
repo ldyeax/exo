@@ -9,6 +9,7 @@ from exo.shared.types.worker.sglang_kt import (
     SglangKtStageSpec,
 )
 from exo.worker.sglang_kt.launch_spec import (
+    GLM_5_2_FULL_INDEXER_LAYER_STARTS,
     REQUIRED_TRANSFORMERS_VERSION,
     SUPPORTED_KTRANSFORMERS_REVISION,
     SUPPORTED_SGLANG_REVISION,
@@ -266,3 +267,23 @@ def test_rejects_unverified_runtime_combinations(
 def test_rejects_non_absolute_python_executable() -> None:
     with pytest.raises(ValidationError, match="executable"):
         build_glm_5_2_fp8_process_launch_specs(make_plan(), "python")
+
+
+def test_rejects_pipeline_start_on_shared_indexer_layer() -> None:
+    plan = make_plan()
+    invalid_stages = (
+        plan.stages[0].model_copy(update={"end_layer": 39}),
+        plan.stages[1].model_copy(update={"start_layer": 39}),
+        plan.stages[2],
+    )
+    invalid_plan = plan.model_copy(update={"stages": invalid_stages})
+
+    assert 30 in GLM_5_2_FULL_INDEXER_LAYER_STARTS
+    assert 38 in GLM_5_2_FULL_INDEXER_LAYER_STARTS
+    assert 58 in GLM_5_2_FULL_INDEXER_LAYER_STARTS
+    assert 39 not in GLM_5_2_FULL_INDEXER_LAYER_STARTS
+    with pytest.raises(ValueError, match="full IndexShare layers"):
+        build_glm_5_2_fp8_process_launch_specs(
+            invalid_plan,
+            PYTHON_EXECUTABLE,
+        )

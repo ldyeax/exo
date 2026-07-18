@@ -18,6 +18,9 @@ from exo.utils.pydantic_ext import FrozenModel
 
 GLM_5_2_FP8_MODEL_ID: Final = ModelId("zai-org/GLM-5.2-FP8")
 GLM_5_2_LAYER_COUNT: Final = 78
+GLM_5_2_FULL_INDEXER_LAYER_STARTS: Final = frozenset(
+    (0, 1, 2, *range(6, GLM_5_2_LAYER_COUNT, 4))
+)
 
 # KTransformers v0.6.3 is the first release with explicit GLM-5.2 support. Its
 # SGLang submodule pins the matching fork revision below.
@@ -236,6 +239,16 @@ def _validate_supported_plan(plan: SglangKtLaunchPlan) -> None:
     if plan.ktransformers_revision != SUPPORTED_KTRANSFORMERS_REVISION:
         raise ValueError(
             f"KTransformers revision must be {SUPPORTED_KTRANSFORMERS_REVISION}"
+        )
+    invalid_pipeline_starts = tuple(
+        stage.start_layer
+        for stage in plan.stages[1:]
+        if stage.start_layer not in GLM_5_2_FULL_INDEXER_LAYER_STARTS
+    )
+    if invalid_pipeline_starts:
+        raise ValueError(
+            "GLM-5.2 pipeline stages must begin on full IndexShare layers; "
+            f"invalid starts: {invalid_pipeline_starts}"
         )
     for stage in plan.stages:
         if stage.ktransformers_method != "FP8":
