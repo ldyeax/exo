@@ -1,3 +1,4 @@
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
@@ -42,6 +43,50 @@ from exo.worker.tests.unittests.test_sglang_kt_launch_spec import (
 
 def make_specs() -> tuple[SglangKtProcessLaunchSpec, ...]:
     return build_glm_5_2_fp8_process_launch_specs(make_plan(), PYTHON_EXECUTABLE)
+
+
+def make_glm_5_2_fp8_config() -> dict[str, object]:
+    return {
+        "architectures": ["GlmMoeDsaForCausalLM"],
+        "model_type": "glm_moe_dsa",
+        "num_hidden_layers": 78,
+        "n_routed_experts": 256,
+        "num_experts_per_tok": 8,
+        "n_shared_experts": 1,
+        "first_k_dense_replace": 3,
+        "num_nextn_predict_layers": 1,
+        "index_topk_freq": 4,
+        "index_share_for_mtp_iteration": True,
+        "quantization_config": {
+            "activation_scheme": "dynamic",
+            "fmt": "e4m3",
+            "quant_method": "fp8",
+            "weight_block_size": [128, 128],
+            "modules_to_not_convert": ["model.embed_tokens"],
+        },
+        # Snapshot metadata is intentionally not part of the runtime pin check.
+        "transformers_version": "999.0.0",
+        "unrelated_checkpoint_metadata": {"ignored": True},
+    }
+
+
+def write_model_config(path: Path, config: dict[str, object]) -> None:
+    path.mkdir()
+    (path / "config.json").write_text(json.dumps(config), encoding="utf-8")
+
+
+def observe_default_glm_5_2_fp8_compatibility(
+    path: Path,
+) -> SglangKtModelSnapshotReceiptObservation | None:
+    spec = make_specs()[0]
+    probe = LocalSglangKtFilesystemProbe(
+        model_snapshot_completeness_checker=(lambda _path, _model_id, _revision: True)
+    )
+    return probe.observe_model_snapshot(
+        str(path),
+        spec.model_id,
+        spec.expected_model_revision,
+    )
 
 
 def make_runtime(spec: SglangKtProcessLaunchSpec) -> SglangKtRuntimeObservation:
@@ -384,6 +429,97 @@ def test_external_runtime_probe_leaves_no_git_source_revisions_unobserved() -> N
     assert observed == no_git_runtime
     assert observed.sglang_revision is None
     assert observed.ktransformers_revision is None
+
+
+def test_default_glm_5_2_fp8_compatibility_verifier_accepts_exact_config(
+    tmp_path: Path,
+) -> None:
+    model_path = tmp_path / "model"
+    write_model_config(model_path, make_glm_5_2_fp8_config())
+
+    receipt = observe_default_glm_5_2_fp8_compatibility(model_path)
+
+    assert receipt is not None
+    assert receipt.weight_format == "safetensors"
+    assert receipt.ktransformers_method == "FP8"
+    assert receipt.receipt_verified
+    assert receipt.snapshot_complete
+
+
+def test_default_glm_5_2_fp8_compatibility_verifier_rejects_malformed_json(
+    tmp_path: Path,
+) -> None:
+    model_path = tmp_path / "model"
+    model_path.mkdir()
+    (model_path / "config.json").write_text("{not-json", encoding="utf-8")
+
+    assert observe_default_glm_5_2_fp8_compatibility(model_path) is None
+
+
+@pytest.mark.parametrize(
+    "mismatch",
+    (
+        {"architectures": ["GlmForCausalLM"]},
+        {"model_type": "glm"},
+        {"num_hidden_layers": 77},
+        {"n_routed_experts": 255},
+        {"num_experts_per_tok": 7},
+        {"n_shared_experts": 0},
+        {"first_k_dense_replace": 2},
+        {"num_nextn_predict_layers": 0},
+        {"index_topk_freq": 1},
+        {"index_share_for_mtp_iteration": False},
+        {
+            "quantization_config": {
+                "activation_scheme": "static",
+                "fmt": "e4m3",
+                "quant_method": "fp8",
+                "weight_block_size": [128, 128],
+            }
+        },
+        {
+            "quantization_config": {
+                "activation_scheme": "dynamic",
+                "fmt": "e5m2",
+                "quant_method": "fp8",
+                "weight_block_size": [128, 128],
+            }
+        },
+        {
+            "quantization_config": {
+                "activation_scheme": "dynamic",
+                "fmt": "e4m3",
+                "quant_method": "int8",
+                "weight_block_size": [128, 128],
+            }
+        },
+        {
+            "quantization_config": {
+                "activation_scheme": "dynamic",
+                "fmt": "e4m3",
+                "quant_method": "fp8",
+                "weight_block_size": [64, 128],
+            }
+        },
+        {"num_hidden_layers": "78"},
+    ),
+)
+def test_default_glm_5_2_fp8_compatibility_verifier_rejects_mismatch(
+    tmp_path: Path,
+    mismatch: dict[str, object],
+) -> None:
+    model_path = tmp_path / "model"
+    config = make_glm_5_2_fp8_config()
+    config.update(mismatch)
+    write_model_config(model_path, config)
+
+    assert observe_default_glm_5_2_fp8_compatibility(model_path) is None
+
+
+def test_default_glm_5_2_fp8_compatibility_verifier_rejects_read_error(
+    tmp_path: Path,
+) -> None:
+    assert observe_default_glm_5_2_fp8_compatibility(tmp_path / "missing") is None
 
 
 def test_local_filesystem_probe_preserves_receipt_and_completeness_distinction() -> (
