@@ -1968,10 +1968,15 @@ def validate_preflight(
         or model.physical_weight_bytes <= 0
         or model.weight_files < 1
         or not model.sha256_manifest
-        or model_manifest_sha256(model.sha256_manifest)
-        != config.model.expected_manifest_sha256
     ):
         raise HarnessError(f"exact model snapshot verification failed on {host.name}")
+    observed_manifest_sha256 = model_manifest_sha256(model.sha256_manifest)
+    if observed_manifest_sha256 != config.model.expected_manifest_sha256:
+        raise HarnessError(
+            f"exact model snapshot verification failed on {host.name}: expected "
+            f"manifest {config.model.expected_manifest_sha256}; observed "
+            f"{observed_manifest_sha256}"
+        )
 
 
 class HarnessEffects(Protocol):
@@ -2158,13 +2163,7 @@ try:
         if not shard_path.is_file() or shard_path.is_symlink():
             raise RuntimeError(f"referenced weight shard is missing: {shard_name}")
         weights.append(shard_path)
-    snapshot_files = []
-    for item in path.rglob("*"):
-        relative = item.relative_to(path)
-        if relative.parts and relative.parts[0] == ".cache":
-            continue
-        if item.is_file() and item != receipt_path:
-            snapshot_files.append(item)
+    snapshot_files = [item for item in path.rglob("*") if item.is_file()]
     indexed_weights = {item.resolve() for item in weights}
     unexpected_weights = [
         str(item.relative_to(path))

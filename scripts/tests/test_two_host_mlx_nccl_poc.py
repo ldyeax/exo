@@ -85,6 +85,14 @@ RUNTIME_DISTRIBUTION_VERSIONS = {
     "transformers": "5.6.2",
 }
 
+
+def test_model_manifest_digest_has_a_stable_canonical_golden() -> None:
+    assert (
+        poc.model_manifest_sha256(TEST_MODEL_MANIFEST)
+        == "b70f2cd17ae7774effc8d7a75884de4598b4b1eb5a6cdf71430b7f0555041d72"
+    )
+
+
 DWAGON_GPUS = (
     GpuIdentity(
         device_uuid="GPU-dwagon-0",
@@ -2865,6 +2873,10 @@ def test_model_probe_uses_indexed_bytes_and_hashes_full_snapshot(
     (model_path / ".exo-huggingface-revision.json").write_text(
         json.dumps({"repo_id": MODEL_ID, "revision": REVISION})
     )
+    cache_metadata = model_path / ".cache" / "huggingface" / "download"
+    cache_metadata.mkdir(parents=True)
+    metadata_file = cache_metadata / "config.json.metadata"
+    metadata_file.write_text(f"{REVISION}\n")
     unrelated = model_path / "unrelated.bin"
     unrelated.write_bytes(b"tokenizer-side files must also be hashed")
 
@@ -2893,6 +2905,8 @@ def test_model_probe_uses_indexed_bytes_and_hashes_full_snapshot(
         "model.safetensors.index.json",
         shard.name,
         unrelated.name,
+        ".exo-huggingface-revision.json",
+        str(metadata_file.relative_to(model_path)),
     }
 
 
