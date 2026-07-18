@@ -390,9 +390,7 @@ def apply_instance_deleted(event: InstanceDeleted, state: State) -> State:
             deleted_instance, state.node_compute_resources
         ).items():
             runner_status = state.runners.get(runner_id)
-            if runner_status is not None and not isinstance(
-                runner_status, RunnerShutdown
-            ):
+            if not isinstance(runner_status, RunnerShutdown):
                 retiring_compute_resources.setdefault(resource_id, runner_id)
 
     new_instances: Mapping[InstanceId, Instance] = {

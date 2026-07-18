@@ -16,6 +16,7 @@ from exo.shared.types.events import (
     IndexedEvent,
     InstanceDeleted,
     RunnerStatusUpdated,
+    TaskCreated,
     TaskStatusUpdated,
 )
 from exo.shared.types.memory import Memory
@@ -23,6 +24,7 @@ from exo.shared.types.state import State
 from exo.shared.types.tasks import (
     ConnectToGroup,
     CreateRunner,
+    Shutdown,
     StartWarmup,
     Task,
     TaskId,
@@ -42,6 +44,7 @@ from exo.shared.types.worker.runners import (
     RunnerIdle,
     RunnerLoaded,
     RunnerReady,
+    RunnerShutdown,
     ShardAssignments,
 )
 from exo.shared.types.worker.shards import TensorShardMetadata
@@ -97,11 +100,32 @@ class _EventApplierTestWorker(Worker):
         event_receiver: Receiver[IndexedEvent],
         state: State,
     ) -> None:
+        self.node_id = DWAGON
         self.event_receiver = event_receiver
+        self.event_sender, self.output_event_receiver = channel[Event]()
         self.state = state
         self.runners = {}
         self._instance_backoff = KeyedBackoff()
         self._runner_backoff = KeyedBackoff()
+        self._runner_lifecycle_lock = anyio.Lock()
+        self.creation_started = anyio.Event()
+        self.allow_creation = anyio.Event()
+        self.allow_creation.set()
+        self.pause_creation = False
+        self.create_supervisor_calls = 0
+
+    async def _create_supervisor(self, task: CreateRunner) -> RunnerSupervisor:
+        self.create_supervisor_calls += 1
+        self.creation_started.set()
+        if self.pause_creation:
+            await self.allow_creation.wait()
+        runner = FakeRunnerSupervisor(
+            bound_instance=task.bound_instance,
+            status=RunnerIdle(),
+        )
+        supervisor = cast(RunnerSupervisor, cast(object, runner))
+        self.runners[task.bound_instance.bound_runner_id] = supervisor
+        return supervisor
 
     def record_backoff_attempts(
         self,
@@ -300,11 +324,14 @@ def test_reset_runner_backoff_uses_all_instance_assignments() -> None:
 
 @pytest.mark.anyio
 async def test_instance_deletion_resets_backoff_after_supervisors_are_gone() -> None:
-    instance, runner_ids, _ = _resource_bound_instance()
+    instance, runner_ids, resources = _resource_bound_instance()
     indexed_event_sender, indexed_event_receiver = channel[IndexedEvent]()
     worker = _EventApplierTestWorker(
         indexed_event_receiver,
-        State(instances={instance.instance_id: instance}),
+        State(
+            instances={instance.instance_id: instance},
+            node_compute_resources=resources,
+        ),
     )
     worker.record_backoff_attempts(instance.instance_id, runner_ids)
 
@@ -323,6 +350,147 @@ async def test_instance_deletion_resets_backoff_after_supervisors_are_gone() -> 
     assert all(
         worker.runner_backoff_attempts(runner_id) == 0 for runner_id in runner_ids
     )
+    shutdown_events = worker.output_event_receiver.collect()
+    assert {
+        event.runner_id
+        for event in shutdown_events
+        if isinstance(event, RunnerStatusUpdated)
+        and isinstance(event.runner_status, RunnerShutdown)
+    } == set(runner_ids[:2])
+
+
+@pytest.mark.anyio
+async def test_stale_create_is_suppressed_after_deletion_ack() -> None:
+    instance, runner_ids, resources = _resource_bound_instance()
+    _indexed_event_sender, indexed_event_receiver = channel[IndexedEvent]()
+    worker = _EventApplierTestWorker(
+        indexed_event_receiver,
+        State(
+            instances={instance.instance_id: instance},
+            node_compute_resources=resources,
+        ),
+    )
+    stale_task = _plan_create_runner(instance, {}, resources)
+    assert isinstance(stale_task, CreateRunner)
+
+    await worker._apply_indexed_event(  # pyright: ignore[reportPrivateUsage]
+        IndexedEvent(
+            idx=0,
+            event=InstanceDeleted(instance_id=instance.instance_id),
+        )
+    )
+    runner_started = await worker._start_planned_runner(  # pyright: ignore[reportPrivateUsage]
+        stale_task
+    )
+
+    assert not runner_started
+    assert worker.create_supervisor_calls == 0
+    assert worker.runners == {}
+    emitted_events = worker.output_event_receiver.collect()
+    assert all(isinstance(event, RunnerStatusUpdated) for event in emitted_events)
+    assert {
+        event.runner_id
+        for event in emitted_events
+        if isinstance(event, RunnerStatusUpdated)
+        and isinstance(event.runner_status, RunnerShutdown)
+    } == set(runner_ids[:2])
+
+
+@pytest.mark.anyio
+async def test_creation_finishes_before_deletion_uses_normal_shutdown_path() -> None:
+    instance, runner_ids, resources = _resource_bound_instance()
+    _indexed_event_sender, indexed_event_receiver = channel[IndexedEvent]()
+    worker = _EventApplierTestWorker(
+        indexed_event_receiver,
+        State(
+            instances={instance.instance_id: instance},
+            node_compute_resources=resources,
+        ),
+    )
+    worker.pause_creation = True
+    worker.allow_creation = anyio.Event()
+    create_task = _plan_create_runner(instance, {}, resources)
+    assert isinstance(create_task, CreateRunner)
+    create_results: list[bool] = []
+    deletion_complete = anyio.Event()
+
+    async def start_runner() -> None:
+        create_results.append(
+            await worker._start_planned_runner(  # pyright: ignore[reportPrivateUsage]
+                create_task
+            )
+        )
+
+    async def delete_instance() -> None:
+        await worker._apply_indexed_event(  # pyright: ignore[reportPrivateUsage]
+            IndexedEvent(
+                idx=0,
+                event=InstanceDeleted(instance_id=instance.instance_id),
+            )
+        )
+        deletion_complete.set()
+
+    async with anyio.create_task_group() as task_group:
+        task_group.start_soon(start_runner)
+        await worker.creation_started.wait()
+        task_group.start_soon(delete_instance)
+        await anyio.sleep(0)
+        assert not deletion_complete.is_set()
+        assert instance.instance_id in worker.state.instances
+        worker.allow_creation.set()
+
+    assert create_results == [True]
+    assert instance.instance_id not in worker.state.instances
+    assert runner_ids[0] in worker.runners
+    emitted_events = worker.output_event_receiver.collect()
+    assert any(isinstance(event, TaskCreated) for event in emitted_events)
+    assert {
+        event.runner_id
+        for event in emitted_events
+        if isinstance(event, RunnerStatusUpdated)
+        and isinstance(event.runner_status, RunnerShutdown)
+    } == {runner_ids[1]}
+
+    shutdown_task = plan(
+        node_id=DWAGON,
+        runners=worker.runners,
+        global_download_status={},
+        instances=worker.state.instances,
+        all_runners=worker.state.runners,
+        tasks=worker.state.tasks,
+        input_chunk_buffer={},
+        image_cache={},
+        instance_backoff=KeyedBackoff(),
+        download_backoff=KeyedBackoff(),
+        node_compute_resources=resources,
+        runner_backoff=KeyedBackoff(),
+    )
+    assert isinstance(shutdown_task, Shutdown)
+    assert shutdown_task.runner_id == runner_ids[0]
+
+
+@pytest.mark.anyio
+async def test_failed_task_created_send_does_not_register_supervisor() -> None:
+    instance, _, resources = _resource_bound_instance()
+    _indexed_event_sender, indexed_event_receiver = channel[IndexedEvent]()
+    worker = _EventApplierTestWorker(
+        indexed_event_receiver,
+        State(
+            instances={instance.instance_id: instance},
+            node_compute_resources=resources,
+        ),
+    )
+    create_task = _plan_create_runner(instance, {}, resources)
+    assert isinstance(create_task, CreateRunner)
+    worker.event_sender.close()
+
+    with pytest.raises(anyio.ClosedResourceError):
+        await worker._start_planned_runner(  # pyright: ignore[reportPrivateUsage]
+            create_task
+        )
+
+    assert worker.create_supervisor_calls == 0
+    assert worker.runners == {}
 
 
 def test_resource_lifecycle_tasks_target_selected_local_rank() -> None:
