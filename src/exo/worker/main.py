@@ -467,7 +467,7 @@ class Worker:
                             await runner.start_task(task)
                             await runner.wait_for_shutdown_received()
                             graceful_shutdown_received = True
-                    except TimeoutError:
+                    except (TimeoutError, anyio.BrokenResourceError):
                         if task.task_id not in runner.completed:
                             await self.event_sender.send(
                                 TaskStatusUpdated(

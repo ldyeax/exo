@@ -52,6 +52,12 @@ class _ShutdownRunner:
         return False
 
 
+class _ClosedShutdownRunner(_ShutdownRunner):
+    async def start_task(self, _task: Task) -> None:
+        self.started.set()
+        raise anyio.BrokenResourceError
+
+
 def _make_worker() -> tuple[Worker, Sender[Event], Receiver[Event]]:
     _, indexed_event_receiver = channel[IndexedEvent]()
     event_sender, event_receiver = channel[Event]()
@@ -66,6 +72,40 @@ def _make_worker() -> tuple[Worker, Sender[Event], Receiver[Event]]:
         api_port=52415,
     )
     return worker, event_sender, event_receiver
+
+
+@pytest.mark.anyio
+async def test_closed_runner_channel_still_waits_for_confirmed_stop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner_id = RunnerId("runner-a")
+    task = Shutdown(
+        task_id=TaskId("shutdown-a"),
+        instance_id=InstanceId("instance-a"),
+        runner_id=runner_id,
+    )
+    _return_task_once(monkeypatch, task)
+    worker, event_sender, event_receiver = _make_worker()
+    runner = _ClosedShutdownRunner()
+    worker.runners[runner_id] = cast(RunnerSupervisor, cast(object, runner))
+
+    async with anyio.create_task_group() as task_group:
+        task_group.start_soon(worker.plan_step)
+        await runner.shutdown_requested.wait()
+        assert runner_id in worker.runners
+        assert not any(
+            isinstance(event, RunnerStatusUpdated) for event in event_receiver.collect()
+        )
+
+        runner.allow_stop.set()
+        await runner.stop_confirmed.wait()
+        shutdown = await event_receiver.receive()
+        assert isinstance(shutdown, RunnerStatusUpdated)
+        assert isinstance(shutdown.runner_status, RunnerShutdown)
+        assert runner_id not in worker.runners
+        task_group.cancel_scope.cancel()
+
+    event_sender.close()
 
 
 def _return_task_once(monkeypatch: pytest.MonkeyPatch, task: Task) -> None:
