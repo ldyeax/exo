@@ -1,0 +1,669 @@
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Literal
+
+import pytest
+from pydantic import ValidationError
+
+from exo.shared.types.common import Host, ModelId
+from exo.shared.types.compute_resources import NvidiaGpuComputeResource
+from exo.shared.types.worker.sglang_kt import (
+    AbsoluteRuntimePath,
+    GitRevision,
+    NetworkPort,
+)
+from exo.worker.sglang_kt.launch_spec import (
+    SglangKtProcessLaunchSpec,
+    build_glm_5_2_fp8_process_launch_specs,
+)
+from exo.worker.sglang_kt.preflight import (
+    SglangKtHostPreflightObservation,
+    SglangKtModelSnapshotReceiptObservation,
+    SglangKtPreflightPassed,
+    SglangKtPythonVersionObservation,
+    SglangKtRuntimeObservation,
+    evaluate_sglang_kt_preflight,
+)
+from exo.worker.sglang_kt.preflight_collector import (
+    ExternalPythonSglangKtRuntimeProbe,
+    LinuxSglangKtHostInventoryProbe,
+    LocalSglangKtFilesystemProbe,
+    SglangKtLocalHostInventory,
+    SglangKtModelSnapshotCompatibility,
+    SglangKtRuntimeCommandResult,
+    SocketSglangKtPortProbe,
+    collect_sglang_kt_local_host_preflight_observation,
+)
+from exo.worker.tests.unittests.test_sglang_kt_launch_spec import (
+    PYTHON_EXECUTABLE,
+    make_plan,
+)
+
+
+def make_specs() -> tuple[SglangKtProcessLaunchSpec, ...]:
+    return build_glm_5_2_fp8_process_launch_specs(make_plan(), PYTHON_EXECUTABLE)
+
+
+def make_runtime(spec: SglangKtProcessLaunchSpec) -> SglangKtRuntimeObservation:
+    return SglangKtRuntimeObservation(
+        executable=spec.executable,
+        python_implementation="CPython",
+        python_version=SglangKtPythonVersionObservation(
+            major=3,
+            minor=13,
+            patch=7,
+        ),
+        sglang_revision=spec.expected_sglang_revision,
+        ktransformers_revision=spec.expected_ktransformers_revision,
+        transformers_version=spec.required_transformers_version,
+    )
+
+
+def make_gpu_resource(
+    spec: SglangKtProcessLaunchSpec,
+) -> NvidiaGpuComputeResource:
+    return NvidiaGpuComputeResource.from_device(
+        device_uuid=spec.gpu_uuid,
+        pci_bus_id=f"0000:{spec.pipeline_rank + 1:02x}:00.0",
+        model_name="NVIDIA GeForce RTX 3090",
+        total_memory_bytes=24 * 1024**3,
+        numa_node=spec.memory_nodes[0],
+        cpu_affinity=spec.cpu_cores,
+    )
+
+
+@dataclass
+class StaticRuntimeProbe:
+    observation: SglangKtRuntimeObservation
+    calls: list[AbsoluteRuntimePath] = field(default_factory=list)
+
+    def observe_runtime(
+        self, executable: AbsoluteRuntimePath
+    ) -> SglangKtRuntimeObservation:
+        self.calls.append(executable)
+        return self.observation
+
+
+@dataclass
+class SuccessfulFilesystemProbe:
+    readable_calls: list[AbsoluteRuntimePath] = field(default_factory=list)
+    snapshot_calls: list[tuple[AbsoluteRuntimePath, ModelId, GitRevision]] = field(
+        default_factory=list
+    )
+
+    def is_readable_directory(self, path: AbsoluteRuntimePath) -> bool:
+        self.readable_calls.append(path)
+        return True
+
+    def observe_model_snapshot(
+        self,
+        path: AbsoluteRuntimePath,
+        model_id: ModelId,
+        revision: GitRevision,
+    ) -> SglangKtModelSnapshotReceiptObservation:
+        self.snapshot_calls.append((path, model_id, revision))
+        return SglangKtModelSnapshotReceiptObservation(
+            model_path=path,
+            model_id=model_id,
+            revision=revision,
+            weight_format="safetensors",
+            ktransformers_method="FP8",
+            receipt_verified=True,
+            snapshot_complete=True,
+        )
+
+
+@dataclass
+class IncompatibleFilesystemProbe:
+    mode: Literal["missing", "wrong_method", "wrong_path"]
+
+    def is_readable_directory(self, path: AbsoluteRuntimePath) -> bool:
+        del path
+        return True
+
+    def observe_model_snapshot(
+        self,
+        path: AbsoluteRuntimePath,
+        model_id: ModelId,
+        revision: GitRevision,
+    ) -> SglangKtModelSnapshotReceiptObservation | None:
+        if self.mode == "missing":
+            return None
+        return SglangKtModelSnapshotReceiptObservation(
+            model_path="/injected/wrong-path" if self.mode == "wrong_path" else path,
+            model_id=model_id,
+            revision=revision,
+            weight_format="safetensors",
+            ktransformers_method=("BF16" if self.mode == "wrong_method" else "FP8"),
+            receipt_verified=True,
+            snapshot_complete=True,
+        )
+
+
+@dataclass
+class StaticInventoryProbe:
+    inventory: SglangKtLocalHostInventory
+    calls: list[tuple[NvidiaGpuComputeResource, ...]] = field(default_factory=list)
+
+    def observe_inventory(
+        self,
+        gpu_resources: tuple[NvidiaGpuComputeResource, ...],
+    ) -> SglangKtLocalHostInventory:
+        self.calls.append(gpu_resources)
+        return self.inventory
+
+
+@dataclass
+class SuccessfulPortProbe:
+    endpoint_calls: list[Host] = field(default_factory=list)
+    port_calls: list[NetworkPort] = field(default_factory=list)
+
+    def can_bind_endpoint(self, endpoint: Host) -> bool:
+        self.endpoint_calls.append(endpoint)
+        return True
+
+    def can_bind_local_port(self, port: NetworkPort) -> bool:
+        self.port_calls.append(port)
+        return True
+
+
+def make_inventory(
+    specs: tuple[SglangKtProcessLaunchSpec, ...],
+) -> SglangKtLocalHostInventory:
+    return SglangKtLocalHostInventory(
+        gpu_resources=tuple(make_gpu_resource(spec) for spec in specs),
+        cpu_cores=tuple(core for spec in specs for core in spec.cpu_cores),
+        memory_nodes=tuple(
+            dict.fromkeys(node for spec in specs for node in spec.memory_nodes)
+        ),
+        hca_devices=tuple(
+            dict.fromkeys(device for spec in specs for device in spec.hca_devices)
+        ),
+    )
+
+
+def collect_successful_observation(
+    specs: tuple[SglangKtProcessLaunchSpec, ...],
+) -> tuple[
+    SglangKtHostPreflightObservation,
+    SuccessfulFilesystemProbe,
+    StaticInventoryProbe,
+    SuccessfulPortProbe,
+]:
+    gpu_resources = tuple(make_gpu_resource(spec) for spec in specs)
+    filesystem_probe = SuccessfulFilesystemProbe()
+    inventory_probe = StaticInventoryProbe(make_inventory(specs))
+    port_probe = SuccessfulPortProbe()
+    observation = collect_sglang_kt_local_host_preflight_observation(
+        specs,
+        gpu_resources=gpu_resources,
+        runtime_probe=StaticRuntimeProbe(make_runtime(specs[0])),
+        filesystem_probe=filesystem_probe,
+        inventory_probe=inventory_probe,
+        port_probe=port_probe,
+    )
+    return observation, filesystem_probe, inventory_probe, port_probe
+
+
+def test_collects_exact_facts_for_multiple_local_process_specs() -> None:
+    specs = make_specs()
+    dwagon, filesystem_probe, inventory_probe, port_probe = (
+        collect_successful_observation((specs[0], specs[1]))
+    )
+    fwuff, _filesystem, _inventory, _ports = collect_successful_observation((specs[2],))
+
+    result = evaluate_sglang_kt_preflight(specs, (dwagon, fwuff))
+
+    assert isinstance(result, SglangKtPreflightPassed)
+    assert dwagon.node_id == specs[0].node_id
+    assert dwagon.gpu_uuids == (specs[0].gpu_uuid, specs[1].gpu_uuid)
+    assert dwagon.cpu_cores == (*specs[0].cpu_cores, *specs[1].cpu_cores)
+    assert dwagon.memory_nodes == (0, 1)
+    assert dwagon.hca_devices == ("mlx4_0:1", "mlx4_0:2")
+    assert dwagon.readable_directories == (
+        specs[0].model_path,
+        specs[0].ktransformers_weight_path,
+    )
+    assert tuple(receipt.model_path for receipt in dwagon.model_snapshot_receipts) == (
+        specs[0].model_path,
+        specs[0].ktransformers_weight_path,
+    )
+    assert filesystem_probe.readable_calls == [
+        specs[0].model_path,
+        specs[0].ktransformers_weight_path,
+    ]
+    assert len(filesystem_probe.snapshot_calls) == 2
+    assert inventory_probe.calls == [
+        (make_gpu_resource(specs[0]), make_gpu_resource(specs[1]))
+    ]
+    assert port_probe.endpoint_calls == [
+        specs[0].service_endpoint,
+        specs[1].service_endpoint,
+        specs[0].distributed_coordinator,
+    ]
+    assert port_probe.port_calls == [specs[0].nccl_port, specs[1].nccl_port]
+
+
+@pytest.mark.parametrize("mode", ["missing", "wrong_method", "wrong_path"])
+def test_collector_omits_unestablished_or_incompatible_snapshot_facts(
+    mode: Literal["missing", "wrong_method", "wrong_path"],
+) -> None:
+    spec = make_specs()[0]
+    gpu_resource = make_gpu_resource(spec)
+
+    observation = collect_sglang_kt_local_host_preflight_observation(
+        (spec,),
+        gpu_resources=(gpu_resource,),
+        runtime_probe=StaticRuntimeProbe(make_runtime(spec)),
+        filesystem_probe=IncompatibleFilesystemProbe(mode),
+        inventory_probe=StaticInventoryProbe(make_inventory((spec,))),
+        port_probe=SuccessfulPortProbe(),
+    )
+
+    assert observation.model_snapshot_receipts == ()
+
+
+def test_shared_model_and_ktransformers_path_is_probed_once() -> None:
+    plan = make_plan()
+    shared_path_plan = plan.model_copy(
+        update={
+            "stages": tuple(
+                stage.model_copy(update={"ktransformers_weight_path": stage.model_path})
+                for stage in plan.stages
+            )
+        }
+    )
+    specs = build_glm_5_2_fp8_process_launch_specs(
+        shared_path_plan,
+        PYTHON_EXECUTABLE,
+    )
+
+    dwagon, filesystem_probe, _inventory, _ports = collect_successful_observation(
+        (specs[0], specs[1])
+    )
+    fwuff, _filesystem, _inventory, _ports = collect_successful_observation((specs[2],))
+
+    assert isinstance(
+        evaluate_sglang_kt_preflight(specs, (dwagon, fwuff)),
+        SglangKtPreflightPassed,
+    )
+    assert filesystem_probe.snapshot_calls == [
+        (specs[0].model_path, specs[0].model_id, specs[0].expected_model_revision)
+    ]
+    assert len(dwagon.model_snapshot_receipts) == 1
+
+
+@dataclass
+class RecordingRuntimeCommandRunner:
+    result: SglangKtRuntimeCommandResult
+    calls: list[tuple[tuple[str, ...], float]] = field(default_factory=list)
+
+    def __call__(
+        self,
+        command: tuple[str, ...],
+        timeout_seconds: float,
+    ) -> SglangKtRuntimeCommandResult:
+        self.calls.append((command, timeout_seconds))
+        return self.result
+
+
+def test_external_runtime_probe_parses_only_the_external_python_payload() -> None:
+    spec = make_specs()[0]
+    expected = make_runtime(spec)
+    command_runner = RecordingRuntimeCommandRunner(
+        SglangKtRuntimeCommandResult(
+            return_code=0,
+            stdout=expected.model_dump_json(),
+            stderr="",
+        )
+    )
+
+    observed = ExternalPythonSglangKtRuntimeProbe(command_runner).observe_runtime(
+        spec.executable
+    )
+
+    assert observed == expected
+    assert len(command_runner.calls) == 1
+    command, timeout_seconds = command_runner.calls[0]
+    assert command[:3] == (spec.executable, "-I", "-c")
+    assert 'source_revision("sglang")' in command[3]
+    assert 'source_revision("ktransformers")' in command[3]
+    assert '"status"' in command[3]
+    assert '"--untracked-files=no"' in command[3]
+    assert timeout_seconds == 15.0
+
+
+@pytest.mark.parametrize(
+    "command_result",
+    [
+        SglangKtRuntimeCommandResult(return_code=1, stdout="{}", stderr="failure"),
+        SglangKtRuntimeCommandResult(return_code=0, stdout="not-json", stderr=""),
+        SglangKtRuntimeCommandResult(
+            return_code=0,
+            stdout='{"executable":"/usr/bin/python","sglangRevision":"main"}',
+            stderr="",
+        ),
+    ],
+)
+def test_external_runtime_probe_fails_closed_on_untrusted_results(
+    command_result: SglangKtRuntimeCommandResult,
+) -> None:
+    observed = ExternalPythonSglangKtRuntimeProbe(
+        RecordingRuntimeCommandRunner(command_result)
+    ).observe_runtime(PYTHON_EXECUTABLE)
+
+    assert observed == SglangKtRuntimeObservation()
+
+
+def test_external_runtime_probe_leaves_no_git_source_revisions_unobserved() -> None:
+    spec = make_specs()[0]
+    no_git_runtime = SglangKtRuntimeObservation(
+        executable=spec.executable,
+        python_implementation="CPython",
+        python_version=SglangKtPythonVersionObservation(
+            major=3,
+            minor=13,
+            patch=7,
+        ),
+        sglang_revision=None,
+        ktransformers_revision=None,
+        transformers_version=spec.required_transformers_version,
+    )
+    command_runner = RecordingRuntimeCommandRunner(
+        SglangKtRuntimeCommandResult(
+            return_code=0,
+            stdout=no_git_runtime.model_dump_json(),
+            stderr="",
+        )
+    )
+
+    observed = ExternalPythonSglangKtRuntimeProbe(command_runner).observe_runtime(
+        spec.executable
+    )
+
+    assert observed == no_git_runtime
+    assert observed.sglang_revision is None
+    assert observed.ktransformers_revision is None
+
+
+def test_local_filesystem_probe_preserves_receipt_and_completeness_distinction() -> (
+    None
+):
+    spec = make_specs()[0]
+    checked_directories: list[Path] = []
+    checked_snapshots: list[tuple[Path, ModelId, GitRevision]] = []
+
+    def check_directory(path: Path) -> bool:
+        checked_directories.append(path)
+        return True
+
+    def check_snapshot(path: Path, model_id: ModelId, revision: GitRevision) -> bool:
+        checked_snapshots.append((path, model_id, revision))
+        return False
+
+    probe = LocalSglangKtFilesystemProbe(
+        model_snapshot_compatibility_verifier=lambda _path, _model_id, _revision: (
+            SglangKtModelSnapshotCompatibility(
+                weight_format="safetensors",
+                ktransformers_method="FP8",
+            )
+        ),
+        readable_directory_checker=check_directory,
+        model_snapshot_completeness_checker=check_snapshot,
+    )
+
+    readable = probe.is_readable_directory(spec.model_path)
+    receipt = probe.observe_model_snapshot(
+        spec.model_path,
+        spec.model_id,
+        spec.expected_model_revision,
+    )
+
+    assert readable
+    assert receipt is not None
+    assert receipt.receipt_verified
+    assert not receipt.snapshot_complete
+    assert checked_directories == [Path(spec.model_path)]
+    assert checked_snapshots == [
+        (Path(spec.model_path), spec.model_id, spec.expected_model_revision)
+    ]
+
+
+def test_local_filesystem_probe_fails_closed_when_an_injected_check_raises() -> None:
+    spec = make_specs()[0]
+
+    def raise_error(*_arguments: object) -> bool:
+        raise OSError("injected failure")
+
+    probe = LocalSglangKtFilesystemProbe(
+        model_snapshot_compatibility_verifier=lambda _path, _model_id, _revision: (
+            SglangKtModelSnapshotCompatibility(
+                weight_format="safetensors",
+                ktransformers_method="FP8",
+            )
+        ),
+        readable_directory_checker=raise_error,
+        model_snapshot_completeness_checker=raise_error,
+    )
+
+    assert not probe.is_readable_directory(spec.model_path)
+    receipt = probe.observe_model_snapshot(
+        spec.model_path,
+        spec.model_id,
+        spec.expected_model_revision,
+    )
+    assert receipt is None
+
+
+def test_local_filesystem_probe_omits_receipt_without_verified_compatibility() -> None:
+    spec = make_specs()[0]
+    probe = LocalSglangKtFilesystemProbe(
+        model_snapshot_compatibility_verifier=(
+            lambda _path, _model_id, _revision: None
+        ),
+        readable_directory_checker=lambda _path: True,
+        model_snapshot_completeness_checker=(lambda _path, _model_id, _revision: True),
+    )
+
+    assert (
+        probe.observe_model_snapshot(
+            spec.model_path,
+            spec.model_id,
+            spec.expected_model_revision,
+        )
+        is None
+    )
+
+
+def test_linux_inventory_uses_injected_cpu_numa_gpu_and_active_hca_facts() -> None:
+    spec = make_specs()[0]
+    numa_root = Path("/injected/sys/devices/system/node")
+    infiniband_root = Path("/injected/sys/class/infiniband")
+    directory_names = {
+        infiniband_root: ("mlx5_0", "mlx4_0", "invalid:device"),
+        infiniband_root / "mlx5_0" / "ports": ("2", "1"),
+        infiniband_root / "mlx4_0" / "ports": ("1",),
+    }
+    text = {
+        numa_root / "online": "0-2,4\n",
+        infiniband_root / "mlx5_0" / "ports" / "1" / "state": "4: ACTIVE\n",
+        infiniband_root / "mlx5_0" / "ports" / "2" / "state": "1: DOWN\n",
+        infiniband_root / "mlx4_0" / "ports" / "1" / "state": "4: Active\n",
+    }
+
+    def read_directory_names(path: Path) -> tuple[str, ...]:
+        return directory_names[path]
+
+    def read_text(path: Path) -> str:
+        return text[path]
+
+    gpu_resource = make_gpu_resource(spec)
+    probe = LinuxSglangKtHostInventoryProbe(
+        cpu_affinity_reader=lambda: {3, 2, 1},
+        directory_names_reader=read_directory_names,
+        text_reader=read_text,
+        numa_nodes_path=numa_root,
+        infiniband_devices_path=infiniband_root,
+    )
+
+    inventory = probe.observe_inventory((gpu_resource,))
+
+    assert inventory.gpu_resources == (gpu_resource,)
+    assert inventory.gpu_resources[0].numa_node == spec.memory_nodes[0]
+    assert inventory.gpu_resources[0].cpu_affinity == spec.cpu_cores
+    assert inventory.cpu_cores == (1, 2, 3)
+    assert inventory.memory_nodes == (0, 1, 2, 4)
+    assert inventory.hca_devices == ("mlx4_0:1", "mlx5_0:1")
+
+
+def test_linux_inventory_fails_each_unobserved_sysfs_fact_closed() -> None:
+    def raise_error(*_arguments: object) -> tuple[str, ...]:
+        raise OSError("injected failure")
+
+    probe = LinuxSglangKtHostInventoryProbe(
+        cpu_affinity_reader=lambda: (_ for _ in ()).throw(OSError("failure")),
+        directory_names_reader=raise_error,
+        text_reader=lambda _path: "malformed-range",
+        numa_nodes_path=Path("/injected/numa"),
+        infiniband_devices_path=Path("/injected/infiniband"),
+    )
+
+    inventory = probe.observe_inventory(())
+
+    assert inventory == SglangKtLocalHostInventory()
+
+
+def test_collector_rejects_reordered_supplied_gpu_inventory() -> None:
+    specs = make_specs()[:2]
+    supplied_gpu_resources = tuple(make_gpu_resource(spec) for spec in specs)
+    inventory = make_inventory(specs)
+    reordered_inventory = SglangKtLocalHostInventory(
+        gpu_resources=tuple(reversed(inventory.gpu_resources)),
+        cpu_cores=inventory.cpu_cores,
+        memory_nodes=inventory.memory_nodes,
+        hca_devices=inventory.hca_devices,
+    )
+
+    observation = collect_sglang_kt_local_host_preflight_observation(
+        specs,
+        gpu_resources=supplied_gpu_resources,
+        runtime_probe=StaticRuntimeProbe(make_runtime(specs[0])),
+        filesystem_probe=SuccessfulFilesystemProbe(),
+        inventory_probe=StaticInventoryProbe(reordered_inventory),
+        port_probe=SuccessfulPortProbe(),
+    )
+
+    assert observation.gpu_uuids == ()
+    assert observation.cpu_cores == ()
+    assert observation.memory_nodes == ()
+    assert observation.hca_devices == ()
+
+
+def test_socket_port_probe_uses_only_the_injected_bind_effect() -> None:
+    calls: list[tuple[str, int]] = []
+
+    def bind_probe(ip: str, port: NetworkPort) -> bool:
+        calls.append((ip, port))
+        return port != 31_001
+
+    probe = SocketSglangKtPortProbe(bind_probe)
+
+    assert probe.can_bind_endpoint(Host(ip="192.0.2.10", port=30_000))
+    assert probe.can_bind_local_port(31_000)
+    assert not probe.can_bind_local_port(31_001)
+    assert calls == [
+        ("192.0.2.10", 30_000),
+        ("0.0.0.0", 31_000),
+        ("0.0.0.0", 31_001),
+    ]
+
+
+class ExplodingProbe:
+    def observe_runtime(
+        self, executable: AbsoluteRuntimePath
+    ) -> SglangKtRuntimeObservation:
+        del executable
+        raise RuntimeError("injected runtime failure")
+
+    def is_readable_directory(self, path: AbsoluteRuntimePath) -> bool:
+        del path
+        raise RuntimeError("injected filesystem failure")
+
+    def observe_model_snapshot(
+        self,
+        path: AbsoluteRuntimePath,
+        model_id: ModelId,
+        revision: GitRevision,
+    ) -> SglangKtModelSnapshotReceiptObservation:
+        del path, model_id, revision
+        raise RuntimeError("injected receipt failure")
+
+    def observe_inventory(
+        self,
+        gpu_resources: tuple[NvidiaGpuComputeResource, ...],
+    ) -> SglangKtLocalHostInventory:
+        del gpu_resources
+        raise RuntimeError("injected inventory failure")
+
+    def can_bind_endpoint(self, endpoint: Host) -> bool:
+        del endpoint
+        raise RuntimeError("injected port failure")
+
+    def can_bind_local_port(self, port: NetworkPort) -> bool:
+        del port
+        raise RuntimeError("injected port failure")
+
+
+def test_collector_omits_every_fact_whose_injected_probe_failed() -> None:
+    spec = make_specs()[0]
+    exploding_probe = ExplodingProbe()
+
+    observation = collect_sglang_kt_local_host_preflight_observation(
+        (spec,),
+        gpu_resources=(make_gpu_resource(spec),),
+        runtime_probe=exploding_probe,
+        filesystem_probe=exploding_probe,
+        inventory_probe=exploding_probe,
+        port_probe=exploding_probe,
+    )
+
+    assert observation.runtime == SglangKtRuntimeObservation()
+    assert observation.readable_directories == ()
+    assert observation.gpu_uuids == ()
+    assert observation.cpu_cores == ()
+    assert observation.memory_nodes == ()
+    assert observation.hca_devices == ()
+    assert observation.available_bind_endpoints == ()
+    assert observation.available_local_ports == ()
+    assert observation.model_snapshot_receipts == ()
+
+
+def test_collector_rejects_empty_mixed_node_or_duplicate_rank_inputs() -> None:
+    specs = make_specs()
+    probe = ExplodingProbe()
+
+    def collect(local_specs: tuple[SglangKtProcessLaunchSpec, ...]) -> object:
+        return collect_sglang_kt_local_host_preflight_observation(
+            local_specs,
+            gpu_resources=(),
+            runtime_probe=probe,
+            filesystem_probe=probe,
+            inventory_probe=probe,
+            port_probe=probe,
+        )
+
+    with pytest.raises(ValueError, match="requires process specs"):
+        collect(())
+    with pytest.raises(ValueError, match="target one node"):
+        collect((specs[0], specs[2]))
+    with pytest.raises(ValueError, match="ranks must be unique"):
+        collect((specs[0], specs[0]))
+
+
+def test_local_inventory_rejects_duplicate_gpu_identities() -> None:
+    gpu_resource = make_gpu_resource(make_specs()[0])
+
+    with pytest.raises(ValidationError, match="gpu_resources must be unique"):
+        SglangKtLocalHostInventory(
+            gpu_resources=(gpu_resource, gpu_resource),
+        )
