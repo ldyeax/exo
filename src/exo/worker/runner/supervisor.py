@@ -25,8 +25,11 @@ from exo.shared.types.events import (
 )
 from exo.shared.types.tasks import (
     CANCEL_ALL_TASKS,
+    ConnectToGroup,
     ImageEdits,
     ImageGeneration,
+    LoadModel,
+    StartWarmup,
     Task,
     TaskId,
     TaskStatus,
@@ -181,6 +184,12 @@ class RunnerStdioHandler:
 
 
 @dataclass(eq=False)
+class _InitializationWatchdog:
+    activity: anyio.Event = field(default_factory=anyio.Event)
+    layers_loaded: int | None = None
+
+
+@dataclass(eq=False)
 class RunnerSupervisor:
     shard_metadata: ShardMetadata
     bound_instance: BoundInstance
@@ -203,6 +212,9 @@ class RunnerSupervisor:
     _stopped: anyio.Event = field(default_factory=anyio.Event, init=False)
     _pending_shutdown_status: RunnerStatusUpdated | None = field(
         default=None, init=False
+    )
+    _initialization_watchdogs: dict[TaskId, _InitializationWatchdog] = field(
+        default_factory=dict, init=False
     )
     _cancel_watch_runner: anyio.CancelScope = field(
         default_factory=anyio.CancelScope, init=False
@@ -316,7 +328,7 @@ class RunnerSupervisor:
                 self._shutdown_forwarded.set()
 
     async def start_task(self, task: Task):
-        if task.task_id in self.pending:
+        if task.task_id in self.pending or task.task_id in self.in_progress:
             logger.warning(
                 f"Skipping invalid task {task} as it has already been submitted"
             )
@@ -328,21 +340,100 @@ class RunnerSupervisor:
             return
         logger.info(f"Starting task {task}")
         acknowledgement = anyio.Event()
+        initialization_task = (
+            task if isinstance(task, (ConnectToGroup, LoadModel, StartWarmup)) else None
+        )
+        initialization_watchdog = (
+            _InitializationWatchdog() if initialization_task is not None else None
+        )
         self.pending[task.task_id] = acknowledgement
         self.in_progress[task.task_id] = task
+        if initialization_watchdog is not None:
+            self._initialization_watchdogs[task.task_id] = initialization_watchdog
         try:
             await self._task_sender.send_async(task)
         except ClosedResourceError as error:
             self.pending.pop(task.task_id, None)
             self.in_progress.pop(task.task_id, None)
+            if initialization_watchdog is not None and (
+                self._initialization_watchdogs.get(task.task_id)
+                is initialization_watchdog
+            ):
+                self._initialization_watchdogs.pop(task.task_id)
             logger.warning(f"Task {task} dropped, runner closed communication.")
             raise BrokenResourceError from error
         try:
             with anyio.fail_after(self.task_ack_timeout):
                 await acknowledgement.wait()
+        except BaseException:
+            if initialization_watchdog is not None and (
+                self._initialization_watchdogs.get(task.task_id)
+                is initialization_watchdog
+            ):
+                self._initialization_watchdogs.pop(task.task_id)
+            raise
         finally:
             if self.pending.get(task.task_id) is acknowledgement:
                 self.pending.pop(task.task_id, None)
+        if initialization_task is not None and initialization_watchdog is not None:
+            self._tg.start_soon(
+                self._watch_initialization_task,
+                initialization_task,
+                initialization_watchdog,
+            )
+
+    async def _watch_initialization_task(
+        self,
+        task: ConnectToGroup | LoadModel | StartWarmup,
+        watchdog: _InitializationWatchdog,
+    ) -> None:
+        while True:
+            activity = watchdog.activity
+            with anyio.move_on_after(self.initialize_timeout) as timeout_scope:
+                await activity.wait()
+            if self._initialization_watchdogs.get(task.task_id) is not watchdog:
+                return
+            if activity.is_set():
+                if watchdog.activity is activity:
+                    watchdog.activity = anyio.Event()
+                continue
+            if not timeout_scope.cancel_called:
+                return
+            if self.in_progress.get(task.task_id) is not task:
+                self._initialization_watchdogs.pop(task.task_id)
+                return
+
+            self._initialization_watchdogs.pop(task.task_id)
+            self.completed.add(task.task_id)
+            await self._check_runner(
+                TimeoutError(
+                    f"{task.__class__.__name__} made no progress for "
+                    f"{self.initialize_timeout:g}s"
+                ),
+                timed_out_task_id=task.task_id,
+            )
+            return
+
+    def _record_initialization_progress(self, status: RunnerStatus) -> None:
+        for task_id, watchdog in self._initialization_watchdogs.items():
+            task = self.in_progress.get(task_id)
+            if (
+                isinstance(task, ConnectToGroup)
+                and isinstance(status, RunnerConnecting)
+                or isinstance(task, StartWarmup)
+                and isinstance(status, RunnerWarmingUp)
+            ):
+                watchdog.activity.set()
+            elif (
+                isinstance(task, LoadModel)
+                and isinstance(status, RunnerLoading)
+                and (
+                    watchdog.layers_loaded is None
+                    or status.layers_loaded > watchdog.layers_loaded
+                )
+            ):
+                watchdog.layers_loaded = status.layers_loaded
+                watchdog.activity.set()
 
     async def cancel_task(self, task_id: TaskId):
         if task_id in self.completed:
@@ -378,6 +469,7 @@ class RunnerSupervisor:
                         continue
                     if isinstance(event, RunnerStatusUpdated):
                         self.status = event.runner_status
+                        self._record_initialization_progress(event.runner_status)
                     if isinstance(event, TaskAcknowledged):
                         acknowledgement = self.pending.pop(event.task_id, None)
                         if acknowledgement is None:
@@ -399,6 +491,16 @@ class RunnerSupervisor:
                         TaskStatus.Failed,
                         TaskStatus.Cancelled,
                     }:
+                        if event.task_id in self.completed:
+                            logger.debug(
+                                f"Ignoring late terminal status for {event.task_id}"
+                            )
+                            continue
+                        initialization_watchdog = self._initialization_watchdogs.pop(
+                            event.task_id, None
+                        )
+                        if initialization_watchdog is not None:
+                            initialization_watchdog.activity.set()
                         # If a task has just been completed, we should be working on it.
                         if event.task_status == TaskStatus.Complete:
                             assert isinstance(
@@ -431,7 +533,10 @@ class RunnerSupervisor:
                     await self._check_runner(RuntimeError("Runner found to be dead"))
 
     async def _check_runner(
-        self, e: RunnerTerminationError | Exception | None = None
+        self,
+        e: RunnerTerminationError | Exception | None = None,
+        *,
+        timed_out_task_id: TaskId | None = None,
     ) -> None:
         if not self._cancel_watch_runner.cancel_called:
             self._cancel_watch_runner.cancel()
@@ -442,6 +547,11 @@ class RunnerSupervisor:
                 await self.runner_process.stop()
         rc = self.runner_process.exitcode
         logger.info(f"Runner exited with exit code {rc}")
+
+        initialization_watchdogs = tuple(self._initialization_watchdogs.values())
+        self._initialization_watchdogs.clear()
+        for watchdog in initialization_watchdogs:
+            watchdog.activity.set()
 
         # If exit code is 0 then the transient errors were recoverable, meaning we don't need runner diagnostics
         if rc == 0:
@@ -481,7 +591,11 @@ class RunnerSupervisor:
                     await self._event_sender.send(
                         TaskStatusUpdated(
                             task_id=task.task_id,
-                            task_status=TaskStatus.Failed,
+                            task_status=(
+                                TaskStatus.TimedOut
+                                if task.task_id == timed_out_task_id
+                                else TaskStatus.Failed
+                            ),
                             runner_id=self.bound_instance.bound_runner_id,
                         )
                     )

@@ -14,7 +14,15 @@ from exo.shared.types.events import (
     TaskAcknowledged,
     TaskStatusUpdated,
 )
-from exo.shared.types.tasks import Task, TaskId, TaskStatus, TextGeneration
+from exo.shared.types.tasks import (
+    ConnectToGroup,
+    LoadModel,
+    StartWarmup,
+    Task,
+    TaskId,
+    TaskStatus,
+    TextGeneration,
+)
 from exo.shared.types.text_generation import (
     InputMessage,
     InputMessageContent,
@@ -22,8 +30,10 @@ from exo.shared.types.text_generation import (
 )
 from exo.shared.types.worker.instances import BoundInstance, InstanceId
 from exo.shared.types.worker.runners import (
+    RunnerConnecting,
     RunnerFailed,
     RunnerId,
+    RunnerLoading,
     RunnerShutdown,
     RunnerShuttingDown,
 )
@@ -231,6 +241,177 @@ async def test_task_ack_timeout_cleans_pending_and_late_ack_is_harmless() -> Non
     runner_events.events.append(TaskAcknowledged(task_id=task.task_id))
     await supervisor._forward_events()  # pyright: ignore[reportPrivateUsage]
     assert supervisor.pending == {}
+
+
+@pytest.mark.parametrize("task_type", [ConnectToGroup, LoadModel, StartWarmup])
+@pytest.mark.anyio
+async def test_acknowledged_initialization_task_has_a_progress_deadline(
+    task_type: type[ConnectToGroup | LoadModel | StartWarmup],
+) -> None:
+    event_sender, _ = channel[Event]()
+    runner_events = _RunnerEventReceiver([])
+    supervisor = await _make_supervisor(event_sender, runner_events)
+    supervisor.initialize_timeout = 0.01
+    task = task_type(
+        task_id=TaskId(f"stuck-{task_type.__name__}"),
+        instance_id=supervisor.bound_instance.instance.instance_id,
+        runner_id=supervisor.bound_instance.bound_runner_id,
+    )
+    observed_errors: list[Exception | None] = []
+
+    async def record_runner_failure(
+        error: Exception | None = None, **_: object
+    ) -> None:
+        observed_errors.append(error)
+
+    supervisor._check_runner = record_runner_failure  # pyright: ignore[reportPrivateUsage,reportAttributeAccessIssue]
+    async with supervisor._tg as task_group:  # pyright: ignore[reportPrivateUsage]
+        task_group.start_soon(supervisor.start_task, task)
+        await anyio.sleep(0)
+        runner_events.events.append(TaskAcknowledged(task_id=task.task_id))
+        await supervisor._forward_events()  # pyright: ignore[reportPrivateUsage]
+        with anyio.fail_after(1):
+            while not observed_errors:
+                await anyio.sleep(0.01)
+
+    assert len(observed_errors) == 1
+    assert isinstance(observed_errors[0], TimeoutError)
+    assert task_type.__name__ in str(observed_errors[0])
+    assert task.task_id not in supervisor._initialization_watchdogs  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.anyio
+async def test_completed_initialization_task_disarms_progress_deadline() -> None:
+    event_sender, _ = channel[Event]()
+    runner_events = _RunnerEventReceiver([])
+    supervisor = await _make_supervisor(event_sender, runner_events)
+    supervisor.initialize_timeout = 0.01
+    supervisor.status = RunnerConnecting()
+    task = ConnectToGroup(
+        task_id=TaskId("completed-connect"),
+        instance_id=supervisor.bound_instance.instance.instance_id,
+        runner_id=supervisor.bound_instance.bound_runner_id,
+    )
+    observed_errors: list[Exception | None] = []
+
+    async def record_runner_failure(error: Exception | None = None) -> None:
+        observed_errors.append(error)
+
+    supervisor._check_runner = record_runner_failure  # pyright: ignore[reportPrivateUsage,reportAttributeAccessIssue]
+    async with supervisor._tg as task_group:  # pyright: ignore[reportPrivateUsage]
+        task_group.start_soon(supervisor.start_task, task)
+        await anyio.sleep(0)
+        runner_events.events.extend(
+            [
+                TaskAcknowledged(task_id=task.task_id),
+                TaskStatusUpdated(
+                    task_id=task.task_id,
+                    task_status=TaskStatus.Complete,
+                ),
+            ]
+        )
+        await supervisor._forward_events()  # pyright: ignore[reportPrivateUsage]
+        await anyio.sleep(0.03)
+
+    assert observed_errors == []
+    assert task.task_id not in supervisor._initialization_watchdogs  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.anyio
+async def test_model_load_progress_refreshes_initialization_deadline() -> None:
+    event_sender, _ = channel[Event]()
+    runner_events = _RunnerEventReceiver([])
+    supervisor = await _make_supervisor(event_sender, runner_events)
+    supervisor.initialize_timeout = 0.05
+    task = LoadModel(
+        task_id=TaskId("progressing-load"),
+        instance_id=supervisor.bound_instance.instance.instance_id,
+        runner_id=supervisor.bound_instance.bound_runner_id,
+    )
+    observed_errors: list[Exception | None] = []
+
+    async def record_runner_failure(
+        error: Exception | None = None, **_: object
+    ) -> None:
+        observed_errors.append(error)
+
+    supervisor._check_runner = record_runner_failure  # pyright: ignore[reportPrivateUsage,reportAttributeAccessIssue]
+    async with supervisor._tg as task_group:  # pyright: ignore[reportPrivateUsage]
+        task_group.start_soon(supervisor.start_task, task)
+        await anyio.sleep(0)
+        runner_events.events.append(TaskAcknowledged(task_id=task.task_id))
+        await supervisor._forward_events()  # pyright: ignore[reportPrivateUsage]
+
+        for layers_loaded in range(1, 4):
+            await anyio.sleep(0.03)
+            runner_events.events.append(
+                RunnerStatusUpdated(
+                    runner_id=supervisor.bound_instance.bound_runner_id,
+                    runner_status=RunnerLoading(
+                        layers_loaded=layers_loaded,
+                        total_layers=4,
+                    ),
+                )
+            )
+            await supervisor._forward_events()  # pyright: ignore[reportPrivateUsage]
+            assert observed_errors == []
+
+        runner_events.events.append(
+            TaskStatusUpdated(
+                task_id=task.task_id,
+                task_status=TaskStatus.Complete,
+            )
+        )
+        await supervisor._forward_events()  # pyright: ignore[reportPrivateUsage]
+        await anyio.sleep(0.06)
+
+    assert observed_errors == []
+
+
+@pytest.mark.anyio
+async def test_in_progress_task_id_cannot_replace_watchdog_owner() -> None:
+    event_sender, _ = channel[Event]()
+    supervisor = await _make_supervisor(event_sender, _RunnerEventReceiver([]))
+    original = ConnectToGroup(
+        task_id=TaskId("duplicate-connect"),
+        instance_id=supervisor.bound_instance.instance.instance_id,
+        runner_id=supervisor.bound_instance.bound_runner_id,
+    )
+    duplicate = original.model_copy()
+    supervisor.in_progress[original.task_id] = original
+
+    await supervisor.start_task(duplicate)
+
+    assert supervisor.in_progress[original.task_id] is original
+    assert supervisor.pending == {}
+    assert supervisor._initialization_watchdogs == {}  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.anyio
+async def test_runner_check_reports_initialization_stall_as_timed_out() -> None:
+    event_sender, event_receiver = channel[Event]()
+    supervisor = await _make_supervisor(event_sender, _RunnerEventReceiver([]))
+    task = StartWarmup(
+        task_id=TaskId("timed-out-warmup"),
+        instance_id=supervisor.bound_instance.instance.instance_id,
+        runner_id=supervisor.bound_instance.bound_runner_id,
+    )
+    supervisor.in_progress[task.task_id] = task
+    supervisor.shutdown = lambda: None
+
+    await supervisor._check_runner(  # pyright: ignore[reportPrivateUsage]
+        TimeoutError("warmup stalled"), timed_out_task_id=task.task_id
+    )
+
+    forwarded_events = event_receiver.collect()
+    task_statuses = [
+        event
+        for event in forwarded_events
+        if isinstance(event, TaskStatusUpdated) and event.task_id == task.task_id
+    ]
+    assert len(task_statuses) == 1
+    assert task_statuses[0].task_status == TaskStatus.TimedOut
+    assert task.task_id not in supervisor.in_progress
 
 
 @pytest.mark.anyio
