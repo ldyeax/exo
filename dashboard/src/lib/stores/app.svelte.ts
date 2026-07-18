@@ -564,6 +564,7 @@ class AppStore {
   selectedPreviewModelId = $state<string | null>(null);
   isLoadingPreviews = $state(false);
   previewNodeFilter = $state<Set<string>>(new Set());
+  previewUseAllComputeResources = $state(false);
   lastUpdate = $state<number | null>(null);
   nodeIdentities = $state<Record<string, RawNodeIdentity>>({});
   thunderboltBridgeCycles = $state<string[][]>([]);
@@ -612,6 +613,7 @@ class AppStore {
 
   private fetchInterval: ReturnType<typeof setInterval> | null = null;
   private previewsInterval: ReturnType<typeof setInterval> | null = null;
+  private placementPreviewRequestId = 0;
   private lastConversationPersistTs = 0;
   private previousNodeIds: Set<string> = new Set();
 
@@ -1376,6 +1378,7 @@ class AppStore {
   async fetchPlacementPreviews(modelId: string, showLoading = true) {
     if (!modelId) return;
 
+    const requestId = ++this.placementPreviewRequestId;
     if (showLoading) {
       this.isLoadingPreviews = true;
     }
@@ -1383,6 +1386,7 @@ class AppStore {
 
     try {
       let url = `/instance/previews?model_id=${encodeURIComponent(modelId)}`;
+      url += `&use_all_compute_resources=${this.previewUseAllComputeResources}`;
       // Add node filter if active
       if (this.previewNodeFilter.size > 0) {
         for (const nodeId of this.previewNodeFilter) {
@@ -1396,12 +1400,16 @@ class AppStore {
         );
       }
       const data: PlacementPreviewResponse = await response.json();
-      this.placementPreviews = data.previews;
+      if (requestId === this.placementPreviewRequestId) {
+        this.placementPreviews = data.previews;
+      }
     } catch (error) {
       console.error("Error fetching placement previews:", error);
-      this.placementPreviews = [];
+      if (requestId === this.placementPreviewRequestId) {
+        this.placementPreviews = [];
+      }
     } finally {
-      if (showLoading) {
+      if (requestId === this.placementPreviewRequestId) {
         this.isLoadingPreviews = false;
       }
     }
@@ -1434,8 +1442,20 @@ class AppStore {
       this.startPreviewsPolling(modelId);
     } else {
       this.stopPreviewsPolling();
+      this.placementPreviewRequestId++;
       this.selectedPreviewModelId = null;
       this.placementPreviews = [];
+      this.isLoadingPreviews = false;
+    }
+  }
+
+  setPreviewUseAllComputeResources(useAllComputeResources: boolean) {
+    if (this.previewUseAllComputeResources === useAllComputeResources) return;
+
+    this.previewUseAllComputeResources = useAllComputeResources;
+    this.placementPreviews = [];
+    if (this.selectedPreviewModelId) {
+      this.fetchPlacementPreviews(this.selectedPreviewModelId);
     }
   }
 
@@ -3512,6 +3532,8 @@ export const nodeDisk = () => appStore.nodeDisk;
 export const placementPreviews = () => appStore.placementPreviews;
 export const selectedPreviewModelId = () => appStore.selectedPreviewModelId;
 export const isLoadingPreviews = () => appStore.isLoadingPreviews;
+export const previewUseAllComputeResources = () =>
+  appStore.previewUseAllComputeResources;
 export const lastUpdate = () => appStore.lastUpdate;
 export const isTopologyMinimized = () => appStore.isTopologyMinimized;
 export const selectedChatModel = () => appStore.selectedChatModel;
@@ -3551,6 +3573,9 @@ export const setSelectedChatModel = (modelId: string) =>
   appStore.setSelectedModel(modelId);
 export const selectPreviewModel = (modelId: string | null) =>
   appStore.selectPreviewModel(modelId);
+export const setPreviewUseAllComputeResources = (
+  useAllComputeResources: boolean,
+) => appStore.setPreviewUseAllComputeResources(useAllComputeResources);
 export const togglePreviewNodeFilter = (nodeId: string) =>
   appStore.togglePreviewNodeFilter(nodeId);
 export const clearPreviewNodeFilter = () => appStore.clearPreviewNodeFilter();
