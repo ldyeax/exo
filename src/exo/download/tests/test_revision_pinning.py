@@ -21,7 +21,12 @@ from exo.download.impl_shard_downloader import (
     build_full_shard,
 )
 from exo.shared.models import model_cards
-from exo.shared.models.model_cards import ModelCard, ModelTask, VisionCardConfig
+from exo.shared.models.model_cards import (
+    ModelCard,
+    ModelTask,
+    VisionCardConfig,
+    validate_hugging_face_revision,
+)
 from exo.shared.types.backends import Backend
 from exo.shared.types.common import ModelId
 from exo.shared.types.memory import Memory
@@ -103,13 +108,13 @@ def test_model_card_defaults_to_main_and_requires_exact_commit() -> None:
         _card(REVISION[:-1])
 
 
-async def test_existing_builtin_cards_roundtrip_as_main() -> None:
+async def test_existing_builtin_cards_roundtrip_with_valid_revisions() -> None:
     loaded = 0
     with patch("exo.shared.models.model_cards.EXO_MODELS_DIRS", ()):
         for directory in model_cards._BUILTIN_CARD_DIRS:  # pyright: ignore[reportPrivateUsage]
             async for card_path in directory.rglob("*.toml"):
                 card = await ModelCard.load_from_path(card_path)
-                assert card.revision == "main"
+                assert validate_hugging_face_revision(card.revision) == card.revision
                 loaded += 1
     assert loaded > 0
 
@@ -174,15 +179,35 @@ async def test_revision_aware_card_cache_and_custom_filenames_do_not_collide(
         assert await ModelCard.load(MODEL_ID, REVISION) == pinned_card
 
 
-async def test_public_shard_builder_selects_exact_card_revision() -> None:
+async def test_legacy_load_and_shard_builder_select_unique_pinned_card() -> None:
     pinned_card = _card(REVISION)
-    with patch.object(
-        ModelCard, "load", new_callable=AsyncMock, return_value=pinned_card
-    ) as load:
-        shard = await build_full_shard(MODEL_ID, REVISION)
+    cache = model_cards._CardCache()  # pyright: ignore[reportPrivateUsage]
+    cache.add_to_memory(pinned_card)
+    with patch("exo.shared.models.model_cards.card_cache", cache):
+        assert await ModelCard.load(MODEL_ID) == pinned_card
+        shard = await build_full_shard(MODEL_ID)
 
-    load.assert_awaited_once_with(MODEL_ID, REVISION)
     assert shard.model_card.revision == REVISION
+
+
+async def test_omitted_revision_prefers_main_and_rejects_sha_only_ambiguity() -> None:
+    main_card = _card()
+    pinned_card = _card(REVISION)
+    cache = model_cards._CardCache()  # pyright: ignore[reportPrivateUsage]
+    cache.add_to_memory(main_card)
+    cache.add_to_memory(pinned_card)
+    with patch("exo.shared.models.model_cards.card_cache", cache):
+        assert await ModelCard.load(MODEL_ID) == main_card
+        assert await ModelCard.load(MODEL_ID, REVISION) == pinned_card
+
+    sha_only_cache = model_cards._CardCache()  # pyright: ignore[reportPrivateUsage]
+    sha_only_cache.add_to_memory(pinned_card)
+    sha_only_cache.add_to_memory(_card(OTHER_REVISION))
+    with (
+        patch("exo.shared.models.model_cards.card_cache", sha_only_cache),
+        pytest.raises(ValueError, match="Specify an exact revision"),
+    ):
+        await ModelCard.load(MODEL_ID)
 
 
 async def test_main_path_is_unchanged_and_pin_gets_receipted_directory(

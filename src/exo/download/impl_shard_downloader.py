@@ -34,7 +34,7 @@ def exo_shard_downloader(
 
 
 async def build_base_shard(
-    model_id: ModelId, revision: HuggingFaceRevision = "main"
+    model_id: ModelId, revision: HuggingFaceRevision | None = None
 ) -> ShardMetadata:
     model_card = await ModelCard.load(model_id, revision)
     return PipelineShardMetadata(
@@ -48,7 +48,7 @@ async def build_base_shard(
 
 
 async def build_full_shard(
-    model_id: ModelId, revision: HuggingFaceRevision = "main"
+    model_id: ModelId, revision: HuggingFaceRevision | None = None
 ) -> PipelineShardMetadata:
     base_shard = await build_base_shard(model_id, revision)
     return PipelineShardMetadata(
