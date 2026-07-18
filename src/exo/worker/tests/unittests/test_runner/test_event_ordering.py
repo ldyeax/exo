@@ -203,6 +203,7 @@ class EventCollector:
     def __init__(self, on_event: Callable[[Event], None] | None = None) -> None:
         self.events: list[Event] = []
         self._on_event = on_event
+        self.flush_timeouts: list[float] = []
 
     def send(self, event: Event) -> None:
         self.events.append(event)
@@ -211,6 +212,9 @@ class EventCollector:
 
     def close(self) -> None:
         pass
+
+    def flush(self, *, timeout_seconds: float) -> None:
+        self.flush_timeouts.append(timeout_seconds)
 
     def join(self) -> None:
         pass
@@ -243,7 +247,9 @@ class MockGroup:
         return 1
 
 
-def _run(tasks: Iterable[Task], send_after_ready: list[Task] | None = None):
+def _run(
+    tasks: Iterable[Task], send_after_ready: list[Task] | None = None
+) -> EventCollector:
     bound_instance = get_bound_mlx_ring_instance(
         instance_id=INSTANCE_1_ID,
         model_id=MODEL_A_ID,
@@ -292,14 +298,17 @@ def _run(tasks: Iterable[Task], send_after_ready: list[Task] | None = None):
         )
         runner.main()
 
-        return event_sender.events
+        return event_sender
 
 
 def test_events_processed_in_correct_order(patch_out_mlx: pytest.MonkeyPatch):
-    events = _run(
+    event_collector = _run(
         [INIT_TASK, LOAD_TASK, WARMUP_TASK, CHAT_TASK],
         send_after_ready=[SHUTDOWN_TASK],
     )
+    events = event_collector.events
+
+    assert event_collector.flush_timeouts == [10.0, 10.0, 10.0]
 
     expected_chunk = ChunkGenerated(
         command_id=COMMAND_1_ID,

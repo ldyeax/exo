@@ -4,8 +4,9 @@ from dataclasses import dataclass, field
 from functools import wraps
 from inspect import iscoroutinefunction
 from math import inf
-from multiprocessing.synchronize import Event
+from multiprocessing.synchronize import Event, Lock, Semaphore
 from queue import Empty, Full
+from time import monotonic
 from types import CoroutineType, TracebackType
 from typing import Any, Callable, NoReturn, Self, cast, overload, override
 
@@ -219,6 +220,10 @@ class _MpEndOfStream:
     pass
 
 
+class _MpFlush:
+    pass
+
+
 class MpState[T]:
     def __init__(self, max_buffer_size: float):
         if max_buffer_size == inf:
@@ -228,8 +233,10 @@ class MpState[T]:
         )
 
         self.max_buffer_size: float = max_buffer_size
-        self.buffer: mp.Queue[T | _MpEndOfStream] = mp.Queue(max_buffer_size)
+        self.buffer: mp.Queue[T | _MpEndOfStream | _MpFlush] = mp.Queue(max_buffer_size)
         self.closed: Event = mp.Event()
+        self.flush_acknowledged: Semaphore = mp.Semaphore(0)
+        self.flush_lock: Lock = mp.Lock()
 
     def __getstate__(self):
         d = self.__dict__.copy()
@@ -270,6 +277,51 @@ class MpSender[T]:
         await to_thread.run_sync(
             self.send, item, limiter=CapacityLimiter(1), abandon_on_cancel=True
         )
+
+    def flush(self, *, timeout_seconds: float) -> None:
+        """Wait until the receiver has consumed every previously sent item."""
+        if timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be greater than zero")
+
+        deadline = monotonic() + timeout_seconds
+        flush_lock_acquired = self._state.flush_lock.acquire(timeout=timeout_seconds)
+        if not flush_lock_acquired:
+            self._state.closed.set()
+            raise TimeoutError("interprocess channel flush timed out")
+
+        try:
+            if self._state.closed.is_set():
+                raise ClosedResourceError
+
+            remaining_seconds = deadline - monotonic()
+            if remaining_seconds <= 0:
+                self._state.closed.set()
+                raise TimeoutError("interprocess channel flush timed out")
+            try:
+                self._state.buffer.put(
+                    _MpFlush(), block=True, timeout=remaining_seconds
+                )
+            except Full:
+                self._state.closed.set()
+                raise TimeoutError("interprocess channel flush timed out") from None
+            except ValueError as error:
+                raise ClosedResourceError from error
+
+            while True:
+                remaining_seconds = deadline - monotonic()
+                if remaining_seconds <= 0:
+                    # A late marker acknowledgement cannot be matched safely to
+                    # a subsequent flush, so a timed-out channel is terminal.
+                    self._state.closed.set()
+                    raise TimeoutError("interprocess channel flush timed out")
+                if self._state.flush_acknowledged.acquire(
+                    timeout=min(remaining_seconds, 0.1)
+                ):
+                    return
+                if self._state.closed.is_set():
+                    raise ClosedResourceError
+        finally:
+            self._state.flush_lock.release()
 
     def close(self) -> None:
         if not self._state.closed.is_set():
@@ -317,33 +369,41 @@ class MpReceiver[T]:
         if self._state.closed.is_set():
             raise ClosedResourceError
 
-        try:
-            item = self._state.buffer.get(block=False)
+        while True:
+            try:
+                item = self._state.buffer.get(block=False)
+            except Empty:
+                raise WouldBlock from None
+            except ValueError as e:
+                print("Unreachable code path - let me know!")
+                raise ClosedResourceError from e
+            if isinstance(item, _MpFlush):
+                self._state.flush_acknowledged.release()
+                continue
             if isinstance(item, _MpEndOfStream):
                 self.close()
                 raise EndOfStream
             return item
-        except Empty:
-            raise WouldBlock from None
-        except ValueError as e:
-            print("Unreachable code path - let me know!")
-            raise ClosedResourceError from e
 
     def receive(self) -> T:
         try:
             return self.receive_nowait()
         except WouldBlock:
-            try:
-                item = self._state.buffer.get()
-            except (TypeError, OSError):
-                # Queue pipe can get closed while we are blocked on get().
-                # The underlying connection._handle becomes None, causing
-                # TypeError in read(handle, remaining).
-                raise ClosedResourceError from None
-            if isinstance(item, _MpEndOfStream):
-                self.close()
-                raise EndOfStream from None
-            return item
+            while True:
+                try:
+                    item = self._state.buffer.get()
+                except (TypeError, OSError):
+                    # Queue pipe can get closed while we are blocked on get().
+                    # The underlying connection._handle becomes None, causing
+                    # TypeError in read(handle, remaining).
+                    raise ClosedResourceError from None
+                if isinstance(item, _MpFlush):
+                    self._state.flush_acknowledged.release()
+                    continue
+                if isinstance(item, _MpEndOfStream):
+                    self.close()
+                    raise EndOfStream from None
+                return item
 
     async def receive_async(self) -> T:
         return await to_thread.run_sync(

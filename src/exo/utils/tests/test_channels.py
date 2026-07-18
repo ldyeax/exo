@@ -1,5 +1,8 @@
 import multiprocessing as mp
+import sys
+import threading
 import time
+from multiprocessing.synchronize import Event
 
 import pytest
 from anyio import (
@@ -58,6 +61,31 @@ def bar(send: MpSender[str]):
     send.close()
 
 
+def flush_before_holding_gil(
+    send: MpSender[str],
+    gil_hold_started: Event,
+    close_allowed: Event,
+) -> None:
+    for message in ("running", "connecting", "acknowledged"):
+        send.send(message)
+    send.flush(timeout_seconds=2)
+    gil_hold_started.set()
+
+    previous_switch_interval = sys.getswitchinterval()
+    try:
+        sys.setswitchinterval(10)
+        deadline = time.monotonic() + 0.25
+        while time.monotonic() < deadline:
+            pass
+    finally:
+        sys.setswitchinterval(previous_switch_interval)
+
+    send.send("after gil hold")
+    close_allowed.wait()
+    send.close()
+    send.join()
+
+
 @pytest.mark.anyio
 async def test_channel_ipc():
     with fail_after(0.5):
@@ -68,6 +96,79 @@ async def test_channel_ipc():
         p2.start()
         p1.join()
         p2.join()
+
+
+def test_mp_channel_flush_precedes_gil_holding_work() -> None:
+    send, receive = mp_channel[str]()
+    gil_hold_started = mp.Event()
+    close_allowed = mp.Event()
+    process = mp.Process(
+        target=flush_before_holding_gil,
+        args=(send, gil_hold_started, close_allowed),
+    )
+    final_messages: list[str] = []
+    lifecycle_received = threading.Event()
+    consume_flush_allowed = threading.Event()
+
+    def collect_messages() -> None:
+        final_messages.extend(receive.receive() for _ in range(3))
+        lifecycle_received.set()
+        consume_flush_allowed.wait()
+        final_messages.append(receive.receive())
+
+    final_receiver = threading.Thread(
+        target=collect_messages,
+        daemon=True,
+    )
+    process.start()
+    final_receiver.start()
+    try:
+        assert lifecycle_received.wait(timeout=2)
+        assert final_messages == ["running", "connecting", "acknowledged"]
+        assert not gil_hold_started.is_set()
+
+        consume_flush_allowed.set()
+        assert gil_hold_started.wait(timeout=2)
+        final_receiver.join(timeout=2)
+        assert final_messages == [
+            "running",
+            "connecting",
+            "acknowledged",
+            "after gil hold",
+        ]
+    finally:
+        consume_flush_allowed.set()
+        close_allowed.set()
+        process.join(timeout=2)
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=2)
+
+    assert process.exitcode == 0
+
+
+def test_mp_channel_flush_times_out_and_closes_channel() -> None:
+    send, _receive = mp_channel[str]()
+
+    with pytest.raises(TimeoutError, match="flush timed out"):
+        send.flush(timeout_seconds=0.01)
+
+    with pytest.raises(ClosedResourceError):
+        send.send("unreachable")
+
+    send.close()
+    send.join()
+
+
+def test_mp_channel_flush_timeout_bounds_marker_enqueue() -> None:
+    send, _receive = mp_channel[str](1)
+    send.send("fill bounded queue")
+
+    with pytest.raises(TimeoutError, match="flush timed out"):
+        send.flush(timeout_seconds=0.01)
+
+    send.close()
+    send.join()
 
 
 def test_channel_error_override_replaces_sync_errors_with_subclasses():

@@ -59,6 +59,7 @@ from exo.worker.runner.bootstrap import logger
 
 PREFILL_PICKUP_TIMEOUT_SECONDS = 3
 PREFILL_FINISH_TIMEOUT_SECONDS = 300
+INITIALIZATION_EVENT_FLUSH_TIMEOUT_SECONDS = 10.0
 
 
 @dataclass
@@ -204,6 +205,14 @@ class Runner:
     def acknowledge_task(self, task: Task):
         self.event_sender.send(TaskAcknowledged(task_id=task.task_id))
 
+    def acknowledge_initialization_task(self, task: Task) -> None:
+        self.acknowledge_task(task)
+        # MLX initialization may hold the GIL. Confirm the supervisor consumed
+        # lifecycle events before entering native code so other ranks can start.
+        self.event_sender.flush(
+            timeout_seconds=INITIALIZATION_EVENT_FLUSH_TIMEOUT_SECONDS
+        )
+
     def main(self):
         self._start_task_reader()
         try:
@@ -238,7 +247,7 @@ class Runner:
                 assert isinstance(self.generator, Builder)
                 logger.info("runner connecting")
                 self.update_status(RunnerConnecting())
-                self.acknowledge_task(task)
+                self.acknowledge_initialization_task(task)
 
                 self.generator.connect(self.bound_instance)
 
@@ -258,7 +267,7 @@ class Runner:
                 self.update_status(
                     RunnerLoading(layers_loaded=0, total_layers=total_layers)
                 )
-                self.acknowledge_task(task)
+                self.acknowledge_initialization_task(task)
 
                 for load_progress in self.generator.load(self.bound_instance):
                     self.update_status(
@@ -279,7 +288,7 @@ class Runner:
                 logger.info("runner warming up")
 
                 self.update_status(RunnerWarmingUp())
-                self.acknowledge_task(task)
+                self.acknowledge_initialization_task(task)
 
                 self.generator.warmup()
 
