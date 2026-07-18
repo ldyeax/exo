@@ -75,6 +75,17 @@ _DEFAULT_LOCK_PATH = Path("/var/lock/fwuffydwagon-benchmark.lock")
 _LEASE_BIND_TIMEOUT_SECONDS = 5.0
 _LEASE_METADATA_MAX_AGE = timedelta(minutes=15)
 _MINIMUM_CLEANUP_GRACE_SECONDS = 300.0
+_REQUIRED_RUNTIME_DISTRIBUTIONS = (
+    "exo",
+    "huggingface-hub",
+    "mlx",
+    "mlx-cuda-13",
+    "mlx-lm",
+    "nvidia-nccl-cu13",
+    "safetensors",
+    "tokenizers",
+    "transformers",
+)
 
 
 class HarnessError(RuntimeError):
@@ -196,6 +207,7 @@ class ModelSnapshot(StrictModel):
     model_id: str = Field(min_length=3)
     revision: str
     expected_weight_bytes: int = Field(gt=0)
+    expected_manifest_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
     @field_validator("revision")
     @classmethod
@@ -282,6 +294,9 @@ class ApiConfig(StrictModel):
 class BenchmarkConfig(StrictModel):
     prompt: str = Field(min_length=1)
     expected_content_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    expected_prompt_tokens: int = Field(gt=0)
+    expected_completion_tokens: int = Field(gt=0)
+    expected_finish_reason: Literal["stop", "length", "tool_calls"]
     warmup_count: int = Field(ge=2)
     sample_count: int = Field(ge=3)
     max_tokens: int = Field(ge=1)
@@ -324,12 +339,27 @@ class RuntimeRequirements(StrictModel):
     minimum_nvidia_driver_version: str
     python_abi: PythonAbiIdentity
     host_pins: dict[str, HostRuntimePin]
+    distribution_versions: dict[str, str]
 
     @field_validator("minimum_nvidia_driver_version")
     @classmethod
     def validate_driver_version(cls, value: str) -> str:
         if re.fullmatch(r"[0-9]+(?:\.[0-9]+){1,3}", value) is None:
             raise ValueError("minimum NVIDIA driver must be a dotted numeric version")
+        return value
+
+    @field_validator("distribution_versions")
+    @classmethod
+    def validate_distribution_versions(cls, value: dict[str, str]) -> dict[str, str]:
+        expected_names = set(_REQUIRED_RUNTIME_DISTRIBUTIONS)
+        if set(value) != expected_names:
+            raise ValueError(
+                "distribution_versions must exactly pin the required inference stack"
+            )
+        if any(not version.strip() or "\0" in version for version in value.values()):
+            raise ValueError(
+                "distribution versions must be nonempty and contain no NUL"
+            )
         return value
 
 
@@ -875,14 +905,7 @@ class LinuxHostProbe:
             sorted({line.strip() for line in raw_driver_versions.splitlines() if line})
         )
         runtime_versions: dict[str, JsonScalar] = {"python": sys.version}
-        for distribution in (
-            "exo",
-            "mlx",
-            "mlx-cuda-12",
-            "mlx-cuda-13",
-            "nvidia-nccl-cu12",
-            "nvidia-nccl-cu13",
-        ):
+        for distribution in _REQUIRED_RUNTIME_DISTRIBUTIONS:
             try:
                 runtime_versions[distribution] = importlib.metadata.version(
                     distribution
@@ -1262,6 +1285,18 @@ def _validated_json_value(value: object, description: str) -> JsonValue:
     raise HarnessError(f"{description} contains a non-JSON value")
 
 
+def model_manifest_sha256(manifest: Mapping[str, str]) -> str:
+    validated = _validated_json_value(dict(manifest), "model SHA-256 manifest")
+    encoded = json.dumps(
+        validated,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def _parse_json_value(raw: str, description: str) -> JsonValue:
     try:
         value = cast(object, json.loads(raw))
@@ -1342,6 +1377,7 @@ def _lease_static_metadata(config: HarnessConfig, command: Sequence[str]) -> Jso
         {
             "model_id": config.model.model_id,
             "revision": config.model.revision,
+            "expected_manifest_sha256": config.model.expected_manifest_sha256,
             "paths": model_paths,
         }
     ]
@@ -1417,6 +1453,9 @@ def _lease_static_metadata(config: HarnessConfig, command: Sequence[str]) -> Jso
                 config.benchmark.prompt.encode("utf-8")
             ).hexdigest(),
             "expected_content_sha256": (config.benchmark.expected_content_sha256),
+            "expected_prompt_tokens": config.benchmark.expected_prompt_tokens,
+            "expected_completion_tokens": (config.benchmark.expected_completion_tokens),
+            "expected_finish_reason": config.benchmark.expected_finish_reason,
         },
         "gpu_bindings": gpu_bindings,
         "cpu_bindings": cpu_bindings,
@@ -1753,17 +1792,19 @@ def validated_runtime_identity(
     runtime_versions = report.facts.get("runtime_versions")
     if not isinstance(runtime_versions, dict):
         raise HarnessError(f"runtime versions are missing on {host.name}")
-    cuda_distribution = f"mlx-cuda-{config.runtime.cuda_major}"
-    nccl_distribution = f"nvidia-nccl-cu{config.runtime.cuda_major}"
-    required_distributions = ("exo", "mlx", cuda_distribution, nccl_distribution)
     full_python_version = runtime_versions.get("python")
     if not isinstance(full_python_version, str) or not full_python_version:
         raise HarnessError(f"required runtime python is missing on {host.name}")
-    for distribution in required_distributions:
+    for distribution, expected_version in config.runtime.distribution_versions.items():
         version = runtime_versions.get(distribution)
         if not isinstance(version, str) or not version:
             raise HarnessError(
                 f"required runtime {distribution} is missing on {host.name}"
+            )
+        if version != expected_version:
+            raise HarnessError(
+                f"runtime {distribution} does not match the configured version on "
+                f"{host.name}"
             )
 
     raw_python_abi = report.facts.get("python_abi")
@@ -1836,7 +1877,7 @@ def validated_runtime_identity(
     relative_origin = str(resolved_origin.relative_to(source_directory))
     runtime_versions_json: JsonObject = {
         distribution: runtime_versions[distribution]
-        for distribution in required_distributions
+        for distribution in config.runtime.distribution_versions
     }
     return {
         "runtime_versions": runtime_versions_json,
@@ -1927,6 +1968,8 @@ def validate_preflight(
         or model.physical_weight_bytes <= 0
         or model.weight_files < 1
         or not model.sha256_manifest
+        or model_manifest_sha256(model.sha256_manifest)
+        != config.model.expected_manifest_sha256
     ):
         raise HarnessError(f"exact model snapshot verification failed on {host.name}")
 
@@ -3356,16 +3399,65 @@ def validate_completion_oracle(
     warmups: Sequence[JsonObject],
     samples: Sequence[JsonObject],
 ) -> None:
-    observed_hashes = {
-        _string(result.get("content_sha256"), "completion content SHA-256")
-        for result in (*warmups, *samples)
+    observed_signatures: set[tuple[str, int, int, str]] = set()
+    for result in (*warmups, *samples):
+        statistics_value = _object(
+            result.get("generation_stats"), "completion generation statistics"
+        )
+        finish_reason = _string(result.get("finish_reason"), "completion finish reason")
+        observed_signatures.add(
+            (
+                _string(result.get("content_sha256"), "completion content SHA-256"),
+                _positive_integer(
+                    statistics_value.get(
+                        "prompt_tokens", statistics_value.get("promptTokens")
+                    ),
+                    "completion prompt token count",
+                ),
+                _positive_integer(
+                    statistics_value.get(
+                        "generation_tokens", statistics_value.get("generationTokens")
+                    ),
+                    "completion generation token count",
+                ),
+                finish_reason,
+            )
+        )
+    expected_signature = {
+        (
+            config.benchmark.expected_content_sha256,
+            config.benchmark.expected_prompt_tokens,
+            config.benchmark.expected_completion_tokens,
+            config.benchmark.expected_finish_reason,
+        )
     }
-    expected_hash = config.benchmark.expected_content_sha256
-    if observed_hashes != {expected_hash}:
-        observed = ", ".join(sorted(observed_hashes)) or "none"
+    if observed_signatures != expected_signature:
+        expected = json.dumps(
+            {
+                "content_sha256": config.benchmark.expected_content_sha256,
+                "prompt_tokens": config.benchmark.expected_prompt_tokens,
+                "completion_tokens": config.benchmark.expected_completion_tokens,
+                "finish_reason": config.benchmark.expected_finish_reason,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        observed = json.dumps(
+            [
+                {
+                    "content_sha256": signature[0],
+                    "prompt_tokens": signature[1],
+                    "completion_tokens": signature[2],
+                    "finish_reason": signature[3],
+                }
+                for signature in sorted(observed_signatures)
+            ],
+            sort_keys=True,
+            separators=(",", ":"),
+        )
         raise HarnessError(
             "benchmark completion differs from the correctness oracle: "
-            f"expected {expected_hash}; observed {observed}"
+            f"expected {expected}; observed {observed}"
         )
 
 
@@ -3917,6 +4009,14 @@ def run_harness(
                     config.benchmark.prompt.encode("utf-8")
                 ).hexdigest(),
                 "expected_content_sha256": (config.benchmark.expected_content_sha256),
+                "expected_prompt_tokens": config.benchmark.expected_prompt_tokens,
+                "expected_completion_tokens": (
+                    config.benchmark.expected_completion_tokens
+                ),
+                "expected_finish_reason": config.benchmark.expected_finish_reason,
+                "expected_model_manifest_sha256": (
+                    config.model.expected_manifest_sha256
+                ),
             },
             "model_paths": {host.name: host.model_path for host in config.hosts},
             "preflight": preflights,

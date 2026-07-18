@@ -68,6 +68,22 @@ PYTHON_ABI = PythonAbiIdentity(
     abiflags="",
 )
 EXO_RS_SHA_BY_HOST = {"dwagon": "a" * 64, "fwuff": "b" * 64}
+TEST_MODEL_MANIFEST = {
+    "config.json": "1" * 64,
+    "model.safetensors.index.json": "2" * 64,
+    "model-00001-of-00001.safetensors": "3" * 64,
+}
+RUNTIME_DISTRIBUTION_VERSIONS = {
+    "exo": "1.0.0",
+    "huggingface-hub": "1.0.0",
+    "mlx": "0.32.0",
+    "mlx-cuda-13": "0.32.0",
+    "mlx-lm": "0.31.3",
+    "nvidia-nccl-cu13": "2.28.9",
+    "safetensors": "0.7.0",
+    "tokenizers": "0.22.2",
+    "transformers": "5.6.2",
+}
 
 DWAGON_GPUS = (
     GpuIdentity(
@@ -103,12 +119,7 @@ def _preflight_facts(host_name: str = "dwagon") -> dict[str, object]:
         "cpu_frequency_policy": {"policy0.scaling_governor": "performance"},
         "runtime_versions": {
             "python": "3.13.14 (main, Jul  1 2026) [GCC 15.2.1]",
-            "exo": "1.0.0",
-            "mlx": "0.32.0",
-            "mlx-cuda-12": None,
-            "mlx-cuda-13": "0.32.0",
-            "nvidia-nccl-cu12": None,
-            "nvidia-nccl-cu13": "2.28.9",
+            **RUNTIME_DISTRIBUTION_VERSIONS,
         },
         "python_abi": PYTHON_ABI.model_dump(mode="json"),
         "exo_rs_artifact": {
@@ -247,6 +258,7 @@ def make_config(tmp_path: Path) -> HarnessConfig:
             model_id=MODEL_ID,
             revision=REVISION,
             expected_weight_bytes=WEIGHT_BYTES,
+            expected_manifest_sha256=poc.model_manifest_sha256(TEST_MODEL_MANIFEST),
         ),
         hosts=(dwagon, fwuff),
         benchmark=BenchmarkConfig(
@@ -254,6 +266,9 @@ def make_config(tmp_path: Path) -> HarnessConfig:
             expected_content_sha256=(
                 "7b6643ad1dc722043097271b4d9e337d64fac848b8f219d1e65988db98cb25c9"
             ),
+            expected_prompt_tokens=10,
+            expected_completion_tokens=5,
+            expected_finish_reason="stop",
             warmup_count=2,
             sample_count=3,
             max_tokens=32,
@@ -277,6 +292,7 @@ def make_config(tmp_path: Path) -> HarnessConfig:
                 host_name: HostRuntimePin(exo_rs_native_sha256=sha256)
                 for host_name, sha256 in EXO_RS_SHA_BY_HOST.items()
             },
+            distribution_versions=RUNTIME_DISTRIBUTION_VERSIONS,
         ),
     )
 
@@ -527,11 +543,7 @@ class FakeEffects:
             weight_bytes=model.expected_weight_bytes,
             physical_weight_bytes=model.expected_weight_bytes + 1024,
             weight_files=1,
-            sha256_manifest={
-                "config.json": "1" * 64,
-                "model.safetensors.index.json": "2" * 64,
-                "model-00001-of-00001.safetensors": "3" * 64,
-            },
+            sha256_manifest=TEST_MODEL_MANIFEST,
             receipt_kind="exo",
             verified=True,
         )
@@ -876,6 +888,12 @@ def test_active_lease_binding_requires_held_lock_and_exact_static_proof(
     oracle = metadata["correctness_oracle"]
     assert isinstance(oracle, dict)
     assert oracle["expected_content_sha256"] == config.benchmark.expected_content_sha256
+    assert oracle["expected_prompt_tokens"] == config.benchmark.expected_prompt_tokens
+    assert (
+        oracle["expected_completion_tokens"]
+        == config.benchmark.expected_completion_tokens
+    )
+    assert oracle["expected_finish_reason"] == config.benchmark.expected_finish_reason
 
 
 @pytest.mark.parametrize("mutation", ["python_abi", "host_pin"])
@@ -2067,9 +2085,7 @@ def test_cuda_driver_major_rejects_unrelated_nvidia_version_labels() -> None:
     assert poc._cuda_driver_major_from_nvidia_smi("KMD Version: 610.43.03") is None
 
 
-@pytest.mark.parametrize(
-    "distribution", ["exo", "mlx", "mlx-cuda-13", "nvidia-nccl-cu13"]
-)
+@pytest.mark.parametrize("distribution", sorted(RUNTIME_DISTRIBUTION_VERSIONS))
 def test_different_required_runtime_versions_fail_before_process_start(
     tmp_path: Path, distribution: str
 ) -> None:
@@ -2094,7 +2110,7 @@ def test_different_required_runtime_versions_fail_before_process_start(
     result = run_harness(config, effects)
 
     assert result["status"] == "preflight_failed"
-    assert "runtime identity differs" in str(result["error"])
+    assert "does not match the configured version" in str(result["error"])
     assert effects.started == []
 
 
@@ -2130,6 +2146,32 @@ def test_measured_output_mismatch_is_non_reportable_and_cleans_up(
     assert result["nccl_log_evidence"] is not None
     assert result["cleanup_succeeded"] is True
     assert effects.deleted_paths == ["/instance/owned-instance"]
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [
+        ("expected_prompt_tokens", 11),
+        ("expected_completion_tokens", 6),
+        ("expected_finish_reason", "length"),
+    ],
+)
+def test_tp1_token_accounting_mismatch_is_non_reportable(
+    tmp_path: Path, field_name: str, value: int | str
+) -> None:
+    raw = make_config(tmp_path).model_dump(mode="json")
+    raw["benchmark"][field_name] = value
+    config = HarnessConfig.model_validate_json(json.dumps(raw))
+    effects = FakeEffects(config)
+
+    result = run_harness(config, effects)
+
+    assert result["status"] == "benchmark_failed"
+    assert "differs from the correctness oracle" in str(result["error"])
+    assert len(result["warmups"]) == config.benchmark.warmup_count
+    assert len(result["samples"]) == config.benchmark.sample_count
+    assert result["nccl_log_evidence"] is not None
+    assert result["cleanup_succeeded"] is True
 
 
 def test_managed_signal_runs_owned_cleanup_before_reporting_interrupt(
@@ -2960,7 +3002,31 @@ def test_model_manifest_mismatch_aborts_before_process_start(tmp_path: Path) -> 
     result = run_harness(config, effects)
 
     assert result["status"] == "preflight_failed"
-    assert "SHA-256 manifests differ" in str(result["error"])
+    assert "exact model snapshot verification failed" in str(result["error"])
+    assert effects.started == []
+
+
+def test_tp1_manifest_digest_rejects_matching_but_wrong_host_snapshots(
+    tmp_path: Path,
+) -> None:
+    config = make_config(tmp_path)
+    effects = FakeEffects(config)
+    original_probe = effects.probe_model
+
+    def matching_wrong_probe(
+        host: HostConfig, model: ModelSnapshot
+    ) -> ModelProbeResult:
+        result = original_probe(host, model)
+        manifest = dict(result.sha256_manifest)
+        manifest["config.json"] = "f" * 64
+        return result.model_copy(update={"sha256_manifest": manifest})
+
+    effects.probe_model = matching_wrong_probe  # type: ignore[method-assign]
+
+    result = run_harness(config, effects)
+
+    assert result["status"] == "preflight_failed"
+    assert "exact model snapshot verification failed" in str(result["error"])
     assert effects.started == []
 
 
