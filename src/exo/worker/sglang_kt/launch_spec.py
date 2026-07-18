@@ -7,6 +7,7 @@ from exo.shared.types.worker.sglang_kt import (
     AbsoluteRuntimePath,
     GitRevision,
     GpuUuid,
+    HcaDevice,
     NetworkPort,
     ResourceIndex,
     SglangKtLaunchPlan,
@@ -37,9 +38,13 @@ class SglangKtProcessLaunchSpec(FrozenModel):
     executable: AbsoluteRuntimePath
     arguments: tuple[str, ...]
     environment: tuple[EnvironmentVariable, ...]
+    model_path: AbsoluteRuntimePath
+    ktransformers_weight_path: AbsoluteRuntimePath
     cpu_cores: tuple[ResourceIndex, ...]
     memory_nodes: tuple[ResourceIndex, ...]
+    hca_devices: tuple[HcaDevice, ...]
     service_endpoint: Host
+    distributed_coordinator: Host
     nccl_port: NetworkPort
     model_id: ModelId
     expected_model_revision: GitRevision
@@ -155,9 +160,13 @@ def build_glm_5_2_fp8_process_launch_specs(
                 ("SGLANG_ENABLE_JIT_DEEPGEMM", "0"),
                 ("SGLANG_PP_LAYER_PARTITION", layer_partition),
             ),
+            model_path=stage.model_path,
+            ktransformers_weight_path=stage.ktransformers_weight_path,
             cpu_cores=stage.cpu_cores,
             memory_nodes=stage.memory_nodes,
+            hca_devices=stage.hca_devices,
             service_endpoint=stage.service_endpoint,
+            distributed_coordinator=plan.distributed_coordinator,
             nccl_port=stage.nccl_port,
             model_id=plan.model_id,
             expected_model_revision=plan.model_revision,
