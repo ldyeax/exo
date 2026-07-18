@@ -198,7 +198,12 @@ class RunnerSupervisor:
     in_progress: dict[TaskId, Task] = field(default_factory=dict, init=False)
     completed: set[TaskId] = field(default_factory=set, init=False)
     cancelled: set[TaskId] = field(default_factory=set, init=False)
+    _shutdown_received: anyio.Event = field(default_factory=anyio.Event, init=False)
     _shutdown_forwarded: anyio.Event = field(default_factory=anyio.Event, init=False)
+    _stopped: anyio.Event = field(default_factory=anyio.Event, init=False)
+    _pending_shutdown_status: RunnerStatusUpdated | None = field(
+        default=None, init=False
+    )
     _cancel_watch_runner: anyio.CancelScope = field(
         default_factory=anyio.CancelScope, init=False
     )
@@ -266,23 +271,43 @@ class RunnerSupervisor:
             with contextlib.suppress(ClosedResourceError):
                 self._task_sender.close()
             with contextlib.suppress(ClosedResourceError):
-                self._event_sender.close()
-            with contextlib.suppress(ClosedResourceError):
                 self._cancel_sender.send(CANCEL_ALL_TASKS)
             with contextlib.suppress(ClosedResourceError):
                 self._cancel_sender.close()
 
-            with anyio.CancelScope(shield=True):
-                await self.runner_process.stop()
-                logger.info(
-                    f"Runner process successfully terminated: {self.runner_process.exitcode}"
-                )
+            try:
+                with anyio.CancelScope(shield=True):
+                    await self._stop_process_and_forward_shutdown()
+            finally:
+                with contextlib.suppress(ClosedResourceError):
+                    self._event_sender.close()
 
     def shutdown(self):
         self._tg.cancel_tasks()
 
+    async def wait_for_shutdown_received(self) -> None:
+        await self._shutdown_received.wait()
+
     async def wait_for_shutdown_forwarded(self) -> None:
         await self._shutdown_forwarded.wait()
+
+    def shutdown_was_forwarded(self) -> bool:
+        return self._shutdown_forwarded.is_set()
+
+    async def wait_for_stopped(self) -> None:
+        await self._stopped.wait()
+
+    async def _stop_process_and_forward_shutdown(self) -> None:
+        await self.runner_process.stop()
+        logger.info(
+            f"Runner process successfully terminated: {self.runner_process.exitcode}"
+        )
+
+        if self._pending_shutdown_status is not None:
+            self.status = self._pending_shutdown_status.runner_status
+            await self._event_sender.send(self._pending_shutdown_status)
+            self._shutdown_forwarded.set()
+        self._stopped.set()
 
     async def start_task(self, task: Task):
         if task.task_id in self.pending:
@@ -339,6 +364,12 @@ class RunnerSupervisor:
                         # try to get exception if possible
                         await self._check_runner(event)
                         break
+                    if isinstance(event, RunnerStatusUpdated) and isinstance(
+                        event.runner_status, RunnerShutdown
+                    ):
+                        self._pending_shutdown_status = event
+                        self._shutdown_received.set()
+                        continue
                     if isinstance(event, RunnerStatusUpdated):
                         self.status = event.runner_status
                     if isinstance(event, TaskAcknowledged):
@@ -377,10 +408,6 @@ class RunnerSupervisor:
                         self.in_progress.pop(event.task_id, None)
                         self.completed.add(event.task_id)
                     await self._event_sender.send(event)
-                    if isinstance(event, RunnerStatusUpdated) and isinstance(
-                        event.runner_status, RunnerShutdown
-                    ):
-                        self._shutdown_forwarded.set()
         except (ClosedResourceError, BrokenResourceError):
             # this is the happy path shutdown - we don't need to spam log with it
             await self._check_runner()

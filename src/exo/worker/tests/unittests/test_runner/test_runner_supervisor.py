@@ -28,8 +28,9 @@ from exo.shared.types.worker.runners import (
     RunnerShuttingDown,
 )
 from exo.utils.async_process import AsyncProcess
-from exo.utils.channels import MpReceiver, Sender, channel, mp_channel
+from exo.utils.channels import MpReceiver, MpSender, Sender, channel
 from exo.worker.runner.bootstrap import RunnerTerminationError
+from exo.worker.runner.diagnostics import RunnerDiagnosticCollector
 from exo.worker.runner.supervisor import RunnerStdioHandler, RunnerSupervisor
 from exo.worker.tests.unittests.conftest import get_bound_mlx_ring_instance
 
@@ -40,11 +41,15 @@ class _DeadProcess:
         rx2, _ = channel[bytes]()
         self.stdout = rx1
         self.stderr = rx2
+        self.stopped = False
 
     exitcode = -6
 
     def is_alive(self) -> bool:
         return False
+
+    async def stop(self) -> None:
+        self.stopped = True
 
 
 class _RunnerEventReceiver:
@@ -71,13 +76,26 @@ class _RunnerEventReceiver:
         return self.events.pop(0)
 
 
+class _FakeMpSender:
+    def send(self, _item: object) -> None:
+        pass
+
+    async def send_async(self, _item: object) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+
+class _FakeStdioHandler:
+    def __init__(self) -> None:
+        self.diagnostics = RunnerDiagnosticCollector()
+
+
 async def _make_supervisor(
     event_sender: Sender[Event],
     runner_events: _RunnerEventReceiver,
 ) -> RunnerSupervisor:
-    task_sender, _ = mp_channel[Task]()
-    cancel_sender, _ = mp_channel[TaskId]()
-
     bound_instance: BoundInstance = get_bound_mlx_ring_instance(
         instance_id=InstanceId("instance-a"),
         model_id=ModelId("mlx-community/Llama-3.2-1B-Instruct-4bit"),
@@ -86,26 +104,25 @@ async def _make_supervisor(
     )
 
     process = cast(AsyncProcess, cast(object, _DeadProcess()))
-    handler = await RunnerStdioHandler.create(
-        stdout_rx=process.stdout, stderr_rx=process.stderr
-    )
     return RunnerSupervisor(
         shard_metadata=bound_instance.bound_shard,
         bound_instance=bound_instance,
         runner_process=process,
-        _runner_stdio_handler=handler,
+        _runner_stdio_handler=cast(
+            RunnerStdioHandler, cast(object, _FakeStdioHandler())
+        ),
         initialize_timeout=400,
         _ev_recv=cast(
             MpReceiver[Event | RunnerTerminationError], cast(object, runner_events)
         ),
-        _task_sender=task_sender,
+        _task_sender=cast(MpSender[Task], cast(object, _FakeMpSender())),
         _event_sender=event_sender,
-        _cancel_sender=cancel_sender,
+        _cancel_sender=cast(MpSender[TaskId], cast(object, _FakeMpSender())),
     )
 
 
 @pytest.mark.anyio
-async def test_wait_for_shutdown_forwarded_waits_for_terminal_status() -> None:
+async def test_terminal_status_is_forwarded_only_after_process_stop() -> None:
     event_sender, event_receiver = channel[Event]()
     runner_events = _RunnerEventReceiver([])
     supervisor = await _make_supervisor(event_sender, runner_events)
@@ -116,8 +133,10 @@ async def test_wait_for_shutdown_forwarded_waits_for_terminal_status() -> None:
             runner_status=RunnerShuttingDown(),
         )
     )
-    await supervisor._forward_events()  # pyright: ignore[reportPrivateUsage]
-    assert isinstance(await event_receiver.receive(), RunnerStatusUpdated)
+    with anyio.fail_after(2):
+        await supervisor._forward_events()  # pyright: ignore[reportPrivateUsage]
+    with anyio.fail_after(2):
+        assert isinstance(await event_receiver.receive(), RunnerStatusUpdated)
     assert not supervisor._shutdown_forwarded.is_set()  # pyright: ignore[reportPrivateUsage]
 
     runner_events.events.append(
@@ -126,11 +145,29 @@ async def test_wait_for_shutdown_forwarded_waits_for_terminal_status() -> None:
             runner_status=RunnerShutdown(),
         )
     )
-    await supervisor._forward_events()  # pyright: ignore[reportPrivateUsage]
-    forwarded = await event_receiver.receive()
+    with anyio.fail_after(2):
+        await supervisor._forward_events()  # pyright: ignore[reportPrivateUsage]
+    with anyio.fail_after(2):
+        await supervisor.wait_for_shutdown_received()
+    with pytest.raises(anyio.WouldBlock):
+        event_receiver.receive_nowait()
+
+    process = cast(_DeadProcess, cast(object, supervisor.runner_process))
+    with anyio.fail_after(2):
+        await supervisor._stop_process_and_forward_shutdown()  # pyright: ignore[reportPrivateUsage]
+
+    assert process.stopped
+    with anyio.fail_after(2):
+        await supervisor.wait_for_stopped()
+    with anyio.fail_after(2):
+        forwarded = await event_receiver.receive()
     assert isinstance(forwarded, RunnerStatusUpdated)
     assert isinstance(forwarded.runner_status, RunnerShutdown)
-    await supervisor.wait_for_shutdown_forwarded()
+    with anyio.fail_after(2):
+        await supervisor.wait_for_shutdown_forwarded()
+    supervisor._task_sender.close()  # pyright: ignore[reportPrivateUsage]
+    supervisor._cancel_sender.close()  # pyright: ignore[reportPrivateUsage]
+    event_sender.close()
 
 
 @pytest.mark.anyio
@@ -182,9 +219,7 @@ async def test_task_ack_timeout_cleans_pending_and_late_ack_is_harmless() -> Non
 @pytest.mark.anyio
 async def test_check_runner_emits_error_chunk_for_inflight_text_generation() -> None:
     event_sender, event_receiver = channel[Event]()
-    task_sender, _ = mp_channel[Task]()
-    cancel_sender, _ = mp_channel[TaskId]()
-    _, ev_recv = mp_channel[Event | RunnerTerminationError]()
+    runner_events = _RunnerEventReceiver([])
 
     bound_instance: BoundInstance = get_bound_mlx_ring_instance(
         instance_id=InstanceId("instance-a"),
@@ -194,19 +229,20 @@ async def test_check_runner_emits_error_chunk_for_inflight_text_generation() -> 
     )
 
     proc = cast(AsyncProcess, cast(object, _DeadProcess()))
-    handler = await RunnerStdioHandler.create(
-        stdout_rx=proc.stdout, stderr_rx=proc.stderr
-    )
     supervisor = RunnerSupervisor(
         shard_metadata=bound_instance.bound_shard,
         bound_instance=bound_instance,
         runner_process=proc,
-        _runner_stdio_handler=handler,
+        _runner_stdio_handler=cast(
+            RunnerStdioHandler, cast(object, _FakeStdioHandler())
+        ),
         initialize_timeout=400,
-        _ev_recv=ev_recv,
-        _task_sender=task_sender,
+        _ev_recv=cast(
+            MpReceiver[Event | RunnerTerminationError], cast(object, runner_events)
+        ),
+        _task_sender=cast(MpSender[Task], cast(object, _FakeMpSender())),
         _event_sender=event_sender,
-        _cancel_sender=cancel_sender,
+        _cancel_sender=cast(MpSender[TaskId], cast(object, _FakeMpSender())),
     )
 
     command_id = CommandId("cmd-a")
