@@ -226,6 +226,23 @@ def test_process_launch_spec_roundtrip() -> None:
     assert SglangKtProcessLaunchSpec.model_validate_json(spec.model_dump_json()) == spec
 
 
+def test_process_launch_spec_rejects_free_form_command_or_environment() -> None:
+    spec = build_glm_5_2_fp8_process_launch_specs(make_plan(), PYTHON_EXECUTABLE)[0]
+    serialized = spec.model_dump()
+
+    with pytest.raises(ValidationError, match="arguments"):
+        SglangKtProcessLaunchSpec.model_validate(
+            {**serialized, "arguments": ("-m", "untrusted.module")}
+        )
+    with pytest.raises(ValidationError, match="environment"):
+        SglangKtProcessLaunchSpec.model_validate(
+            {
+                **serialized,
+                "environment": (("CUDA_VISIBLE_DEVICES", "GPU-wrong"),),
+            }
+        )
+
+
 @pytest.mark.parametrize(
     ("plan", "error_message"),
     [
