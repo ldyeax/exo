@@ -81,14 +81,18 @@ def test_shard_assignments_accept_optional_compute_resource_bindings() -> None:
         },
         node_to_runner={NodeId("node-a"): runner_id},
         compute_resource_to_runner={resource_id: runner_id},
+        compute_resource_to_node={resource_id: NodeId("node-a")},
     )
 
     assert assignments.compute_resource_to_runner == {resource_id: runner_id}
+    assert assignments.compute_resource_to_node == {resource_id: NodeId("node-a")}
 
     legacy_payload = assignments.model_dump()
     del legacy_payload["compute_resource_to_runner"]
+    del legacy_payload["compute_resource_to_node"]
     restored_legacy_assignments = ShardAssignments.model_validate(legacy_payload)
     assert restored_legacy_assignments.compute_resource_to_runner == {}
+    assert restored_legacy_assignments.compute_resource_to_node == {}
 
 
 def test_shard_assignments_reject_unknown_resource_runner() -> None:
@@ -104,4 +108,39 @@ def test_shard_assignments_reject_unknown_resource_runner() -> None:
             compute_resource_to_runner={
                 _gpu_resource().resource_id: RunnerId("unknown-runner")
             },
+        )
+
+
+def test_shard_assignments_reject_partial_resource_ownership() -> None:
+    model_id = ModelId("test-model")
+    runner_id = RunnerId("runner-a")
+    with pytest.raises(ValueError, match="cover exactly the bound resources"):
+        ShardAssignments(
+            model_id=model_id,
+            runner_to_shard={
+                runner_id: get_pipeline_shard_metadata(model_id, device_rank=0)
+            },
+            node_to_runner={NodeId("node-a"): runner_id},
+            compute_resource_to_runner={_gpu_resource().resource_id: runner_id},
+            compute_resource_to_node={
+                ComputeResourceId.from_nvidia_device_uuid(
+                    "GPU-00000000-0000-0000-0000-000000000002"
+                ): NodeId("node-a")
+            },
+        )
+
+
+def test_shard_assignments_reject_unknown_resource_owner() -> None:
+    model_id = ModelId("test-model")
+    runner_id = RunnerId("runner-a")
+    resource_id = _gpu_resource().resource_id
+    with pytest.raises(ValueError, match="owned by unknown node"):
+        ShardAssignments(
+            model_id=model_id,
+            runner_to_shard={
+                runner_id: get_pipeline_shard_metadata(model_id, device_rank=0)
+            },
+            node_to_runner={NodeId("node-a"): runner_id},
+            compute_resource_to_runner={resource_id: runner_id},
+            compute_resource_to_node={resource_id: NodeId("node-b")},
         )

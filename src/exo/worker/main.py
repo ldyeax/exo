@@ -1,6 +1,7 @@
 import hashlib
 from collections import defaultdict
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 import anyio
@@ -58,6 +59,7 @@ from exo.shared.types.topology import Connection, SocketConnection
 from exo.shared.types.worker.downloads import DownloadCompleted
 from exo.shared.types.worker.instances import Instance, InstanceId
 from exo.shared.types.worker.runners import (
+    RunnerFailed,
     RunnerId,
     RunnerReady,
     RunnerRunning,
@@ -72,6 +74,13 @@ from exo.worker.plan import plan
 from exo.worker.runner.supervisor import RunnerSupervisor
 
 RUNNER_SHUTDOWN_TIMEOUT_SECONDS = 3
+RUNNER_TASK_START_TIMEOUT_SECONDS = 30.0
+
+
+@dataclass(frozen=True)
+class RunnerTaskStartFailure:
+    runner_id: RunnerId
+    error_message: str
 
 
 def get_local_runner_ids_for_task(
@@ -106,11 +115,49 @@ async def start_local_runner_task(
     instance: Instance,
     node_id: NodeId,
     runners: Mapping[RunnerId, RunnerSupervisor],
-) -> None:
+    timeout_seconds: float = RUNNER_TASK_START_TIMEOUT_SECONDS,
+) -> tuple[RunnerTaskStartFailure, ...]:
     runner_ids = get_local_runner_ids_for_task(task, instance, node_id, runners)
+    failures: list[RunnerTaskStartFailure] = []
+
+    async def start_runner_task(runner_id: RunnerId) -> None:
+        try:
+            with fail_after(timeout_seconds):
+                await runners[runner_id].start_task(task)
+        except TimeoutError:
+            failures.append(
+                RunnerTaskStartFailure(
+                    runner_id=runner_id,
+                    error_message=(
+                        f"Timed out after {timeout_seconds:g}s while starting "
+                        f"{task.__class__.__name__}"
+                    ),
+                )
+            )
+        except Exception as error:
+            failures.append(
+                RunnerTaskStartFailure(
+                    runner_id=runner_id,
+                    error_message=(
+                        f"{type(error).__qualname__} while starting "
+                        f"{task.__class__.__name__}: {error}"
+                    ),
+                )
+            )
+
+    # All local ranks receive generation work before any shared task-completion
+    # update can suppress local dispatch. Global completion is still not rank-aware.
     async with anyio.create_task_group() as task_group:
         for runner_id in runner_ids:
-            task_group.start_soon(runners[runner_id].start_task, task)
+            task_group.start_soon(start_runner_task, runner_id)
+    return tuple(sorted(failures, key=lambda failure: failure.runner_id))
+
+
+def reset_runner_backoff_for_instance(
+    runner_backoff: KeyedBackoff[RunnerId], instance: Instance
+) -> None:
+    for runner_id in instance.shard_assignments.runner_to_shard:
+        runner_backoff.reset(runner_id)
 
 
 class Worker:
@@ -191,19 +238,22 @@ class Worker:
 
     async def _event_applier(self):
         with self.event_receiver as events:
-            async for event in events:
+            async for indexed_event in events:
+                event = indexed_event.event
+                deleted_instance = (
+                    self.state.instances.get(event.instance_id)
+                    if isinstance(event, InstanceDeleted)
+                    else None
+                )
                 # 2. for each event, apply it to the state
-                self.state = apply(self.state, event=event)
-                event = event.event
+                self.state = apply(self.state, event=indexed_event)
 
                 if isinstance(event, InstanceDeleted):
                     self._instance_backoff.reset(event.instance_id)
-                    for runner_id, runner in self.runners.items():
-                        if (
-                            runner.bound_instance.instance.instance_id
-                            == event.instance_id
-                        ):
-                            self._runner_backoff.reset(runner_id)
+                    if deleted_instance is not None:
+                        reset_runner_backoff_for_instance(
+                            self._runner_backoff, deleted_instance
+                        )
 
                 # Buffer input image chunks for image editing
                 if isinstance(event, InputChunkReceived):
@@ -455,12 +505,30 @@ class Worker:
 
     async def _start_runner_task(self, task: Task):
         if (instance := self.state.instances.get(task.instance_id)) is not None:
-            await start_local_runner_task(
+            failures = await start_local_runner_task(
                 task,
                 instance,
                 self.node_id,
                 self.runners,
             )
+            for failure in failures:
+                runner_status = RunnerFailed(
+                    error_message=failure.error_message,
+                    diagnostics=[],
+                )
+                runner = self.runners.get(failure.runner_id)
+                if runner is not None:
+                    runner.status = runner_status
+                logger.error(
+                    f"Runner {failure.runner_id} task start failed: "
+                    f"{failure.error_message}"
+                )
+                await self.event_sender.send(
+                    RunnerStatusUpdated(
+                        runner_id=failure.runner_id,
+                        runner_status=runner_status,
+                    )
+                )
 
     async def _create_supervisor(self, task: CreateRunner) -> RunnerSupervisor:
         """Creates and stores a new AssignedRunner with initial downloading status."""

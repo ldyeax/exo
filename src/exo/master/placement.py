@@ -23,7 +23,7 @@ from exo.shared.types.commands import (
     PlaceInstance,
 )
 from exo.shared.types.common import NodeId
-from exo.shared.types.compute_resources import ComputeResource
+from exo.shared.types.compute_resources import ComputeResource, ComputeResourceId
 from exo.shared.types.events import (
     Event,
     InstanceCreated,
@@ -57,13 +57,154 @@ INSTANCE_META_BACKENDS: dict[InstanceMeta, list[Backend]] = {
     InstanceMeta.MlxNccl: [Backend.MlxCuda],
 }
 
+GPU_PLACEMENT_MINIMUM_HEADROOM_BYTES = 1024**3
+GPU_PLACEMENT_HEADROOM_PERCENT = 10
+
+
+def estimated_gpu_rank_memory_requirement(
+    model_storage: Memory,
+    world_size: int,
+    gpu_total_memory: Memory,
+) -> Memory:
+    """Estimate sharded weights plus conservative placement-only GPU headroom.
+
+    This intentionally does not claim to model KV cache or runtime workspace.
+    """
+    if world_size <= 0:
+        raise ValueError("Tensor world size must be positive")
+    model_share_bytes = (model_storage.in_bytes + world_size - 1) // world_size
+    proportional_headroom_bytes = (
+        gpu_total_memory.in_bytes * GPU_PLACEMENT_HEADROOM_PERCENT + 99
+    ) // 100
+    headroom_bytes = max(
+        GPU_PLACEMENT_MINIMUM_HEADROOM_BYTES,
+        proportional_headroom_bytes,
+    )
+    return Memory.from_bytes(model_share_bytes + headroom_bytes)
+
+
+def _compute_resource_inventory_by_id(
+    node_compute_resources: Mapping[NodeId, Sequence[ComputeResource]],
+) -> dict[ComputeResourceId, tuple[NodeId, ComputeResource]]:
+    inventory: dict[ComputeResourceId, tuple[NodeId, ComputeResource]] = {}
+    for node_id, resources in node_compute_resources.items():
+        for resource in resources:
+            if resource.resource_id in inventory:
+                raise ValueError(
+                    f"Compute resource {resource.resource_id} is advertised more than once"
+                )
+            inventory[resource.resource_id] = (node_id, resource)
+    return inventory
+
+
+def _occupied_compute_resource_ids(
+    instances: Mapping[InstanceId, Instance],
+    *,
+    excluding_instance_id: InstanceId | None = None,
+    node_compute_resources: Mapping[NodeId, Sequence[ComputeResource]] | None = None,
+) -> set[ComputeResourceId]:
+    occupied_resource_ids = {
+        resource_id
+        for instance_id, instance in instances.items()
+        if instance_id != excluding_instance_id
+        for resource_id in instance.shard_assignments.compute_resource_to_runner
+    }
+    if node_compute_resources is None:
+        return occupied_resource_ids
+    legacy_nccl_node_ids = {
+        node_id
+        for instance_id, instance in instances.items()
+        if instance_id != excluding_instance_id
+        and isinstance(instance, MlxNcclInstance)
+        and not instance.shard_assignments.compute_resource_to_runner
+        for node_id in instance.shard_assignments.node_to_runner
+    }
+    occupied_resource_ids.update(
+        resource.resource_id
+        for node_id in legacy_nccl_node_ids
+        for resource in node_compute_resources.get(node_id, ())
+    )
+    return occupied_resource_ids
+
+
+def validate_instance_compute_resources(
+    instance: Instance,
+    node_compute_resources: Mapping[NodeId, Sequence[ComputeResource]],
+    current_instances: Mapping[InstanceId, Instance] | None = None,
+) -> None:
+    assignments = instance.shard_assignments
+    resource_assignments = assignments.compute_resource_to_runner
+    if (
+        isinstance(instance, MlxNcclInstance)
+        and any(node_compute_resources.values())
+        and not resource_assignments
+    ):
+        raise ValueError(
+            "New MlxNccl instances require explicit compute resource bindings "
+            "when live GPU inventory is available"
+        )
+    if not resource_assignments:
+        return
+    resource_owners = assignments.compute_resource_to_node
+    if not resource_owners:
+        raise ValueError(
+            "Resource-bound instances require explicit compute resource ownership"
+        )
+
+    inventory = _compute_resource_inventory_by_id(node_compute_resources)
+    occupied_resource_ids = _occupied_compute_resource_ids(
+        current_instances or {},
+        excluding_instance_id=instance.instance_id,
+        node_compute_resources=node_compute_resources,
+    )
+    conflicting_resource_ids = set(resource_assignments) & occupied_resource_ids
+    if conflicting_resource_ids:
+        raise ValueError(
+            "Compute resources are already occupied by another instance: "
+            f"{sorted(conflicting_resource_ids)}"
+        )
+
+    world_size = len(assignments.runner_to_shard)
+    for resource_id, runner_id in resource_assignments.items():
+        inventory_entry = inventory.get(resource_id)
+        if inventory_entry is None:
+            raise ValueError(f"Compute resource {resource_id} is not live")
+        live_node_id, resource = inventory_entry
+        assigned_node_id = resource_owners[resource_id]
+        if live_node_id != assigned_node_id:
+            raise ValueError(
+                f"Compute resource {resource_id} is assigned to {assigned_node_id} "
+                f"but advertised by {live_node_id}"
+            )
+        model_storage = assignments.runner_to_shard[runner_id].model_card.storage_size
+        required_memory = estimated_gpu_rank_memory_requirement(
+            model_storage,
+            world_size,
+            resource.total_memory,
+        )
+        if required_memory > resource.total_memory:
+            raise ValueError(
+                f"Compute resource {resource_id} has {resource.total_memory} but the "
+                f"placement estimate requires {required_memory}: ceil(model storage / "
+                "world size) + max(1 GiB, 10% GPU VRAM). KV cache and runtime "
+                "workspace are not modeled"
+            )
+
 
 def add_instance_to_placements(
     command: CreateInstance,
     topology: Topology,
     current_instances: Mapping[InstanceId, Instance],
+    node_compute_resources: Mapping[NodeId, Sequence[ComputeResource]] | None = None,
 ) -> Mapping[InstanceId, Instance]:
     # TODO: validate against topology
+
+    if node_compute_resources is not None:
+        validate_instance_compute_resources(
+            command.instance,
+            node_compute_resources,
+            current_instances,
+        )
 
     return {**current_instances, command.instance.instance_id: command.instance}
 
@@ -149,11 +290,21 @@ def place_instance(
     if len(cycles_with_sufficient_memory) == 0:
         raise ValueError("No cycles found with sufficient memory")
 
-    placement_compute_resources = (
-        node_compute_resources
-        if command.instance_meta == InstanceMeta.MlxNccl and node_compute_resources
-        else None
-    )
+    placement_compute_resources: dict[NodeId, Sequence[ComputeResource]] | None = None
+    if command.instance_meta == InstanceMeta.MlxNccl and node_compute_resources:
+        _ = _compute_resource_inventory_by_id(node_compute_resources)
+        occupied_resource_ids = _occupied_compute_resource_ids(
+            current_instances,
+            node_compute_resources=node_compute_resources,
+        )
+        placement_compute_resources = {
+            node_id: [
+                resource
+                for resource in resources
+                if resource.resource_id not in occupied_resource_ids
+            ]
+            for node_id, resources in node_compute_resources.items()
+        }
     if placement_compute_resources is not None:
         cycles_with_sufficient_memory = [
             cycle
@@ -162,8 +313,8 @@ def place_instance(
         ]
         if not cycles_with_sufficient_memory:
             raise ValueError(
-                "No cycles found where every node advertises NVIDIA GPU compute "
-                "resources"
+                "No cycles found where every node advertises an available NVIDIA "
+                "GPU compute resource"
             )
 
     def selected_compute_resources(
@@ -171,22 +322,61 @@ def place_instance(
     ) -> dict[NodeId, Sequence[ComputeResource]] | None:
         if placement_compute_resources is None:
             return None
-        return {
-            node_id: (
-                sorted(
-                    placement_compute_resources[node_id],
-                    key=lambda resource: resource.resource_id,
-                )
-                if command.use_all_compute_resources
-                else [
-                    min(
-                        placement_compute_resources[node_id],
-                        key=lambda resource: resource.resource_id,
-                    )
-                ]
+        resources_by_node: dict[NodeId, Sequence[ComputeResource]] = {
+            node_id: sorted(
+                placement_compute_resources[node_id],
+                key=lambda resource: resource.resource_id,
             )
             for node_id in cycle
         }
+        if command.use_all_compute_resources:
+            world_size = sum(len(resources) for resources in resources_by_node.values())
+            if all(
+                estimated_gpu_rank_memory_requirement(
+                    command.model_card.storage_size,
+                    world_size,
+                    resource.total_memory,
+                )
+                <= resource.total_memory
+                for resources in resources_by_node.values()
+                for resource in resources
+            ):
+                return resources_by_node
+            return None
+
+        world_size = len(cycle)
+        selection: dict[NodeId, Sequence[ComputeResource]] = {}
+        for node_id, resources in resources_by_node.items():
+            capable_resource = next(
+                (
+                    resource
+                    for resource in resources
+                    if estimated_gpu_rank_memory_requirement(
+                        command.model_card.storage_size,
+                        world_size,
+                        resource.total_memory,
+                    )
+                    <= resource.total_memory
+                ),
+                None,
+            )
+            if capable_resource is None:
+                return None
+            selection[node_id] = [capable_resource]
+        return selection
+
+    if placement_compute_resources is not None:
+        cycles_with_sufficient_memory = [
+            cycle
+            for cycle in cycles_with_sufficient_memory
+            if selected_compute_resources(cycle) is not None
+        ]
+        if not cycles_with_sufficient_memory:
+            raise ValueError(
+                "No available GPU selection satisfies the conservative placement "
+                "estimate: ceil(model storage / world size) + max(1 GiB, 10% GPU "
+                "VRAM). KV cache and runtime workspace are not modeled"
+            )
 
     if command.sharding == Sharding.Tensor:
         if not command.model_card.supports_tensor:
@@ -203,6 +393,7 @@ def place_instance(
         def tensor_world_size(cycle: Cycle) -> int:
             compute_resources = selected_compute_resources(cycle)
             if compute_resources is None:
+                assert placement_compute_resources is None
                 return len(cycle)
             return sum(len(compute_resources[node_id]) for node_id in cycle)
 
@@ -397,6 +588,13 @@ def place_instance(
                 hosts_by_node=hosts_by_node,
                 ephemeral_port=ephemeral_port,
             )
+
+    if node_compute_resources is not None:
+        validate_instance_compute_resources(
+            target_instances[instance_id],
+            node_compute_resources,
+            current_instances,
+        )
 
     return target_instances
 

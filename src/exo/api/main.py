@@ -124,7 +124,10 @@ from exo.api.types.openai_responses import (
     ResponsesResponse,
 )
 from exo.master.image_store import ImageStore
-from exo.master.placement import place_instance as get_instance_placements
+from exo.master.placement import (
+    place_instance as get_instance_placements,
+)
+from exo.master.placement import validate_instance_compute_resources
 from exo.shared.apply import apply
 from exo.shared.constants import (
     DASHBOARD_DIR,
@@ -447,6 +450,14 @@ class API:
     ) -> CreateInstanceResponse:
         instance = payload.instance
         model_card = await ModelCard.load(instance.shard_assignments.model_id)
+        try:
+            validate_instance_compute_resources(
+                instance,
+                self.state.node_compute_resources,
+                self.state.instances,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         required_memory = model_card.storage_size
         available_memory = self._calculate_total_available_memory()
 
@@ -514,8 +525,9 @@ class API:
         self,
         model_id: ModelId,
         node_ids: Annotated[list[NodeId] | None, Query()] = None,
+        use_all_compute_resources: bool = False,
     ) -> PlacementPreviewResponse:
-        seen: set[tuple[ModelId, Sharding, InstanceMeta, int]] = set()
+        seen: set[tuple[ModelId, Sharding, InstanceMeta, int, bool]] = set()
         previews: list[PlacementPreview] = []
         required_nodes = set(node_ids) if node_ids else None
 
@@ -554,6 +566,7 @@ class API:
                         sharding=sharding,
                         instance_meta=instance_meta,
                         min_nodes=min_nodes,
+                        use_all_compute_resources=use_all_compute_resources,
                     ),
                     node_memory=self.state.node_memory,
                     node_network=self.state.node_network,
@@ -566,17 +579,25 @@ class API:
                     node_compute_resources=self.state.node_compute_resources,
                 )
             except ValueError as exc:
-                if (model_card.model_id, sharding, instance_meta, 0) not in seen:
+                error_identity = (
+                    model_card.model_id,
+                    sharding,
+                    instance_meta,
+                    0,
+                    use_all_compute_resources,
+                )
+                if error_identity not in seen:
                     previews.append(
                         PlacementPreview(
                             model_id=model_card.model_id,
                             sharding=sharding,
                             instance_meta=instance_meta,
+                            use_all_compute_resources=use_all_compute_resources,
                             instance=None,
                             error=str(exc),
                         )
                     )
-                seen.add((model_card.model_id, sharding, instance_meta, 0))
+                seen.add(error_identity)
                 continue
 
             current_ids = set(self.state.instances.keys())
@@ -587,17 +608,25 @@ class API:
             ]
 
             if len(new_instances) != 1:
-                if (model_card.model_id, sharding, instance_meta, 0) not in seen:
+                error_identity = (
+                    model_card.model_id,
+                    sharding,
+                    instance_meta,
+                    0,
+                    use_all_compute_resources,
+                )
+                if error_identity not in seen:
                     previews.append(
                         PlacementPreview(
                             model_id=model_card.model_id,
                             sharding=sharding,
                             instance_meta=instance_meta,
+                            use_all_compute_resources=use_all_compute_resources,
                             instance=None,
                             error="Expected exactly one new instance from placement",
                         )
                     )
-                seen.add((model_card.model_id, sharding, instance_meta, 0))
+                seen.add(error_identity)
                 continue
 
             instance = new_instances[0]
@@ -605,7 +634,30 @@ class API:
             placement_node_ids = list(shard_assignments.node_to_runner.keys())
 
             memory_delta_by_node: dict[str, int] = {}
-            if placement_node_ids:
+            resource_owners = shard_assignments.compute_resource_to_node
+            if resource_owners:
+                total_bytes = model_card.storage_size.in_bytes
+                ranked_node_ids = [
+                    node_id
+                    for _, node_id in sorted(
+                        (
+                            shard_assignments.runner_to_shard[
+                                shard_assignments.compute_resource_to_runner[resource_id]
+                            ].device_rank,
+                            node_id,
+                        )
+                        for resource_id, node_id in resource_owners.items()
+                    )
+                ]
+                per_rank = total_bytes // len(ranked_node_ids)
+                remainder = total_bytes % len(ranked_node_ids)
+                for index, node_id in enumerate(ranked_node_ids):
+                    extra = 1 if index < remainder else 0
+                    key = str(node_id)
+                    memory_delta_by_node[key] = (
+                        memory_delta_by_node.get(key, 0) + per_rank + extra
+                    )
+            elif placement_node_ids:
                 total_bytes = model_card.storage_size.in_bytes
                 per_node = total_bytes // len(placement_node_ids)
                 remainder = total_bytes % len(placement_node_ids)
@@ -613,30 +665,26 @@ class API:
                     extra = 1 if index < remainder else 0
                     memory_delta_by_node[str(node_id)] = per_node + extra
 
-            if (
+            preview_identity = (
                 model_card.model_id,
                 sharding,
                 instance_meta,
                 len(placement_node_ids),
-            ) not in seen:
+                use_all_compute_resources,
+            )
+            if preview_identity not in seen:
                 previews.append(
                     PlacementPreview(
                         model_id=model_card.model_id,
                         sharding=sharding,
                         instance_meta=instance_meta,
+                        use_all_compute_resources=use_all_compute_resources,
                         instance=instance,
                         memory_delta_by_node=memory_delta_by_node or None,
                         error=None,
                     )
                 )
-            seen.add(
-                (
-                    model_card.model_id,
-                    sharding,
-                    instance_meta,
-                    len(placement_node_ids),
-                )
-            )
+            seen.add(preview_identity)
 
         return PlacementPreviewResponse(previews=previews)
 

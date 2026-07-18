@@ -251,6 +251,7 @@ def get_shard_assignments_for_tensor_parallel(
     runner_to_shard: dict[RunnerId, ShardMetadata] = {}
     node_to_runner: dict[NodeId, RunnerId] = {}
     compute_resource_to_runner: dict[ComputeResourceId, RunnerId] = {}
+    compute_resource_to_node: dict[ComputeResourceId, NodeId] = {}
 
     targets: list[tuple[NodeId, ComputeResourceId | None]]
     if node_compute_resources is None:
@@ -293,12 +294,14 @@ def get_shard_assignments_for_tensor_parallel(
         node_to_runner.setdefault(node_id, runner_id)
         if resource_id is not None:
             compute_resource_to_runner[resource_id] = runner_id
+            compute_resource_to_node[resource_id] = node_id
 
     shard_assignments = ShardAssignments(
         model_id=model_card.model_id,
         runner_to_shard=runner_to_shard,
         node_to_runner=node_to_runner,
         compute_resource_to_runner=compute_resource_to_runner,
+        compute_resource_to_node=compute_resource_to_node,
     )
 
     return shard_assignments

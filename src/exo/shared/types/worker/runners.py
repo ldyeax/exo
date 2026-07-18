@@ -89,6 +89,7 @@ class ShardAssignments(FrozenModel):
     runner_to_shard: Mapping[RunnerId, ShardMetadata]
     node_to_runner: Mapping[NodeId, RunnerId]
     compute_resource_to_runner: Mapping[ComputeResourceId, RunnerId] = {}
+    compute_resource_to_node: Mapping[ComputeResourceId, NodeId] = {}
 
     @model_validator(mode="after")
     def validate_runners_exist(self) -> "ShardAssignments":
@@ -102,5 +103,16 @@ class ShardAssignments(FrozenModel):
                 raise ValueError(
                     f"Runner {runner_id} assigned to compute resource {resource_id} "
                     "does not exist in runner_to_shard"
+                )
+        if self.compute_resource_to_node and set(self.compute_resource_to_node) != set(
+            self.compute_resource_to_runner
+        ):
+            raise ValueError(
+                "Compute resource ownership must cover exactly the bound resources"
+            )
+        for resource_id, node_id in self.compute_resource_to_node.items():
+            if node_id not in self.node_to_runner:
+                raise ValueError(
+                    f"Compute resource {resource_id} is owned by unknown node {node_id}"
                 )
         return self

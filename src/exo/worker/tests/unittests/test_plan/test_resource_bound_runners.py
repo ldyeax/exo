@@ -1,6 +1,7 @@
 from collections.abc import Mapping, Sequence
 from typing import cast
 
+import anyio
 import pytest
 
 from exo.shared.models.model_cards import ModelCard, ModelId, ModelTask
@@ -10,7 +11,9 @@ from exo.shared.types.compute_resources import (
     ComputeResource,
     NvidiaGpuComputeResource,
 )
+from exo.shared.types.events import IndexedEvent, InstanceDeleted
 from exo.shared.types.memory import Memory
+from exo.shared.types.state import State
 from exo.shared.types.tasks import (
     ConnectToGroup,
     CreateRunner,
@@ -35,8 +38,14 @@ from exo.shared.types.worker.runners import (
     ShardAssignments,
 )
 from exo.shared.types.worker.shards import TensorShardMetadata
+from exo.utils.channels import Receiver, channel
 from exo.utils.keyed_backoff import KeyedBackoff
-from exo.worker.main import get_local_runner_ids_for_task, start_local_runner_task
+from exo.worker.main import (
+    Worker,
+    get_local_runner_ids_for_task,
+    reset_runner_backoff_for_instance,
+    start_local_runner_task,
+)
 from exo.worker.plan import plan
 from exo.worker.runner.supervisor import RunnerSupervisor
 from exo.worker.tests.unittests.conftest import FakeRunnerSupervisor
@@ -55,6 +64,43 @@ class _RecordingRunner:
 
     async def start_task(self, task: Task) -> None:
         self.started.append(task)
+
+
+class _BlockingRunner(_RecordingRunner):
+    async def start_task(self, task: Task) -> None:
+        self.started.append(task)
+        await anyio.sleep_forever()
+
+
+class _EventApplierTestWorker(Worker):
+    def __init__(
+        self,
+        event_receiver: Receiver[IndexedEvent],
+        state: State,
+    ) -> None:
+        self.event_receiver = event_receiver
+        self.state = state
+        self.runners = {}
+        self._instance_backoff = KeyedBackoff()
+        self._runner_backoff = KeyedBackoff()
+
+    def record_backoff_attempts(
+        self,
+        instance_id: InstanceId,
+        runner_ids: Sequence[RunnerId],
+    ) -> None:
+        self._instance_backoff.record_attempt(instance_id)
+        for runner_id in runner_ids:
+            self._runner_backoff.record_attempt(runner_id)
+
+    def instance_backoff_attempts(self, instance_id: InstanceId) -> int:
+        return self._instance_backoff.attempts(instance_id)
+
+    def runner_backoff_attempts(self, runner_id: RunnerId) -> int:
+        return self._runner_backoff.attempts(runner_id)
+
+    async def apply_events(self) -> None:
+        await self._event_applier()
 
 
 def _gpu_resource(index: int) -> NvidiaGpuComputeResource:
@@ -112,6 +158,9 @@ def _resource_bound_instance() -> tuple[
             runner_to_shard=shards,
             node_to_runner={DWAGON: runner_ids[0], FWUFF: runner_ids[2]},
             compute_resource_to_runner=dict(zip(resource_ids, runner_ids, strict=True)),
+            compute_resource_to_node=dict(
+                zip(resource_ids, (DWAGON, DWAGON, FWUFF), strict=True)
+            ),
         ),
         nccl_coordinator=Host(ip="192.0.2.1", port=5000),
     )
@@ -164,6 +213,17 @@ def test_plan_creates_each_runner_bound_to_local_gpu() -> None:
     )
 
 
+def test_bound_instance_rejects_resource_owned_by_another_node() -> None:
+    instance, runner_ids, _ = _resource_bound_instance()
+
+    with pytest.raises(ValueError, match="owned by dwagon, not bound node fwuff"):
+        BoundInstance(
+            instance=instance,
+            bound_runner_id=runner_ids[0],
+            bound_node_id=FWUFF,
+        )
+
+
 def test_plan_does_not_create_runner_for_resource_not_advertised_locally() -> None:
     instance, runner_ids, resources = _resource_bound_instance()
     local_resources = {DWAGON: [resources[DWAGON][0]]}
@@ -206,6 +266,44 @@ def test_resource_runner_creation_backoff_is_per_runner() -> None:
 
     assert isinstance(second_task, CreateRunner)
     assert second_task.bound_instance.bound_runner_id == runner_ids[1]
+
+
+def test_reset_runner_backoff_uses_all_instance_assignments() -> None:
+    instance, runner_ids, _ = _resource_bound_instance()
+    runner_backoff: KeyedBackoff[RunnerId] = KeyedBackoff()
+    for runner_id in runner_ids:
+        runner_backoff.record_attempt(runner_id)
+
+    reset_runner_backoff_for_instance(runner_backoff, instance)
+
+    assert all(runner_backoff.attempts(runner_id) == 0 for runner_id in runner_ids)
+
+
+@pytest.mark.anyio
+async def test_instance_deletion_resets_backoff_after_supervisors_are_gone() -> None:
+    instance, runner_ids, _ = _resource_bound_instance()
+    indexed_event_sender, indexed_event_receiver = channel[IndexedEvent]()
+    worker = _EventApplierTestWorker(
+        indexed_event_receiver,
+        State(instances={instance.instance_id: instance}),
+    )
+    worker.record_backoff_attempts(instance.instance_id, runner_ids)
+
+    async with anyio.create_task_group() as task_group:
+        task_group.start_soon(worker.apply_events)
+        await indexed_event_sender.send(
+            IndexedEvent(
+                idx=0,
+                event=InstanceDeleted(instance_id=instance.instance_id),
+            )
+        )
+        indexed_event_sender.close()
+
+    assert instance.instance_id not in worker.state.instances
+    assert worker.instance_backoff_attempts(instance.instance_id) == 0
+    assert all(
+        worker.runner_backoff_attempts(runner_id) == 0 for runner_id in runner_ids
+    )
 
 
 def test_resource_lifecycle_tasks_target_selected_local_rank() -> None:
@@ -333,11 +431,59 @@ async def test_generation_task_is_started_on_both_local_ranks() -> None:
         for runner_id in runner_ids[:2]
     }
 
-    await start_local_runner_task(
+    failures = await start_local_runner_task(
         task,
         instance,
         DWAGON,
         cast(Mapping[RunnerId, RunnerSupervisor], cast(object, recording_runners)),
     )
 
+    assert failures == ()
     assert all(runner.started == [task] for runner in recording_runners.values())
+
+
+@pytest.mark.anyio
+async def test_generation_task_start_timeout_is_contained_per_local_rank() -> None:
+    instance, runner_ids, _ = _resource_bound_instance()
+    task = TextGeneration(
+        task_id=TaskId("timeout-generation-task"),
+        instance_id=instance.instance_id,
+        task_status=TaskStatus.Pending,
+        command_id=CommandId("timeout-generation-command"),
+        task_params=TextGenerationTaskParams(
+            model=instance.shard_assignments.model_id,
+            input=[InputMessage(role="user", content=InputMessageContent("test"))],
+        ),
+    )
+    first_runner = _RecordingRunner(
+        BoundInstance(
+            instance=instance,
+            bound_runner_id=runner_ids[0],
+            bound_node_id=DWAGON,
+        )
+    )
+    second_runner = _BlockingRunner(
+        BoundInstance(
+            instance=instance,
+            bound_runner_id=runner_ids[1],
+            bound_node_id=DWAGON,
+        )
+    )
+    recording_runners = {
+        runner_ids[0]: first_runner,
+        runner_ids[1]: second_runner,
+    }
+
+    failures = await start_local_runner_task(
+        task,
+        instance,
+        DWAGON,
+        cast(Mapping[RunnerId, RunnerSupervisor], cast(object, recording_runners)),
+        timeout_seconds=0.01,
+    )
+
+    assert first_runner.started == [task]
+    assert second_runner.started == [task]
+    assert len(failures) == 1
+    assert failures[0].runner_id == runner_ids[1]
+    assert "Timed out after 0.01s" in failures[0].error_message
