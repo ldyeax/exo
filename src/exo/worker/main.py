@@ -1,6 +1,6 @@
 import hashlib
 from collections import defaultdict
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -29,6 +29,7 @@ from exo.shared.types.commands import (
     StartDownload,
 )
 from exo.shared.types.common import CommandId, NodeId, SystemId
+from exo.shared.types.compute_resources import ComputeResource
 from exo.shared.types.events import (
     Event,
     IndexedEvent,
@@ -167,6 +168,40 @@ def reset_runner_backoff_for_instance(
         runner_backoff.reset(runner_id)
 
 
+def get_assigned_local_runner_ids(
+    instance: Instance,
+    node_id: NodeId,
+    node_compute_resources: Mapping[NodeId, Sequence[ComputeResource]],
+) -> tuple[RunnerId, ...]:
+    assignments = instance.shard_assignments
+    if not assignments.compute_resource_to_runner:
+        runner_id = assignments.node_to_runner.get(node_id)
+        return () if runner_id is None else (runner_id,)
+
+    resource_owners = assignments.compute_resource_to_node
+    if resource_owners:
+        runner_ids = {
+            runner_id
+            for resource_id, runner_id in assignments.compute_resource_to_runner.items()
+            if resource_owners.get(resource_id) == node_id
+        }
+    else:
+        local_resource_ids = {
+            resource.resource_id for resource in node_compute_resources.get(node_id, ())
+        }
+        runner_ids = {
+            runner_id
+            for resource_id, runner_id in assignments.compute_resource_to_runner.items()
+            if resource_id in local_resource_ids
+        }
+    return tuple(
+        sorted(
+            runner_ids,
+            key=lambda runner_id: assignments.runner_to_shard[runner_id].device_rank,
+        )
+    )
+
+
 class Worker:
     def __init__(
         self,
@@ -205,6 +240,7 @@ class Worker:
             base=0.5, cap=10.0
         )
         self._runner_backoff: KeyedBackoff[RunnerId] = KeyedBackoff(base=0.5, cap=10.0)
+        self._runner_lifecycle_lock = anyio.Lock()
         self._stopped: anyio.Event = anyio.Event()
 
     async def run(self):
@@ -248,21 +284,8 @@ class Worker:
     async def _event_applier(self):
         with self.event_receiver as events:
             async for indexed_event in events:
+                await self._apply_indexed_event(indexed_event)
                 event = indexed_event.event
-                deleted_instance = (
-                    self.state.instances.get(event.instance_id)
-                    if isinstance(event, InstanceDeleted)
-                    else None
-                )
-                # 2. for each event, apply it to the state
-                self.state = apply(self.state, event=indexed_event)
-
-                if isinstance(event, InstanceDeleted):
-                    self._instance_backoff.reset(event.instance_id)
-                    if deleted_instance is not None:
-                        reset_runner_backoff_for_instance(
-                            self._runner_backoff, deleted_instance
-                        )
 
                 # Buffer input image chunks for image editing
                 if isinstance(event, InputChunkReceived):
@@ -293,6 +316,38 @@ class Worker:
                                     hashlib.sha256(img.encode("ascii")).hexdigest()
                                 )
                             ] = img
+
+    async def _apply_indexed_event(self, indexed_event: IndexedEvent) -> None:
+        event = indexed_event.event
+        if isinstance(event, InstanceDeleted):
+            shutdown_acknowledgements: tuple[RunnerId, ...] = ()
+            async with self._runner_lifecycle_lock:
+                deleted_instance = self.state.instances.get(event.instance_id)
+                self.state = apply(self.state, event=indexed_event)
+                self._instance_backoff.reset(event.instance_id)
+                if deleted_instance is not None:
+                    reset_runner_backoff_for_instance(
+                        self._runner_backoff, deleted_instance
+                    )
+                    local_runner_ids = get_assigned_local_runner_ids(
+                        deleted_instance,
+                        self.node_id,
+                        self.state.node_compute_resources,
+                    )
+                    shutdown_acknowledgements = tuple(
+                        runner_id
+                        for runner_id in local_runner_ids
+                        if runner_id not in self.runners
+                    )
+            for runner_id in shutdown_acknowledgements:
+                await self.event_sender.send(
+                    RunnerStatusUpdated(
+                        runner_id=runner_id,
+                        runner_status=RunnerShutdown(),
+                    )
+                )
+        else:
+            self.state = apply(self.state, event=indexed_event)
 
     async def _reconcile_custom_cards(self) -> None:
         while True:
@@ -350,25 +405,16 @@ class Worker:
                     )
                     continue
 
-            logger.info(f"Worker plan: {task.__class__.__name__}")
             assert task.task_status
+            if isinstance(task, CreateRunner):
+                await self._start_planned_runner(task)
+                continue
+
+            logger.info(f"Worker plan: {task.__class__.__name__}")
             await self.event_sender.send(TaskCreated(task_id=task.task_id, task=task))
 
             # lets not kill the worker if a runner is unresponsive
             match task:
-                case CreateRunner():
-                    await self._create_supervisor(task)
-                    if task.bound_instance.instance.shard_assignments.compute_resource_to_runner:
-                        self._runner_backoff.record_attempt(
-                            task.bound_instance.bound_runner_id
-                        )
-                    else:
-                        self._instance_backoff.record_attempt(task.instance_id)
-                    await self.event_sender.send(
-                        TaskStatusUpdated(
-                            task_id=task.task_id, task_status=TaskStatus.Complete
-                        )
-                    )
                 case DownloadModel(shard_metadata=shard):
                     model_id = shard.model_card.model_id
                     self._download_backoff.record_attempt(
@@ -517,6 +563,55 @@ class Worker:
                     await self._start_runner_task(task)
                 case task:
                     await self._start_runner_task(task)
+
+    async def _start_planned_runner(self, task: CreateRunner) -> bool:
+        async with self._runner_lifecycle_lock:
+            current_instance = self.state.instances.get(task.instance_id)
+            runner_id = task.bound_instance.bound_runner_id
+            if (
+                current_instance is None
+                or current_instance != task.bound_instance.instance
+            ):
+                logger.info(
+                    f"Skipping stale CreateRunner for deleted instance {task.instance_id}"
+                )
+                return False
+            assigned_runner_ids = get_assigned_local_runner_ids(
+                current_instance,
+                self.node_id,
+                self.state.node_compute_resources,
+            )
+            if runner_id not in assigned_runner_ids or runner_id in self.runners:
+                logger.info(f"Skipping stale CreateRunner for runner {runner_id}")
+                return False
+            bound_resource_ids = set(task.bound_instance.bound_compute_resource_ids)
+            live_resource_ids = {
+                resource.resource_id
+                for resource in self.state.node_compute_resources.get(self.node_id, ())
+            }
+            if bound_resource_ids and not bound_resource_ids.issubset(
+                live_resource_ids
+            ):
+                logger.info(
+                    f"Skipping CreateRunner for unavailable compute resource on {runner_id}"
+                )
+                return False
+
+            logger.info(f"Worker plan: {task.__class__.__name__}")
+            await self.event_sender.send(TaskCreated(task_id=task.task_id, task=task))
+            await self._create_supervisor(task)
+            if current_instance.shard_assignments.compute_resource_to_runner:
+                self._runner_backoff.record_attempt(runner_id)
+            else:
+                self._instance_backoff.record_attempt(task.instance_id)
+
+        await self.event_sender.send(
+            TaskStatusUpdated(
+                task_id=task.task_id,
+                task_status=TaskStatus.Complete,
+            )
+        )
+        return True
 
     async def shutdown(self):
         self._tg.cancel_tasks()

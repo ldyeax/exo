@@ -137,16 +137,34 @@ def test_deleted_instance_keeps_gpu_until_runner_shutdown() -> None:
     assert state.retiring_compute_resources == {}
 
 
-def test_deleting_never_created_or_shutdown_runner_does_not_lease_gpu() -> None:
+def test_missing_runner_status_leases_until_shutdown_ack() -> None:
     node_id = NodeId("node-a")
     runner_id = RunnerId("runner-a")
     resource = _gpu_resource(1)
     instance = _ring_instance(node_id=node_id, runner_id=runner_id, resource=resource)
 
-    never_created = apply_instance_deleted(
+    missing_status = apply_instance_deleted(
         InstanceDeleted(instance_id=instance.instance_id),
         State(instances={instance.instance_id: instance}),
     )
+
+    assert missing_status.retiring_compute_resources == {
+        resource.resource_id: runner_id
+    }
+
+    acknowledged = apply_runner_status_updated(
+        RunnerStatusUpdated(runner_id=runner_id, runner_status=RunnerShutdown()),
+        missing_status,
+    )
+
+    assert acknowledged.retiring_compute_resources == {}
+
+
+def test_deleting_instance_with_known_shutdown_runner_does_not_lease_gpu() -> None:
+    node_id = NodeId("node-a")
+    runner_id = RunnerId("runner-a")
+    resource = _gpu_resource(1)
+    instance = _ring_instance(node_id=node_id, runner_id=runner_id, resource=resource)
     already_shutdown = apply_instance_deleted(
         InstanceDeleted(instance_id=instance.instance_id),
         State(
@@ -155,7 +173,6 @@ def test_deleting_never_created_or_shutdown_runner_does_not_lease_gpu() -> None:
         ),
     )
 
-    assert never_created.retiring_compute_resources == {}
     assert already_shutdown.retiring_compute_resources == {}
 
 
