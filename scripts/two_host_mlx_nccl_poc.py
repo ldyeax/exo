@@ -813,17 +813,17 @@ class LinuxHostProbe:
         }
         command_line = " ".join(arguments)
         executable = Path(arguments[0]).name
-        argument_basenames = {Path(argument).name for argument in arguments}
         python_module_exo = any(
             argument == "-m"
             and index + 1 < len(arguments)
             and arguments[index + 1].split(".", 1)[0] == "exo"
             for index, argument in enumerate(arguments)
         )
+        uv_exo = executable in {"uv", "uvx"} and "exo" in arguments[1:]
         return (
             executable in exact_executables
             or python_module_exo
-            or "exo" in argument_basenames
+            or uv_exo
             or any(substring in command_line for substring in substrings)
         )
 

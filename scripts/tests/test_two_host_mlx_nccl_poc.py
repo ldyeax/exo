@@ -2338,6 +2338,26 @@ def test_process_conflict_matcher_covers_exo_and_nccl_launch_forms(
     assert poc.LinuxHostProbe._command_is_conflict(arguments, ("mlx_nccl_smoke",))
 
 
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        (
+            "/usr/bin/codex-linux-sandbox",
+            "--sandbox-policy-cwd",
+            "/root/exo",
+            "--command-cwd",
+            "/root/exo",
+        ),
+        ("/usr/bin/screen", "-r", "exo"),
+        ("/usr/bin/python", "/root/exo/scripts/maintenance.py"),
+    ],
+)
+def test_process_conflict_matcher_ignores_non_launcher_exo_paths_and_labels(
+    arguments: tuple[str, ...],
+) -> None:
+    assert not poc.LinuxHostProbe._command_is_conflict(arguments, ())
+
+
 def test_system_effects_preflight_uses_deployed_script_and_remote_argv(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
