@@ -12,13 +12,18 @@ from collections.abc import AsyncIterator, Awaitable
 from datetime import timedelta
 from pathlib import Path
 from typing import Callable, Literal
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from exo.download.coordinator import DownloadCoordinator
 from exo.download.download_utils import RepoDownloadProgress
 from exo.download.impl_shard_downloader import SingletonShardDownloader
 from exo.download.shard_downloader import ShardDownloader
-from exo.shared.models.model_cards import ModelCard, ModelId, ModelTask
+from exo.shared.models.model_cards import (
+    ModelCard,
+    ModelId,
+    ModelTask,
+    model_snapshot_id,
+)
 from exo.shared.types.backends import Backend
 from exo.shared.types.commands import ForwarderDownloadCommand
 from exo.shared.types.common import NodeId
@@ -26,6 +31,8 @@ from exo.shared.types.events import Event, NodeDownloadProgress
 from exo.shared.types.memory import Memory
 from exo.shared.types.worker.downloads import (
     DownloadCompleted,
+    DownloadFailed,
+    DownloadOngoing,
     DownloadPending,
 )
 from exo.shared.types.worker.shards import PipelineShardMetadata, ShardMetadata
@@ -34,6 +41,7 @@ from exo.utils.channels import Receiver, Sender, channel
 NODE_ID = NodeId("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 MODEL_ID = ModelId("test-org/test-model")
 MODEL_DIR = Path("/fake/models/test-org--test-model")
+REVISION = "0123456789abcdef0123456789abcdef01234567"
 
 
 def _make_shard(model_id: ModelId = MODEL_ID) -> ShardMetadata:
@@ -56,6 +64,7 @@ def _make_shard(model_id: ModelId = MODEL_ID) -> ShardMetadata:
 
 
 SHARD = _make_shard()
+SNAPSHOT_ID = model_snapshot_id(SHARD.model_card)
 
 
 class FakeShardDownloader(ShardDownloader):
@@ -168,7 +177,7 @@ async def test_completed_status_not_downgraded_by_rescan() -> None:
         total=Memory.from_mb(100),
         model_directory=str(MODEL_DIR),
     )
-    coordinator.download_status[MODEL_ID] = completed
+    coordinator.download_status[SNAPSHOT_ID] = completed
 
     # Run the coordinator (the rescan loop fires immediately)
     coordinator_task = asyncio.create_task(coordinator.run())
@@ -177,8 +186,10 @@ async def test_completed_status_not_downgraded_by_rescan() -> None:
         events = await _collect_events(event_recv, timeout=1.5)
 
         # The model must still be DownloadCompleted — not downgraded
-        assert isinstance(coordinator.download_status[MODEL_ID], DownloadCompleted), (
-            f"Expected DownloadCompleted but got {type(coordinator.download_status[MODEL_ID]).__name__}"
+        assert isinstance(
+            coordinator.download_status[SNAPSHOT_ID], DownloadCompleted
+        ), (
+            f"Expected DownloadCompleted but got {type(coordinator.download_status[SNAPSHOT_ID]).__name__}"
         )
 
         # No DownloadPending event should have been emitted for this model
@@ -217,10 +228,10 @@ async def test_incomplete_model_with_files_present_detected_as_complete() -> Non
 
             # The model should be DownloadCompleted (resolve_existing_model confirmed it)
             assert isinstance(
-                coordinator.download_status.get(MODEL_ID), DownloadCompleted
+                coordinator.download_status.get(SNAPSHOT_ID), DownloadCompleted
             ), (
                 f"Expected DownloadCompleted but got "
-                f"{type(coordinator.download_status.get(MODEL_ID)).__name__}"
+                f"{type(coordinator.download_status.get(SNAPSHOT_ID)).__name__}"
             )
 
             # Should have emitted a DownloadCompleted event
@@ -259,10 +270,10 @@ async def test_genuinely_incomplete_model_stays_pending() -> None:
 
             # The model should be DownloadPending
             assert isinstance(
-                coordinator.download_status.get(MODEL_ID), DownloadPending
+                coordinator.download_status.get(SNAPSHOT_ID), DownloadPending
             ), (
                 f"Expected DownloadPending but got "
-                f"{type(coordinator.download_status.get(MODEL_ID)).__name__}"
+                f"{type(coordinator.download_status.get(SNAPSHOT_ID)).__name__}"
             )
 
             # Should have emitted a DownloadPending event
@@ -281,3 +292,140 @@ async def test_genuinely_incomplete_model_stays_pending() -> None:
             coordinator_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await coordinator_task
+
+
+async def test_wrong_revision_status_does_not_suppress_pinned_download() -> None:
+    downloader = FakeShardDownloader(status="not_started")
+    coordinator, _cmd_send, _event_recv = _setup_coordinator(downloader)
+    coordinator.offline = True
+    main_completed = DownloadCompleted(
+        node_id=NODE_ID,
+        shard_metadata=SHARD,
+        total=Memory.from_mb(100),
+        model_directory=str(MODEL_DIR),
+    )
+    coordinator.download_status[SNAPSHOT_ID] = main_completed
+    pinned_shard = SHARD.model_copy(
+        update={
+            "model_card": SHARD.model_card.model_copy(update={"revision": REVISION})
+        }
+    )
+    pinned_snapshot_id = model_snapshot_id(pinned_shard.model_card)
+
+    with patch(
+        "exo.download.coordinator.to_thread.run_sync",
+        new=AsyncMock(return_value=None),
+    ):
+        await coordinator._start_download(pinned_shard)  # pyright: ignore[reportPrivateUsage]
+
+    assert coordinator.download_status[SNAPSHOT_ID] is main_completed
+    pinned_status = coordinator.download_status[pinned_snapshot_id]
+    assert isinstance(pinned_status, DownloadFailed)
+    assert pinned_status.model_directory.endswith(f"--{REVISION}")
+
+
+async def test_progress_callback_tracks_revisions_independently() -> None:
+    downloader = FakeShardDownloader(status="not_started")
+    coordinator, _cmd_send, _event_recv = _setup_coordinator(downloader)
+    pinned_shard = SHARD.model_copy(
+        update={
+            "model_card": SHARD.model_card.model_copy(update={"revision": REVISION})
+        }
+    )
+    pinned_snapshot_id = model_snapshot_id(pinned_shard.model_card)
+    main_progress = RepoDownloadProgress(
+        repo_id=str(MODEL_ID),
+        repo_revision="main",
+        shard=SHARD,
+        completed_files=0,
+        total_files=1,
+        downloaded=Memory.from_mb(50),
+        downloaded_this_session=Memory.from_mb(50),
+        total=Memory.from_mb(100),
+        overall_speed=1024,
+        overall_eta=timedelta(seconds=1),
+        status="in_progress",
+    )
+    pinned_progress = main_progress.model_copy(
+        update={"repo_revision": REVISION, "shard": pinned_shard}
+    )
+
+    await coordinator._download_progress_callback(  # pyright: ignore[reportPrivateUsage]
+        SHARD, main_progress
+    )
+    await coordinator._download_progress_callback(  # pyright: ignore[reportPrivateUsage]
+        pinned_shard, pinned_progress
+    )
+
+    assert set(coordinator.download_status) == {SNAPSHOT_ID, pinned_snapshot_id}
+    assert set(
+        coordinator._last_progress_time  # pyright: ignore[reportPrivateUsage]
+    ) == {SNAPSHOT_ID, pinned_snapshot_id}
+    main_status = coordinator.download_status[SNAPSHOT_ID]
+    pinned_status = coordinator.download_status[pinned_snapshot_id]
+    assert isinstance(main_status, DownloadOngoing)
+    assert isinstance(pinned_status, DownloadOngoing)
+    assert main_status.model_directory.endswith(MODEL_ID.normalize())
+    assert pinned_status.model_directory.endswith(f"--{REVISION}")
+
+
+async def test_model_wide_delete_refuses_if_any_revision_is_read_only() -> None:
+    downloader = FakeShardDownloader(status="not_started")
+    coordinator, _cmd_send, _event_recv = _setup_coordinator(downloader)
+    pinned_shard = SHARD.model_copy(
+        update={
+            "model_card": SHARD.model_card.model_copy(update={"revision": REVISION})
+        }
+    )
+    pinned_snapshot_id = model_snapshot_id(pinned_shard.model_card)
+    coordinator.download_status[SNAPSHOT_ID] = DownloadCompleted(
+        node_id=NODE_ID,
+        shard_metadata=SHARD,
+        total=Memory.from_mb(100),
+        model_directory=str(MODEL_DIR),
+        read_only=True,
+    )
+    coordinator.download_status[pinned_snapshot_id] = DownloadCompleted(
+        node_id=NODE_ID,
+        shard_metadata=pinned_shard,
+        total=Memory.from_mb(100),
+    )
+
+    with patch(
+        "exo.download.coordinator.delete_model", new_callable=AsyncMock
+    ) as delete:
+        await coordinator._delete_download(MODEL_ID)  # pyright: ignore[reportPrivateUsage]
+
+    delete.assert_not_awaited()
+    assert set(coordinator.download_status) == {SNAPSHOT_ID, pinned_snapshot_id}
+
+
+async def test_model_wide_delete_clears_every_tracked_revision() -> None:
+    downloader = FakeShardDownloader(status="not_started")
+    coordinator, _cmd_send, _event_recv = _setup_coordinator(downloader)
+    pinned_shard = SHARD.model_copy(
+        update={
+            "model_card": SHARD.model_card.model_copy(update={"revision": REVISION})
+        }
+    )
+    pinned_snapshot_id = model_snapshot_id(pinned_shard.model_card)
+    coordinator.download_status[SNAPSHOT_ID] = DownloadCompleted(
+        node_id=NODE_ID,
+        shard_metadata=SHARD,
+        total=Memory.from_mb(100),
+    )
+    coordinator.download_status[pinned_snapshot_id] = DownloadCompleted(
+        node_id=NODE_ID,
+        shard_metadata=pinned_shard,
+        total=Memory.from_mb(100),
+    )
+
+    with patch(
+        "exo.download.coordinator.delete_model",
+        new_callable=AsyncMock,
+        return_value=True,
+    ) as delete:
+        await coordinator._delete_download(MODEL_ID)  # pyright: ignore[reportPrivateUsage]
+
+    delete.assert_awaited_once_with(MODEL_ID)
+    assert not coordinator.download_status

@@ -1018,6 +1018,53 @@ def test_placement_prefers_cycle_with_downloaded_model(
     assert assigned_nodes == {node_b}
 
 
+def test_placement_ignores_downloaded_wrong_revision(
+    model_card: ModelCard,
+) -> None:
+    topology = Topology()
+    node_a = NodeId("node-a")
+    node_b = NodeId("node-b")
+    topology.add_node(node_a)
+    topology.add_node(node_b)
+    node_memory = {
+        node_a: create_node_memory(1001),
+        node_b: create_node_memory(1000),
+    }
+    node_network = {
+        node_a: create_node_network(),
+        node_b: create_node_network(),
+    }
+    pinned_card = model_card.model_copy(
+        update={
+            "revision": "0123456789abcdef0123456789abcdef01234567",
+            "storage_size": Memory.from_bytes(500),
+        }
+    )
+    main_card = pinned_card.model_copy(update={"revision": "main"})
+    download_status = {
+        node_b: [
+            DownloadCompleted(
+                node_id=node_b,
+                shard_metadata=_make_shard_metadata(main_card),
+                total=main_card.storage_size,
+            )
+        ]
+    }
+
+    placements = place_instance(
+        place_instance_command(pinned_card),
+        topology,
+        {},
+        node_memory,
+        node_network,
+        _metal_only(node_memory),
+        download_status=download_status,
+    )
+
+    instance = next(iter(placements.values()))
+    assert set(instance.shard_assignments.node_to_runner) == {node_a}
+
+
 def test_placement_prefers_cycle_with_higher_download_progress(
     model_card: ModelCard,
 ) -> None:

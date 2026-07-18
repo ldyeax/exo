@@ -16,7 +16,11 @@ from exo.routing.event_router import (
 )
 from exo.shared.apply import apply
 from exo.shared.constants import EXO_MAX_INSTANCE_RETRIES
-from exo.shared.models.model_cards import ModelId, card_cache
+from exo.shared.models.model_cards import (
+    ModelSnapshotId,
+    card_cache,
+    model_snapshot_id,
+)
 from exo.shared.types.chunks import InputImageChunk
 from exo.shared.types.commands import (
     DeleteInstance,
@@ -194,7 +198,9 @@ class Worker:
         self.input_chunk_counts: dict[CommandId, int] = {}
         self.image_cache: dict[Base64ImageHash, Base64Image] = {}
 
-        self._download_backoff: KeyedBackoff[ModelId] = KeyedBackoff(base=0.5, cap=10.0)
+        self._download_backoff: KeyedBackoff[ModelSnapshotId] = KeyedBackoff(
+            base=0.5, cap=10.0
+        )
         self._instance_backoff: KeyedBackoff[InstanceId] = KeyedBackoff(
             base=0.5, cap=10.0
         )
@@ -365,7 +371,9 @@ class Worker:
                     )
                 case DownloadModel(shard_metadata=shard):
                     model_id = shard.model_card.model_id
-                    self._download_backoff.record_attempt(model_id)
+                    self._download_backoff.record_attempt(
+                        model_snapshot_id(shard.model_card)
+                    )
 
                     found_path = await to_thread.run_sync(
                         resolve_existing_model, model_id, shard.model_card
@@ -496,8 +504,15 @@ class Worker:
                     await self._start_runner_task(modified_task)
                 case LoadModel(instance_id=instance_id):
                     if (instance := self.state.instances.get(instance_id)) is not None:
-                        model_id = instance.shard_assignments.model_id
-                        self._download_backoff.reset(model_id)
+                        model_card = next(
+                            (
+                                shard.model_card
+                                for shard in instance.shard_assignments.runner_to_shard.values()
+                            ),
+                            None,
+                        )
+                        if model_card is not None:
+                            self._download_backoff.reset(model_snapshot_id(model_card))
 
                     await self._start_runner_task(task)
                 case task:

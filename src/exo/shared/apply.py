@@ -4,7 +4,7 @@ from datetime import datetime
 
 from loguru import logger
 
-from exo.shared.models.model_cards import ModelCard
+from exo.shared.models.model_cards import ModelCard, model_snapshot_id
 from exo.shared.types.common import ModelId, NodeId
 from exo.shared.types.events import (
     ChunkGenerated,
@@ -161,13 +161,10 @@ def apply_node_download_progress(event: NodeDownloadProgress, state: State) -> S
 
     replaced = False
     for i, existing_dp in enumerate(current):
-        # TODO(ciaran): deduplicate by model_id for now. Will need to use
-        # shard_metadata again when pipeline and tensor downloads differ.
-        # For now this is fine
-        if (
-            existing_dp.shard_metadata.model_card.model_id
-            == dp.shard_metadata.model_card.model_id
-        ):
+        # Pipeline and tensor shards share one node-local snapshot download.
+        if model_snapshot_id(
+            existing_dp.shard_metadata.model_card
+        ) == model_snapshot_id(dp.shard_metadata.model_card):
             current[i] = dp
             replaced = True
             break
