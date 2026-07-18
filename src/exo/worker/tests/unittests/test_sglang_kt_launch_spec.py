@@ -185,6 +185,10 @@ def test_builds_pinned_glm_5_2_ktransformers_arguments() -> None:
     assert "--disable-shared-experts-fusion" in spec.arguments
     assert "--trust-remote-code" in spec.arguments
 
+    assert spec.model_path == plan.stages[1].model_path
+    assert spec.ktransformers_weight_path == plan.stages[1].ktransformers_weight_path
+    assert spec.hca_devices == plan.stages[1].hca_devices
+    assert spec.distributed_coordinator == plan.distributed_coordinator
     assert spec.expected_model_revision == MODEL_REVISION
     assert spec.expected_sglang_revision == SUPPORTED_SGLANG_REVISION
     assert spec.expected_ktransformers_revision == SUPPORTED_KTRANSFORMERS_REVISION
