@@ -1,6 +1,6 @@
-from typing import ClassVar, Self
+from typing import ClassVar, Self, cast
 
-from pydantic import model_validator
+from pydantic import field_validator, model_validator
 
 from exo.shared.types.common import Id
 from exo.shared.types.memory import Memory
@@ -32,6 +32,15 @@ class NvidiaGpuComputeResource(TaggedModel):
     pci_bus_id: str
     model_name: str
     total_memory: Memory
+    numa_node: int | None = None
+    cpu_affinity: tuple[int, ...] = ()
+
+    @field_validator("cpu_affinity", mode="before")
+    @classmethod
+    def deserialize_cpu_affinity(cls, value: object) -> object:
+        if isinstance(value, list):
+            return tuple(cast(list[object], value))
+        return value
 
     @classmethod
     def from_device(
@@ -41,6 +50,8 @@ class NvidiaGpuComputeResource(TaggedModel):
         pci_bus_id: str,
         model_name: str,
         total_memory_bytes: int,
+        numa_node: int | None = None,
+        cpu_affinity: tuple[int, ...] = (),
     ) -> Self:
         return cls(
             resource_id=ComputeResourceId.from_nvidia_device_uuid(device_uuid),
@@ -48,6 +59,8 @@ class NvidiaGpuComputeResource(TaggedModel):
             pci_bus_id=pci_bus_id.strip(),
             model_name=model_name.strip(),
             total_memory=Memory.from_bytes(total_memory_bytes),
+            numa_node=numa_node,
+            cpu_affinity=cpu_affinity,
         )
 
     @model_validator(mode="after")
@@ -64,6 +77,12 @@ class NvidiaGpuComputeResource(TaggedModel):
             raise ValueError("NVIDIA model name must not be empty")
         if self.total_memory.in_bytes <= 0:
             raise ValueError("NVIDIA total memory must be positive")
+        if self.numa_node is not None and self.numa_node < 0:
+            raise ValueError("NVIDIA NUMA node must not be negative")
+        if any(cpu_id < 0 for cpu_id in self.cpu_affinity):
+            raise ValueError("NVIDIA CPU affinity must not contain negative CPU IDs")
+        if self.cpu_affinity != tuple(sorted(set(self.cpu_affinity))):
+            raise ValueError("NVIDIA CPU affinity must be sorted and unique")
         return self
 
 
