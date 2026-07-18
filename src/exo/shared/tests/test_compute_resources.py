@@ -23,6 +23,8 @@ def _gpu_resource(
         pci_bus_id="00000000:27:00.0",
         model_name="NVIDIA GeForce RTX 3090",
         total_memory_bytes=24 * 1024**3,
+        numa_node=1,
+        cpu_affinity=(16, 17, 18, 19),
     )
 
 
@@ -33,10 +35,29 @@ def test_nvidia_gpu_resource_has_stable_identity_and_roundtrips() -> None:
         "nvidia-gpu:GPU-00000000-0000-0000-0000-000000000001"
     )
     assert resource.total_memory.in_gb == 24
+    assert resource.numa_node == 1
+    assert resource.cpu_affinity == (16, 17, 18, 19)
     assert (
         NvidiaGpuComputeResource.model_validate_json(resource.model_dump_json())
         == resource
     )
+
+
+def test_nvidia_gpu_resource_accepts_legacy_payload_without_locality() -> None:
+    resource = NvidiaGpuComputeResource.model_validate_json(
+        """{
+            "NvidiaGpuComputeResource": {
+                "resourceId": "nvidia-gpu:GPU-legacy",
+                "deviceUuid": "GPU-legacy",
+                "pciBusId": "00000000:27:00.0",
+                "modelName": "NVIDIA GeForce RTX 3090",
+                "totalMemory": {"inBytes": 25769803776}
+            }
+        }"""
+    )
+
+    assert resource.numa_node is None
+    assert resource.cpu_affinity == ()
 
 
 def test_nvidia_gpu_resource_rejects_mismatched_identity() -> None:
@@ -65,6 +86,9 @@ def test_compute_resources_are_applied_serialized_and_removed_on_timeout() -> No
     assert state.node_compute_resources[node_id] == [resource]
     restored_state = State.model_validate_json(state.model_dump_json())
     assert restored_state.node_compute_resources[node_id] == [resource]
+    restored_resource = restored_state.node_compute_resources[node_id][0]
+    assert restored_resource.numa_node == 1
+    assert restored_resource.cpu_affinity == (16, 17, 18, 19)
 
     timed_out_state = apply_node_timed_out(NodeTimedOut(node_id=node_id), state)
     assert node_id not in timed_out_state.node_compute_resources
