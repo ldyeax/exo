@@ -4,9 +4,9 @@ import socket
 import subprocess
 from collections.abc import Hashable, Iterable, Sequence
 from pathlib import Path
-from typing import Callable, Literal, Protocol, cast, final
+from typing import Annotated, Callable, Literal, Protocol, cast, final
 
-from pydantic import model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from exo.download.download_utils import is_model_directory_complete
 from exo.shared.types.common import Host, ModelId, NodeId
@@ -235,6 +235,55 @@ type ModelSnapshotCompatibilityVerifier = Callable[
 ]
 
 
+@final
+class _Glm52Fp8QuantizationConfig(BaseModel):
+    model_config = ConfigDict(extra="ignore", frozen=True, strict=True)
+
+    activation_scheme: Literal["dynamic"]
+    fmt: Literal["e4m3"]
+    quant_method: Literal["fp8"]
+    weight_block_size: tuple[Literal[128], Literal[128]]
+
+
+@final
+class _Glm52Fp8ModelConfig(BaseModel):
+    """Raw checkpoint fields required by the pinned GLM-5.2 runtime."""
+
+    model_config = ConfigDict(extra="ignore", frozen=True, strict=True)
+
+    architectures: tuple[Literal["GlmMoeDsaForCausalLM"]]
+    model_type: Literal["glm_moe_dsa"]
+    num_hidden_layers: Literal[78]
+    n_routed_experts: Literal[256]
+    num_experts_per_tok: Literal[8]
+    n_shared_experts: Literal[1]
+    first_k_dense_replace: Literal[3]
+    num_nextn_predict_layers: Literal[1]
+    index_topk_freq: Annotated[int, Field(gt=1)]
+    index_share_for_mtp_iteration: Literal[True]
+    quantization_config: _Glm52Fp8QuantizationConfig
+
+
+def verify_glm_5_2_fp8_model_snapshot_compatibility(
+    path: Path,
+    model_id: ModelId,
+    revision: GitRevision,
+) -> SglangKtModelSnapshotCompatibility | None:
+    """Verify the GLM-5.2-FP8 artifact contract from raw ``config.json``."""
+
+    del model_id, revision
+    try:
+        _Glm52Fp8ModelConfig.model_validate_json(
+            (path / "config.json").read_text(encoding="utf-8")
+        )
+    except (OSError, UnicodeError, ValidationError):
+        return None
+    return SglangKtModelSnapshotCompatibility(
+        weight_format="safetensors",
+        ktransformers_method="FP8",
+    )
+
+
 def _is_readable_directory(path: Path) -> bool:
     return path.is_dir() and os.access(path, os.R_OK | os.X_OK)
 
@@ -254,14 +303,16 @@ def _is_model_snapshot_complete(
 class LocalSglangKtFilesystemProbe:
     """Check local paths using Exo's exact revision-receipt semantics.
 
-    The required compatibility verifier must inspect the snapshot and return
-    only facts it established. Returning ``None`` withholds the entire receipt.
+    The compatibility verifier must inspect the snapshot and return only facts
+    it established. Returning ``None`` withholds the entire receipt.
     """
 
     def __init__(
         self,
         *,
-        model_snapshot_compatibility_verifier: ModelSnapshotCompatibilityVerifier,
+        model_snapshot_compatibility_verifier: ModelSnapshotCompatibilityVerifier = (
+            verify_glm_5_2_fp8_model_snapshot_compatibility
+        ),
         readable_directory_checker: ReadableDirectoryChecker = _is_readable_directory,
         model_snapshot_completeness_checker: ModelSnapshotCompletenessChecker = (
             _is_model_snapshot_complete
