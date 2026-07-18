@@ -1785,6 +1785,23 @@ def test_different_supported_driver_versions_do_not_break_runtime_identity(
     assert result["status"] == "completed"
 
 
+@pytest.mark.parametrize(
+    "banner",
+    [
+        "Driver Version: 595.71.05 CUDA Version: 13.2",
+        "KMD Version: 610.43.03 CUDA UMD Version: 13.3",
+    ],
+)
+def test_cuda_driver_major_accepts_legacy_and_umd_banner_labels(
+    banner: str,
+) -> None:
+    assert poc._cuda_driver_major_from_nvidia_smi(banner) == 13
+
+
+def test_cuda_driver_major_rejects_unrelated_nvidia_version_labels() -> None:
+    assert poc._cuda_driver_major_from_nvidia_smi("KMD Version: 610.43.03") is None
+
+
 def test_different_mlx_runtime_versions_fail_before_process_start(
     tmp_path: Path,
 ) -> None:

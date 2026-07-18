@@ -965,6 +965,13 @@ def _numeric_version(value: str) -> tuple[int, ...]:
     return tuple(int(component) for component in value.split("."))
 
 
+def _cuda_driver_major_from_nvidia_smi(banner: str) -> int:
+    match = re.search(r"CUDA(?: UMD)? Version:\s*([0-9]+)(?:\.[0-9]+)?", banner)
+    if match is None:
+        raise OracleError("nvidia-smi did not report a CUDA driver version")
+    return int(match.group(1))
+
+
 def validate_preflight(report: PreflightReport, config: OracleConfig) -> None:
     if report.run_id != config.run_id or report.host_name != config.host_name:
         raise OracleError("preflight identity differs from config")
@@ -2190,9 +2197,7 @@ class SystemEffects:
         parsed_runtime = cast(object, json.loads(raw_runtime))
         runtime = _object(parsed_runtime, "configured Python runtime probe")
         banner = self._command(("nvidia-smi",))
-        cuda_match = re.search(r"CUDA Version:\s*([0-9]+)(?:\.[0-9]+)?", banner)
-        if cuda_match is None:
-            raise OracleError("nvidia-smi did not report a CUDA driver version")
+        cuda_driver_major = _cuda_driver_major_from_nvidia_smi(banner)
         driver_rows = self._command(
             (
                 "nvidia-smi",
@@ -2219,7 +2224,7 @@ class SystemEffects:
             exo_rs_origin=_string(runtime.get("exo_rs_origin"), "exo_rs origin"),
             exo_rs_sha256=_string(runtime.get("exo_rs_sha256"), "exo_rs SHA-256"),
             nvidia_driver_version=selected_driver,
-            cuda_driver_major=int(cuda_match.group(1)),
+            cuda_driver_major=cuda_driver_major,
             nvidia_smi_banner=banner,
         )
 

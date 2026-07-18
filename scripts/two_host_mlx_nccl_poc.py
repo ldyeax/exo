@@ -1691,6 +1691,11 @@ def _numeric_version(value: str) -> tuple[int, ...]:
     return tuple(int(component) for component in value.split("."))
 
 
+def _cuda_driver_major_from_nvidia_smi(banner: str) -> int | None:
+    match = re.search(r"CUDA(?: UMD)? Version:\s*([0-9]+)(?:\.[0-9]+)?", banner)
+    return None if match is None else int(match.group(1))
+
+
 def validated_runtime_identity(
     report: HostPreflightReport, host: HostConfig, config: HarnessConfig
 ) -> JsonObject:
@@ -1744,10 +1749,8 @@ def validated_runtime_identity(
                 f"on {host.name}"
             )
     banner = report.facts.get("nvidia_smi_banner")
-    if (
-        not isinstance(banner, str)
-        or re.search(rf"CUDA Version:\s*{config.runtime.cuda_major}(?:\.|\b)", banner)
-        is None
+    if not isinstance(banner, str) or (
+        _cuda_driver_major_from_nvidia_smi(banner) != config.runtime.cuda_major
     ):
         raise HarnessError(
             f"nvidia-smi does not advertise CUDA {config.runtime.cuda_major} on "

@@ -239,6 +239,24 @@ def make_placement(
     }
 
 
+@pytest.mark.parametrize(
+    ("banner", "major"),
+    [
+        ("Driver Version: 595.71.05 CUDA Version: 13.2", 13),
+        ("KMD Version: 610.43.03 CUDA UMD Version: 13.3", 13),
+    ],
+)
+def test_cuda_driver_major_accepts_legacy_and_umd_banner_labels(
+    banner: str, major: int
+) -> None:
+    assert oracle._cuda_driver_major_from_nvidia_smi(banner) == major
+
+
+def test_cuda_driver_major_rejects_banner_without_cuda_version() -> None:
+    with pytest.raises(oracle.OracleError, match="CUDA driver version"):
+        oracle._cuda_driver_major_from_nvidia_smi("KMD Version: 610.43.03")
+
+
 def make_completion(
     config: oracle.OracleConfig,
     *,
