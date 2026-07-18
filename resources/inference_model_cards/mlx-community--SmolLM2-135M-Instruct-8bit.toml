@@ -1,0 +1,19 @@
+model_id = "mlx-community/SmolLM2-135M-Instruct-8bit"
+revision = "0f0d9b8218915bc34d401e1a340b8c049d300d5e"
+n_layers = 30
+hidden_size = 576
+num_key_value_heads = 3
+supports_tensor = true
+tasks = ["TextGeneration"]
+family = "llama"
+quantization = "8bit"
+base_model = "SmolLM2 135M"
+capabilities = ["text"]
+
+context_length = 8192
+backends = ["MlxMetal", "MlxCuda", "MlxCpu"]
+[storage_size]
+in_bytes = 142955136
+
+# Source: https://huggingface.co/mlx-community/SmolLM2-135M-Instruct-8bit/blob/0f0d9b8218915bc34d401e1a340b8c049d300d5e/config.json
+# Source: https://huggingface.co/mlx-community/SmolLM2-135M-Instruct-8bit/blob/0f0d9b8218915bc34d401e1a340b8c049d300d5e/model.safetensors.index.json

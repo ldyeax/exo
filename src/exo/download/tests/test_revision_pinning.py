@@ -38,7 +38,13 @@ MODEL_ID = ModelId("test-org/test-model")
 REVISION = "0123456789abcdef0123456789abcdef01234567"
 OTHER_REVISION = "89abcdef0123456789abcdef0123456789abcdef"
 
-LADDER_MODEL_CARDS: tuple[tuple[str, ModelId, str, int], ...] = (
+PINNED_NCCL_MODEL_CARDS: tuple[tuple[str, ModelId, str, int], ...] = (
+    (
+        "mlx-community--SmolLM2-135M-Instruct-8bit.toml",
+        ModelId("mlx-community/SmolLM2-135M-Instruct-8bit"),
+        "0f0d9b8218915bc34d401e1a340b8c049d300d5e",
+        142955136,
+    ),
     (
         "mlx-community--Llama-3.2-1B-Instruct-4bit.toml",
         ModelId("mlx-community/Llama-3.2-1B-Instruct-4bit"),
@@ -172,12 +178,12 @@ def test_model_card_defaults_to_main_and_requires_exact_commit() -> None:
         _card(REVISION[:-1])
 
 
-async def test_existing_builtin_cards_roundtrip_with_valid_revisions() -> None:
+def test_existing_builtin_cards_roundtrip_with_valid_revisions() -> None:
     loaded = 0
     with patch("exo.shared.models.model_cards.EXO_MODELS_DIRS", ()):
         for directory in model_cards._BUILTIN_CARD_DIRS:  # pyright: ignore[reportPrivateUsage]
-            async for card_path in directory.rglob("*.toml"):
-                card = await ModelCard.load_from_path(card_path)
+            for card_path in Path(str(directory)).rglob("*.toml"):
+                card = ModelCard.model_validate(tomlkit.loads(card_path.read_text()))
                 assert validate_hugging_face_revision(card.revision) == card.revision
                 loaded += 1
     assert loaded > 0
@@ -185,9 +191,9 @@ async def test_existing_builtin_cards_roundtrip_with_valid_revisions() -> None:
 
 @pytest.mark.parametrize(
     ("filename", "model_id", "revision", "storage_size_bytes"),
-    LADDER_MODEL_CARDS,
+    PINNED_NCCL_MODEL_CARDS,
 )
-def test_ladder_cards_are_pinned_to_verified_snapshots(
+def test_nccl_model_cards_are_pinned_to_verified_snapshots(
     filename: str,
     model_id: ModelId,
     revision: str,
@@ -198,6 +204,18 @@ def test_ladder_cards_are_pinned_to_verified_snapshots(
     assert card.model_id == model_id
     assert card.revision == revision
     assert card.storage_size.in_bytes == storage_size_bytes
+
+
+def test_smol_lm_card_is_compatible_with_three_tensor_ranks() -> None:
+    card = _load_builtin_card("mlx-community--SmolLM2-135M-Instruct-8bit.toml")
+
+    assert card.family == "llama"
+    assert card.supports_tensor
+    assert card.n_layers == 30
+    assert card.context_length == 8192
+    assert card.hidden_size % 3 == 0
+    assert card.num_key_value_heads is not None
+    assert card.num_key_value_heads % 3 == 0
 
 
 def test_pinned_qwen35_card_inherits_revision_for_vision_weights() -> None:
