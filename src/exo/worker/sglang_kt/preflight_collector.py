@@ -5,9 +5,9 @@ import socket
 import subprocess
 from collections.abc import Hashable, Iterable, Sequence
 from pathlib import Path
-from typing import Annotated, Callable, Literal, Protocol, cast, final
+from typing import Callable, Literal, Protocol, cast, final
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
 
 from exo.download.download_utils import is_model_directory_complete
 from exo.shared.types.common import Host, ModelId, NodeId
@@ -273,7 +273,9 @@ class _Glm52Fp8ModelConfig(BaseModel):
     n_shared_experts: Literal[1]
     first_k_dense_replace: Literal[3]
     num_nextn_predict_layers: Literal[1]
-    index_topk_freq: Annotated[int, Field(gt=1)]
+    index_topk_freq: Literal[4]
+    index_topk_pattern: None
+    index_skip_topk_offset: Literal[3]
     index_share_for_mtp_iteration: Literal[True]
     indexer_types: tuple[Literal["full", "shared"], ...]
     quantization_config: _Glm52Fp8QuantizationConfig

@@ -60,6 +60,8 @@ def make_glm_5_2_fp8_config() -> dict[str, object]:
         "first_k_dense_replace": 3,
         "num_nextn_predict_layers": 1,
         "index_topk_freq": 4,
+        "index_topk_pattern": None,
+        "index_skip_topk_offset": 3,
         "index_share_for_mtp_iteration": True,
         "indexer_types": tuple(
             "full" if index in FULL_INDEXER_LAYER_STARTS else "shared"
@@ -543,6 +545,8 @@ def test_default_glm_5_2_fp8_compatibility_verifier_rejects_malformed_json(
         {"first_k_dense_replace": 2},
         {"num_nextn_predict_layers": 0},
         {"index_topk_freq": 1},
+        {"index_topk_pattern": ["full"]},
+        {"index_skip_topk_offset": 2},
         {"index_share_for_mtp_iteration": False},
         {"indexer_types": ("full",) * 78},
         {"indexer_types": ("full",) * 77},
