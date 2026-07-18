@@ -74,6 +74,14 @@ export interface Instance {
   };
 }
 
+export type InstanceMeta = "MlxRing" | "MlxJaccl" | "MlxNccl";
+
+export interface InstanceWrapper {
+  MlxRingInstance?: Instance;
+  MlxJacclInstance?: Instance;
+  MlxNcclInstance?: Instance;
+}
+
 export interface RawInstanceLink {
   linkId: string;
   prefillInstances: string[];
@@ -174,7 +182,7 @@ export interface ModelDownloadStatus {
 export interface PlacementPreview {
   model_id: string;
   sharding: "Pipeline" | "Tensor";
-  instance_meta: "MlxRing" | "MlxJaccl" | "MlxNccl";
+  instance_meta: InstanceMeta;
   use_all_compute_resources: boolean;
   instance: unknown | null;
   memory_delta_by_node: Record<string, number> | null;
@@ -222,13 +230,7 @@ export interface TraceListResponse {
 
 interface RawStateResponse {
   topology?: RawTopology;
-  instances?: Record<
-    string,
-    {
-      MlxRingInstance?: Instance;
-      MlxJacclInstance?: Instance;
-    }
-  >;
+  instances?: Record<string, InstanceWrapper>;
   runners?: Record<string, unknown>;
   instanceLinks?: Record<string, RawInstanceLink>;
   downloads?: Record<string, unknown[]>;
@@ -935,6 +937,7 @@ class AppStore {
     let instanceType: string | null = null;
     if (instanceTag === "MlxRingInstance") instanceType = "MLX Ring";
     else if (instanceTag === "MlxJacclInstance") instanceType = "MLX RDMA";
+    else if (instanceTag === "MlxNcclInstance") instanceType = "MLX NCCL";
 
     let sharding: string | null = null;
     const inst = instance as {

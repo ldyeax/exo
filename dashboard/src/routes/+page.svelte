@@ -66,6 +66,7 @@
     nodeIdentities,
     isConnected,
     type DownloadProgress,
+    type InstanceMeta,
     type PlacementPreview,
   } from "$lib/stores/app.svelte";
   import { addToast, dismissByMessage } from "$lib/stores/toast.svelte";
@@ -886,7 +887,6 @@
   }
 
   let selectedSharding = $state<"Pipeline" | "Tensor">("Pipeline");
-  type InstanceMeta = "MlxRing" | "MlxJaccl";
 
   // Launch defaults persistence
   const LAUNCH_DEFAULTS_KEY = "exo-launch-defaults-v2";
@@ -915,11 +915,40 @@
     try {
       const stored = localStorage.getItem(LAUNCH_DEFAULTS_KEY);
       if (!stored) return null;
-      return JSON.parse(stored) as LaunchDefaults;
+      const parsed: unknown = JSON.parse(stored);
+      if (!isLaunchDefaults(parsed)) {
+        console.warn("Ignoring invalid launch defaults");
+        return null;
+      }
+      return parsed;
     } catch (e) {
       console.warn("Failed to load launch defaults:", e);
       return null;
     }
+  }
+
+  function isInstanceMeta(value: unknown): value is InstanceMeta {
+    return value === "MlxRing" || value === "MlxJaccl" || value === "MlxNccl";
+  }
+
+  function isLaunchDefaults(value: unknown): value is LaunchDefaults {
+    if (!value || typeof value !== "object") return false;
+    const defaults = value as Record<string, unknown>;
+    return (
+      (defaults.modelId === null || typeof defaults.modelId === "string") &&
+      (defaults.sharding === "Pipeline" || defaults.sharding === "Tensor") &&
+      isInstanceMeta(defaults.instanceType) &&
+      (defaults.instanceType !== "MlxNccl" || defaults.sharding === "Tensor") &&
+      typeof defaults.minNodes === "number" &&
+      Number.isInteger(defaults.minNodes) &&
+      defaults.minNodes >= 1
+    );
+  }
+
+  function selectInstanceType(instanceType: InstanceMeta): void {
+    selectedInstanceType = instanceType;
+    if (instanceType === "MlxNccl") selectedSharding = "Tensor";
+    saveLaunchDefaults();
   }
 
   function applyLaunchDefaults(
@@ -931,8 +960,7 @@
 
     // Apply sharding and instance type unconditionally
     selectedSharding = defaults.sharding;
-    selectedInstanceType =
-      defaults.instanceType === "MlxRing" ? "MlxRing" : "MlxJaccl";
+    selectedInstanceType = defaults.instanceType;
 
     // Apply minNodes if valid (between 1 and maxNodes)
     if (
@@ -1146,9 +1174,7 @@
   }
 
   const matchesSelectedRuntime = (runtime: InstanceMeta): boolean =>
-    selectedInstanceType === "MlxRing"
-      ? runtime === "MlxRing"
-      : runtime === "MlxJaccl";
+    runtime === selectedInstanceType;
 
   // Helper to check if a model can be launched (has valid placement with >= minNodes)
   function canModelFit(modelId: string): boolean {
@@ -1923,7 +1949,8 @@
     if (has("Loading")) {
       // Tensor parallel: each runner loads all layers — use max/min (bottleneck)
       // Pipeline parallel: each runner loads a disjoint slice — use sum
-      const isTensor = instanceTag === "MlxJacclInstance";
+      const isTensor =
+        instanceTag === "MlxJacclInstance" || instanceTag === "MlxNcclInstance";
       let layersLoaded = isTensor ? Infinity : 0;
       let totalLayers = 0;
       for (const rid of runnerIds) {
@@ -2066,6 +2093,7 @@
     let instanceType = "Unknown";
     if (instanceTag === "MlxRingInstance") instanceType = "MLX Ring";
     else if (instanceTag === "MlxJacclInstance") instanceType = "MLX RDMA";
+    else if (instanceTag === "MlxNcclInstance") instanceType = "MLX NCCL";
 
     const inst = instance as {
       shardAssignments?: {
@@ -2212,6 +2240,7 @@
         const [tag, shard] = getTagged(shardWrapped);
         const meta = shard as
           | {
+              deviceRank?: number;
               modelMeta?: {
                 worldSize?: number;
                 nLayers?: number;
@@ -2219,7 +2248,7 @@
               };
             }
           | undefined;
-        const deviceRank = meta?.modelMeta?.deviceRank ?? 0;
+        const deviceRank = meta?.deviceRank ?? meta?.modelMeta?.deviceRank ?? 0;
         return { runnerId, tag, deviceRank };
       },
     );
@@ -2278,6 +2307,32 @@
   }> {
     const [instanceTag, instance] = getTagged(instanceWrapped);
     if (!instance || typeof instance !== "object") return [];
+
+    if (instanceTag === "MlxNcclInstance") {
+      const ordered = getOrderedRunnerNodes(
+        instance as Record<string, unknown>,
+        "Tensor",
+      );
+      const coordinator = (
+        instance as { ncclCoordinator?: { ip: string; port: number } }
+      ).ncclCoordinator;
+      const coordinatorNode = ordered[0];
+      if (!coordinator || !coordinatorNode) return [];
+
+      const interfaceInfo = getInterfaceLabel(
+        coordinatorNode.nodeId,
+        coordinator.ip,
+      );
+      return ordered.slice(1).map((peer) => ({
+        from: getNodeLabel(peer.nodeId),
+        to: getNodeLabel(coordinatorNode.nodeId),
+        ip: `${coordinator.ip}:${coordinator.port}`,
+        ifaceLabel: interfaceInfo.missing
+          ? "NCCL bootstrap ?"
+          : `NCCL bootstrap ${interfaceInfo.label}`,
+        missingIface: interfaceInfo.missing,
+      }));
+    }
 
     // Jaccl (RDMA) – show RDMA interfaces from ibvDevices
     if (instanceTag === "MlxJacclInstance") {
@@ -2697,8 +2752,8 @@
   }
 
   // Pick optimal placement from previews (frontend logic)
-  // Rules: 1-node → Pipeline/Ring, multi-node with RDMA → Tensor/Jaccl (most nodes),
-  //         multi-node without RDMA → 1-node Pipeline/Ring
+  // Rules: 1-node → Pipeline/Ring; multi-node CUDA → Tensor/NCCL;
+  // Apple RDMA → Tensor/JACCL; otherwise fall back to Pipeline/Ring.
   function pickOptimalPlacement(
     previews: PlacementPreview[],
   ): PlacementPreview | null {
@@ -2708,7 +2763,13 @@
     const hasMultiNode = valid.some((p) => getPreviewNodeCount(p) > 1);
 
     if (hasMultiNode) {
-      // Multi-node with RDMA: prefer Jaccl + Tensor with most nodes (fastest TPS)
+      // A valid NCCL placement is CUDA-only by backend contract.
+      const ncclTensor = valid
+        .filter((p) => p.instance_meta === "MlxNccl" && p.sharding === "Tensor")
+        .sort((a, b) => getPreviewNodeCount(b) - getPreviewNodeCount(a));
+      if (ncclTensor.length > 0) return ncclTensor[0];
+
+      // On Apple hardware, prefer JACCL + Tensor with the most nodes.
       const jacclTensor = valid
         .filter(
           (p) => p.instance_meta === "MlxJaccl" && p.sharding === "Tensor",
@@ -5731,10 +5792,14 @@
                           selectedSharding = "Pipeline";
                           saveLaunchDefaults();
                         }}
+                        disabled={selectedInstanceType === "MlxNccl"}
+                        title={selectedInstanceType === "MlxNccl"
+                          ? "NCCL requires tensor sharding"
+                          : "Pipeline sharding"}
                         class="flex items-center gap-2 py-1.5 px-3 text-xs font-mono border rounded transition-all duration-200 cursor-pointer {selectedSharding ===
                         'Pipeline'
                           ? 'bg-transparent text-exo-yellow border-exo-yellow'
-                          : 'bg-transparent text-white/70 border-exo-medium-gray/50 hover:border-exo-yellow/50'}"
+                          : 'bg-transparent text-white/70 border-exo-medium-gray/50 hover:border-exo-yellow/50'} disabled:opacity-40 disabled:cursor-not-allowed"
                       >
                         <span
                           class="w-3 h-3 rounded-full border-2 flex items-center justify-center {selectedSharding ===
@@ -5780,12 +5845,10 @@
                     <div class="text-xs text-white/50 font-mono mb-2">
                       Interconnect:
                     </div>
-                    <div class="flex gap-2">
+                    <div class="flex flex-wrap gap-2">
                       <button
-                        onclick={() => {
-                          selectedInstanceType = "MlxRing";
-                          saveLaunchDefaults();
-                        }}
+                        onclick={() => selectInstanceType("MlxRing")}
+                        title="MLX Ring over standard IP networking"
                         class="flex items-center gap-2 py-1.5 px-3 text-xs font-mono border rounded transition-all duration-200 cursor-pointer {selectedInstanceType ===
                         'MlxRing'
                           ? 'bg-transparent text-exo-yellow border-exo-yellow'
@@ -5805,10 +5868,8 @@
                         TCP/IP
                       </button>
                       <button
-                        onclick={() => {
-                          selectedInstanceType = "MlxJaccl";
-                          saveLaunchDefaults();
-                        }}
+                        onclick={() => selectInstanceType("MlxJaccl")}
+                        title="JACCL on Apple MLX devices"
                         class="flex items-center gap-2 py-1.5 px-3 text-xs font-mono border rounded transition-all duration-200 cursor-pointer {selectedInstanceType ===
                         'MlxJaccl'
                           ? 'bg-transparent text-exo-yellow border-exo-yellow'
@@ -5825,7 +5886,28 @@
                             ></span>
                           {/if}
                         </span>
-                        RDMA (Fast)
+                        JACCL / Apple
+                      </button>
+                      <button
+                        onclick={() => selectInstanceType("MlxNccl")}
+                        title="NCCL on NVIDIA CUDA devices"
+                        class="flex items-center gap-2 py-1.5 px-3 text-xs font-mono border rounded transition-all duration-200 cursor-pointer {selectedInstanceType ===
+                        'MlxNccl'
+                          ? 'bg-transparent text-exo-yellow border-exo-yellow'
+                          : 'bg-transparent text-white/70 border-exo-medium-gray/50 hover:border-exo-yellow/50'}"
+                      >
+                        <span
+                          class="w-3 h-3 rounded-full border-2 flex items-center justify-center {selectedInstanceType ===
+                          'MlxNccl'
+                            ? 'border-exo-yellow'
+                            : 'border-exo-medium-gray'}"
+                        >
+                          {#if selectedInstanceType === "MlxNccl"}
+                            <span class="w-1.5 h-1.5 rounded-full bg-exo-yellow"
+                            ></span>
+                          {/if}
+                        </span>
+                        NCCL / CUDA
                       </button>
                     </div>
                   </div>
