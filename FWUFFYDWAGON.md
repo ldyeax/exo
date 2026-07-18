@@ -12,7 +12,7 @@ Bring Exo to a working, efficient Linux/NVIDIA deployment that can serve GLM-5.2
 - 768 GB installed DDR5-6000 RDIMM; the current CPU/firmware may train it below the DIMM rating.
 - Two RTX 3090 GPUs at `16:00.0` and `27:00.0`, both currently attached to NUMA 0, with an active NV4/NVLink connection. Preserve the bridge when testing slot changes.
 - Dual-port Intel X710 10 GbE on NUMA 1.
-- NVIDIA driver 610.43.03 and MLX CUDA 13 are healthy. The ConnectX-3 HCA is PCIe 3.0 x8 on NUMA 1.
+- NVIDIA driver 610.43.03 and MLX CUDA 13 are healthy. The ConnectX-3 HCA is at `0000:d8:00.0`, PCIe 3.0 x8, on NUMA 1.
 
 ### fwuff
 
@@ -20,18 +20,18 @@ Bring Exo to a working, efficient Linux/NVIDIA deployment that can serve GLM-5.2
 - 256 GB installed DDR5-6000 RDIMM; the current CPU/firmware may train it below the DIMM rating.
 - One RTX 3090 at PCIe 4.0 x16.
 - Dual-port Intel X550 10 GbE.
-- The ConnectX-3 HCA is currently constrained to PCIe 3.0 x4; move it to the available x16-wired slot before expecting dual-rail scaling.
+- The ConnectX-3 HCA is at `0000:16:00.0`, PCIe 3.0 x8, on NUMA 0 after the slot move.
 - `/mnt/sanic` is a 3x2 TB RAID0 model volume.
 
 ### Interconnect
 
-- One MCX354A ConnectX-3 VPI QDR card is installed in each server. Both ports are active at 4X QDR, 40 Gb/s raw per port.
+- One MCX354A ConnectX-3 VPI QDR card is installed in each server. Both physical links train `LinkUp` at 4X QDR, 40 Gb/s raw per port. They are normally `INIT` without a persistent subnet manager; benchmark-owned OpenSM instances make both direct-connect subnets `ACTIVE` for a run.
 - Planned upgrade: a matched pair of Mellanox `MCX555A-ECAT` ConnectX-5 VPI single-port EDR/100GbE cards and an EDR-rated QSFP28 100G direct cable. Preserve all current QDR results as the pre-upgrade baseline.
 - Use the kernel `mlx4_core`/`mlx4_ib` drivers, `rdma-core`, `perftest`, Mellanox Firmware Tools, and one OpenSM instance per disconnected direct-connect rail. Current MLNX_OFED releases no longer support ConnectX-3.
 - Keep 10 GbE as the management/control plane. QDR ports do not aggregate automatically; select and benchmark both rails explicitly.
 - Default to host-staged NCCL/InfiniBand. RTX 3090 GPUDirect RDMA is not an officially supported configuration; test `nvidia-peermem` only as an optional A/B path.
 - NCCL 2.28 GIN requires ConnectX-4 or newer. On these ConnectX-3 cards, NCCL crashed in `ncclNetInit` while initializing its GIN plugin; `NCCL_GIN_ENABLE=0` alone was insufficient. Set both `NCCL_GIN_ENABLE=0` and `NCCL_GIN_TYPE=0`. GIN is a device-side API, not the ordinary host-launched NCCL/verbs transport, so disabling it loses no standard IB collective capability. `NCCL_NET=IB` selects the generic IB transport and fails rather than silently falling back to Socket; `NCCL_NET_GDR_LEVEL=LOC` deliberately keeps this baseline host-staged. [NCCL network selection](https://github.com/NVIDIA/nccl/blob/ae7aed194dc63c65d1bf5c0385ba3d68d3b64c8c/src/plugin/net.cc#L351-L380) [NCCL GDR level](https://github.com/NVIDIA/nccl/blob/5067397c2676d5aed50042fc39e5c8ee96eb0027/docs/userguide/source/env.rst#L1113-L1143)
-- Verified `ib_write_bw`: 28.46 and 28.56 Gb/s single-rail, 29.80 Gb/s concurrent aggregate. The aggregate ceiling is consistent with `fwuff`'s PCIe x4 HCA placement.
+- Historical fwuff-x4 `ib_write_bw` baseline: 28.46 and 28.56 Gb/s single-rail, 29.80 Gb/s concurrent aggregate. After both HCAs negotiated PCIe 3.0 x8, the reportable v3 baseline measured 31.74 Gb/s on either rail and 32.57 Gb/s native dual-port aggregate, split 16.29/16.28 Gb/s. Dual-port is only 1.026x one rail and 51.31% of the two independent single-rail results, so the endpoint/HCA path remains the limiting factor despite the slot fix. The receipt captured data/packet counters but not HCA error/discard counters; the logs have no failures, but a future baseline must add those counters before claiming a zero-error run.
 
 ## Model and Memory Findings
 
@@ -92,10 +92,14 @@ If three logical resources cannot be launched reliably, use PP=2/TP=1 with `SGLA
 - Completed dashboard support for `MlxNccl`: persisted runtime selection, tensor-only launch validation, exact preview filtering, CUDA/NCCL automatic placement preference, advanced controls, instance labels, topology metadata, and prefill/decode wrappers. An NCCL-only `Use all available GPUs` control now persists and propagates through preview, onboarding, automatic, and fallback launch paths, including stale-response rejection and the selected minimum-node count. The production dashboard build passes. `npm run check` improved from 19 errors to 15; the remaining 15 errors and 6 warnings all predate this work.
 - Aggregated generation task status per runner/rank with monotonic terminal handling. Duplicate acknowledgements, late completion, one-rank failure, and runner crashes can no longer make a distributed task appear complete or erase a terminal result incorrectly.
 - Added `scripts/benchmark_lease.py`, which implements the exclusive lease and manifest heartbeat required by `/ai/coordinate.md`. It does not replace benchmark-specific preflight, telemetry, remote ownership checks, or cleanup.
+- Added fail-closed runner event-race handling, stalled-initialization timeouts, ownership-confirmed cleanup, raw-verbs/NCCL validation, deterministic TP1 capture, revision-pinned two-host model staging, and leased InfiniBand baseline harnesses. Commit `bbea0dc5` makes TCP control-port probes phase-aware while retaining strict singleton checks immediately before each launch; future staging and TP runs use ports below the Linux ephemeral range.
 - Focused tests for the integrated EOS, vision policy, compute-resource, shutdown, placement, bootstrap, and launch-plan slices pass. The corrected SGLang launch/snapshot/preflight slice has 94 passing tests; the final combined scheduler, supervisor, compute-resource lifecycle, and SGLang slice has 138 passing tests. Ruff lint and format checks pass, and strict targeted Basedpyright configurations report zero errors. The broad non-image baseline remains 459 passed and 5 skipped with the unchanged stale Rust binding test failure. A fresh full-repository attempt did not supersede that baseline: root collection stops because the external `exo_tools` module is absent, and `src/exo` collection stops in MLX/image tests because this source-only sandbox exposes no CUDA-capable device. `nix fmt` could not run because Nix is not installed on dwagon.
+- The IB harness and lease slice has 112 passing tests; its changed files pass Ruff lint/format, `py_compile`, and strict source-only Pyright. Repository-wide blockers remain the absent external `exo_tools`, unavailable Nix, and environment-wide Pyright dependency/type failures.
 - A leased live shutdown regression was aborted at preflight because fwuff's only RTX 3090 had an unowned ComfyUI compute process (PID 5334, 256 MiB). Nothing was launched or killed; the abort manifest is `/var/lib/exo/benchmarks/exo-nccl-shutdown-preflight-20260718T0450/manifest.json`. Repeat the live deletion test only when that GPU is idle.
-- Source implementation at this stopping point is committed through `cefea632` on the isolated `agent/linux-cuda-nccl` worktree; the plan update follows as a documentation-only commit. The local remotes are normalized as `upstream=exo-explore/exo` and reserved `origin=ldyeax/exo`; publication is pending creation of the GitHub fork because `ldyeax/exo` does not yet exist and `gh` is not installed on dwagon.
-- Both Codex tasks must follow `/ai/coordinate.md`: one exclusive two-host benchmark lease, separate worktrees/deployments, unique namespaces/ports, preflight, ownership-safe cleanup, and per-run manifests. Since coordination was reaffirmed, this work used only source inspection and unit/static tests: it did not contact `fwuff`, load a model, touch `/mnt/sanic`, initialize CUDA/NCCL/InfiniBand, reserve service ports, or run a performance measurement.
+- Source implementation is committed through `bbea0dc5` on the isolated `agent/linux-cuda-nccl` worktree. The local remotes are normalized as `upstream=exo-explore/exo` and reserved `origin=ldyeax/exo`; publication is pending creation of the GitHub fork because `ldyeax/exo` does not yet exist and `gh` is not installed on dwagon.
+- Both Codex tasks follow `/ai/coordinate.md`: equal first-lock arbitration, no preemption of a valid lease, a five-minute same-owner cooldown, separate worktrees/deployments, unique namespaces/ports, preflight, ownership-safe cleanup, and per-run manifests. This Exo task may reserve during its final ready-to-run preflight for at most five minutes, while another ready task remains free to acquire whenever the lock is available and its cooldown has ended.
+- The formal x8/x8 baseline is reportable and clean at `/var/lib/exo/benchmarks/ib-qdr-x8x8-20260718-v3`: child and wrapper returned 0, all eight owned client/server/OpenSM process groups terminated with verified ownership, and the lease was removed. It used clean commit `bbea0dc59a1a79f9c41b667d172d322348b44382`, config SHA-256 `a4937b973cb7337defa0edfa0b4a71de44f3b5bec37fecbb016c0c1bb9c2ebd6`, harness SHA-256 `0fda6ce29a8b172e915d2f2417309ed0952189d02385d4949b5957f615114852`, and perftest SHA-256 `60cf23a301b14d2a789fa5ea0776343c3081062d4baa46b0353800f98ae72d3a`. v1 failed before traffic because ports 58140-58142 overlapped the ephemeral range; v2's 31.74 Gb/s port-1 row is diagnostic only because its old post-case strict probe encountered expected TCP `TIME_WAIT`.
+- Operational conflicts removed for shared testing: dwagon containers `/voice-backend` and `/voice-speaker-embedding` are stopped with restart policy `no`; fwuff `ollama.service` is stopped/inactive but remains enabled.
 - Remaining limitations before general NVIDIA support: GPU placement has only one-per-node or all-available policies rather than arbitrary subsets; KV/workspace/prefix-cache VRAM is not modeled; GPU enumeration still requires NVML even though locality now comes from sysfs; SGLang external-process lifecycle, API proxying, patched-runtime capability collection, and live SM86 GLM/NSA validation are not implemented; and live multi-GPU dashboard/hardware validation remains pending.
 
 1. **Resource model and discovery**
@@ -135,16 +139,16 @@ If three logical resources cannot be launched reliably, use PP=2/TP=1 with `SGLA
 
 1. Keep both healthy NVIDIA drivers and the verified MLX CUDA 13/NCCL 2.28.9 user-space stack; exact driver versions may differ if both satisfy the CUDA ABI.
 2. A/B test moving dwagon's NUMA-1 RTX 3090 from x8 to a local x16 slot while preserving NVLink.
-3. Place dwagon's HCA near the NUMA-1 inter-host pipeline stage; use an x8-or-better slot on fwuff.
-4. Both QDR rails and two OpenSM instances are operational. Make the two OpenSM processes persistent across reboot, then repeat `ib_write_bw`, `ib_read_bw`, and the MLX NCCL diagnostic.
-5. The current dual-rail result cannot meet the 1.7x target because `fwuff` is PCIe x4. Re-test the target after moving that HCA.
+3. Keep dwagon's HCA near the NUMA-1 inter-host pipeline stage and fwuff's HCA in its verified x8 NUMA-0 slot.
+4. Both QDR rails and benchmark-owned OpenSM instances are operational. Decide separately whether OpenSM should persist across reboot; reproducible benchmark wrappers must continue to own and clean up the exact managers they launch.
+5. The completed x8/x8 retest improved dual-port throughput from 29.80 to 32.57 Gb/s, only about 9.3%, and did not approach the 1.7x target. Treat shared ConnectX-3/PCIe/host-path behavior as the current ceiling and preserve v3 for the ConnectX-5 comparison.
 6. Install the selected `MCX555A-ECAT` pair in PCIe 3.0 x16-or-better slots with NUMA/root-complex placement chosen for the inter-host GPU boundary. Re-run the identical perftest, NCCL, and model benchmark manifests over the EDR QSFP28 link.
 7. Free at least 650 GB on dwagon and retain at least 300 GB free on fwuff before full GLM-5.2 staging. Use NFS only for initial loading, not the inference hot path.
 8. Do not add slower nodes until profiling proves their memory contribution exceeds their pipeline/network penalty.
 
 ### RDMA HCA upgrade research (2026-07-18)
 
-1. **Do the free fix first:** move fwuff's current ConnectX-3 from PCIe 3.0 x4 to an x8-or-better slot. Its measured 29.80 Gb/s dual-rail aggregate matches the roughly 31.5 Gb/s x4 payload ceiling; x8 should permit roughly 55-60 Gb/s after tuning.
+1. **Completed free fix:** fwuff's ConnectX-3 now negotiates PCIe 3.0 x8. The formal retest reached 32.57 Gb/s aggregate rather than the estimated 55-60 Gb/s, proving that slot width was not the only bottleneck.
 2. **Best-value matched pair:** ConnectX-5 VPI `MCX555A-ECAT`, one EDR InfiniBand/100GbE QSFP28 port on PCIe 3.0 x16. Prefer the dual-port `MCX556A-ECAT` only at similar cost because PCIe 3.0 x16 cannot sustain two 100 Gb/s ports simultaneously. A sensible used target is at or below roughly $150 per clean, full-height card. [Official ConnectX-5 VPI specifications](https://networking-docs.nvidia.com/connectx5vpihw/specifications)
 3. **Lowest-cost useful modernization:** ConnectX-4 VPI `MCX455A-ECAT` or dual-port `MCX456A-ECAT`, EDR/100GbE on PCIe 3.0 x16. It is the first `mlx5` generation and the minimum generation supported by current NCCL GIN, but buy it only when materially cheaper than ConnectX-5. [Official ConnectX-4 VPI overview](https://networking-docs.nvidia.com/connectx4vpihw/introduction)
 4. **Best performance/future option that fits these hosts:** ConnectX-6 VPI `MCX653105A-HDAT` (or ConnectX-6 DE `MCX683105AN-HDAT` when cheaper), one HDR InfiniBand/200GbE QSFP56 port on PCIe 4.0 x16. Target surplus pricing around $250-$350 per card; one 200 Gb/s port already consumes most of PCIe 4.0 x16, so a dual-port model adds little for this direct two-host link. [Official ConnectX-6 compatible-products table](https://networking-docs.nvidia.com/connectx6fwrn/20395124lts/firmware-compatible-products)
@@ -171,15 +175,16 @@ If three logical resources cannot be launched reliably, use PP=2/TP=1 with `SGLA
    .venv/bin/python -c 'from pathlib import Path; from exo.download.download_utils import migrate_hugging_face_local_dir_to_pinned_revision as migrate; from exo.shared.types.common import ModelId; print(migrate(Path("/mnt/sanic/exo/models"), ModelId("mlx-community/Llama-3.2-1B-Instruct-4bit"), "08231374eeacb049a0eade7922910865b8fce912"))'
    ```
 
-3. Run `mlx-community/SmolLM2-135M-Instruct-8bit@0f0d9b8218915bc34d401e1a340b8c049d300d5e` with Tensor=3 and `MlxNccl` across dwagon's two GPUs and fwuff's GPU before larger models. Its Llama hidden size 576, 9 attention heads, 3 KV heads, and MLP width 1536 are all divisible by three; the indexed weights are 142,955,136 bytes. Use this as a scheduler, multi-runner lifecycle, and collective-correctness proof rather than a performance result.
-   The dashboard can now request this topology by selecting NCCL Tensor, two minimum nodes, and `Use all available GPUs`. Hold the `/ai/coordinate.md` lease for the model migration/download and the complete live run.
-4. Keep `mlx-community/Qwen3-0.6B-8bit` for single-GPU and Ring/Pipeline regression only. Pipeline over NCCL requires adding `ncclSend`/`ncclRecv` support to MLX first.
-5. Re-run the known Ornith-1.0-35B FP8/MXFP4 workload as an AMX/OSCAR regression baseline.
-6. Validate the hybrid AMX offload path with DeepSeek-V4-Flash (284B total/13B active, mixed FP4/FP8, 1M context support).
-7. Commit a KTransformers/SGLang runtime fork that fixes stage-local broadcasts, SM86 NSA, physical NUMA mapping, process CPU affinity, and the executed AMX backend. Update Exo's accepted runtime SHAs only after the PP=3 initialization and per-stage capability receipts pass.
-8. Build a tiny deterministic GLM IndexShare fixture and require single-rank versus pipeline output parity. Keep deferred work at zero until stage-local final-layer flushing has its own parity test.
-9. Start full GLM-5.2 FP8 weights at 4K with a proven Ampere-compatible KV backend, then test 32K, 128K, and finally 245,760 input tokens plus a 16,384-token output reserve. Do not select FP8 KV merely to meet the cache estimate.
-10. Tune resident experts at 0/1/2/4, then enable MTP and deferred work independently with correctness and performance A/B tests.
+3. Completed the formal pre-upgrade x8/x8 InfiniBand baseline: 31.74 Gb/s per independent rail and 32.57 Gb/s native dual-port aggregate. Use `/var/lib/exo/benchmarks/ib-qdr-x8x8-20260718-v3` for the later ConnectX-5 A/B comparison.
+4. Stage and run `mlx-community/SmolLM2-135M-Instruct-8bit@0f0d9b8218915bc34d401e1a340b8c049d300d5e` with Tensor=3 and `MlxNccl` across dwagon's two GPUs and fwuff's GPU before larger models. Its Llama hidden size 576, 9 attention heads, 3 KV heads, and MLP width 1536 are all divisible by three; the indexed weights are 142,955,136 bytes. Use this as a scheduler, multi-runner lifecycle, and collective-correctness proof rather than a performance result. Revision-pinned destinations are `dwagon:/var/lib/exo/models/mlx-community--SmolLM2-135M-Instruct-8bit--0f0d9b8218915bc34d401e1a340b8c049d300d5e` and `fwuff:/mnt/sanic/exo/models/mlx-community--SmolLM2-135M-Instruct-8bit--0f0d9b8218915bc34d401e1a340b8c049d300d5e`.
+   The dashboard can request this topology by selecting NCCL Tensor, two minimum nodes, and `Use all available GPUs`. Hold the `/ai/coordinate.md` lease for model staging and the complete live run, with the required cooldown between them.
+5. Keep `mlx-community/Qwen3-0.6B-8bit` for single-GPU and Ring/Pipeline regression only. Pipeline over NCCL requires adding `ncclSend`/`ncclRecv` support to MLX first.
+6. Re-run the known Ornith-1.0-35B FP8/MXFP4 workload as an AMX/OSCAR regression baseline.
+7. Validate the hybrid AMX offload path with DeepSeek-V4-Flash (284B total/13B active, mixed FP4/FP8, 1M context support).
+8. Commit a KTransformers/SGLang runtime fork that fixes stage-local broadcasts, SM86 NSA, physical NUMA mapping, process CPU affinity, and the executed AMX backend. Update Exo's accepted runtime SHAs only after the PP=3 initialization and per-stage capability receipts pass.
+9. Build a tiny deterministic GLM IndexShare fixture and require single-rank versus pipeline output parity. Keep deferred work at zero until stage-local final-layer flushing has its own parity test.
+10. Start full GLM-5.2 FP8 weights at 4K with a proven Ampere-compatible KV backend, then test 32K, 128K, and finally 245,760 input tokens plus a 16,384-token output reserve. Do not select FP8 KV merely to meet the cache estimate.
+11. Tune resident experts at 0/1/2/4, then enable MTP and deferred work independently with correctness and performance A/B tests.
 
 ### Pre-ConnectX-5 MLX/NCCL benchmark ladder
 
