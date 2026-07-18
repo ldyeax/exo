@@ -1043,13 +1043,14 @@ class HostProbeRequest(StrictModel):
 
     @model_validator(mode="after")
     def validate_ports(self) -> "HostProbeRequest":
-        if (
-            not self.reserved_ports
-            or tuple(sorted(set(self.reserved_ports))) != self.reserved_ports
+        if self.reserved_ports and (
+            tuple(sorted(set(self.reserved_ports))) != self.reserved_ports
             or self.reserved_ports[0] < 1
             or self.reserved_ports[-1] > 65535
         ):
-            raise ValueError("reserved_ports must be sorted, unique, and valid")
+            raise ValueError(
+                "reserved_ports must be empty or sorted, unique, and valid"
+            )
         return self
 
 
@@ -1441,6 +1442,13 @@ def probe_reserved_ports_unused(ports: Sequence[int]) -> tuple[int, ...]:
     return normalized
 
 
+def _probe_requested_reserved_ports(ports: Sequence[int]) -> tuple[int, ...]:
+    normalized = tuple(ports)
+    if not normalized:
+        return ()
+    return probe_reserved_ports_unused(normalized)
+
+
 def _port_guid_from_gid(gid: str) -> str:
     packed = ipaddress.IPv6Address(gid).packed[-8:].hex()
     return ":".join(packed[index : index + 4] for index in range(0, 16, 4))
@@ -1542,7 +1550,7 @@ def collect_host_observation(
         cpu_flags=_cpu_flags(proc_root, host.cpu_set),
         raid_sync_conflicts=raid_sync_conflicts(sys_block_root),
         gpu_bindings=(),
-        unused_reserved_ports=probe_reserved_ports_unused(reserved_ports),
+        unused_reserved_ports=_probe_requested_reserved_ports(reserved_ports),
         conflicts=process_conflicts(proc_root, ignored_pids=ignored_pids),
     )
 
@@ -1655,13 +1663,13 @@ def validate_active_rails(
     validate_host_observation(
         local,
         config.local_host,
-        reserved_ports=config.reserved_ports,
+        reserved_ports=(),
         require_active=True,
     )
     validate_host_observation(
         remote,
         config.remote_host,
-        reserved_ports=config.reserved_ports,
+        reserved_ports=(),
         require_active=True,
     )
     for local_port, remote_port in zip(local.ports, remote.ports, strict=True):
@@ -2017,9 +2025,15 @@ def build_remote_request(
 
 class BaselineEffects(Protocol):
     def probe_local(
-        self, host: HostConfig, ignored_pids: Sequence[int] = ()
+        self,
+        host: HostConfig,
+        *,
+        reserved_ports: Sequence[int],
+        ignored_pids: Sequence[int] = (),
     ) -> HostObservation: ...
-    def probe_remote(self, host: HostConfig) -> HostObservation: ...
+    def probe_remote(
+        self, host: HostConfig, *, reserved_ports: Sequence[int]
+    ) -> HostObservation: ...
     def start_opensm(self, port: PortIdentity, owner_token: str) -> LocalHandle: ...
     def start_remote_server(
         self,
@@ -2051,21 +2065,27 @@ class SystemEffects:
         self.results = results
 
     def probe_local(
-        self, host: HostConfig, ignored_pids: Sequence[int] = ()
+        self,
+        host: HostConfig,
+        *,
+        reserved_ports: Sequence[int],
+        ignored_pids: Sequence[int] = (),
     ) -> HostObservation:
         return collect_host_observation(
             host,
-            reserved_ports=self.config.reserved_ports,
+            reserved_ports=reserved_ports,
             ignored_pids=ignored_pids,
             proc_root=Path("/proc"),
             hostname=socket.gethostname,
         )
 
-    def probe_remote(self, host: HostConfig) -> HostObservation:
+    def probe_remote(
+        self, host: HostConfig, *, reserved_ports: Sequence[int]
+    ) -> HostObservation:
         completed = subprocess.run(
             build_ssh_argv(self.config, "host-probe"),
             input=HostProbeRequest(
-                host=host, reserved_ports=self.config.reserved_ports
+                host=host, reserved_ports=tuple(reserved_ports)
             ).model_dump_json()
             + "\n",
             text=True,
@@ -2188,7 +2208,10 @@ class SystemEffects:
     def start_local_client(
         self, command: Sequence[str], kind: str, owner_token: str
     ) -> LocalHandle:
-        probe_reserved_ports_unused(self.config.reserved_ports)
+        control_port = _reserved_control_port_from_command(
+            command, self.config.reserved_ports
+        )
+        probe_reserved_ports_unused((control_port,))
         return self._start_local(command, kind, owner_token, f"{kind}.log")
 
     def start_remote_server(
@@ -2198,6 +2221,7 @@ class SystemEffects:
         owner_token: str,
         timeout_seconds: float,
     ) -> RemoteHandle:
+        _reserved_control_port_from_command(command, self.config.reserved_ports)
         log_name = f"{kind}.log"
         with self.results.create_log(log_name):
             pass
@@ -2634,6 +2658,24 @@ def _validate_remote_server_command(command: Sequence[str], host: HostConfig) ->
         raise BaselineError("remote perftest command uses the wrong HCA")
 
 
+def _reserved_control_port_from_command(
+    command: Sequence[str], reserved_ports: Sequence[int]
+) -> int:
+    raw_ports = tuple(
+        argument.removeprefix("--port=")
+        for argument in command
+        if argument.startswith("--port=")
+    )
+    if len(raw_ports) != 1 or re.fullmatch(r"[0-9]+", raw_ports[0]) is None:
+        raise BaselineError(
+            "perftest command must use exactly one numeric control port"
+        )
+    control_port = int(raw_ports[0])
+    if control_port not in reserved_ports:
+        raise BaselineError("perftest command must use a reserved control port")
+    return control_port
+
+
 def _counter_delta(before: HostObservation, after: HostObservation) -> JsonObject:
     result: JsonObject = {}
     for before_port, after_port in zip(before.ports, after.ports, strict=True):
@@ -2702,11 +2744,13 @@ def _wait_for_active_rails(
         try:
             local = _probe_without_owned_conflicts(
                 effects.probe_local(
-                    config.local_host, tuple(process.pid for process in owned)
+                    config.local_host,
+                    reserved_ports=(),
+                    ignored_pids=tuple(process.pid for process in owned),
                 ),
                 owned,
             )
-            remote = effects.probe_remote(config.remote_host)
+            remote = effects.probe_remote(config.remote_host, reserved_ports=())
             validate_active_rails(local, remote, config)
             return local, remote
         except ProcessConflictError:
@@ -2855,8 +2899,12 @@ def run_harness(
         replace=True,
     )
     try:
-        local = effects.probe_local(config.local_host)
-        remote = effects.probe_remote(config.remote_host)
+        local = effects.probe_local(
+            config.local_host, reserved_ports=config.reserved_ports
+        )
+        remote = effects.probe_remote(
+            config.remote_host, reserved_ports=config.reserved_ports
+        )
         validate_host_observation(
             local,
             config.local_host,
@@ -2931,18 +2979,18 @@ def run_harness(
         for handle in reversed(open_sm_handles):
             cleanups.append(effects.stop_local(handle, config.timeouts.cleanup_seconds))
         try:
-            local_final = effects.probe_local(config.local_host)
-            remote_final = effects.probe_remote(config.remote_host)
+            local_final = effects.probe_local(config.local_host, reserved_ports=())
+            remote_final = effects.probe_remote(config.remote_host, reserved_ports=())
             validate_host_observation(
                 local_final,
                 config.local_host,
-                reserved_ports=config.reserved_ports,
+                reserved_ports=(),
                 require_active=False,
             )
             validate_host_observation(
                 remote_final,
                 config.remote_host,
-                reserved_ports=config.reserved_ports,
+                reserved_ports=(),
                 require_active=False,
             )
             final_observations["after_cleanup"] = {
@@ -3112,13 +3160,7 @@ def parse_remote_request(
         or reserved_ports[-1] > 65535
     ):
         raise BaselineError("remote reserved ports must be sorted, unique, and valid")
-    command_ports = tuple(
-        int(argument.removeprefix("--port="))
-        for argument in command
-        if argument.startswith("--port=")
-    )
-    if len(command_ports) != 1 or command_ports[0] not in reserved_ports:
-        raise BaselineError("remote command must use exactly one reserved control port")
+    _reserved_control_port_from_command(command, reserved_ports)
     owner_token = _string(request.get("owner_token"), "owner token")
     namespace = _string(request.get("namespace"), "namespace")
     timeout_value = request.get("timeout_seconds")
@@ -3168,7 +3210,8 @@ def remote_supervise_main() -> int:
             raise ProcessConflictError(
                 f"remote host has unowned benchmark/SM processes: {'; '.join(conflicts)}"
             )
-        probe_reserved_ports_unused(reserved_ports)
+        control_port = _reserved_control_port_from_command(command, reserved_ports)
+        probe_reserved_ports_unused((control_port,))
         temporary = tempfile.TemporaryFile(mode="w+b")  # noqa: SIM115
         environment = {
             "PATH": os.defpath,

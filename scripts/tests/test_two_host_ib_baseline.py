@@ -152,7 +152,10 @@ def config(result_directory: Path) -> baseline.BaselineConfig:
 
 
 def observation(
-    host_config: baseline.HostConfig, *, counter: int = 100
+    host_config: baseline.HostConfig,
+    *,
+    counter: int = 100,
+    unused_reserved_ports: tuple[int, ...] = (28515, 28516, 28517),
 ) -> baseline.HostObservation:
     observed_ports = tuple(
         baseline.PortObservation(
@@ -207,7 +210,7 @@ def observation(
         cpu_flags=("amx_bf16", "amx_int8", "amx_tile"),
         raid_sync_conflicts=(),
         gpu_bindings=(),
-        unused_reserved_ports=(28515, 28516, 28517),
+        unused_reserved_ports=unused_reserved_ports,
         conflicts=(),
     )
 
@@ -352,6 +355,13 @@ def test_host_probe_request_preserves_exact_reserved_ports(tmp_path: Path) -> No
     )
     observed = baseline.HostProbeRequest.model_validate_json(request.model_dump_json())
     assert observed.reserved_ports == (28515, 28516, 28517)
+    skipped = baseline.HostProbeRequest(host=configured.remote_host, reserved_ports=())
+    assert (
+        baseline.HostProbeRequest.model_validate_json(
+            skipped.model_dump_json()
+        ).reserved_ports
+        == ()
+    )
 
 
 def test_result_directory_rejects_path_replacement(tmp_path: Path) -> None:
@@ -464,6 +474,7 @@ def test_reserved_port_probe_rejects_occupied_tcp_and_udp(
     occupied_socket_type: int, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     occupied = True
+    observed_options: list[tuple[int, int, int]] = []
 
     class FakeSocket:
         def __init__(self, family: int, socket_type: int) -> None:
@@ -471,7 +482,7 @@ def test_reserved_port_probe_rejects_occupied_tcp_and_udp(
             self.socket_type = socket_type
 
         def setsockopt(self, level: int, option: int, value: int) -> None:
-            del level, option, value
+            observed_options.append((level, option, value))
 
         def bind(self, address: tuple[str, int]) -> None:
             del address
@@ -493,9 +504,53 @@ def test_reserved_port_probe_rejects_occupied_tcp_and_udp(
         baseline.probe_reserved_ports_unused((28515,))
     occupied = False
     assert baseline.probe_reserved_ports_unused((28515,)) == (28515,)
+    assert not any(
+        level == socket.SOL_SOCKET and option == socket.SO_REUSEADDR
+        for level, option, _ in observed_options
+    )
 
 
-def test_remote_supervisor_rechecks_exact_ports_before_process_start(
+def test_empty_reserved_port_request_skips_binding_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unexpected_probe(ports: Sequence[int]) -> tuple[int, ...]:
+        del ports
+        raise AssertionError("empty request must not claim a port availability probe")
+
+    monkeypatch.setattr(baseline, "probe_reserved_ports_unused", unexpected_probe)
+    assert baseline._probe_requested_reserved_ports(()) == ()
+
+
+def test_remote_host_probe_transports_empty_request_and_observation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    configured = config(tmp_path / "run")
+    results = result_directory(Path(configured.result_directory))
+    requests: list[baseline.HostProbeRequest] = []
+
+    def fake_run(
+        command: Sequence[str], **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        raw_request = kwargs.get("input")
+        assert isinstance(raw_request, str)
+        request = baseline.HostProbeRequest.model_validate_json(raw_request)
+        requests.append(request)
+        observed = observation(request.host, unused_reserved_ports=())
+        return subprocess.CompletedProcess(
+            tuple(command), 0, stdout=observed.model_dump_json(), stderr=""
+        )
+
+    monkeypatch.setattr(baseline.subprocess, "run", fake_run)
+    try:
+        effects = baseline.SystemEffects(configured, results)
+        observed = effects.probe_remote(configured.remote_host, reserved_ports=())
+    finally:
+        results.close()
+    assert [request.reserved_ports for request in requests] == [()]
+    assert observed.unused_reserved_ports == ()
+
+
+def test_remote_supervisor_rechecks_only_current_port_before_process_start(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     configured = config(tmp_path / "run")
@@ -535,10 +590,10 @@ def test_remote_supervisor_rechecks_exact_ports_before_process_start(
         StringIO(json.dumps(request, sort_keys=True, separators=(",", ":")) + "\n"),
     )
     assert baseline.remote_supervise_main() == 70
-    assert observed_ports == [configured.reserved_ports]
+    assert observed_ports == [(configured.benchmark.single_port_1_control_port,)]
 
 
-def test_local_client_rechecks_exact_ports_before_process_start(
+def test_local_client_rechecks_only_current_port_before_process_start(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     configured = config(tmp_path / "run")
@@ -551,15 +606,57 @@ def test_local_client_rechecks_exact_ports_before_process_start(
         raise baseline.PortConflictError("occupied in test")
 
     monkeypatch.setattr(baseline, "probe_reserved_ports_unused", reject_ports)
+    command = baseline.perftest_command(
+        configured,
+        configured.local_host,
+        port=2,
+        control_port=configured.benchmark.single_port_2_control_port,
+        dual_port=False,
+        server=False,
+    )
     try:
         effects = baseline.SystemEffects(configured, results)
         with pytest.raises(baseline.PortConflictError, match="occupied in test"):
-            effects.start_local_client(
-                ("/usr/bin/ib_write_bw",), "test-client", "run:owner-token"
+            effects.start_local_client(command, "test-client", "run:owner-token")
+    finally:
+        results.close()
+    assert observed_ports == [(configured.benchmark.single_port_2_control_port,)]
+
+
+def test_remote_server_rejects_missing_current_port_before_transport(
+    tmp_path: Path,
+) -> None:
+    configured = config(tmp_path / "run")
+    results = result_directory(Path(configured.result_directory))
+    try:
+        effects = baseline.SystemEffects(configured, results)
+        with pytest.raises(baseline.BaselineError, match="numeric control port"):
+            effects.start_remote_server(
+                ("/usr/bin/ib_write_bw",),
+                "test-server",
+                "run:owner-token",
+                30.0,
             )
     finally:
         results.close()
-    assert observed_ports == [configured.reserved_ports]
+
+
+@pytest.mark.parametrize(
+    ("arguments", "expected_error"),
+    [
+        (("--port=28515", "--port=28516"), "exactly one numeric control port"),
+        (("--port=28x15",), "exactly one numeric control port"),
+        (("--port=" + chr(0x661),), "exactly one numeric control port"),
+        (("--port=28518",), "reserved control port"),
+    ],
+)
+def test_control_port_parser_rejects_ambiguous_or_unreserved_values(
+    arguments: tuple[str, ...], expected_error: str
+) -> None:
+    with pytest.raises(baseline.BaselineError, match=expected_error):
+        baseline._reserved_control_port_from_command(
+            ("/usr/bin/ib_write_bw", *arguments), (28515, 28516, 28517)
+        )
 
 
 def test_ssh_argv_ignores_mutable_configuration_and_pins_transport(
@@ -726,14 +823,34 @@ class FakeEffects:
     def __init__(self, configured: baseline.BaselineConfig) -> None:
         self.config = configured
         self.next_pid = 1000
+        self.probe_requests: list[tuple[str, tuple[int, ...]]] = []
 
     def probe_local(
-        self, host: baseline.HostConfig, ignored_pids: Sequence[int] = ()
+        self,
+        host: baseline.HostConfig,
+        *,
+        reserved_ports: Sequence[int],
+        ignored_pids: Sequence[int] = (),
     ) -> baseline.HostObservation:
-        return observation(host, counter=self.next_pid)
+        del ignored_pids
+        normalized = tuple(reserved_ports)
+        self.probe_requests.append((host.name, normalized))
+        return observation(
+            host,
+            counter=self.next_pid,
+            unused_reserved_ports=normalized,
+        )
 
-    def probe_remote(self, host: baseline.HostConfig) -> baseline.HostObservation:
-        return observation(host, counter=self.next_pid)
+    def probe_remote(
+        self, host: baseline.HostConfig, *, reserved_ports: Sequence[int]
+    ) -> baseline.HostObservation:
+        normalized = tuple(reserved_ports)
+        self.probe_requests.append((host.name, normalized))
+        return observation(
+            host,
+            counter=self.next_pid,
+            unused_reserved_ports=normalized,
+        )
 
     def receipt(self, host_name: str, kind: str) -> baseline.OwnedProcess:
         self.next_pid += 1
@@ -832,8 +949,9 @@ def test_run_harness_records_three_cases_and_confirms_all_cleanup(
     run_path = tmp_path / "run-1"
     configured = config(run_path)
     results = result_directory(run_path)
+    effects = FakeEffects(configured)
     try:
-        outcome = baseline.run_harness(configured, FakeEffects(configured), results)
+        outcome = baseline.run_harness(configured, effects, results)
         assert outcome["status"] == "completed"
         assert outcome["cleanup_succeeded"] is True
         cases = cast(list[baseline.JsonObject], cast(object, outcome["cases"]))
@@ -850,6 +968,18 @@ def test_run_harness_records_three_cases_and_confirms_all_cleanup(
             json.loads((run_path / "benchmark-result.json").read_text())["reportable"]
             is True
         )
+        assert effects.probe_requests[:2] == [
+            (configured.local_host.name, configured.reserved_ports),
+            (configured.remote_host.name, configured.reserved_ports),
+        ]
+        assert effects.probe_requests[2:] == [
+            (host_name, ())
+            for _ in range(8)
+            for host_name in (
+                configured.local_host.name,
+                configured.remote_host.name,
+            )
+        ]
     finally:
         results.close()
 
