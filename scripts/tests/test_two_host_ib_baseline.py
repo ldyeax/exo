@@ -15,6 +15,21 @@ from pydantic import ValidationError
 
 from scripts import two_host_ib_baseline as baseline
 
+HEALTH_COUNTERS = (
+    "symbol_error",
+    "link_downed",
+    "link_error_recovery",
+    "port_rcv_errors",
+    "port_rcv_remote_physical_errors",
+    "port_rcv_switch_relay_errors",
+    "port_xmit_discards",
+    "port_xmit_constraint_errors",
+    "port_rcv_constraint_errors",
+    "local_link_integrity_errors",
+    "excessive_buffer_overrun_errors",
+    "VL15_dropped",
+)
+
 
 def source_identity() -> baseline.SourceIdentity:
     return baseline.SourceIdentity(commit="1" * 40, dirty_file_hashes={})
@@ -151,6 +166,23 @@ def config(result_directory: Path) -> baseline.BaselineConfig:
     )
 
 
+def independent_config(result_directory: Path) -> baseline.BaselineConfig:
+    raw = config(result_directory).model_dump(mode="json")
+    raw["local_host"]["rail_cpu_bindings"] = {
+        "port_1": [0],
+        "port_2": [1],
+    }
+    raw["remote_host"]["rail_cpu_bindings"] = {
+        "port_1": [0],
+        "port_2": [1],
+    }
+    raw["local_host"]["hca"]["expected_health_counters"] = list(HEALTH_COUNTERS)
+    raw["remote_host"]["hca"]["expected_health_counters"] = list(HEALTH_COUNTERS)
+    raw["benchmark"]["independent_port_1_control_port"] = 28518
+    raw["benchmark"]["independent_port_2_control_port"] = 28519
+    return baseline.BaselineConfig.model_validate_json(json.dumps(raw))
+
+
 def observation(
     host_config: baseline.HostConfig,
     *,
@@ -172,6 +204,7 @@ def observation(
                 "port_rcv_data": counter,
                 "port_xmit_packets": counter,
                 "port_rcv_packets": counter,
+                **{name: 0 for name in host_config.hca.expected_health_counters},
             },
         )
         for item in host_config.hca.ports
@@ -240,6 +273,34 @@ def test_config_rejects_artifact_hash_mismatch(tmp_path: Path) -> None:
         baseline.BaselineConfig.model_validate_json(json.dumps(raw))
 
 
+def test_independent_config_requires_two_ports_and_disjoint_host_bindings(
+    tmp_path: Path,
+) -> None:
+    configured = config(tmp_path / "run")
+    raw = configured.model_dump(mode="json")
+    raw["benchmark"]["independent_port_1_control_port"] = 28518
+    with pytest.raises(ValidationError, match="configured together"):
+        baseline.BaselineConfig.model_validate_json(json.dumps(raw))
+
+    raw = independent_config(tmp_path / "independent").model_dump(mode="json")
+    raw["remote_host"]["rail_cpu_bindings"]["port_2"] = [0]
+    with pytest.raises(ValidationError, match="must be disjoint"):
+        baseline.BaselineConfig.model_validate_json(json.dumps(raw))
+
+
+def test_legacy_config_keeps_three_ports_and_independent_config_appends_two(
+    tmp_path: Path,
+) -> None:
+    assert config(tmp_path / "legacy").reserved_ports == (28515, 28516, 28517)
+    assert independent_config(tmp_path / "independent").reserved_ports == (
+        28515,
+        28516,
+        28517,
+        28518,
+        28519,
+    )
+
+
 def test_parse_single_port_output() -> None:
     rows = baseline.parse_ib_write_bw_output(
         "#bytes iterations peak average msg\n8388608 3758 0.00 28.56 0.000425\n"
@@ -258,6 +319,75 @@ def test_parse_exact_native_dual_port_nine_column_output() -> None:
         (1, 14.01),
         (2, 14.01),
     ]
+
+
+def test_health_counter_deltas_allow_nonzero_baseline_and_reject_increase(
+    tmp_path: Path,
+) -> None:
+    configured = independent_config(tmp_path / "run")
+    before = observation(configured.remote_host, counter=100)
+    before_ports = tuple(
+        item.model_copy(
+            update={
+                "counters": {
+                    **item.counters,
+                    "link_downed": item.port,
+                }
+            }
+        )
+        for item in before.ports
+    )
+    before = before.model_copy(update={"ports": before_ports})
+    after = observation(configured.remote_host, counter=110)
+    after_ports = tuple(
+        item.model_copy(
+            update={
+                "counters": {
+                    **item.counters,
+                    "link_downed": item.port,
+                }
+            }
+        )
+        for item in after.ports
+    )
+    after = after.model_copy(update={"ports": after_ports})
+    deltas = baseline.counter_delta(before, after)
+    port_1_deltas = cast(dict[str, baseline.JsonValue], deltas["1"])
+    assert port_1_deltas["link_downed"] == 0
+    assert port_1_deltas["port_xmit_data"] == 10
+
+    increased_counters = dict(after.ports[0].counters)
+    increased_counters["link_downed"] = 2
+    increased_port = after.ports[0].model_copy(update={"counters": increased_counters})
+    increased = after.model_copy(update={"ports": (increased_port, after.ports[1])})
+    with pytest.raises(baseline.BaselineError, match="health counter link_downed"):
+        baseline.counter_delta(before, increased)
+
+
+def test_counter_reader_discovers_hw_counter_and_binds_required_set(
+    tmp_path: Path,
+) -> None:
+    standard = tmp_path / "counters"
+    hardware = tmp_path / "hw_counters"
+    standard.mkdir()
+    hardware.mkdir()
+    (hardware / "symbol_error").write_text("7\n")
+    assert (
+        baseline.read_port_counter(
+            (standard, hardware), "symbol_error", port=1, required=True
+        )
+        == 7
+    )
+    assert (
+        baseline.read_port_counter(
+            (standard, hardware), "link_downed", port=1, required=False
+        )
+        is None
+    )
+    with pytest.raises(baseline.BaselineError, match="required port 1 counter"):
+        baseline.read_port_counter(
+            (standard, hardware), "link_downed", port=1, required=True
+        )
 
 
 def test_perftest_commands_use_native_dual_port_and_management_address(
@@ -289,6 +419,72 @@ def test_perftest_commands_use_native_dual_port_and_management_address(
     assert "--dualport" in server and "--report-per-port" in server
     assert server[-1] == "--report-per-port"
     assert client[-1] == "192.168.40.248"
+
+
+def test_independent_commands_use_matching_per_rail_cpu_bindings(
+    tmp_path: Path,
+) -> None:
+    configured = independent_config(tmp_path / "run")
+    local_bindings = configured.local_host.rail_cpu_bindings
+    remote_bindings = configured.remote_host.rail_cpu_bindings
+    assert local_bindings is not None and remote_bindings is not None
+    for port_number, control_port in zip(
+        (cast(Literal[1, 2], 1), cast(Literal[1, 2], 2)),
+        cast(tuple[int, int], configured.benchmark.independent_control_ports),
+        strict=True,
+    ):
+        server = baseline.perftest_command(
+            configured,
+            configured.remote_host,
+            port=port_number,
+            control_port=control_port,
+            dual_port=False,
+            server=True,
+            cpu_set=remote_bindings.for_port(port_number),
+        )
+        client = baseline.perftest_command(
+            configured,
+            configured.local_host,
+            port=port_number,
+            control_port=control_port,
+            dual_port=False,
+            server=False,
+            cpu_set=local_bindings.for_port(port_number),
+        )
+        assert server[1] == f"--physcpubind={port_number - 1}"
+        assert client[1] == f"--physcpubind={port_number - 1}"
+        baseline.parse_remote_request(
+            baseline.build_remote_request(
+                configured.remote_host,
+                server,
+                "run:owner-token",
+                configured.namespace,
+                30.0,
+                configured.reserved_ports,
+            )
+        )
+    mismatched_server = baseline.perftest_command(
+        configured,
+        configured.remote_host,
+        port=1,
+        control_port=cast(
+            tuple[int, int], configured.benchmark.independent_control_ports
+        )[0],
+        dual_port=False,
+        server=True,
+        cpu_set=remote_bindings.port_2,
+    )
+    with pytest.raises(baseline.BaselineError, match="exact bindings|rail CPU binding"):
+        baseline.parse_remote_request(
+            baseline.build_remote_request(
+                configured.remote_host,
+                mismatched_server,
+                "run:owner-token",
+                configured.namespace,
+                30.0,
+                configured.reserved_ports,
+            )
+        )
 
 
 def test_remote_supervisor_request_round_trips_strict_json_config(
@@ -409,6 +605,22 @@ def test_process_conflicts_detects_perftest_without_matching_arguments(
     assert "ib_write_bw" in baseline.process_conflicts(proc)[0]
 
 
+def test_process_conflicts_allows_only_matching_owned_concurrent_sibling(
+    tmp_path: Path,
+) -> None:
+    proc = tmp_path / "proc"
+    (proc / "123").mkdir(parents=True)
+    (proc / "123" / "cmdline").write_bytes(b"/usr/bin/ib_write_bw\0")
+    (proc / "123" / "environ").write_bytes(
+        b"EXO_BENCHMARK_NAMESPACE=ib-test\0EXO_BENCHMARK_OWNER_TOKEN=owner-123\0"
+    )
+    assert baseline.process_conflicts(proc) != ()
+    assert (
+        baseline.process_conflicts(proc, owned_identity=("ib-test", "owner-123")) == ()
+    )
+    assert baseline.process_conflicts(proc, owned_identity=("ib-test", "other")) != ()
+
+
 @pytest.mark.parametrize(
     ("arguments", "environment", "expected_class"),
     [
@@ -518,7 +730,7 @@ def test_empty_reserved_port_request_skips_binding_probe(
         raise AssertionError("empty request must not claim a port availability probe")
 
     monkeypatch.setattr(baseline, "probe_reserved_ports_unused", unexpected_probe)
-    assert baseline._probe_requested_reserved_ports(()) == ()
+    assert baseline.probe_requested_reserved_ports(()) == ()
 
 
 def test_remote_host_probe_transports_empty_request_and_observation(
@@ -573,9 +785,12 @@ def test_remote_supervisor_rechecks_only_current_port_before_process_start(
     observed_ports: list[tuple[int, ...]] = []
 
     def no_conflicts(
-        proc_root: Path = Path("/proc"), *, ignored_pids: Sequence[int] = ()
+        proc_root: Path = Path("/proc"),
+        *,
+        ignored_pids: Sequence[int] = (),
+        owned_identity: tuple[str, str] | None = None,
     ) -> tuple[str, ...]:
-        del proc_root, ignored_pids
+        del proc_root, ignored_pids, owned_identity
         return ()
 
     def reject_ports(ports: Sequence[int]) -> tuple[int, ...]:
@@ -654,7 +869,7 @@ def test_control_port_parser_rejects_ambiguous_or_unreserved_values(
     arguments: tuple[str, ...], expected_error: str
 ) -> None:
     with pytest.raises(baseline.BaselineError, match=expected_error):
-        baseline._reserved_control_port_from_command(
+        baseline.reserved_control_port_from_command(
             ("/usr/bin/ib_write_bw", *arguments), (28515, 28516, 28517)
         )
 
@@ -824,6 +1039,7 @@ class FakeEffects:
         self.config = configured
         self.next_pid = 1000
         self.probe_requests: list[tuple[str, tuple[int, ...]]] = []
+        self.events: list[str] = []
 
     def probe_local(
         self,
@@ -888,6 +1104,7 @@ class FakeEffects:
         timeout_seconds: float,
     ) -> baseline.RemoteHandle:
         self.owner_token = owner_token
+        self.events.append(f"start-remote:{kind}")
         receipt = self.receipt(self.config.remote_host.name, kind)
         transport_receipt = self.receipt(
             self.config.local_host.name, f"{kind}-ssh-transport"
@@ -904,6 +1121,7 @@ class FakeEffects:
         self, command: Sequence[str], kind: str, owner_token: str
     ) -> baseline.LocalHandle:
         self.owner_token = owner_token
+        self.events.append(f"start-local:{kind}")
         receipt = self.receipt(self.config.local_host.name, kind)
         return baseline.LocalHandle(
             receipt,
@@ -921,8 +1139,13 @@ class FakeEffects:
     def wait_local(
         self, handle: baseline.LocalHandle, timeout_seconds: float
     ) -> tuple[int, str, baseline.CleanupReceipt]:
+        self.events.append(f"wait-local:{handle.receipt.kind}")
         if "native-dual" in handle.receipt.kind:
             output = "8388608 3758 0.00 28.02 0.000418 14.01 0.000209 14.01 0.000209\n"
+        elif "independent-concurrent-port-1" in handle.receipt.kind:
+            output = "8388608 3758 0.00 20.00 0.000300\n"
+        elif "independent-concurrent-port-2" in handle.receipt.kind:
+            output = "8388608 3758 0.00 21.00 0.000310\n"
         else:
             output = "8388608 3758 0.00 28.56 0.000425\n"
         return 0, output, self.cleanup(handle.receipt)
@@ -930,16 +1153,19 @@ class FakeEffects:
     def wait_remote(
         self, handle: baseline.RemoteHandle, timeout_seconds: float
     ) -> tuple[int, str, baseline.CleanupReceipt]:
+        self.events.append(f"wait-remote:{handle.receipt.kind}")
         return 0, "server complete", self.cleanup(handle.receipt)
 
     def stop_local(
         self, handle: baseline.LocalHandle, timeout_seconds: float
     ) -> baseline.CleanupReceipt:
+        self.events.append(f"stop-local:{handle.receipt.kind}")
         return self.cleanup(handle.receipt)
 
     def stop_remote(
         self, handle: baseline.RemoteHandle, timeout_seconds: float
     ) -> baseline.CleanupReceipt:
+        self.events.append(f"stop-remote:{handle.receipt.kind}")
         return self.cleanup(handle.receipt)
 
 
@@ -980,6 +1206,212 @@ def test_run_harness_records_three_cases_and_confirms_all_cleanup(
                 configured.remote_host.name,
             )
         ]
+    finally:
+        results.close()
+
+
+def test_independent_concurrent_case_launches_both_pairs_and_aggregates_rows(
+    tmp_path: Path,
+) -> None:
+    run_path = tmp_path / "run-independent"
+    configured = independent_config(run_path)
+    results = result_directory(run_path)
+    effects = FakeEffects(configured)
+    try:
+        outcome = baseline.run_harness(configured, effects, results)
+        assert outcome["status"] == "completed"
+        assert outcome["reportable"] is True
+        cases = cast(list[baseline.JsonObject], cast(object, outcome["cases"]))
+        assert [item["name"] for item in cases] == [
+            "single-port-1",
+            "single-port-2",
+            "native-dual-port",
+            "independent-concurrent",
+        ]
+        concurrent = cases[-1]
+        assert concurrent["aggregate_average_gigabits_per_second"] == 41.0
+        rails = cast(list[baseline.JsonObject], cast(object, concurrent["rails"]))
+        assert [rail["port"] for rail in rails] == [1, 2]
+        assert [rail["maximum_average_gigabits_per_second"] for rail in rails] == [
+            20.0,
+            21.0,
+        ]
+        assert rails[0]["cpu_bindings"] == {"dwagon": [0], "fwuff": [0]}
+        assert rails[1]["cpu_bindings"] == {"dwagon": [1], "fwuff": [1]}
+        owned_processes = cast(
+            list[baseline.JsonObject], cast(object, outcome["owned_processes"])
+        )
+        assert len(owned_processes) == 12
+        independent_events = [
+            event for event in effects.events if "independent-concurrent" in event
+        ]
+        assert independent_events == [
+            "start-remote:independent-concurrent-port-1-server",
+            "start-remote:independent-concurrent-port-2-server",
+            "start-local:independent-concurrent-port-1-client",
+            "start-local:independent-concurrent-port-2-client",
+            "wait-local:independent-concurrent-port-1-client",
+            "wait-local:independent-concurrent-port-2-client",
+            "wait-remote:independent-concurrent-port-1-server",
+            "wait-remote:independent-concurrent-port-2-server",
+        ]
+        current_ports = cast(
+            tuple[int, int], configured.benchmark.independent_control_ports
+        )
+        assert effects.probe_requests.count(("dwagon", current_ports)) == 1
+        assert effects.probe_requests.count(("fwuff", current_ports)) == 1
+        counter_deltas = cast(
+            dict[str, baseline.JsonValue], concurrent["counter_deltas"]
+        )
+        fwuff_deltas = cast(dict[str, baseline.JsonValue], counter_deltas["fwuff"])
+        fwuff_port_1 = cast(dict[str, baseline.JsonValue], fwuff_deltas["1"])
+        assert {name: fwuff_port_1[name] for name in HEALTH_COUNTERS} == {
+            name: 0 for name in HEALTH_COUNTERS
+        }
+    finally:
+        results.close()
+
+
+class FailSecondIndependentClientEffects(FakeEffects):
+    def start_local_client(
+        self, command: Sequence[str], kind: str, owner_token: str
+    ) -> baseline.LocalHandle:
+        if kind == "independent-concurrent-port-2-client":
+            self.events.append(f"start-local-failed:{kind}")
+            raise baseline.BaselineError("synthetic second-client launch failure")
+        return super().start_local_client(command, kind, owner_token)
+
+
+class FailSecondIndependentServerEffects(FakeEffects):
+    def start_remote_server(
+        self,
+        command: Sequence[str],
+        kind: str,
+        owner_token: str,
+        timeout_seconds: float,
+    ) -> baseline.RemoteHandle:
+        if kind == "independent-concurrent-port-2-server":
+            self.events.append(f"start-remote-failed:{kind}")
+            raise baseline.BaselineError("synthetic second-server launch failure")
+        return super().start_remote_server(command, kind, owner_token, timeout_seconds)
+
+
+def test_independent_concurrent_second_server_failure_cleans_first_server(
+    tmp_path: Path,
+) -> None:
+    run_path = tmp_path / "run-second-server-failure"
+    configured = independent_config(run_path)
+    results = result_directory(run_path)
+    effects = FailSecondIndependentServerEffects(configured)
+    try:
+        outcome = baseline.run_harness(configured, effects, results)
+        assert outcome["status"] == "benchmark_failed"
+        assert outcome["reportable"] is False
+        assert outcome["cleanup_succeeded"] is True
+        assert [
+            event
+            for event in effects.events
+            if event.startswith("stop-") and "independent-concurrent" in event
+        ] == ["stop-remote:independent-concurrent-port-1-server"]
+    finally:
+        results.close()
+
+
+def test_independent_concurrent_partial_launch_cleans_every_owned_process(
+    tmp_path: Path,
+) -> None:
+    run_path = tmp_path / "run-partial-failure"
+    configured = independent_config(run_path)
+    results = result_directory(run_path)
+    effects = FailSecondIndependentClientEffects(configured)
+    try:
+        outcome = baseline.run_harness(configured, effects, results)
+        assert outcome["status"] == "benchmark_failed"
+        assert outcome["reportable"] is False
+        assert outcome["cleanup_succeeded"] is True
+        independent_stops = [
+            event
+            for event in effects.events
+            if event.startswith("stop-") and "independent-concurrent" in event
+        ]
+        assert independent_stops == [
+            "stop-local:independent-concurrent-port-1-client",
+            "stop-remote:independent-concurrent-port-2-server",
+            "stop-remote:independent-concurrent-port-1-server",
+        ]
+    finally:
+        results.close()
+
+
+class UnconfirmedIndependentCleanupEffects(FakeEffects):
+    def wait_local(
+        self, handle: baseline.LocalHandle, timeout_seconds: float
+    ) -> tuple[int, str, baseline.CleanupReceipt]:
+        code, output, cleanup = super().wait_local(handle, timeout_seconds)
+        if handle.receipt.kind == "independent-concurrent-port-2-client":
+            cleanup = baseline.CleanupReceipt(
+                cleanup.host_name,
+                cleanup.kind,
+                True,
+                False,
+                False,
+                "synthetic survivor",
+            )
+        return code, output, cleanup
+
+
+class HealthDeltaIndependentEffects(FakeEffects):
+    def probe_local(
+        self,
+        host: baseline.HostConfig,
+        *,
+        reserved_ports: Sequence[int],
+        ignored_pids: Sequence[int] = (),
+    ) -> baseline.HostObservation:
+        observed = super().probe_local(
+            host,
+            reserved_ports=reserved_ports,
+            ignored_pids=ignored_pids,
+        )
+        if "wait-remote:independent-concurrent-port-2-server" not in self.events:
+            return observed
+        counters = dict(observed.ports[0].counters)
+        counters["symbol_error"] = 1
+        changed_port = observed.ports[0].model_copy(update={"counters": counters})
+        return observed.model_copy(update={"ports": (changed_port, observed.ports[1])})
+
+
+def test_independent_concurrent_unconfirmed_cleanup_is_not_reportable(
+    tmp_path: Path,
+) -> None:
+    run_path = tmp_path / "run-cleanup-failure"
+    configured = independent_config(run_path)
+    results = result_directory(run_path)
+    try:
+        outcome = baseline.run_harness(
+            configured, UnconfirmedIndependentCleanupEffects(configured), results
+        )
+        assert outcome["status"] == "cleanup_failed"
+        assert outcome["cleanup_succeeded"] is False
+        assert outcome["reportable"] is False
+    finally:
+        results.close()
+
+
+def test_independent_concurrent_health_delta_is_not_reportable(
+    tmp_path: Path,
+) -> None:
+    run_path = tmp_path / "run-health-delta"
+    configured = independent_config(run_path)
+    results = result_directory(run_path)
+    try:
+        outcome = baseline.run_harness(
+            configured, HealthDeltaIndependentEffects(configured), results
+        )
+        assert outcome["status"] == "benchmark_failed"
+        assert outcome["cleanup_succeeded"] is True
+        assert outcome["reportable"] is False
+        assert "health counter symbol_error increased" in cast(str, outcome["error"])
     finally:
         results.close()
 

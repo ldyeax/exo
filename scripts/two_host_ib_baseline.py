@@ -61,6 +61,27 @@ _HEX_REVISION = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _GUID = re.compile(r"(?:[0-9a-f]{4}:){3}[0-9a-f]{4}")
 _BDF = re.compile(r"[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]")
+_DATA_COUNTER_NAMES = (
+    "port_rcv_data",
+    "port_rcv_packets",
+    "port_xmit_data",
+    "port_xmit_packets",
+)
+_HEALTH_COUNTER_NAMES = (
+    "VL15_dropped",
+    "excessive_buffer_overrun_errors",
+    "link_downed",
+    "link_error_recovery",
+    "local_link_integrity_errors",
+    "port_rcv_constraint_errors",
+    "port_rcv_errors",
+    "port_rcv_remote_physical_errors",
+    "port_rcv_switch_relay_errors",
+    "port_xmit_constraint_errors",
+    "port_xmit_discards",
+    "symbol_error",
+)
+_KNOWN_COUNTER_NAMES = frozenset((*_DATA_COUNTER_NAMES, *_HEALTH_COUNTER_NAMES))
 _PERFTEST_EXECUTABLES = frozenset(
     {
         "opensm",
@@ -226,6 +247,7 @@ class HcaIdentity(StrictModel):
     node_guid: str
     pci: PciIdentity
     ports: tuple[PortIdentity, PortIdentity]
+    expected_health_counters: tuple[str, ...] = ()
 
     @field_validator("node_guid")
     @classmethod
@@ -241,6 +263,12 @@ class HcaIdentity(StrictModel):
             raise ValueError("HCA ports must be exactly ordered ports 1 and 2")
         if self.ports[0].port_guid == self.ports[1].port_guid:
             raise ValueError("HCA port GUIDs must be unique")
+        if len(set(self.expected_health_counters)) != len(
+            self.expected_health_counters
+        ) or not set(self.expected_health_counters) <= set(_HEALTH_COUNTER_NAMES):
+            raise ValueError(
+                "expected_health_counters must be unique known health counters"
+            )
         return self
 
 
@@ -291,6 +319,23 @@ class HostPreflightPolicy(StrictModel):
         return self
 
 
+class RailCpuBindings(StrictModel):
+    port_1: tuple[int, ...]
+    port_2: tuple[int, ...]
+
+    @model_validator(mode="after")
+    def validate_cpu_sets(self) -> "RailCpuBindings":
+        for name, cpu_set in (("port_1", self.port_1), ("port_2", self.port_2)):
+            if not cpu_set or tuple(sorted(set(cpu_set))) != cpu_set or cpu_set[0] < 0:
+                raise ValueError(f"{name} CPU set must be sorted, unique, and nonempty")
+        if set(self.port_1) & set(self.port_2):
+            raise ValueError("per-rail CPU sets must be disjoint")
+        return self
+
+    def for_port(self, port: Literal[1, 2]) -> tuple[int, ...]:
+        return self.port_1 if port == 1 else self.port_2
+
+
 class HostConfig(StrictModel):
     name: str
     management_address: str
@@ -300,6 +345,7 @@ class HostConfig(StrictModel):
     source: SourceIdentity
     preflight: HostPreflightPolicy
     cpu_set: tuple[int, ...]
+    rail_cpu_bindings: RailCpuBindings | None = None
     numa_nodes: tuple[int, ...]
     hca: HcaIdentity
     tools: HostTools
@@ -348,6 +394,13 @@ class HostConfig(StrictModel):
             raise ValueError("numa_nodes must be sorted, unique, and nonempty")
         if self.hca.pci.numa_node not in self.numa_nodes:
             raise ValueError("HCA NUMA node must be included in numa_nodes")
+        if self.rail_cpu_bindings is not None:
+            rail_cpus = {
+                *self.rail_cpu_bindings.port_1,
+                *self.rail_cpu_bindings.port_2,
+            }
+            if not rail_cpus <= set(self.cpu_set):
+                raise ValueError("per-rail CPU sets must be subsets of host cpu_set")
         return self
 
 
@@ -386,22 +439,52 @@ class BenchmarkSpec(StrictModel):
     single_port_1_control_port: int = Field(ge=1024, le=65535)
     single_port_2_control_port: int = Field(ge=1024, le=65535)
     dual_port_control_port: int = Field(ge=1024, le=65535)
+    independent_port_1_control_port: int | None = Field(default=None, ge=1024, le=65535)
+    independent_port_2_control_port: int | None = Field(default=None, ge=1024, le=65535)
 
     @model_validator(mode="after")
     def validate_control_ports(self) -> "BenchmarkSpec":
         values = self.control_ports
-        if len(set(values)) != 3:
-            raise ValueError("three distinct perftest control ports are required")
+        if (self.independent_port_1_control_port is None) != (
+            self.independent_port_2_control_port is None
+        ):
+            raise ValueError(
+                "independent-dual control ports must be configured together"
+            )
+        if len(set(values)) != len(values):
+            raise ValueError("all perftest control ports must be distinct")
         if tuple(sorted(values)) != values:
             raise ValueError("perftest control ports must be in ascending case order")
         return self
 
     @property
-    def control_ports(self) -> tuple[int, int, int]:
-        return (
+    def control_ports(self) -> tuple[int, ...]:
+        base = (
             self.single_port_1_control_port,
             self.single_port_2_control_port,
             self.dual_port_control_port,
+        )
+        if (
+            self.independent_port_1_control_port is None
+            or self.independent_port_2_control_port is None
+        ):
+            return base
+        return (
+            *base,
+            self.independent_port_1_control_port,
+            self.independent_port_2_control_port,
+        )
+
+    @property
+    def independent_control_ports(self) -> tuple[int, int] | None:
+        if (
+            self.independent_port_1_control_port is None
+            or self.independent_port_2_control_port is None
+        ):
+            return None
+        return (
+            self.independent_port_1_control_port,
+            self.independent_port_2_control_port,
         )
 
 
@@ -454,6 +537,12 @@ class BaselineConfig(StrictModel):
             raise ValueError(
                 "artifact revision must equal the common ib_write_bw SHA-256"
             )
+        if self.benchmark.independent_control_ports is not None and any(
+            host.rail_cpu_bindings is None for host in self.hosts
+        ):
+            raise ValueError(
+                "independent-dual case requires per-rail CPU bindings on both hosts"
+            )
         return self
 
     @property
@@ -461,7 +550,7 @@ class BaselineConfig(StrictModel):
         return (self.local_host, self.remote_host)
 
     @property
-    def reserved_ports(self) -> tuple[int, int, int]:
+    def reserved_ports(self) -> tuple[int, ...]:
         return self.benchmark.control_ports
 
 
@@ -591,12 +680,23 @@ def build_static_metadata(
                 "numa_nodes": list(host.numa_nodes),
                 "memory_policy": "bind:"
                 + ",".join(str(node) for node in host.numa_nodes),
+                "per_rail_cpu_sets": None
+                if host.rail_cpu_bindings is None
+                else {
+                    "1": list(host.rail_cpu_bindings.port_1),
+                    "2": list(host.rail_cpu_bindings.port_2),
+                },
             }
             for host in config.hosts
         },
         "hca_bindings": {
             host.name: [
-                {"device": host.hca.device, "port": port.port, "gid": port.gid}
+                {
+                    "device": host.hca.device,
+                    "port": port.port,
+                    "gid": port.gid,
+                    "expected_health_counters": list(host.hca.expected_health_counters),
+                }
                 for port in host.hca.ports
             ]
             for host in config.hosts
@@ -611,7 +711,11 @@ def build_static_metadata(
         },
         "owner_pids": {host.name: [] for host in config.hosts},
         "benchmark_contract": {
-            "kind": "ib_write_bw_single_rails_and_native_dualport",
+            "kind": (
+                "ib_write_bw_single_rails_native_and_independent_dualport"
+                if config.benchmark.independent_control_ports is not None
+                else "ib_write_bw_single_rails_and_native_dualport"
+            ),
             "config_sha256": config_digest,
             "duration_seconds": config.benchmark.duration_seconds,
             "message_bytes": config.benchmark.message_bytes,
@@ -1004,6 +1108,17 @@ class PortObservation(StrictModel):
     sm_lid: int = Field(ge=0)
     counters: dict[str, int]
 
+    @field_validator("counters")
+    @classmethod
+    def validate_counters(cls, value: dict[str, int]) -> dict[str, int]:
+        if not set(_DATA_COUNTER_NAMES) <= set(value):
+            raise ValueError("port observation is missing required data counters")
+        if not set(value) <= _KNOWN_COUNTER_NAMES:
+            raise ValueError("port observation contains an unknown counter")
+        if any(counter < 0 for counter in value.values()):
+            raise ValueError("port counters must be nonnegative")
+        return value
+
 
 class HostObservation(StrictModel):
     hostname: str
@@ -1256,7 +1371,10 @@ def classify_process_conflict(
 
 
 def process_conflicts(
-    proc_root: Path = Path("/proc"), *, ignored_pids: Sequence[int] = ()
+    proc_root: Path = Path("/proc"),
+    *,
+    ignored_pids: Sequence[int] = (),
+    owned_identity: tuple[str, str] | None = None,
 ) -> tuple[str, ...]:
     ignored = {*ignored_pids, os.getpid()}
     conflicts: list[str] = []
@@ -1293,6 +1411,13 @@ def process_conflicts(
             for part in raw_environment.split(b"\0")
             if part
         ]
+        if owned_identity is not None:
+            namespace, owner_token = owned_identity
+            if (
+                f"EXO_BENCHMARK_NAMESPACE={namespace}" in environment
+                and f"EXO_BENCHMARK_OWNER_TOKEN={owner_token}" in environment
+            ):
+                continue
         matched = classify_process_conflict(arguments, environment)
         if matched:
             conflicts.append(
@@ -1442,7 +1567,7 @@ def probe_reserved_ports_unused(ports: Sequence[int]) -> tuple[int, ...]:
     return normalized
 
 
-def _probe_requested_reserved_ports(ports: Sequence[int]) -> tuple[int, ...]:
+def probe_requested_reserved_ports(ports: Sequence[int]) -> tuple[int, ...]:
     normalized = tuple(ports)
     if not normalized:
         return ()
@@ -1452,6 +1577,33 @@ def _probe_requested_reserved_ports(ports: Sequence[int]) -> tuple[int, ...]:
 def _port_guid_from_gid(gid: str) -> str:
     packed = ipaddress.IPv6Address(gid).packed[-8:].hex()
     return ":".join(packed[index : index + 4] for index in range(0, 16, 4))
+
+
+def read_port_counter(
+    roots: Sequence[Path], name: str, *, port: int, required: bool
+) -> int | None:
+    for root in roots:
+        path = root / name
+        try:
+            text = path.read_text().strip()
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            raise BaselineError(
+                f"cannot read port {port} counter {name} at {path}: {error}"
+            ) from error
+        try:
+            value = int(text)
+        except ValueError as error:
+            raise BaselineError(
+                f"invalid integer in port {port} counter {name}: {text!r}"
+            ) from error
+        if value < 0:
+            raise BaselineError(f"port {port} counter {name} is negative")
+        return value
+    if required:
+        raise BaselineError(f"required port {port} counter {name} is unavailable")
+    return None
 
 
 def collect_host_observation(
@@ -1477,24 +1629,30 @@ def collect_host_observation(
         driver = (pci_root / "driver").resolve(strict=True).name
     except OSError as error:
         raise BaselineError(f"cannot resolve HCA driver: {error}") from error
-    counter_names = (
-        "port_xmit_data",
-        "port_rcv_data",
-        "port_xmit_packets",
-        "port_rcv_packets",
-    )
     ports: list[PortObservation] = []
     for configured in host.hca.ports:
         root = hca_root / "ports" / str(configured.port)
         gid = ipaddress.IPv6Address(
             _read_text(root / "gids" / str(configured.gid_index), "port GID")
         ).exploded
-        counters = {
-            name: _integer_text(
-                root / "counters" / name, f"port {configured.port} {name}"
+        counter_roots = (root / "counters", root / "hw_counters")
+        counters: dict[str, int] = {}
+        for name in _DATA_COUNTER_NAMES:
+            value = read_port_counter(
+                counter_roots, name, port=configured.port, required=True
             )
-            for name in counter_names
-        }
+            assert value is not None
+            counters[name] = value
+        required_health = set(host.hca.expected_health_counters)
+        for name in _HEALTH_COUNTER_NAMES:
+            value = read_port_counter(
+                counter_roots,
+                name,
+                port=configured.port,
+                required=name in required_health,
+            )
+            if value is not None:
+                counters[name] = value
         ports.append(
             PortObservation(
                 port=configured.port,
@@ -1550,7 +1708,7 @@ def collect_host_observation(
         cpu_flags=_cpu_flags(proc_root, host.cpu_set),
         raid_sync_conflicts=raid_sync_conflicts(sys_block_root),
         gpu_bindings=(),
-        unused_reserved_ports=_probe_requested_reserved_ports(reserved_ports),
+        unused_reserved_ports=probe_requested_reserved_ports(reserved_ports),
         conflicts=process_conflicts(proc_root, ignored_pids=ignored_pids),
     )
 
@@ -1649,6 +1807,16 @@ def validate_host_observation(
             raise BaselineError(
                 f"{host.name} port {configured.port} identity/rate differs"
             )
+        expected_counters = {
+            *_DATA_COUNTER_NAMES,
+            *host.hca.expected_health_counters,
+        }
+        if not expected_counters <= set(observed.counters):
+            missing = sorted(expected_counters - set(observed.counters))
+            raise BaselineError(
+                f"{host.name} port {configured.port} is missing expected counters: "
+                f"{missing}"
+            )
         if "LINKUP" not in observed.physical_state.upper():
             raise BaselineError(
                 f"{host.name} port {configured.port} is not physically LinkUp"
@@ -1658,18 +1826,22 @@ def validate_host_observation(
 
 
 def validate_active_rails(
-    local: HostObservation, remote: HostObservation, config: BaselineConfig
+    local: HostObservation,
+    remote: HostObservation,
+    config: BaselineConfig,
+    *,
+    reserved_ports: Sequence[int] = (),
 ) -> None:
     validate_host_observation(
         local,
         config.local_host,
-        reserved_ports=(),
+        reserved_ports=reserved_ports,
         require_active=True,
     )
     validate_host_observation(
         remote,
         config.remote_host,
-        reserved_ports=(),
+        reserved_ports=reserved_ports,
         require_active=True,
     )
     for local_port, remote_port in zip(local.ports, remote.ports, strict=True):
@@ -2012,6 +2184,12 @@ def build_remote_request(
     timeout_seconds: float,
     reserved_ports: Sequence[int],
 ) -> JsonObject:
+    normalized_ports = tuple(reserved_ports)
+    independent_ports = (
+        normalized_ports[3:]
+        if host.rail_cpu_bindings is not None and len(normalized_ports) == 5
+        else ()
+    )
     return {
         "schema_version": 1,
         "host": cast(JsonValue, host.model_dump(mode="json")),
@@ -2019,7 +2197,8 @@ def build_remote_request(
         "owner_token": owner_token,
         "namespace": namespace,
         "timeout_seconds": timeout_seconds,
-        "reserved_ports": list(reserved_ports),
+        "reserved_ports": list(normalized_ports),
+        "independent_control_ports": list(independent_ports),
     }
 
 
@@ -2208,7 +2387,7 @@ class SystemEffects:
     def start_local_client(
         self, command: Sequence[str], kind: str, owner_token: str
     ) -> LocalHandle:
-        control_port = _reserved_control_port_from_command(
+        control_port = reserved_control_port_from_command(
             command, self.config.reserved_ports
         )
         probe_reserved_ports_unused((control_port,))
@@ -2221,7 +2400,7 @@ class SystemEffects:
         owner_token: str,
         timeout_seconds: float,
     ) -> RemoteHandle:
-        _reserved_control_port_from_command(command, self.config.reserved_ports)
+        reserved_control_port_from_command(command, self.config.reserved_ports)
         log_name = f"{kind}.log"
         with self.results.create_log(log_name):
             pass
@@ -2512,10 +2691,15 @@ def _cpu_list(cpus: Sequence[int]) -> str:
     return ",".join(str(cpu) for cpu in cpus)
 
 
-def _numactl_prefix(host: HostConfig) -> tuple[str, str, str]:
+def _numactl_prefix(
+    host: HostConfig, cpu_set: Sequence[int] | None = None
+) -> tuple[str, str, str]:
+    selected_cpus = host.cpu_set if cpu_set is None else tuple(cpu_set)
+    if not selected_cpus:
+        raise BaselineError("numactl CPU binding must not be empty")
     return (
         host.tools.numactl,
-        f"--physcpubind={_cpu_list(host.cpu_set)}",
+        f"--physcpubind={_cpu_list(selected_cpus)}",
         f"--membind={_cpu_list(host.numa_nodes)}",
     )
 
@@ -2594,10 +2778,11 @@ def perftest_command(
     control_port: int,
     dual_port: bool,
     server: bool,
+    cpu_set: Sequence[int] | None = None,
 ) -> tuple[str, ...]:
     benchmark = config.benchmark
     command = [
-        *_numactl_prefix(host),
+        *_numactl_prefix(host, cpu_set),
         host.tools.ib_write_bw,
         f"--ib-dev={host.hca.device}",
         f"--ib-port={port}",
@@ -2620,8 +2805,22 @@ def perftest_command(
 
 
 def _validate_remote_server_command(command: Sequence[str], host: HostConfig) -> None:
-    prefix = (*_numactl_prefix(host), host.tools.ib_write_bw)
-    if tuple(command[:4]) != prefix or len(command) < 12:
+    raw_ib_ports = tuple(
+        argument.removeprefix("--ib-port=")
+        for argument in command
+        if argument.startswith("--ib-port=")
+    )
+    if len(raw_ib_ports) != 1 or raw_ib_ports[0] not in {"1", "2"} or len(command) < 12:
+        raise BaselineError("remote command must select exactly one HCA port")
+    port = cast(Literal[1, 2], int(raw_ib_ports[0]))
+    allowed_cpu_sets = [host.cpu_set]
+    if host.rail_cpu_bindings is not None:
+        allowed_cpu_sets.append(host.rail_cpu_bindings.for_port(port))
+    allowed_prefixes = {
+        (*_numactl_prefix(host, cpu_set), host.tools.ib_write_bw)
+        for cpu_set in allowed_cpu_sets
+    }
+    if tuple(command[:4]) not in allowed_prefixes:
         raise BaselineError(
             "remote command does not invoke pinned numactl/ib_write_bw with exact bindings"
         )
@@ -2658,7 +2857,7 @@ def _validate_remote_server_command(command: Sequence[str], host: HostConfig) ->
         raise BaselineError("remote perftest command uses the wrong HCA")
 
 
-def _reserved_control_port_from_command(
+def reserved_control_port_from_command(
     command: Sequence[str], reserved_ports: Sequence[int]
 ) -> int:
     raw_ports = tuple(
@@ -2676,9 +2875,15 @@ def _reserved_control_port_from_command(
     return control_port
 
 
-def _counter_delta(before: HostObservation, after: HostObservation) -> JsonObject:
+def counter_delta(before: HostObservation, after: HostObservation) -> JsonObject:
     result: JsonObject = {}
     for before_port, after_port in zip(before.ports, after.ports, strict=True):
+        if set(before_port.counters) != set(after_port.counters):
+            raise BaselineError(
+                f"counter set changed on port {before_port.port}: "
+                f"before={sorted(before_port.counters)}, "
+                f"after={sorted(after_port.counters)}"
+            )
         deltas: JsonObject = {}
         for name, initial in before_port.counters.items():
             final = after_port.counters.get(name)
@@ -2686,7 +2891,13 @@ def _counter_delta(before: HostObservation, after: HostObservation) -> JsonObjec
                 raise BaselineError(
                     f"counter {name} regressed on port {before_port.port}"
                 )
-            deltas[name] = final - initial
+            delta = final - initial
+            deltas[name] = delta
+            if name in _HEALTH_COUNTER_NAMES and delta > 0:
+                raise BaselineError(
+                    f"health counter {name} increased by {delta} on port "
+                    f"{before_port.port}"
+                )
         deltas["estimated_xmit_payload_bytes"] = cast(int, deltas["port_xmit_data"]) * 4
         deltas["estimated_rcv_payload_bytes"] = cast(int, deltas["port_rcv_data"]) * 4
         result[str(before_port.port)] = deltas
@@ -2759,6 +2970,27 @@ def _wait_for_active_rails(
             last_error = error
         time.sleep(config.timeouts.poll_seconds)
     raise BaselineError(f"both QDR rails did not become ACTIVE: {last_error}")
+
+
+def _probe_active_rails_with_reserved_ports(
+    config: BaselineConfig,
+    effects: BaselineEffects,
+    owned: Sequence[OwnedProcess],
+    latch: SignalLatch,
+    reserved_ports: Sequence[int],
+) -> tuple[HostObservation, HostObservation]:
+    latch.checkpoint()
+    local = _probe_without_owned_conflicts(
+        effects.probe_local(
+            config.local_host,
+            reserved_ports=reserved_ports,
+            ignored_pids=tuple(process.pid for process in owned),
+        ),
+        owned,
+    )
+    remote = effects.probe_remote(config.remote_host, reserved_ports=reserved_ports)
+    validate_active_rails(local, remote, config, reserved_ports=reserved_ports)
+    return local, remote
 
 
 def _case_result(
@@ -2862,8 +3094,8 @@ def _case_result(
             ),
             "server_output_sha256": hashlib.sha256(server_output.encode()).hexdigest(),
             "counter_deltas": {
-                config.local_host.name: _counter_delta(before_local, after_local),
-                config.remote_host.name: _counter_delta(before_remote, after_remote),
+                config.local_host.name: counter_delta(before_local, after_local),
+                config.remote_host.name: counter_delta(before_remote, after_remote),
             },
         }
     finally:
@@ -2873,6 +3105,197 @@ def _case_result(
             cleanups.append(
                 effects.stop_remote(server, config.timeouts.cleanup_seconds)
             )
+
+
+@dataclass(frozen=True)
+class IndependentRailSpec:
+    port: Literal[1, 2]
+    control_port: int
+    local_cpu_set: tuple[int, ...]
+    remote_cpu_set: tuple[int, ...]
+    server_command: tuple[str, ...]
+    client_command: tuple[str, ...]
+
+
+def _independent_dual_case_result(
+    config: BaselineConfig,
+    effects: BaselineEffects,
+    results: ResultDirectory,
+    owner_token: str,
+    owned: list[OwnedProcess],
+    cleanups: list[CleanupReceipt],
+    opensm_receipts: Sequence[OwnedProcess],
+    latch: SignalLatch,
+) -> JsonObject:
+    control_ports = config.benchmark.independent_control_ports
+    local_bindings = config.local_host.rail_cpu_bindings
+    remote_bindings = config.remote_host.rail_cpu_bindings
+    if control_ports is None or local_bindings is None or remote_bindings is None:
+        raise BaselineError("independent-dual case is not fully configured")
+
+    _wait_for_active_rails(config, effects, opensm_receipts, latch)
+    before_local, before_remote = _probe_active_rails_with_reserved_ports(
+        config,
+        effects,
+        opensm_receipts,
+        latch,
+        control_ports,
+    )
+    rail_specs = tuple(
+        IndependentRailSpec(
+            port=port,
+            control_port=control_port,
+            local_cpu_set=local_bindings.for_port(port),
+            remote_cpu_set=remote_bindings.for_port(port),
+            server_command=perftest_command(
+                config,
+                config.remote_host,
+                port=port,
+                control_port=control_port,
+                dual_port=False,
+                server=True,
+                cpu_set=remote_bindings.for_port(port),
+            ),
+            client_command=perftest_command(
+                config,
+                config.local_host,
+                port=port,
+                control_port=control_port,
+                dual_port=False,
+                server=False,
+                cpu_set=local_bindings.for_port(port),
+            ),
+        )
+        for port, control_port in zip(
+            (cast(Literal[1, 2], 1), cast(Literal[1, 2], 2)),
+            control_ports,
+            strict=True,
+        )
+    )
+    servers: list[RemoteHandle] = []
+    clients: list[LocalHandle] = []
+    cleaned_servers: set[int] = set()
+    cleaned_clients: set[int] = set()
+    client_outcomes: list[tuple[int, str, CleanupReceipt]] = []
+    server_outcomes: list[tuple[int, str, CleanupReceipt]] = []
+    try:
+        for spec in rail_specs:
+            server = effects.start_remote_server(
+                spec.server_command,
+                f"independent-concurrent-port-{spec.port}-server",
+                owner_token,
+                config.timeouts.benchmark_seconds,
+            )
+            servers.append(server)
+            owned.append(server.receipt)
+            results.write_json(
+                RUNTIME_METADATA_FILENAME,
+                _runtime_metadata(config, owner_token, owned),
+                replace=True,
+            )
+        for spec in rail_specs:
+            client = effects.start_local_client(
+                spec.client_command,
+                f"independent-concurrent-port-{spec.port}-client",
+                owner_token,
+            )
+            clients.append(client)
+            owned.append(client.receipt)
+            results.write_json(
+                RUNTIME_METADATA_FILENAME,
+                _runtime_metadata(config, owner_token, owned),
+                replace=True,
+            )
+        latch.checkpoint()
+        for index, client in enumerate(clients):
+            outcome = effects.wait_local(client, config.timeouts.benchmark_seconds)
+            client_outcomes.append(outcome)
+            cleanups.append(outcome[2])
+            cleaned_clients.add(index)
+        for index, server in enumerate(servers):
+            outcome = effects.wait_remote(server, config.timeouts.cleanup_seconds)
+            server_outcomes.append(outcome)
+            cleanups.append(outcome[2])
+            cleaned_servers.add(index)
+        latch.checkpoint()
+
+        return_codes = [
+            *(outcome[0] for outcome in client_outcomes),
+            *(outcome[0] for outcome in server_outcomes),
+        ]
+        if len(return_codes) != 4 or any(code != 0 for code in return_codes):
+            raise BaselineError(
+                "independent-concurrent perftest failed: "
+                f"client={[item[0] for item in client_outcomes]}, "
+                f"server={[item[0] for item in server_outcomes]}"
+            )
+        cleanup_receipts = [
+            *(outcome[2] for outcome in client_outcomes),
+            *(outcome[2] for outcome in server_outcomes),
+        ]
+        if len(cleanup_receipts) != 4 or any(
+            not receipt.ownership_verified or not receipt.terminated
+            for receipt in cleanup_receipts
+        ):
+            raise BaselineError("independent-concurrent cleanup was not confirmed")
+
+        aggregate_average = 0.0
+        rails: list[JsonValue] = []
+        for spec, client_outcome, server_outcome in zip(
+            rail_specs, client_outcomes, server_outcomes, strict=True
+        ):
+            rows = parse_ib_write_bw_output(client_outcome[1])
+            if any(row.port is not None for row in rows):
+                raise BaselineError(
+                    f"independent rail {spec.port} returned dual-port rows"
+                )
+            rail_average = max(row.average_gigabits_per_second for row in rows)
+            aggregate_average += rail_average
+            rails.append(
+                {
+                    "port": spec.port,
+                    "control_port": spec.control_port,
+                    "cpu_bindings": {
+                        config.local_host.name: list(spec.local_cpu_set),
+                        config.remote_host.name: list(spec.remote_cpu_set),
+                    },
+                    "server_command": list(spec.server_command),
+                    "client_command": list(spec.client_command),
+                    "rows": [
+                        cast(JsonValue, row.model_dump(mode="json")) for row in rows
+                    ],
+                    "maximum_average_gigabits_per_second": rail_average,
+                    "server_output_sha256": hashlib.sha256(
+                        server_outcome[1].encode()
+                    ).hexdigest(),
+                }
+            )
+        after_local, after_remote = _wait_for_active_rails(
+            config, effects, opensm_receipts, latch
+        )
+        return {
+            "name": "independent-concurrent",
+            "mode": "independent_dual_port",
+            "ports": [1, 2],
+            "control_ports": list(control_ports),
+            "rails": rails,
+            "aggregate_average_gigabits_per_second": aggregate_average,
+            "counter_deltas": {
+                config.local_host.name: counter_delta(before_local, after_local),
+                config.remote_host.name: counter_delta(before_remote, after_remote),
+            },
+        }
+    finally:
+        for index in range(len(clients) - 1, -1, -1):
+            if index not in cleaned_clients:
+                cleanups.append(
+                    effects.stop_local(clients[index], config.timeouts.cleanup_seconds)
+                )
+        for index in range(len(servers) - 1, -1, -1):
+            if index not in cleaned_servers:
+                cleanups.append(
+                    effects.stop_remote(servers[index], config.timeouts.cleanup_seconds)
+                )
 
 
 def run_harness(
@@ -2966,6 +3389,19 @@ def run_harness(
                     port=port,
                     control_port=control_port,
                     dual_port=dual_port,
+                )
+            )
+        if config.benchmark.independent_control_ports is not None:
+            cases.append(
+                _independent_dual_case_result(
+                    config,
+                    effects,
+                    results,
+                    owner_token,
+                    owned,
+                    cleanups,
+                    tuple(handle.receipt for handle in open_sm_handles),
+                    signal_latch,
                 )
             )
         completed = True
@@ -3160,7 +3596,45 @@ def parse_remote_request(
         or reserved_ports[-1] > 65535
     ):
         raise BaselineError("remote reserved ports must be sorted, unique, and valid")
-    _reserved_control_port_from_command(command, reserved_ports)
+    control_port = reserved_control_port_from_command(command, reserved_ports)
+    raw_independent_ports = request.get("independent_control_ports")
+    if not isinstance(raw_independent_ports, list) or not all(
+        type(value) is int for value in raw_independent_ports
+    ):
+        raise BaselineError("remote independent control ports must be an integer array")
+    independent_ports = tuple(cast(list[int], raw_independent_ports))
+    expected_independent_ports = (
+        reserved_ports[3:]
+        if host.rail_cpu_bindings is not None and len(reserved_ports) == 5
+        else ()
+    )
+    if independent_ports != expected_independent_ports:
+        raise BaselineError("remote independent control-port binding is inconsistent")
+    if independent_ports:
+        assert host.rail_cpu_bindings is not None
+        independent_bindings = {
+            independent_ports[0]: (
+                cast(Literal[1, 2], 1),
+                host.rail_cpu_bindings.port_1,
+            ),
+            independent_ports[1]: (
+                cast(Literal[1, 2], 2),
+                host.rail_cpu_bindings.port_2,
+            ),
+        }
+        if control_port in independent_bindings:
+            required_port, required_cpu_set = independent_bindings[control_port]
+            required_prefix = (
+                *_numactl_prefix(host, required_cpu_set),
+                host.tools.ib_write_bw,
+            )
+            if (
+                f"--ib-port={required_port}" not in command
+                or tuple(command[:4]) != required_prefix
+            ):
+                raise BaselineError(
+                    "independent remote command does not match its rail CPU binding"
+                )
     owner_token = _string(request.get("owner_token"), "owner token")
     namespace = _string(request.get("namespace"), "namespace")
     timeout_value = request.get("timeout_seconds")
@@ -3205,12 +3679,15 @@ def remote_supervise_main() -> int:
             timeout_seconds,
             reserved_ports,
         ) = parse_remote_request(request)
-        conflicts = process_conflicts(ignored_pids=(os.getpid(), os.getppid()))
+        conflicts = process_conflicts(
+            ignored_pids=(os.getpid(), os.getppid()),
+            owned_identity=(namespace, owner_token),
+        )
         if conflicts:
             raise ProcessConflictError(
                 f"remote host has unowned benchmark/SM processes: {'; '.join(conflicts)}"
             )
-        control_port = _reserved_control_port_from_command(command, reserved_ports)
+        control_port = reserved_control_port_from_command(command, reserved_ports)
         probe_reserved_ports_unused((control_port,))
         temporary = tempfile.TemporaryFile(mode="w+b")  # noqa: SIM115
         environment = {
