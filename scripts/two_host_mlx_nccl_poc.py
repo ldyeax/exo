@@ -365,7 +365,7 @@ class RuntimeRequirements(StrictModel):
 
 
 class HarnessConfig(StrictModel):
-    schema_version: Literal[2]
+    schema_version: Literal[3]
     run_id: str
     namespace: str
     result_directory: str
@@ -1227,10 +1227,12 @@ def _validate_launch_contract(host: HostConfig, config: HarnessConfig) -> None:
         if api_port != str(config.api.port):
             raise ValueError("coordinator launch must use the reserved API port")
     else:
-        if "--no-api" not in arguments:
-            raise ValueError("worker launch must disable its API")
-        if "--force-master" in arguments or api_port is not None:
-            raise ValueError("worker launch must not configure coordinator API flags")
+        if "--no-api" in arguments:
+            raise ValueError("worker must expose the API for peer reachability probes")
+        if "--force-master" in arguments:
+            raise ValueError("worker launch must not force master")
+        if api_port != str(config.api.port):
+            raise ValueError("worker launch must use the shared reserved API port")
     model_path = Path(host.model_path)
     model_parent = str(model_path.parent)
     expected_model_directory = (
@@ -1859,6 +1861,150 @@ def validate_cluster_inventory(
     if set(runtime_node_ids) != set(expected_by_host):
         raise HarnessError("cluster inventory did not identify both configured hosts")
     return runtime_node_ids
+
+
+def _memory_in_bytes(value: JsonValue, description: str) -> int:
+    memory = _object(value, description)
+    in_bytes = memory.get("inBytes")
+    if not isinstance(in_bytes, int) or isinstance(in_bytes, bool) or in_bytes < 0:
+        raise HarnessError(f"{description}.inBytes must be a nonnegative integer")
+    return in_bytes
+
+
+def validate_cluster_readiness(
+    state_value: JsonValue, config: HarnessConfig
+) -> tuple[dict[str, str], JsonObject]:
+    """Validate one coherent state snapshot needed for two-host placement."""
+    state = _object(state_value, "cluster state")
+    runtime_node_ids = validate_cluster_inventory(
+        state.get("nodeComputeResources"),
+        state.get("nodeBackends"),
+        config,
+    )
+    expected_node_ids = set(runtime_node_ids.values())
+
+    node_memory = _object(state.get("nodeMemory"), "cluster node memory")
+    if set(node_memory) != expected_node_ids:
+        raise HarnessError(
+            "cluster node memory must contain exactly the two discovered nodes"
+        )
+    available_memory_by_host: JsonObject = {}
+    total_available_memory = 0
+    for host in config.hosts:
+        node_id = runtime_node_ids[host.name]
+        usage = _object(node_memory.get(node_id), f"memory for {host.name}")
+        available_memory = _memory_in_bytes(
+            usage.get("ramAvailable"), f"available RAM for {host.name}"
+        )
+        if available_memory == 0:
+            raise HarnessError(f"available RAM for {host.name} must be positive")
+        available_memory_by_host[host.name] = available_memory
+        total_available_memory += available_memory
+    if total_available_memory < config.model.expected_weight_bytes:
+        raise HarnessError(
+            "cluster available RAM is smaller than the exact model weight bytes"
+        )
+
+    node_network = _object(state.get("nodeNetwork"), "cluster node network")
+    if set(node_network) != expected_node_ids:
+        raise HarnessError(
+            "cluster node network must contain exactly the two discovered nodes"
+        )
+    for host in config.hosts:
+        node_id = runtime_node_ids[host.name]
+        network = _object(node_network.get(node_id), f"network for {host.name}")
+        interfaces = network.get("interfaces")
+        if not isinstance(interfaces, list) or not interfaces:
+            raise HarnessError(
+                f"network for {host.name} must advertise at least one interface"
+            )
+
+    topology = _object(state.get("topology"), "cluster topology")
+    raw_topology_nodes = topology.get("nodes")
+    if not isinstance(raw_topology_nodes, list):
+        raise HarnessError("cluster topology nodes must be a list")
+    topology_nodes = {
+        _string(node_id, "cluster topology node") for node_id in raw_topology_nodes
+    }
+    if len(topology_nodes) != len(raw_topology_nodes):
+        raise HarnessError("cluster topology nodes must be unique")
+    if topology_nodes != expected_node_ids:
+        raise HarnessError(
+            "cluster topology must contain exactly the two discovered nodes"
+        )
+    connections = _object(topology.get("connections"), "cluster topology connections")
+    socket_edges: JsonObject = {}
+    for source_host in config.hosts:
+        target_host = next(
+            host for host in config.hosts if host.name != source_host.name
+        )
+        source_node_id = runtime_node_ids[source_host.name]
+        target_node_id = runtime_node_ids[target_host.name]
+        targets = _object(
+            connections.get(source_node_id),
+            f"topology connections from {source_host.name}",
+        )
+        raw_edges = targets.get(target_node_id)
+        if not isinstance(raw_edges, list):
+            raise HarnessError(
+                f"topology edges from {source_host.name} to {target_host.name} "
+                "must be a list"
+            )
+        ipv4_api_addresses: list[str] = []
+        for index, raw_edge in enumerate(raw_edges):
+            edge = _object(
+                raw_edge,
+                f"topology edge {source_host.name}->{target_host.name}[{index}]",
+            )
+            raw_multiaddr = edge.get("sinkMultiaddr")
+            if raw_multiaddr is None:
+                continue
+            multiaddr = _object(
+                raw_multiaddr,
+                f"socket address {source_host.name}->{target_host.name}[{index}]",
+            )
+            address = _string(
+                multiaddr.get("address"),
+                f"socket address {source_host.name}->{target_host.name}[{index}]",
+            )
+            if address.startswith("/ip4/") and address.endswith(
+                f"/tcp/{config.api.port}"
+            ):
+                ipv4_api_addresses.append(address)
+        if not ipv4_api_addresses:
+            raise HarnessError(
+                f"topology lacks an IPv4 API edge from {source_host.name} "
+                f"to {target_host.name} on port {config.api.port}"
+            )
+        sorted_addresses: list[JsonValue] = [
+            address for address in sorted(ipv4_api_addresses)
+        ]
+        socket_edges[f"{source_host.name}->{target_host.name}"] = sorted_addresses
+
+    last_event_applied_index = state.get("lastEventAppliedIdx")
+    if (
+        not isinstance(last_event_applied_index, int)
+        or isinstance(last_event_applied_index, bool)
+        or last_event_applied_index < 0
+    ):
+        raise HarnessError("cluster lastEventAppliedIdx must be nonnegative")
+    evidence = _object(
+        _validated_json_value(
+            {
+                "runtime_node_ids": runtime_node_ids,
+                "available_memory_bytes": available_memory_by_host,
+                "total_available_memory_bytes": total_available_memory,
+                "required_model_weight_bytes": config.model.expected_weight_bytes,
+                "topology_nodes": sorted(topology_nodes),
+                "ipv4_api_edges": socket_edges,
+                "api_port": config.api.port,
+                "last_event_applied_index": last_event_applied_index,
+            },
+            "cluster readiness evidence",
+        ),
+        "cluster readiness evidence",
+    )
+    return runtime_node_ids, evidence
 
 
 def _numeric_version(value: str) -> tuple[int, ...]:
@@ -3289,29 +3435,42 @@ def wait_for_cluster(
     effects: HarnessEffects,
     config: HarnessConfig,
     processes: Sequence[OwnedProcess],
-) -> dict[str, str]:
+) -> tuple[dict[str, str], JsonObject]:
     runtime_node_ids: dict[str, str] | None = None
+    readiness_evidence: JsonObject | None = None
+    last_readiness_error: HarnessError | None = None
 
     def cluster_is_ready() -> bool:
-        nonlocal runtime_node_ids
-        resources = effects.request_json("GET", "/state/nodeComputeResources")
-        backends = effects.request_json("GET", "/state/nodeBackends")
+        nonlocal runtime_node_ids, readiness_evidence, last_readiness_error
+        state = effects.request_json("GET", "/state")
         try:
-            runtime_node_ids = validate_cluster_inventory(resources, backends, config)
-        except HarnessError:
+            runtime_node_ids, readiness_evidence = validate_cluster_readiness(
+                state, config
+            )
+        except HarnessError as error:
+            last_readiness_error = error
             return False
+        last_readiness_error = None
         return True
 
-    _wait_until(
-        effects,
-        timeout_seconds=config.timeouts.cluster_seconds,
-        poll_seconds=config.timeouts.poll_seconds,
-        description="the exact two-host CUDA inventory",
-        processes=processes,
-        check=cluster_is_ready,
-    )
+    try:
+        _wait_until(
+            effects,
+            timeout_seconds=config.timeouts.cluster_seconds,
+            poll_seconds=config.timeouts.poll_seconds,
+            description="the placement-ready two-host CUDA topology",
+            processes=processes,
+            check=cluster_is_ready,
+        )
+    except HarnessError as error:
+        if last_readiness_error is None:
+            raise
+        raise HarnessError(
+            f"{error}: last readiness error was {last_readiness_error}"
+        ) from error
     assert runtime_node_ids is not None
-    return runtime_node_ids
+    assert readiness_evidence is not None
+    return runtime_node_ids, readiness_evidence
 
 
 def _get_optional_state(effects: HarnessEffects, path: str) -> JsonValue | None:
@@ -3904,6 +4063,7 @@ def run_harness(
     aggregate: JsonObject | None = None
     nccl_log_evidence: JsonObject | None = None
     runtime_node_ids: dict[str, str] = {}
+    cluster_readiness: JsonObject | None = None
     started_at = time.time()
 
     try:
@@ -3939,7 +4099,9 @@ def run_harness(
             latch.checkpoint()
 
         api_node_id = wait_for_api(effects, config, processes)
-        runtime_node_ids = wait_for_cluster(effects, config, processes)
+        runtime_node_ids, cluster_readiness = wait_for_cluster(
+            effects, config, processes
+        )
         coordinator = next(host for host in config.hosts if host.role == "coordinator")
         if runtime_node_ids[coordinator.name] != api_node_id:
             raise HarnessError(
@@ -4115,6 +4277,7 @@ def run_harness(
             "model_paths": {host.name: host.model_path for host in config.hosts},
             "preflight": preflights,
             "model_probes": model_probes,
+            "cluster_readiness": cluster_readiness,
             "commands": {host.name: list(host.launch_argv) for host in config.hosts},
             "environment": {
                 host.name: {

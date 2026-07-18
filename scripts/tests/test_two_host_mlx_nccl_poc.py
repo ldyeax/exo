@@ -166,9 +166,8 @@ def _launch_arguments(
         "--no-downloads",
     ]
     if coordinator:
-        arguments.extend(("--force-master", "--api-port", "6100"))
-    else:
-        arguments.append("--no-api")
+        arguments.append("--force-master")
+    arguments.extend(("--api-port", "6100"))
     return tuple(arguments)
 
 
@@ -257,7 +256,7 @@ def make_config(tmp_path: Path) -> HarnessConfig:
         launch_order=1,
     )
     return HarnessConfig(
-        schema_version=2,
+        schema_version=3,
         run_id=run_id,
         namespace=namespace,
         result_directory=str(tmp_path),
@@ -501,6 +500,64 @@ def _resource_json(gpu: GpuIdentity) -> JsonObject:
     }
 
 
+def make_cluster_state(config: HarnessConfig) -> JsonObject:
+    node_ids = {host.name: RUNTIME_NODE_IDS[host.name] for host in config.hosts}
+    host_ips = {"dwagon": "192.168.40.24", "fwuff": "192.168.40.248"}
+    connections: JsonObject = {}
+    for source_host in config.hosts:
+        target_host = next(
+            host for host in config.hosts if host.name != source_host.name
+        )
+        connections[node_ids[source_host.name]] = {
+            node_ids[target_host.name]: [
+                {
+                    "sinkMultiaddr": {
+                        "address": (
+                            f"/ip4/{host_ips[target_host.name]}/tcp/{config.api.port}"
+                        )
+                    }
+                }
+            ]
+        }
+    return {
+        "instances": {},
+        "runners": {},
+        "retiringComputeResources": {},
+        "prefillServerPorts": {},
+        "nodeComputeResources": {
+            node_ids[host.name]: [_resource_json(gpu) for gpu in host.gpus]
+            for host in config.hosts
+        },
+        "nodeBackends": {node_ids[host.name]: ["MlxCuda"] for host in config.hosts},
+        "nodeMemory": {
+            node_ids[host.name]: {
+                "ramTotal": {"inBytes": 512 * 1024**3},
+                "ramAvailable": {"inBytes": 500 * 1024**3},
+                "swapTotal": {"inBytes": 0},
+                "swapAvailable": {"inBytes": 0},
+            }
+            for host in config.hosts
+        },
+        "nodeNetwork": {
+            node_ids[host.name]: {
+                "interfaces": [
+                    {
+                        "name": "eth0",
+                        "ipAddress": host_ips[host.name],
+                        "interfaceType": "ethernet",
+                    }
+                ]
+            }
+            for host in config.hosts
+        },
+        "topology": {
+            "nodes": list(node_ids.values()),
+            "connections": connections,
+        },
+        "lastEventAppliedIdx": 20,
+    }
+
+
 class FakeEffects:
     def __init__(
         self,
@@ -716,12 +773,7 @@ class FakeEffects:
             self.created = False
             return {"message": "Command received"}
         if method == "GET" and path == "/state":
-            return {
-                "instances": {},
-                "runners": {},
-                "retiringComputeResources": {},
-                "prefillServerPorts": {},
-            }
+            return make_cluster_state(self.config)
         raise AssertionError(f"unexpected request: {method} {path}")
 
     def monotonic(self) -> float:
@@ -764,6 +816,14 @@ def test_config_is_strict_and_requires_the_reserved_nccl_port(tmp_path: Path) ->
     raw = config.model_dump(mode="json")
     raw["reserved_ports"].remove(config.nccl_coordinator_port)
     with pytest.raises(ValidationError, match="must be reserved"):
+        HarnessConfig.model_validate_json(json.dumps(raw))
+
+
+def test_config_rejects_pre_topology_readiness_schema(tmp_path: Path) -> None:
+    raw = make_config(tmp_path).model_dump(mode="json")
+    raw["schema_version"] = 2
+
+    with pytest.raises(ValidationError, match="literal_error"):
         HarnessConfig.model_validate_json(json.dumps(raw))
 
 
@@ -819,6 +879,76 @@ def test_tp2_cluster_inventory_still_requires_the_unused_physical_gpu(
 
     with pytest.raises(HarnessError, match="GPU inventory"):
         poc.validate_cluster_inventory(resources, backends, config)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("missing_memory", "node memory"),
+        ("missing_network", "node network"),
+        ("no_edges", "connections from dwagon"),
+        ("one_way", "connections from fwuff"),
+        ("wrong_port", "lacks an IPv4 API edge"),
+    ],
+)
+def test_cluster_readiness_rejects_incomplete_placement_state(
+    tmp_path: Path, mutation: str, message: str
+) -> None:
+    config = make_config(tmp_path)
+    state = make_cluster_state(config)
+    if mutation == "missing_memory":
+        node_memory = state["nodeMemory"]
+        assert isinstance(node_memory, dict)
+        node_memory.pop(RUNTIME_NODE_IDS["fwuff"])
+    elif mutation == "missing_network":
+        node_network = state["nodeNetwork"]
+        assert isinstance(node_network, dict)
+        node_network.pop(RUNTIME_NODE_IDS["fwuff"])
+    else:
+        topology = state["topology"]
+        assert isinstance(topology, dict)
+        connections = topology["connections"]
+        assert isinstance(connections, dict)
+        if mutation == "no_edges":
+            connections.clear()
+        elif mutation == "one_way":
+            connections.pop(RUNTIME_NODE_IDS["fwuff"])
+        else:
+            dwagon_targets = connections[RUNTIME_NODE_IDS["dwagon"]]
+            assert isinstance(dwagon_targets, dict)
+            edges = dwagon_targets[RUNTIME_NODE_IDS["fwuff"]]
+            assert isinstance(edges, list)
+            edge = edges[0]
+            assert isinstance(edge, dict)
+            multiaddr = edge["sinkMultiaddr"]
+            assert isinstance(multiaddr, dict)
+            multiaddr["address"] = "/ip4/192.168.40.248/tcp/65003"
+
+    with pytest.raises(HarnessError, match=message):
+        poc.validate_cluster_readiness(state, config)
+
+
+def test_cluster_readiness_records_memory_and_bidirectional_api_edges(
+    tmp_path: Path,
+) -> None:
+    config = make_config(tmp_path)
+
+    runtime_node_ids, evidence = poc.validate_cluster_readiness(
+        make_cluster_state(config), config
+    )
+
+    assert runtime_node_ids == RUNTIME_NODE_IDS
+    assert evidence["available_memory_bytes"] == {
+        "dwagon": 500 * 1024**3,
+        "fwuff": 500 * 1024**3,
+    }
+    assert evidence["total_available_memory_bytes"] == 1000 * 1024**3
+    assert evidence["required_model_weight_bytes"] == WEIGHT_BYTES
+    assert evidence["api_port"] == config.api.port
+    assert evidence["last_event_applied_index"] == 20
+    api_edges = evidence["ipv4_api_edges"]
+    assert isinstance(api_edges, dict)
+    assert set(api_edges) == {"dwagon->fwuff", "fwuff->dwagon"}
 
 
 @pytest.mark.parametrize("mutation", ["missing", "extra"])
@@ -908,6 +1038,31 @@ def test_config_binds_exact_model_and_executable_contract(
         coordinator["launch_argv"].remove("--no-downloads")
     else:
         coordinator["launch_argv"][3] = "/other/venv/bin/python"
+
+    with pytest.raises(ValidationError, match=message):
+        HarnessConfig.model_validate_json(json.dumps(raw))
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("disable_api", "peer reachability probes"),
+        ("wrong_api_port", "shared reserved API port"),
+        ("missing_api_port", "shared reserved API port"),
+    ],
+)
+def test_worker_api_uses_the_shared_port_for_bidirectional_topology_probes(
+    tmp_path: Path, mutation: str, message: str
+) -> None:
+    raw = make_config(tmp_path).model_dump(mode="json")
+    arguments = raw["hosts"][1]["launch_argv"]
+    api_port_index = arguments.index("--api-port")
+    if mutation == "disable_api":
+        arguments.append("--no-api")
+    elif mutation == "wrong_api_port":
+        arguments[api_port_index + 1] = "65003"
+    else:
+        del arguments[api_port_index : api_port_index + 2]
 
     with pytest.raises(ValidationError, match=message):
         HarnessConfig.model_validate_json(json.dumps(raw))
@@ -2071,6 +2226,53 @@ def test_tp2_cleanup_ignores_the_unselected_physical_gpu(tmp_path: Path) -> None
         ("runner-0", "runner-1"),
         selected_resources,
     )
+
+
+def test_harness_waits_for_memory_and_two_way_topology_before_placement(
+    tmp_path: Path,
+) -> None:
+    config = make_config(tmp_path)
+
+    class DelayedReadinessEffects(FakeEffects):
+        state_requests = 0
+        placement_requests = 0
+
+        def request_json(
+            self,
+            method: str,
+            path: str,
+            *,
+            params: QueryParameters | None = None,
+            body: JsonObject | None = None,
+        ) -> JsonValue:
+            if method == "GET" and path == "/state":
+                self.state_requests += 1
+                state = make_cluster_state(self.config)
+                if self.state_requests == 1:
+                    node_memory = state["nodeMemory"]
+                    assert isinstance(node_memory, dict)
+                    node_memory.pop(RUNTIME_NODE_IDS["fwuff"])
+                elif self.state_requests == 2:
+                    topology = state["topology"]
+                    assert isinstance(topology, dict)
+                    connections = topology["connections"]
+                    assert isinstance(connections, dict)
+                    connections.pop(RUNTIME_NODE_IDS["fwuff"])
+                return state
+            if method == "GET" and path == "/instance/placement":
+                self.placement_requests += 1
+                assert self.state_requests >= 3
+            return super().request_json(method, path, params=params, body=body)
+
+    effects = DelayedReadinessEffects(config)
+
+    result = run_harness(config, effects)
+
+    assert result["status"] == "completed"
+    assert effects.placement_requests == 1
+    readiness = result["cluster_readiness"]
+    assert isinstance(readiness, dict)
+    assert readiness["last_event_applied_index"] == 20
 
 
 def test_full_harness_uses_deterministic_requests_and_owned_cleanup(

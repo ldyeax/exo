@@ -272,7 +272,7 @@ def test_place_mlx_nccl_requires_multiple_nodes(model_card: ModelCard):
         min_nodes=1,
     )
 
-    with pytest.raises(ValueError, match="No cycles found with sufficient memory"):
+    with pytest.raises(ValueError, match="No connectivity cycle satisfies"):
         place_instance(
             command,
             topology,
@@ -280,6 +280,91 @@ def test_place_mlx_nccl_requires_multiple_nodes(model_card: ModelCard):
             {node_id: create_node_memory(1000 * 1024)},
             {node_id: create_node_network()},
             {node_id: [Backend.MlxCuda]},
+        )
+
+
+def test_place_mlx_nccl_reports_missing_cycle_memory_telemetry(
+    model_card: ModelCard,
+) -> None:
+    node_a = NodeId("node-a")
+    node_b = NodeId("node-b")
+    topology = Topology()
+    topology.add_connection(
+        Connection(source=node_a, sink=node_b, edge=create_socket_connection(2))
+    )
+    topology.add_connection(
+        Connection(source=node_b, sink=node_a, edge=create_socket_connection(1))
+    )
+    command = PlaceInstance(
+        command_id=CommandId(),
+        model_card=model_card.model_copy(update={"backends": [Backend.MlxCuda]}),
+        sharding=Sharding.Tensor,
+        instance_meta=InstanceMeta.MlxNccl,
+        min_nodes=2,
+    )
+
+    with pytest.raises(ValueError, match=r"memory telemetry.*node-b"):
+        place_instance(
+            command,
+            topology,
+            {},
+            {node_a: create_node_memory(1000 * 1024)},
+            {
+                node_a: create_node_network(),
+                node_b: create_node_network(),
+            },
+            {
+                node_a: [Backend.MlxCuda],
+                node_b: [Backend.MlxCuda],
+            },
+        )
+
+
+def test_place_reports_incomplete_memory_cycles_when_complete_cycles_do_not_fit(
+    model_card: ModelCard,
+) -> None:
+    complete_nodes = (NodeId("complete-a"), NodeId("complete-b"))
+    incomplete_nodes = (NodeId("incomplete-a"), NodeId("incomplete-b"))
+    topology = Topology()
+    for nodes, ip_suffix in ((complete_nodes, 1), (incomplete_nodes, 3)):
+        topology.add_connection(
+            Connection(
+                source=nodes[0],
+                sink=nodes[1],
+                edge=create_socket_connection(ip_suffix + 1),
+            )
+        )
+        topology.add_connection(
+            Connection(
+                source=nodes[1],
+                sink=nodes[0],
+                edge=create_socket_connection(ip_suffix),
+            )
+        )
+    command = PlaceInstance(
+        command_id=CommandId(),
+        model_card=model_card.model_copy(update={"backends": [Backend.MlxCuda]}),
+        sharding=Sharding.Tensor,
+        instance_meta=InstanceMeta.MlxNccl,
+        min_nodes=2,
+    )
+    all_nodes = complete_nodes + incomplete_nodes
+    node_memory = {
+        node_id: create_node_memory(1)
+        for node_id in (*complete_nodes, incomplete_nodes[0])
+    }
+
+    with pytest.raises(
+        ValueError,
+        match=r"incomplete_cycles_missing_node_ids=.*incomplete-b",
+    ):
+        place_instance(
+            command,
+            topology,
+            {},
+            node_memory,
+            {node_id: create_node_network() for node_id in all_nodes},
+            {node_id: [Backend.MlxCuda] for node_id in all_nodes},
         )
 
 
@@ -460,7 +545,7 @@ def test_get_instance_placements_one_node_not_fit() -> None:
         ),
     )
 
-    with pytest.raises(ValueError, match="No cycles found with sufficient memory"):
+    with pytest.raises(ValueError, match="sufficient aggregate host RAM"):
         place_instance(
             cic, topology, {}, node_memory, node_network, _metal_only(node_memory)
         )

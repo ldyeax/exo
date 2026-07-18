@@ -474,11 +474,48 @@ def place_instance(
                 for cycle in candidate_cycles
                 if required_nodes.issubset(cycle.node_ids)
             ]
+    if not candidate_cycles:
+        raise ValueError(
+            "No connectivity cycle satisfies "
+            f"min_nodes={minimum_nodes} and the required-node policy"
+        )
+    missing_memory_node_ids = sorted(
+        {
+            str(node_id)
+            for cycle in candidate_cycles
+            for node_id in cycle
+            if node_id not in node_memory
+        }
+    )
+    cycles_with_complete_memory = [
+        cycle
+        for cycle in candidate_cycles
+        if all(node_id in node_memory for node_id in cycle)
+    ]
+    if not cycles_with_complete_memory:
+        raise ValueError(
+            "No candidate connectivity cycle has memory telemetry for every node; "
+            f"missing node IDs: {missing_memory_node_ids}"
+        )
     cycles_with_sufficient_memory = filter_cycles_by_memory(
-        candidate_cycles, node_memory, command.model_card.storage_size
+        cycles_with_complete_memory, node_memory, command.model_card.storage_size
     )
     if len(cycles_with_sufficient_memory) == 0:
-        raise ValueError("No cycles found with sufficient memory")
+        available_by_cycle = [
+            {
+                "nodes": [str(node_id) for node_id in cycle],
+                "available_bytes": sum(
+                    node_memory[node_id].ram_available.in_bytes for node_id in cycle
+                ),
+            }
+            for cycle in cycles_with_complete_memory
+        ]
+        raise ValueError(
+            "No candidate connectivity cycle has sufficient aggregate host RAM: "
+            f"required_bytes={command.model_card.storage_size.in_bytes}, "
+            f"available_by_cycle={available_by_cycle}, "
+            f"incomplete_cycles_missing_node_ids={missing_memory_node_ids}"
+        )
 
     if (
         not has_explicit_resource_selection
