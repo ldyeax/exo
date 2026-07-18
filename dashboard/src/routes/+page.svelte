@@ -34,7 +34,9 @@
     placementPreviews,
     selectedPreviewModelId,
     isLoadingPreviews,
+    previewUseAllComputeResources,
     selectPreviewModel,
+    setPreviewUseAllComputeResources,
     togglePreviewNodeFilter,
     clearPreviewNodeFilter,
     previewNodeFilter,
@@ -87,6 +89,9 @@
   const previewsData = $derived(placementPreviews());
   const selectedModelId = $derived(selectedPreviewModelId());
   const loadingPreviews = $derived(isLoadingPreviews());
+  const useAllComputeResourcesEnabled = $derived(
+    previewUseAllComputeResources(),
+  );
   const debugEnabled = $derived(debugMode());
   const topologyOnlyEnabled = $derived(topologyOnlyMode());
   const sidebarVisible = $derived(chatSidebarVisible());
@@ -706,7 +711,7 @@
     const instanceType = nodeCount <= 1 ? "MlxRing" : selectedInstanceType;
     try {
       const placementResponse = await fetch(
-        `/instance/placement?model_id=${encodeURIComponent(modelId)}&sharding=${sharding}&instance_meta=${instanceType}&min_nodes=1`,
+        `/instance/placement?model_id=${encodeURIComponent(modelId)}&sharding=${sharding}&instance_meta=${instanceType}&min_nodes=1&use_all_compute_resources=${useAllComputeResourcesEnabled}`,
       );
       if (!placementResponse.ok) {
         const errorText = await placementResponse.text();
@@ -895,14 +900,18 @@
     sharding: "Pipeline" | "Tensor";
     instanceType: InstanceMeta;
     minNodes: number;
+    useAllComputeResources?: boolean;
   }
 
-  function saveLaunchDefaults(): void {
+  function saveLaunchDefaults(
+    useAllComputeResources = useAllComputeResourcesEnabled,
+  ): void {
     const defaults: LaunchDefaults = {
       modelId: selectedPreviewModelId(),
       sharding: selectedSharding,
       instanceType: selectedInstanceType,
       minNodes: selectedMinNodes,
+      useAllComputeResources,
     };
     try {
       localStorage.setItem(LAUNCH_DEFAULTS_KEY, JSON.stringify(defaults));
@@ -941,7 +950,9 @@
       (defaults.instanceType !== "MlxNccl" || defaults.sharding === "Tensor") &&
       typeof defaults.minNodes === "number" &&
       Number.isInteger(defaults.minNodes) &&
-      defaults.minNodes >= 1
+      defaults.minNodes >= 1 &&
+      (defaults.useAllComputeResources === undefined ||
+        typeof defaults.useAllComputeResources === "boolean")
     );
   }
 
@@ -949,6 +960,11 @@
     selectedInstanceType = instanceType;
     if (instanceType === "MlxNccl") selectedSharding = "Tensor";
     saveLaunchDefaults();
+  }
+
+  function updateUseAllComputeResources(enabled: boolean): void {
+    setPreviewUseAllComputeResources(enabled);
+    saveLaunchDefaults(enabled);
   }
 
   function applyLaunchDefaults(
@@ -961,6 +977,7 @@
     // Apply sharding and instance type unconditionally
     selectedSharding = defaults.sharding;
     selectedInstanceType = defaults.instanceType;
+    setPreviewUseAllComputeResources(defaults.useAllComputeResources ?? false);
 
     // Apply minNodes if valid (between 1 and maxNodes)
     if (
@@ -1175,6 +1192,8 @@
 
   const matchesSelectedRuntime = (runtime: InstanceMeta): boolean =>
     runtime === selectedInstanceType;
+  const matchesSelectedResourcePolicy = (preview: PlacementPreview): boolean =>
+    preview.use_all_compute_resources === useAllComputeResourcesEnabled;
 
   // Helper to check if a model can be launched (has valid placement with >= minNodes)
   function canModelFit(modelId: string): boolean {
@@ -1184,6 +1203,7 @@
         p.model_id === modelId &&
         p.sharding === selectedSharding &&
         matchesSelectedRuntime(p.instance_meta) &&
+        matchesSelectedResourcePolicy(p) &&
         p.error === null &&
         p.memory_delta_by_node !== null,
     );
@@ -1471,7 +1491,8 @@
             model_id: modelId,
             sharding: selectedSharding,
             instance_meta: selectedInstanceType,
-            min_nodes: 1,
+            min_nodes: selectedMinNodes,
+            use_all_compute_resources: useAllComputeResourcesEnabled,
           }),
         });
       }
@@ -2838,7 +2859,7 @@
     try {
       // Fetch placement previews
       const res = await fetch(
-        `/instance/previews?model_id=${encodeURIComponent(modelId)}`,
+        `/instance/previews?model_id=${encodeURIComponent(modelId)}&use_all_compute_resources=${useAllComputeResourcesEnabled}`,
       );
       if (!res.ok) {
         addToast({
@@ -2978,7 +2999,7 @@
 
     try {
       const res = await fetch(
-        `/instance/previews?model_id=${encodeURIComponent(autoModel.id)}`,
+        `/instance/previews?model_id=${encodeURIComponent(autoModel.id)}&use_all_compute_resources=${useAllComputeResourcesEnabled}`,
       );
       if (!res.ok) {
         addToast({
@@ -3237,6 +3258,7 @@
     for (const preview of previewsData) {
       if (preview.sharding !== selectedSharding) continue;
       if (!matchesSelectedRuntime(preview.instance_meta)) continue;
+      if (!matchesSelectedResourcePolicy(preview)) continue;
       if (preview.error !== null) continue;
       if (!preview.memory_delta_by_node) continue;
 
@@ -3262,6 +3284,7 @@
       (p: PlacementPreview) =>
         p.sharding === selectedSharding &&
         matchesSelectedRuntime(p.instance_meta) &&
+        matchesSelectedResourcePolicy(p) &&
         p.error === null &&
         p.memory_delta_by_node !== null,
     );
@@ -5912,10 +5935,32 @@
                     </div>
                   </div>
 
-                  <!-- Minimum Devices -->
+                  {#if selectedInstanceType === "MlxNccl"}
+                    <div>
+                      <div class="text-xs text-white/50 font-mono mb-2">
+                        GPU Selection:
+                      </div>
+                      <label
+                        class="inline-flex items-center gap-2 text-xs text-white/70 font-mono cursor-pointer"
+                      >
+                        <input
+                          type="checkbox"
+                          class="h-4 w-4 accent-exo-yellow cursor-pointer"
+                          checked={useAllComputeResourcesEnabled}
+                          onchange={(event) =>
+                            updateUseAllComputeResources(
+                              event.currentTarget.checked,
+                            )}
+                        />
+                        Use all available GPUs
+                      </label>
+                    </div>
+                  {/if}
+
+                  <!-- Minimum Nodes -->
                   <div>
                     <div class="text-xs text-white/50 font-mono mb-2">
-                      Minimum Devices:
+                      Minimum Nodes:
                     </div>
                     <!-- Discrete slider track with drag support -->
                     <!-- svelte-ignore a11y_no_static_element_interactions -->
