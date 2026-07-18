@@ -3,6 +3,7 @@ import pytest
 from exo.shared.models.model_cards import ModelCard, ModelId, ModelTask
 from exo.shared.types.backends import Backend
 from exo.shared.types.common import Host, NodeId
+from exo.shared.types.compute_resources import ComputeResourceId
 from exo.shared.types.events import TaskStatusUpdated
 from exo.shared.types.memory import Memory
 from exo.shared.types.multiaddr import Multiaddr
@@ -78,6 +79,18 @@ def test_old_and_rank_aware_task_status_json_are_compatible() -> None:
         restored_rank_aware_state.task_runner_statuses
         == rank_aware_state.task_runner_statuses
     )
+
+
+def test_retiring_compute_resources_are_backward_compatible_and_roundtrip() -> None:
+    resource_id = ComputeResourceId.from_nvidia_device_uuid("GPU-resource-a")
+    runner_id = RunnerId("runner-a")
+
+    assert State.model_validate_json("{}").retiring_compute_resources == {}
+
+    state = State(retiring_compute_resources={resource_id: runner_id})
+    restored_state = State.model_validate_json(state.model_dump_json())
+
+    assert restored_state.retiring_compute_resources == {resource_id: runner_id}
 
 
 def test_nccl_instance_state_serialization_roundtrip() -> None:

@@ -1,3 +1,4 @@
+from collections.abc import Mapping, Sequence
 from enum import Enum
 from ipaddress import IPv4Address, ip_address
 
@@ -5,7 +6,7 @@ from pydantic import model_validator
 
 from exo.shared.models.model_cards import ModelTask
 from exo.shared.types.common import Host, Id, NodeId
-from exo.shared.types.compute_resources import ComputeResourceId
+from exo.shared.types.compute_resources import ComputeResource, ComputeResourceId
 from exo.shared.types.worker.runners import RunnerId, ShardAssignments, ShardMetadata
 from exo.shared.types.worker.shards import TensorShardMetadata
 from exo.utils.pydantic_ext import FrozenModel, TaggedModel
@@ -135,6 +136,23 @@ class MlxNcclInstance(BaseInstance):
 
 # TODO: Single node instance
 Instance = MlxRingInstance | MlxJacclInstance | MlxNcclInstance
+
+
+def instance_compute_resource_runners(
+    instance: Instance,
+    node_compute_resources: Mapping[NodeId, Sequence[ComputeResource]],
+) -> dict[ComputeResourceId, RunnerId]:
+    """Return explicit or conservatively inferred GPU bindings for an instance."""
+    assignments = instance.shard_assignments
+    if assignments.compute_resource_to_runner:
+        return dict(assignments.compute_resource_to_runner)
+    if not isinstance(instance, MlxRingInstance | MlxNcclInstance):
+        return {}
+    return {
+        resource.resource_id: assignments.node_to_runner[node_id]
+        for node_id in assignments.node_to_runner
+        for resource in node_compute_resources.get(node_id, ())
+    }
 
 
 class BoundInstance(FrozenModel):

@@ -379,6 +379,7 @@ class Master:
                                 download_status=self.state.downloads,
                                 node_rdma_ctl=self.state.node_rdma_ctl,
                                 node_compute_resources=self.state.node_compute_resources,
+                                retiring_compute_resources=self.state.retiring_compute_resources,
                             )
                             transition_events = get_transition_events(
                                 self.state.instances, placement, self.state.tasks
@@ -390,6 +391,7 @@ class Master:
                                 self.state.topology,
                                 self.state.instances,
                                 self.state.node_compute_resources,
+                                self.state.retiring_compute_resources,
                             )
                             transition_events = get_transition_events(
                                 self.state.instances, placement, self.state.tasks
