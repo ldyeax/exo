@@ -20,15 +20,25 @@ def make_stage(
     gpu_suffix: int,
     cpu_cores: tuple[int, ...],
     memory_node: int,
+    service_ip: str | None = None,
+    service_port: int | None = None,
+    nccl_port: int | None = None,
 ) -> SglangKtStageSpec:
+    if service_ip is None:
+        service_ip = "192.168.40.248" if node_id == "dwagon" else "192.168.40.249"
     return SglangKtStageSpec(
         pipeline_rank=pipeline_rank,
         start_layer=start_layer,
         end_layer=end_layer,
         node_id=NodeId(node_id),
         gpu_uuid=f"GPU-00000000-0000-0000-0000-{gpu_suffix:012x}",
-        model_path="/var/lib/exo/models/glm-5-fp8",
-        ktransformers_weight_path="/var/lib/exo/models/glm-5-fp8",
+        service_endpoint=Host(
+            ip=service_ip,
+            port=30_000 + pipeline_rank if service_port is None else service_port,
+        ),
+        nccl_port=31_000 + pipeline_rank if nccl_port is None else nccl_port,
+        model_path="/var/lib/exo/models/glm-5.2-fp8",
+        ktransformers_weight_path="/var/lib/exo/models/glm-5.2-fp8",
         cpu_cores=cpu_cores,
         memory_nodes=(memory_node,),
         cpu_infer_threads=len(cpu_cores),
@@ -75,7 +85,7 @@ def make_plan(
             ),
         )
     values: dict[str, object] = {
-        "model_id": ModelId("zai-org/GLM-5-FP8"),
+        "model_id": ModelId("zai-org/GLM-5.2-FP8"),
         "model_revision": REVISION,
         "sglang_revision": "2" * 40,
         "ktransformers_revision": "3" * 40,
@@ -106,6 +116,8 @@ def test_stage_rejects_oversubscribed_cpu_threads() -> None:
             end_layer=1,
             node_id=NodeId("dwagon"),
             gpu_uuid="GPU-00000000-0000-0000-0000-000000000001",
+            service_endpoint=Host(ip="192.168.40.248", port=30_000),
+            nccl_port=31_000,
             model_path="/model",
             ktransformers_weight_path="/weights",
             cpu_cores=(0,),
@@ -231,3 +243,66 @@ def test_launch_plan_rejects_invalid_cluster_fields(
 ) -> None:
     with pytest.raises(ValidationError, match=error_message):
         make_plan(updates=updates)
+
+
+def test_launch_plan_rejects_rank_zero_service_endpoint_mismatch() -> None:
+    with pytest.raises(ValidationError, match="rank_zero_endpoint must equal"):
+        make_plan(
+            updates={"rank_zero_endpoint": Host(ip="192.168.40.248", port=30_010)}
+        )
+
+
+def test_launch_plan_rejects_duplicate_service_endpoints() -> None:
+    stages = (
+        make_stage(
+            0,
+            0,
+            30,
+            node_id="dwagon",
+            gpu_suffix=1,
+            cpu_cores=(0,),
+            memory_node=0,
+        ),
+        make_stage(
+            1,
+            30,
+            78,
+            node_id="fwuff",
+            gpu_suffix=2,
+            cpu_cores=(0,),
+            memory_node=0,
+            service_ip="192.168.40.248",
+            service_port=30_000,
+        ),
+    )
+
+    with pytest.raises(ValidationError, match="distinct service endpoints"):
+        make_plan(stages)
+
+
+def test_launch_plan_rejects_same_node_nccl_port_collision() -> None:
+    stages = (
+        make_stage(
+            0,
+            0,
+            30,
+            node_id="dwagon",
+            gpu_suffix=1,
+            cpu_cores=(0,),
+            memory_node=0,
+            nccl_port=31_000,
+        ),
+        make_stage(
+            1,
+            30,
+            78,
+            node_id="dwagon",
+            gpu_suffix=2,
+            cpu_cores=(1,),
+            memory_node=1,
+            nccl_port=31_000,
+        ),
+    )
+
+    with pytest.raises(ValidationError, match="distinct nccl_port values"):
+        make_plan(stages)

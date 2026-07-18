@@ -18,9 +18,13 @@ GpuUuid = Annotated[
     ),
 ]
 ResourceIndex = Annotated[int, Field(ge=0)]
-HcaDevice = Annotated[str, StringConstraints(min_length=1)]
+NetworkPort = Annotated[int, Field(ge=1, le=65535)]
+HcaDevice = Annotated[
+    str,
+    StringConstraints(pattern=r"^[A-Za-z0-9_.-]+:[0-9]+$"),
+]
 
-# KTransformers 0.6.2 KT-Kernel methods. New runtime methods require an explicit
+# KTransformers 0.6.3 KT-Kernel methods. New runtime methods require an explicit
 # schema update so a persisted launch plan cannot silently change meaning.
 KTransformersMethod = Literal[
     "AMXINT4",
@@ -36,6 +40,22 @@ KTransformersMethod = Literal[
 ]
 
 
+def _validate_concrete_ipv4_endpoint(endpoint_name: str, endpoint: Host) -> None:
+    try:
+        endpoint_ip = ip_address(endpoint.ip)
+    except ValueError as error:
+        raise ValueError(f"{endpoint_name} must use a concrete IPv4 address") from error
+    if (
+        not isinstance(endpoint_ip, IPv4Address)
+        or endpoint_ip.is_unspecified
+        or endpoint_ip.is_multicast
+        or endpoint.port == 0
+    ):
+        raise ValueError(
+            f"{endpoint_name} must use a concrete IPv4 address and nonzero port"
+        )
+
+
 @final
 class SglangKtStageSpec(FrozenModel):
     """Validated inputs for one logical SGLang pipeline stage.
@@ -49,6 +69,8 @@ class SglangKtStageSpec(FrozenModel):
     end_layer: PositiveInt
     node_id: NodeId
     gpu_uuid: GpuUuid
+    service_endpoint: Host
+    nccl_port: NetworkPort
     model_path: AbsoluteRuntimePath
     ktransformers_weight_path: AbsoluteRuntimePath
     cpu_cores: tuple[ResourceIndex, ...]
@@ -62,6 +84,9 @@ class SglangKtStageSpec(FrozenModel):
 
     @model_validator(mode="after")
     def validate_resources(self) -> "SglangKtStageSpec":
+        _validate_concrete_ipv4_endpoint(
+            "stage service_endpoint", self.service_endpoint
+        )
         if self.end_layer <= self.start_layer:
             raise ValueError("stage end_layer must be greater than start_layer")
         if not self.cpu_cores or len(set(self.cpu_cores)) != len(self.cpu_cores):
@@ -107,7 +132,9 @@ class SglangKtLaunchPlan(FrozenModel):
 
         expected_start_layer = 0
         seen_gpu_uuids: set[str] = set()
+        seen_service_endpoints: set[tuple[str, int]] = set()
         cpu_cores_by_node: dict[NodeId, set[int]] = {}
+        nccl_ports_by_node: dict[NodeId, set[int]] = {}
 
         for expected_rank, stage in enumerate(self.stages):
             if stage.pipeline_rank != expected_rank:
@@ -117,6 +144,13 @@ class SglangKtLaunchPlan(FrozenModel):
             if stage.gpu_uuid in seen_gpu_uuids:
                 raise ValueError("pipeline stages must use distinct GPUs")
 
+            service_endpoint = (
+                stage.service_endpoint.ip,
+                stage.service_endpoint.port,
+            )
+            if service_endpoint in seen_service_endpoints:
+                raise ValueError("pipeline stages must use distinct service endpoints")
+
             assigned_cpu_cores = cpu_cores_by_node.setdefault(stage.node_id, set())
             overlapping_cpu_cores = assigned_cpu_cores.intersection(stage.cpu_cores)
             if overlapping_cpu_cores:
@@ -125,7 +159,15 @@ class SglangKtLaunchPlan(FrozenModel):
                 )
             assigned_cpu_cores.update(stage.cpu_cores)
 
+            assigned_nccl_ports = nccl_ports_by_node.setdefault(stage.node_id, set())
+            if stage.nccl_port in assigned_nccl_ports:
+                raise ValueError(
+                    "pipeline stages on the same node must use distinct nccl_port values"
+                )
+            assigned_nccl_ports.add(stage.nccl_port)
+
             seen_gpu_uuids.add(stage.gpu_uuid)
+            seen_service_endpoints.add(service_endpoint)
             expected_start_layer = stage.end_layer
 
         if expected_start_layer != self.total_layers:
@@ -135,20 +177,17 @@ class SglangKtLaunchPlan(FrozenModel):
             ("distributed_coordinator", self.distributed_coordinator),
             ("rank_zero_endpoint", self.rank_zero_endpoint),
         ):
-            try:
-                endpoint_ip = ip_address(endpoint.ip)
-            except ValueError as error:
-                raise ValueError(
-                    f"{endpoint_name} must use a concrete IPv4 address"
-                ) from error
-            if (
-                not isinstance(endpoint_ip, IPv4Address)
-                or endpoint_ip.is_unspecified
-                or endpoint_ip.is_multicast
-                or endpoint.port == 0
-            ):
-                raise ValueError(
-                    f"{endpoint_name} must use a concrete IPv4 address and nonzero port"
-                )
+            _validate_concrete_ipv4_endpoint(endpoint_name, endpoint)
+
+        if self.stages[0].service_endpoint != self.rank_zero_endpoint:
+            raise ValueError(
+                "rank_zero_endpoint must equal the pipeline rank zero service_endpoint"
+            )
+        if self.distributed_coordinator in (
+            stage.service_endpoint for stage in self.stages
+        ):
+            raise ValueError(
+                "distributed_coordinator must differ from every stage service_endpoint"
+            )
 
         return self
