@@ -3269,7 +3269,6 @@ def _completion_result(
     elapsed_seconds: float,
     iteration: int,
     expected_model_id: str,
-    expected_content_sha256: str,
 ) -> JsonObject:
     response = _object(response_value, "benchmark completion response")
     if response.get("object") != "chat.completion":
@@ -3288,8 +3287,6 @@ def _completion_result(
     if not isinstance(content_value, str) or not content_value:
         raise HarnessError("benchmark completion content must be nonempty text")
     content_sha256 = hashlib.sha256(content_value.encode()).hexdigest()
-    if content_sha256 != expected_content_sha256:
-        raise HarnessError("benchmark completion differs from the correctness oracle")
     if not math.isfinite(elapsed_seconds) or elapsed_seconds <= 0:
         raise HarnessError(
             "benchmark completion elapsed time must be finite and positive"
@@ -3346,13 +3343,30 @@ def run_completions(
             elapsed_seconds=elapsed,
             iteration=iteration,
             expected_model_id=config.model.model_id,
-            expected_content_sha256=config.benchmark.expected_content_sha256,
         )
         if iteration < config.benchmark.warmup_count:
             warmups.append(result)
         else:
             samples.append(result)
     return warmups, samples
+
+
+def validate_completion_oracle(
+    config: HarnessConfig,
+    warmups: Sequence[JsonObject],
+    samples: Sequence[JsonObject],
+) -> None:
+    observed_hashes = {
+        _string(result.get("content_sha256"), "completion content SHA-256")
+        for result in (*warmups, *samples)
+    }
+    expected_hash = config.benchmark.expected_content_sha256
+    if observed_hashes != {expected_hash}:
+        observed = ", ".join(sorted(observed_hashes)) or "none"
+        raise HarnessError(
+            "benchmark completion differs from the correctness oracle: "
+            f"expected {expected_hash}; observed {observed}"
+        )
 
 
 def _instance_uses_resources(instance_value: JsonValue, resource_ids: set[str]) -> bool:
@@ -3699,6 +3713,7 @@ def run_harness(
     submission_attempted = False
     preflight_complete = False
     benchmark_complete = False
+    completions_complete = False
     instance_cleanup_complete = True
     caught_error: BaseException | None = None
     placement: JsonObject | None = None
@@ -3780,6 +3795,8 @@ def run_harness(
             owned_runner_ids,
         )
         warmups, samples = run_completions(effects, config, processes)
+        completions_complete = True
+        validate_completion_oracle(config, warmups, samples)
         aggregate = _sample_aggregate(samples)
         benchmark_complete = True
     except StartNodeError as error:
@@ -3839,7 +3856,7 @@ def run_harness(
                     error=f"{type(error).__name__}: {error}",
                 )
             process_cleanups.append(cast(JsonObject, asdict(cleanup)))
-        if benchmark_complete and placement is not None:
+        if completions_complete and placement is not None:
             try:
                 logs_by_host = {
                     process.host_name: effects.read_owned_log(process)

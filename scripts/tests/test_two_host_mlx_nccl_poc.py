@@ -2124,6 +2124,10 @@ def test_measured_output_mismatch_is_non_reportable_and_cleans_up(
 
     assert result["status"] == "benchmark_failed"
     assert "differs from the correctness oracle" in str(result["error"])
+    assert config.benchmark.expected_content_sha256 in str(result["error"])
+    assert len(result["warmups"]) == config.benchmark.warmup_count
+    assert len(result["samples"]) == config.benchmark.sample_count
+    assert result["nccl_log_evidence"] is not None
     assert result["cleanup_succeeded"] is True
     assert effects.deleted_paths == ["/instance/owned-instance"]
 
@@ -2935,9 +2939,6 @@ def test_completion_validation_rejects_vacuous_or_nonfinite_success(
             elapsed_seconds=elapsed_seconds,
             iteration=0,
             expected_model_id=MODEL_ID,
-            expected_content_sha256=(
-                "eebbf6457e46a7f63acdf9b97390f790ba443d60cfa44b607da7e5c40aa1cc1d"
-            ),
         )
 
 
