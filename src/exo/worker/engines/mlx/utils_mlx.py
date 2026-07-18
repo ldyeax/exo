@@ -65,7 +65,10 @@ from exo.worker.engines.mlx.auto_parallel import (
     pipeline_auto_parallel,
     tensor_auto_parallel,
 )
-from exo.worker.engines.mlx.eos_token_ids import get_eos_token_ids_for_model
+from exo.worker.engines.mlx.eos_token_ids import (
+    get_configured_eos_token_ids,
+    get_eos_token_ids_for_model,
+)
 from exo.worker.engines.mlx.types import Model
 from exo.worker.engines.mlx.vision_policy import get_mlx_vision_loading_mode
 from exo.worker.runner.bootstrap import logger
@@ -341,7 +344,8 @@ def load_tokenizer_for_model_id(
         TokenizerWrapper instance configured for the model
     """
     model_id_lower = model_id.lower()
-    eos_token_ids = get_eos_token_ids_for_model(model_id)
+    known_eos_token_ids = get_eos_token_ids_for_model(model_id)
+    eos_token_ids = known_eos_token_ids or get_configured_eos_token_ids(model_path)
 
     # Kimi uses a custom TikTokenTokenizer that transformers 5.x can't load via AutoTokenizer
     if "kimi-k2" in model_id_lower:

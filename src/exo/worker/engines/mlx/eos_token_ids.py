@@ -1,3 +1,7 @@
+import json
+from pathlib import Path
+from typing import cast
+
 from exo.shared.types.common import ModelId
 
 
@@ -25,4 +29,36 @@ def get_eos_token_ids_for_model(model_id: ModelId) -> list[int] | None:
         return [151645, 151643]
     if "gemma-4" in model_id_lower or "gemma-3" in model_id_lower:
         return [1, 106, 50]
+    return None
+
+
+def get_configured_eos_token_ids(model_path: Path) -> list[int] | None:
+    """Read EOS IDs declared by a local checkpoint, preferring generation config."""
+    for config_name in ("generation_config.json", "config.json"):
+        try:
+            config_value = cast(
+                object, json.loads((model_path / config_name).read_text())
+            )
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(config_value, dict):
+            continue
+
+        config = cast(dict[str, object], config_value)
+        eos_value = config.get("eos_token_id")
+        if eos_value is None and isinstance(config.get("text_config"), dict):
+            text_config = cast(dict[str, object], config["text_config"])
+            eos_value = text_config.get("eos_token_id")
+
+        if isinstance(eos_value, int) and not isinstance(eos_value, bool):
+            return [eos_value]
+        if isinstance(eos_value, list):
+            raw_eos_token_ids = cast(list[object], eos_value)
+            eos_token_ids = [
+                token_id
+                for token_id in raw_eos_token_ids
+                if isinstance(token_id, int) and not isinstance(token_id, bool)
+            ]
+            if eos_token_ids and len(eos_token_ids) == len(raw_eos_token_ids):
+                return list(dict.fromkeys(eos_token_ids))
     return None
