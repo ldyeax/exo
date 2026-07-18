@@ -18,6 +18,7 @@ import math
 import os
 import re
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -42,6 +43,7 @@ METADATA_MAX_FUTURE_SKEW = timedelta(minutes=1)
 BENCHMARK_RESULT_FILENAME = "benchmark-result.json"
 RUNTIME_METADATA_FILENAME = "runtime-metadata.json"
 MANIFEST_FILENAME = "manifest.json"
+RESULT_DIRECTORY_FD_ENVIRONMENT = "EXO_BENCHMARK_RESULT_DIRECTORY_FD"
 _IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _COMMIT_PATTERN = re.compile(r"^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$")
 _SHA256_PATTERN = re.compile(r"^[0-9a-fA-F]{64}$")
@@ -361,13 +363,90 @@ def validate_ports(ports: Sequence[int]) -> tuple[int, ...]:
 
 
 def read_json_object(path: Path) -> dict[str, object]:
-    raw_value = cast(object, json.loads(path.read_text(encoding="utf-8")))
+    descriptor = os.open(
+        path,
+        os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+    )
+    try:
+        file_status = os.fstat(descriptor)
+        if not stat.S_ISREG(file_status.st_mode):
+            raise LeaseError(f"JSON input is not a regular file: {path}")
+        with os.fdopen(descriptor, encoding="utf-8", closefd=False) as input_file:
+            raw_value = cast(object, json.load(input_file))
+    finally:
+        os.close(descriptor)
     if not isinstance(raw_value, dict):
         raise LeaseError(f"Expected a JSON object in {path}")
     object_mapping = cast(dict[object, object], raw_value)
     if not all(isinstance(key, str) for key in object_mapping):
         raise LeaseError(f"Expected string keys in {path}")
     return {cast(str, key): item for key, item in object_mapping.items()}
+
+
+def _validate_directory_entry_name(filename: str) -> str:
+    if not filename or filename in {".", ".."} or "/" in filename or "\0" in filename:
+        raise LeaseError(f"unsafe directory entry name: {filename!r}")
+    return filename
+
+
+def read_json_object_at(directory_descriptor: int, filename: str) -> dict[str, object]:
+    """Read one regular JSON file relative to an already trusted directory."""
+    entry_name = _validate_directory_entry_name(filename)
+    descriptor = os.open(
+        entry_name,
+        os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+        dir_fd=directory_descriptor,
+    )
+    try:
+        file_status = os.fstat(descriptor)
+        if not stat.S_ISREG(file_status.st_mode):
+            raise LeaseError(f"result fragment is not a regular file: {entry_name}")
+        with os.fdopen(descriptor, encoding="utf-8", closefd=False) as input_file:
+            raw_value = cast(object, json.load(input_file))
+    finally:
+        os.close(descriptor)
+    if not isinstance(raw_value, dict):
+        raise LeaseError(f"Expected a JSON object in result entry {entry_name}")
+    object_mapping = cast(dict[object, object], raw_value)
+    if not all(isinstance(key, str) for key in object_mapping):
+        raise LeaseError(f"Expected string keys in result entry {entry_name}")
+    return {cast(str, key): item for key, item in object_mapping.items()}
+
+
+def atomic_write_json_at(
+    directory_descriptor: int, filename: str, value: Mapping[str, object]
+) -> None:
+    """Atomically replace one JSON file below an already trusted directory."""
+    entry_name = _validate_directory_entry_name(filename)
+    temporary_name = f".{entry_name}.{uuid4().hex}.tmp"
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            temporary_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=directory_descriptor,
+        )
+        with os.fdopen(descriptor, mode="w", encoding="utf-8", closefd=False) as output:
+            json.dump(value, output, indent=2, sort_keys=True)
+            output.write("\n")
+            output.flush()
+            os.fchmod(descriptor, 0o644)
+            os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = None
+        os.replace(
+            temporary_name,
+            entry_name,
+            src_dir_fd=directory_descriptor,
+            dst_dir_fd=directory_descriptor,
+        )
+        os.fsync(directory_descriptor)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(temporary_name, dir_fd=directory_descriptor)
 
 
 def atomic_write_json(path: Path, value: Mapping[str, object]) -> None:
@@ -436,6 +515,37 @@ def terminate_owned_process_group(
     return not process_group_exists(process_group_id)
 
 
+def open_directory_without_symlinks(path: Path, *, create: bool) -> int:
+    """Open an absolute directory tree without following any path component."""
+    if not path.is_absolute():
+        raise LeaseError(f"directory path must be absolute: {path}")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    descriptor = os.open("/", flags)
+    try:
+        for component in path.parts[1:]:
+            if component in ("", ".", "..") or "\0" in component:
+                raise LeaseError(f"directory path is not canonical: {path}")
+            try:
+                child_descriptor = os.open(component, flags, dir_fd=descriptor)
+            except FileNotFoundError:
+                if not create:
+                    raise LeaseError(f"directory does not exist: {path}") from None
+                with contextlib.suppress(FileExistsError):
+                    os.mkdir(component, mode=0o755, dir_fd=descriptor)
+                child_descriptor = os.open(component, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child_descriptor
+        return descriptor
+    except LeaseError:
+        os.close(descriptor)
+        raise
+    except OSError as error:
+        os.close(descriptor)
+        raise LeaseError(
+            f"cannot open directory without symlinks {path}: {error}"
+        ) from error
+
+
 class BenchmarkLease:
     def __init__(
         self,
@@ -479,12 +589,20 @@ class BenchmarkLease:
             if not path.is_absolute():
                 raise ValueError(f"{field_name} must be an absolute path")
 
+        validated_run_id = validate_identifier(run_id, "run_id")
+        if result_directory.name != validated_run_id:
+            raise ValueError("result_directory must end with the exact run_id")
+        if len({lock_path, lease_path, result_directory}) != 3:
+            raise ValueError(
+                "lock_path, lease_path, and result_directory must be distinct"
+            )
+
         self.lock_path = lock_path
         self.lease_path = lease_path
         self.result_directory = result_directory
         self.owner = owner
         self.purpose = purpose
-        self.run_id = validate_identifier(run_id, "run_id")
+        self.run_id = validated_run_id
         self.namespace = validate_identifier(namespace, "namespace")
         self.ports = validate_ports(ports)
         self.command = tuple(command)
@@ -498,6 +616,7 @@ class BenchmarkLease:
         self.started_at: datetime | None = None
         self.child_pid: int | None = None
         self._lock_file: TextIO | None = None
+        self._result_directory_descriptor: int | None = None
         self._metadata_lock = threading.Lock()
         self._fragment_lock = threading.RLock()
         self._heartbeat_stop = threading.Event()
@@ -526,6 +645,38 @@ class BenchmarkLease:
                 raise LeaseError(
                     f"metadata.{field_name} does not match the benchmark lease"
                 )
+
+    def _result_descriptor(self) -> int:
+        descriptor = self._result_directory_descriptor
+        if descriptor is None:
+            raise LeaseError("result directory is not owned by an active lease")
+        return descriptor
+
+    @property
+    def result_directory_descriptor(self) -> int:
+        """Return the trusted directory descriptor inherited by the lease child."""
+        return self._result_descriptor()
+
+    def verify_result_directory_identity(self) -> None:
+        """Fail if the configured pathname no longer names the owned directory."""
+        expected = os.fstat(self._result_descriptor())
+        try:
+            observed = os.stat(self.result_directory, follow_symlinks=False)
+        except OSError as error:
+            raise LeaseError(
+                f"owned result directory path became unavailable: {error}"
+            ) from error
+        if not stat.S_ISDIR(observed.st_mode) or (
+            observed.st_dev,
+            observed.st_ino,
+        ) != (expected.st_dev, expected.st_ino):
+            raise LeaseError("owned result directory path identity changed")
+
+    def _read_result_json(self, filename: str) -> dict[str, object]:
+        return read_json_object_at(self._result_descriptor(), filename)
+
+    def _write_result_json(self, filename: str, value: Mapping[str, object]) -> None:
+        atomic_write_json_at(self._result_descriptor(), filename, value)
 
     def __enter__(self) -> Self:
         self.acquire()
@@ -670,13 +821,12 @@ class BenchmarkLease:
         return validated
 
     def _refresh_runtime_metadata(self) -> dict[str, object] | None:
-        runtime_path = self.result_directory / RUNTIME_METADATA_FILENAME
         with self._fragment_lock:
             if self._runtime_metadata_error is not None:
                 return self._runtime_metadata_cache
             try:
                 runtime_metadata = self._validate_runtime_metadata(
-                    read_json_object(runtime_path)
+                    self._read_result_json(RUNTIME_METADATA_FILENAME)
                 )
                 previous = self._runtime_metadata_cache
                 if previous is not None:
@@ -783,14 +933,13 @@ class BenchmarkLease:
         return validated
 
     def _refresh_benchmark_result(self) -> dict[str, object] | None:
-        result_path = self.result_directory / BENCHMARK_RESULT_FILENAME
         with self._fragment_lock:
             self._refresh_runtime_metadata()
             if self._benchmark_result_error is not None:
                 return self._benchmark_result_cache
             try:
                 benchmark_result = self._validate_benchmark_result(
-                    read_json_object(result_path)
+                    self._read_result_json(BENCHMARK_RESULT_FILENAME)
                 )
                 if (
                     self._benchmark_result_cache is not None
@@ -861,7 +1010,7 @@ class BenchmarkLease:
             self._ensure_preserved_record_locked()
 
     def acquire(self) -> None:
-        if self._lock_file is not None:
+        if self._lock_file is not None or self._result_directory_descriptor is not None:
             raise LeaseError("lease is already acquired")
         self.metadata = validate_run_metadata(self.metadata)
         self._validate_metadata_binding()
@@ -884,28 +1033,53 @@ class BenchmarkLease:
                 f"stale lease metadata exists at {self.lease_path}; inspect it manually"
             )
 
+        result_root_descriptor: int | None = None
+        result_descriptor: int | None = None
         try:
-            if self.result_directory.exists() and any(self.result_directory.iterdir()):
-                raise LeaseError(
-                    f"result directory is not empty: {self.result_directory}; "
-                    "use a new run ID"
+            result_root_descriptor = open_directory_without_symlinks(
+                self.result_directory.parent, create=True
+            )
+            try:
+                os.mkdir(
+                    self.result_directory.name,
+                    mode=0o755,
+                    dir_fd=result_root_descriptor,
                 )
-            self.result_directory.mkdir(parents=True, exist_ok=True)
+            except FileExistsError as error:
+                raise LeaseError(
+                    f"result directory already exists: {self.result_directory}; "
+                    "use a new run ID"
+                ) from error
+            result_descriptor = os.open(
+                self.result_directory.name,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=result_root_descriptor,
+            )
         except Exception:
+            if result_descriptor is not None:
+                os.close(result_descriptor)
+            if result_root_descriptor is not None:
+                os.close(result_root_descriptor)
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
             lock_file.close()
             raise
 
         self._lock_file = lock_file
+        assert result_descriptor is not None
+        self._result_directory_descriptor = result_descriptor
         self.started_at = utc_now()
         try:
             atomic_write_json(self.lease_path, self._lease_payload(self.started_at))
         except Exception:
+            os.close(result_descriptor)
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
             lock_file.close()
             self._lock_file = None
+            self._result_directory_descriptor = None
             self.started_at = None
             raise
+        finally:
+            os.close(result_root_descriptor)
 
     def start_heartbeat(self) -> None:
         if self._lock_file is None:
@@ -934,6 +1108,7 @@ class BenchmarkLease:
         self._heartbeat_thread.start()
 
     def update_heartbeat(self) -> None:
+        self.verify_result_directory_identity()
         with self._metadata_lock:
             current = read_json_object(self.lease_path)
             if current.get("lease_id") != self.lease_id:
@@ -975,7 +1150,22 @@ class BenchmarkLease:
     ) -> Path:
         if self.started_at is None:
             raise LeaseError("cannot write manifest before acquiring lease")
-        manifest_path = self.result_directory / MANIFEST_FILENAME
+        identity_failure: str | None = None
+        try:
+            self.verify_result_directory_identity()
+        except LeaseError as error:
+            identity_failure = f"owned result directory identity failure: {error}"
+            try:
+                self.preserve_after_cleanup_failure(identity_failure)
+            except Exception as preservation_error:
+                identity_failure = combine_error_messages(
+                    identity_failure,
+                    f"failed to preserve lease tombstone: {preservation_error}",
+                )
+            status = "wrapper_error"
+            return_code = 75
+            cleanup_succeeded = False
+            error_message = combine_error_messages(error_message, identity_failure)
         benchmark_result = self._refresh_benchmark_result()
         runtime_metadata = self._refresh_runtime_metadata()
         child_manifest: dict[str, object] | None = None
@@ -983,7 +1173,7 @@ class BenchmarkLease:
         existing_runtime_metadata: object | None = None
         existing_child_manifest: object | None = None
         try:
-            existing_manifest = read_json_object(manifest_path)
+            existing_manifest = self._read_result_json(MANIFEST_FILENAME)
         except FileNotFoundError:
             existing_manifest = None
         except (LeaseError, OSError, ValueError) as error:
@@ -1033,8 +1223,10 @@ class BenchmarkLease:
             manifest["runtime_metadata"] = final_runtime_metadata
         if final_child_manifest is not None:
             manifest["child_manifest"] = final_child_manifest
-        atomic_write_json(manifest_path, manifest)
-        return manifest_path
+        self._write_result_json(MANIFEST_FILENAME, manifest)
+        if identity_failure is not None:
+            raise LeaseError(identity_failure)
+        return self.result_directory / MANIFEST_FILENAME
 
     def release(self) -> None:
         heartbeat_error = self.stop_heartbeat()
@@ -1051,6 +1243,10 @@ class BenchmarkLease:
                 current = read_json_object(self.lease_path)
                 if current.get("lease_id") == self.lease_id:
                     self.lease_path.unlink()
+        result_descriptor = self._result_directory_descriptor
+        if result_descriptor is not None:
+            os.close(result_descriptor)
+            self._result_directory_descriptor = None
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
         lock_file.close()
         self._lock_file = None
@@ -1133,7 +1329,16 @@ def run_managed_command(
     wrapper_error: Exception | None = None
     try:
         if managed_signal_state.first_signal_number is None:
-            process = subprocess.Popen(lease.command, start_new_session=True)
+            lease.verify_result_directory_identity()
+            result_descriptor = lease.result_directory_descriptor
+            child_environment = os.environ.copy()
+            child_environment[RESULT_DIRECTORY_FD_ENVIRONMENT] = str(result_descriptor)
+            process = subprocess.Popen(
+                lease.command,
+                start_new_session=True,
+                env=child_environment,
+                pass_fds=(result_descriptor,),
+            )
             lease.child_pid = process.pid
             lease.update_heartbeat()
             while managed_signal_state.first_signal_number is None:
@@ -1159,6 +1364,16 @@ def run_managed_command(
         command_return_code = process.returncode
 
     finalization_error = lease.stop_heartbeat()
+    try:
+        lease.verify_result_directory_identity()
+    except Exception as identity_error:
+        wrapper_error = wrapper_error or identity_error
+        if finalization_error is None:
+            finalization_error = identity_error
+        else:
+            finalization_error = LeaseError(
+                f"{finalization_error}; result identity check failed: {identity_error}"
+            )
     cleanup_succeeded, cleanup_failure = confirm_owned_cleanup(
         lease,
         local_cleanup_succeeded=local_cleanup_succeeded,

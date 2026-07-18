@@ -34,6 +34,7 @@ import select
 import shlex
 import signal
 import socket
+import stat
 import statistics
 import subprocess
 import sys
@@ -66,6 +67,7 @@ _NVIDIA_RESOURCE_PREFIX = "nvidia-gpu:"
 _MODEL_RECEIPT = ".exo-huggingface-revision.json"
 _RESULT_FRAGMENT = "benchmark-result.json"
 _RUNTIME_METADATA = "runtime-metadata.json"
+_RESULT_DIRECTORY_FD_ENVIRONMENT = "EXO_BENCHMARK_RESULT_DIRECTORY_FD"
 _DEFAULT_LEASE_PATH = Path("/var/lib/exo/coordination/benchmark-lease.json")
 _DEFAULT_LOCK_PATH = Path("/var/lock/fwuffydwagon-benchmark.lock")
 _LEASE_BIND_TIMEOUT_SECONDS = 5.0
@@ -104,6 +106,25 @@ class SignalLatch:
 
     def begin_cleanup(self) -> None:
         self.cleanup_started = True
+
+
+@dataclass(frozen=True)
+class LeasePreparation:
+    metadata: JsonObject
+    child_argv: tuple[str, ...]
+    benchmark_lease_argv: tuple[str, ...]
+    generated_at: str
+    minimum_cleanup_grace_seconds: float
+
+    def machine_output(self, metadata_output: Path) -> JsonObject:
+        return {
+            "schema_version": 1,
+            "metadata_output": str(metadata_output),
+            "generated_at": self.generated_at,
+            "minimum_cleanup_grace_seconds": self.minimum_cleanup_grace_seconds,
+            "child_argv": list(self.child_argv),
+            "benchmark_lease_argv": list(self.benchmark_lease_argv),
+        }
 
 
 class StrictModel(BaseModel):
@@ -441,6 +462,12 @@ class HostProbe(Protocol):
     def facts(
         self,
     ) -> dict[str, JsonScalar | list[JsonScalar] | dict[str, JsonScalar]]: ...
+
+
+class LeaseMetadataValidator(Protocol):
+    def validate_run_metadata(
+        self, metadata: Mapping[str, object], *, now: datetime | None = None
+    ) -> dict[str, object]: ...
 
 
 def _parse_id_ranges(value: str) -> tuple[int, ...]:
@@ -1327,6 +1354,33 @@ def _lease_static_metadata(config: HarnessConfig, command: Sequence[str]) -> Jso
     }
 
 
+def minimum_cleanup_grace_seconds(config: HarnessConfig) -> float:
+    remote_start_checkpoint_delay = (
+        2 * config.timeouts.process_start_seconds
+        + config.timeouts.cleanup_seconds
+        + 5.0
+    )
+    maximum_signal_checkpoint_delay = max(
+        config.timeouts.api_start_seconds,
+        config.timeouts.request_seconds,
+        remote_start_checkpoint_delay,
+        config.timeouts.poll_seconds,
+    )
+    delete_and_verify_bound = (
+        2 * config.timeouts.request_seconds
+        + config.timeouts.cleanup_seconds
+        + config.timeouts.poll_seconds
+    )
+    sequential_node_stop_bound = 2 * (2 * config.timeouts.cleanup_seconds + 17.0)
+    return max(
+        _MINIMUM_CLEANUP_GRACE_SECONDS,
+        maximum_signal_checkpoint_delay
+        + delete_and_verify_bound
+        + sequential_node_stop_bound
+        + 30.0,
+    )
+
+
 def validate_active_lease(
     config: HarnessConfig,
     *,
@@ -1421,28 +1475,7 @@ def validate_active_lease(
         or not math.isfinite(cleanup_grace)
     ):
         raise HarnessError("active lease cleanup grace is missing")
-    remote_start_checkpoint_delay = (
-        2 * config.timeouts.process_start_seconds
-        + config.timeouts.cleanup_seconds
-        + 5.0
-    )
-    maximum_signal_checkpoint_delay = max(
-        config.timeouts.api_start_seconds,
-        config.timeouts.request_seconds,
-        remote_start_checkpoint_delay,
-        config.timeouts.poll_seconds,
-    )
-    delete_and_verify_bound = (
-        2 * config.timeouts.request_seconds + config.timeouts.cleanup_seconds
-    )
-    sequential_node_stop_bound = 2 * (2 * config.timeouts.cleanup_seconds + 17.0)
-    worst_case_cleanup = max(
-        _MINIMUM_CLEANUP_GRACE_SECONDS,
-        maximum_signal_checkpoint_delay
-        + delete_and_verify_bound
-        + sequential_node_stop_bound
-        + 30.0,
-    )
+    worst_case_cleanup = minimum_cleanup_grace_seconds(config)
     if cleanup_grace < worst_case_cleanup:
         raise HarnessError(
             "active lease cleanup grace is shorter than the proof cleanup bound"
@@ -2238,11 +2271,20 @@ class _RunningHandle:
 class SystemEffects:
     """Default network/process adapter; tests use an in-memory implementation."""
 
-    def __init__(self, config: HarnessConfig) -> None:
+    def __init__(
+        self, config: HarnessConfig, result_directory_descriptor: int | None = None
+    ) -> None:
         self._config = config
         self._running: dict[str, _RunningHandle] = {}
         self._result_directory = Path(config.result_directory)
-        self._result_directory.mkdir(parents=True, exist_ok=True)
+        self._result_directory_descriptor = (
+            _open_directory_without_symlinks(self._result_directory)
+            if result_directory_descriptor is None
+            else result_directory_descriptor
+        )
+        _validate_result_directory_descriptor(
+            self._result_directory, self._result_directory_descriptor
+        )
 
     @staticmethod
     def _transport_argv(host: HostConfig, command: Sequence[str]) -> list[str]:
@@ -2489,7 +2531,13 @@ class SystemEffects:
         if host.name in self._running:
             raise HarnessError(f"node process already started for {host.name}")
         log_path = self._result_directory / f"exo-{host.name}.log"
-        log_file = log_path.open("x", encoding="utf-8")
+        log_descriptor = os.open(
+            log_path.name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=self._result_directory_descriptor,
+        )
+        log_file = os.fdopen(log_descriptor, mode="w", encoding="utf-8")
         environment = dict(host.environment)
         environment["EXO_BENCHMARK_OWNER_TOKEN"] = owner_token
         log_file.write(
@@ -2873,13 +2921,31 @@ class SystemEffects:
     def read_owned_log(self, process: OwnedProcess) -> str:
         path = Path(process.log_path)
         if (
-            path.parent.resolve() != self._result_directory.resolve()
+            path.parent != self._result_directory
             or path.name != f"exo-{process.host_name}.log"
         ):
             raise HarnessError("owned log path does not match the result directory")
-        if path.stat().st_size > 64 * 1024 * 1024:
-            raise HarnessError(f"owned log is unexpectedly large: {path}")
-        return path.read_text(encoding="utf-8", errors="replace")
+        descriptor = os.open(
+            path.name,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+            dir_fd=self._result_directory_descriptor,
+        )
+        try:
+            file_status = os.fstat(descriptor)
+            if not stat.S_ISREG(file_status.st_mode):
+                raise HarnessError(f"owned log is not a regular file: {path}")
+            if file_status.st_size > 64 * 1024 * 1024:
+                raise HarnessError(f"owned log is unexpectedly large: {path}")
+            with os.fdopen(
+                descriptor,
+                mode="r",
+                encoding="utf-8",
+                errors="replace",
+                closefd=False,
+            ) as input_file:
+                return input_file.read()
+        finally:
+            os.close(descriptor)
 
     def monotonic(self) -> float:
         return time.monotonic()
@@ -2890,14 +2956,37 @@ class SystemEffects:
     def write_result_json(self, filename: str, value: JsonObject) -> None:
         if PurePosixPath(filename).name != filename:
             raise HarnessError("result filename must not contain a path")
-        destination = self._result_directory / filename
-        temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
+        temporary = f".{filename}.{uuid.uuid4().hex}.tmp"
         encoded = json.dumps(value, indent=2, sort_keys=True) + "\n"
-        with temporary.open("x", encoding="utf-8") as output:
-            output.write(encoded)
-            output.flush()
-            os.fsync(output.fileno())
-        os.replace(temporary, destination)
+        descriptor: int | None = None
+        try:
+            descriptor = os.open(
+                temporary,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=self._result_directory_descriptor,
+            )
+            with os.fdopen(
+                descriptor, mode="w", encoding="utf-8", closefd=False
+            ) as output:
+                output.write(encoded)
+                output.flush()
+                os.fchmod(descriptor, 0o644)
+                os.fsync(descriptor)
+            os.close(descriptor)
+            descriptor = None
+            os.replace(
+                temporary,
+                filename,
+                src_dir_fd=self._result_directory_descriptor,
+                dst_dir_fd=self._result_directory_descriptor,
+            )
+            os.fsync(self._result_directory_descriptor)
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(temporary, dir_fd=self._result_directory_descriptor)
 
 
 def _check_processes_alive(
@@ -3769,6 +3858,23 @@ class CliArguments(argparse.Namespace):
     result_dir: Path | None
 
 
+class LeasePreparationCliArguments(argparse.Namespace):
+    config: Path
+    metadata_output: Path
+    wrapper_python: Path
+    child_python: Path
+    benchmark_lease_script: Path
+    harness_script: Path
+    owner: str
+    purpose: str
+    expected_duration_seconds: float
+    heartbeat_seconds: float
+    cleanup_grace_seconds: float
+    lease_path: Path
+    lock_path: Path
+    result_root: Path
+
+
 def parse_args(arguments: Sequence[str] | None = None) -> CliArguments:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True, type=Path)
@@ -3780,6 +3886,527 @@ def parse_args(arguments: Sequence[str] | None = None) -> CliArguments:
         help="must exactly match result_directory in the strict config",
     )
     return parser.parse_args(arguments, namespace=CliArguments())
+
+
+def parse_lease_preparation_args(
+    arguments: Sequence[str] | None = None,
+) -> LeasePreparationCliArguments:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Validate a complete strict POC config and create canonical, fresh "
+            "benchmark-lease metadata. This does not generate the hardware config."
+        )
+    )
+    parser.add_argument("--config", required=True, type=Path)
+    parser.add_argument("--metadata-output", required=True, type=Path)
+    parser.add_argument("--wrapper-python", required=True, type=Path)
+    parser.add_argument("--child-python", required=True, type=Path)
+    parser.add_argument("--benchmark-lease-script", required=True, type=Path)
+    parser.add_argument("--harness-script", required=True, type=Path)
+    parser.add_argument("--owner", required=True)
+    parser.add_argument("--purpose", required=True)
+    parser.add_argument("--expected-duration-seconds", required=True, type=float)
+    parser.add_argument("--heartbeat-seconds", type=float, default=30.0)
+    parser.add_argument("--cleanup-grace-seconds", required=True, type=float)
+    parser.add_argument("--lease-path", type=Path, default=_DEFAULT_LEASE_PATH)
+    parser.add_argument("--lock-path", type=Path, default=_DEFAULT_LOCK_PATH)
+    parser.add_argument("--result-root", required=True, type=Path)
+    return parser.parse_args(arguments, namespace=LeasePreparationCliArguments())
+
+
+def _require_absolute_path(path: Path, description: str) -> None:
+    if not path.is_absolute():
+        raise HarnessError(f"{description} must be an absolute path")
+    if "\0" in str(path):
+        raise HarnessError(f"{description} must not contain NUL")
+
+
+def _require_canonical_regular_file(path: Path, description: str) -> None:
+    _require_absolute_path(path, description)
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError as error:
+        raise HarnessError(f"cannot resolve {description} {path}: {error}") from error
+    if resolved != path:
+        raise HarnessError(f"{description} must be canonical and must not use symlinks")
+    if not path.is_file():
+        raise HarnessError(f"{description} must be a regular file")
+
+
+def _require_canonical_directory(path: Path, description: str) -> None:
+    _require_absolute_path(path, description)
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError as error:
+        raise HarnessError(f"cannot resolve {description} {path}: {error}") from error
+    if resolved != path:
+        raise HarnessError(f"{description} must be canonical and must not use symlinks")
+    if not path.is_dir():
+        raise HarnessError(f"{description} must be a directory")
+
+
+def _require_absolute_executable(path: Path, description: str) -> None:
+    _require_absolute_path(path, description)
+    if not path.is_file() or not os.access(path, os.X_OK):
+        raise HarnessError(f"{description} must be an executable file")
+
+
+def _require_python_interpreter(path: Path) -> None:
+    marker = uuid.uuid4().hex
+    probe_script = (
+        "import json,sys;"
+        "print(json.dumps({"
+        f"'marker':{marker!r},"
+        "'implementation':sys.implementation.name,"
+        "'version':list(sys.version_info[:2]),"
+        "'executable':sys.executable"
+        "},sort_keys=True,separators=(',',':')))"
+    )
+    try:
+        completed = subprocess.run(
+            (str(path), "-I", "-S", "-c", probe_script),
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10.0,
+            env={
+                "PATH": os.defpath,
+                "PYTHONIOENCODING": "utf-8",
+                "PYTHONUTF8": "1",
+            },
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise HarnessError(
+            f"cannot validate configured Python interpreter: {error}"
+        ) from error
+    if completed.returncode != 0:
+        raise HarnessError(
+            "configured Python interpreter probe failed with return code "
+            f"{completed.returncode}: {completed.stderr[-300:]}"
+        )
+    try:
+        value = _object(
+            _parse_json_value(completed.stdout, "configured Python identity probe"),
+            "configured Python identity probe",
+        )
+    except HarnessError as error:
+        raise HarnessError(
+            "configured Python interpreter did not return the identity probe"
+        ) from error
+    expected_identity: dict[str, object] = {
+        "marker": marker,
+        "implementation": "cpython",
+        "version": [3, 13],
+    }
+    if any(value.get(name) != expected for name, expected in expected_identity.items()):
+        raise HarnessError(
+            "configured Python interpreter returned an incompatible identity"
+        )
+    executable = value.get("executable")
+    if not isinstance(executable, str):
+        raise HarnessError("configured Python interpreter omitted sys.executable")
+    try:
+        same_executable = Path(executable).samefile(path)
+    except OSError as error:
+        raise HarnessError(
+            "cannot bind configured Python interpreter to sys.executable"
+        ) from error
+    if not same_executable:
+        raise HarnessError(
+            "configured Python interpreter does not match its sys.executable"
+        )
+
+
+def _canonical_prospective_path(path: Path, description: str) -> Path:
+    _require_absolute_path(path, description)
+    try:
+        resolved = path.resolve(strict=False)
+    except OSError as error:
+        raise HarnessError(f"cannot resolve {description} {path}: {error}") from error
+    if not resolved.is_absolute():
+        raise HarnessError(f"resolved {description} must remain absolute")
+    return resolved
+
+
+def _require_outside_directory(path: Path, directory: Path, description: str) -> None:
+    try:
+        path.relative_to(directory)
+    except ValueError:
+        return
+    raise HarnessError(f"{description} must be outside the source deployment")
+
+
+def _path_exists_without_following(path: Path) -> bool:
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError as error:
+        raise HarnessError(f"cannot inspect path {path}: {error}") from error
+    return True
+
+
+def _format_cli_number(value: float, description: str) -> str:
+    if not math.isfinite(value) or value <= 0:
+        raise HarnessError(f"{description} must be finite and positive")
+    return str(value)
+
+
+def _open_directory_without_symlinks(path: Path) -> int:
+    """Open an absolute directory without following any ancestor symlink."""
+    _require_absolute_path(path, "directory")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    descriptor = os.open("/", flags)
+    try:
+        for component in path.parts[1:]:
+            if component in ("", ".", "..") or "\0" in component:
+                raise HarnessError(f"directory path is not canonical: {path}")
+            child_descriptor = os.open(component, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child_descriptor
+        return descriptor
+    except HarnessError:
+        os.close(descriptor)
+        raise
+    except OSError as error:
+        os.close(descriptor)
+        raise HarnessError(
+            f"cannot open directory without symlinks {path}: {error}"
+        ) from error
+
+
+def _validate_result_directory_descriptor(path: Path, descriptor: int) -> None:
+    try:
+        expected = os.fstat(descriptor)
+        observed = os.stat(path, follow_symlinks=False)
+    except OSError as error:
+        raise HarnessError(
+            f"cannot validate trusted result directory: {error}"
+        ) from error
+    if not stat.S_ISDIR(expected.st_mode):
+        raise HarnessError("trusted result descriptor is not a directory")
+    if not stat.S_ISDIR(observed.st_mode) or (
+        observed.st_dev,
+        observed.st_ino,
+    ) != (expected.st_dev, expected.st_ino):
+        raise HarnessError("trusted result directory path identity changed")
+
+
+def _inherited_result_directory_descriptor(path: Path) -> int:
+    raw_descriptor = os.environ.get(_RESULT_DIRECTORY_FD_ENVIRONMENT)
+    if (
+        raw_descriptor is None
+        or not raw_descriptor.isascii()
+        or not raw_descriptor.isdigit()
+    ):
+        raise HarnessError(
+            f"lease wrapper did not pass {_RESULT_DIRECTORY_FD_ENVIRONMENT}"
+        )
+    descriptor = int(raw_descriptor)
+    _validate_result_directory_descriptor(path, descriptor)
+    return descriptor
+
+
+def _atomic_write_new_json(path: Path, value: Mapping[str, object]) -> None:
+    """Install a new JSON file atomically without following or replacing symlinks."""
+    _require_absolute_path(path, "metadata output")
+    if not path.name:
+        raise HarnessError("metadata output must name a file")
+    _require_canonical_directory(path.parent, "metadata output parent")
+    serialized = (
+        json.dumps(value, indent=2, sort_keys=True, allow_nan=False) + "\n"
+    ).encode("utf-8")
+    directory_descriptor = _open_directory_without_symlinks(path.parent)
+    temporary_name = f".{path.name}.{uuid.uuid4().hex}.tmp"
+    temporary_created = False
+    try:
+        try:
+            os.stat(path.name, dir_fd=directory_descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise HarnessError(f"metadata output already exists: {path}")
+        temporary_flags = (
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW
+        )
+        temporary_descriptor = os.open(
+            temporary_name,
+            temporary_flags,
+            0o600,
+            dir_fd=directory_descriptor,
+        )
+        temporary_created = True
+        with os.fdopen(temporary_descriptor, "wb", closefd=True) as output:
+            output.write(serialized)
+            output.flush()
+            os.fchmod(output.fileno(), 0o644)
+            os.fsync(output.fileno())
+        try:
+            os.link(
+                temporary_name,
+                path.name,
+                src_dir_fd=directory_descriptor,
+                dst_dir_fd=directory_descriptor,
+                follow_symlinks=False,
+            )
+        except FileExistsError as error:
+            raise HarnessError(f"metadata output already exists: {path}") from error
+        os.fsync(directory_descriptor)
+    except OSError as error:
+        raise HarnessError(
+            f"cannot atomically create metadata {path}: {error}"
+        ) from error
+    finally:
+        if temporary_created:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(temporary_name, dir_fd=directory_descriptor)
+        os.close(directory_descriptor)
+
+
+def _validate_metadata_with_benchmark_lease(
+    benchmark_lease_script: Path,
+    metadata: JsonObject,
+    generated_at: datetime,
+) -> None:
+    specification = importlib.util.spec_from_file_location(
+        "_exo_poc_benchmark_lease_validation", benchmark_lease_script
+    )
+    if specification is None or specification.loader is None:
+        raise HarnessError("cannot import the exact benchmark lease wrapper")
+    module = importlib.util.module_from_spec(specification)
+    try:
+        specification.loader.exec_module(module)
+        validator = cast(LeaseMetadataValidator, cast(object, module))
+        validated = validator.validate_run_metadata(
+            cast(Mapping[str, object], metadata), now=generated_at
+        )
+    except Exception as error:
+        raise HarnessError(
+            f"benchmark lease rejected generated metadata: {error}"
+        ) from error
+    if validated != metadata:
+        raise HarnessError("benchmark lease metadata validation changed the document")
+
+
+def _validate_preparation_source(
+    config: HarnessConfig,
+    source_identity: Callable[[str], SourceIdentity],
+) -> SourceIdentity:
+    configured_source = config.hosts[0].source
+    if any(host.source != configured_source for host in config.hosts[1:]):
+        raise HarnessError(
+            "lease v1 requires identical source identities on both hosts"
+        )
+    coordinator = next(host for host in config.hosts if host.role == "coordinator")
+    observed_source = source_identity(coordinator.source_directory)
+    if observed_source != configured_source:
+        raise HarnessError(
+            "strict config source identity is stale for the coordinator deployment"
+        )
+    return observed_source
+
+
+def prepare_lease_metadata(
+    *,
+    config_path: Path,
+    metadata_output: Path,
+    wrapper_python: Path,
+    child_python: Path,
+    benchmark_lease_script: Path,
+    harness_script: Path,
+    owner: str,
+    purpose: str,
+    expected_duration_seconds: float,
+    heartbeat_seconds: float,
+    cleanup_grace_seconds: float,
+    lease_path: Path,
+    lock_path: Path,
+    result_root: Path,
+    now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+    source_identity: Callable[[str], SourceIdentity] | None = None,
+) -> LeasePreparation:
+    path_fields = (
+        (config_path, "config path"),
+        (metadata_output, "metadata output"),
+        (wrapper_python, "wrapper Python"),
+        (child_python, "child Python"),
+        (benchmark_lease_script, "benchmark lease script"),
+        (harness_script, "harness script"),
+        (lease_path, "lease path"),
+        (lock_path, "lock path"),
+        (result_root, "result root"),
+    )
+    for path, description in path_fields:
+        _require_absolute_path(path, description)
+    _require_canonical_regular_file(config_path, "config path")
+    _require_canonical_regular_file(benchmark_lease_script, "benchmark lease script")
+    _require_canonical_regular_file(harness_script, "harness script")
+    _require_absolute_executable(wrapper_python, "wrapper Python")
+    _require_absolute_executable(child_python, "child Python")
+    lease_path = _canonical_prospective_path(lease_path, "lease path")
+    lock_path = _canonical_prospective_path(lock_path, "lock path")
+    _require_canonical_directory(result_root, "result root")
+    _require_canonical_directory(metadata_output.parent, "metadata output parent")
+    if _path_exists_without_following(metadata_output):
+        raise HarnessError(f"metadata output already exists: {metadata_output}")
+
+    config = load_config(config_path)
+    coordinator = next(host for host in config.hosts if host.role == "coordinator")
+    source_directory = Path(coordinator.source_directory)
+    _require_canonical_directory(source_directory, "coordinator source directory")
+    expected_harness_script = source_directory / "scripts" / Path(__file__).name
+    expected_wrapper_script = source_directory / "scripts" / "benchmark_lease.py"
+    if (
+        harness_script != expected_harness_script
+        or harness_script != Path(__file__).resolve()
+    ):
+        raise HarnessError(
+            "harness script does not match the coordinator config source deployment"
+        )
+    if benchmark_lease_script != expected_wrapper_script:
+        raise HarnessError(
+            "benchmark lease script does not match the coordinator config source "
+            "deployment"
+        )
+    if child_python != Path(coordinator.python_executable):
+        raise HarnessError(
+            "child Python does not match the coordinator config python_executable"
+        )
+    if wrapper_python != child_python:
+        raise HarnessError(
+            "wrapper Python must match the configured child Python interpreter"
+        )
+    _require_python_interpreter(wrapper_python)
+    expected_result_directory = result_root / config.run_id
+    result_directory = Path(config.result_directory)
+    if result_directory != expected_result_directory:
+        raise HarnessError(
+            "config result_directory must exactly equal result_root/run_id"
+        )
+    generated_paths = (metadata_output, result_directory, lease_path, lock_path)
+    if len(set(generated_paths)) != len(generated_paths):
+        raise HarnessError(
+            "metadata output, result directory, lease path, and lock path must be "
+            "pairwise distinct"
+        )
+    if _path_exists_without_following(result_directory):
+        raise HarnessError(f"result directory already exists: {result_directory}")
+    for generated_path, description in (
+        (metadata_output, "metadata output"),
+        (result_directory, "result directory"),
+        (lease_path, "lease path"),
+        (lock_path, "lock path"),
+    ):
+        _require_outside_directory(generated_path, source_directory, description)
+
+    owner_value = owner
+    purpose_value = purpose
+    if not owner.strip() or "\0" in owner:
+        raise HarnessError("owner must be nonempty and must not contain NUL")
+    if not purpose.strip() or "\0" in purpose:
+        raise HarnessError("purpose must be nonempty and must not contain NUL")
+    expected_duration = _format_cli_number(
+        expected_duration_seconds, "expected duration"
+    )
+    heartbeat = _format_cli_number(heartbeat_seconds, "heartbeat interval")
+    cleanup_grace = _format_cli_number(cleanup_grace_seconds, "cleanup grace")
+    minimum_grace = minimum_cleanup_grace_seconds(config)
+    if cleanup_grace_seconds < minimum_grace:
+        raise HarnessError(
+            "cleanup grace is shorter than the proof cleanup bound "
+            f"({minimum_grace} seconds)"
+        )
+
+    identity_reader = source_identity or LinuxHostProbe().source_identity
+    observed_source = _validate_preparation_source(config, identity_reader)
+    child_argv = (
+        str(child_python),
+        str(harness_script),
+        "--config",
+        str(config_path),
+        "--lease-path",
+        str(lease_path),
+        "--lock-path",
+        str(lock_path),
+        "--result-dir",
+        config.result_directory,
+    )
+    generated_at_value = now()
+    if generated_at_value.tzinfo is None or generated_at_value.utcoffset() is None:
+        raise HarnessError("metadata clock must return an offset-aware timestamp")
+    generated_at_utc = generated_at_value.astimezone(timezone.utc)
+    generated_at = generated_at_utc.isoformat(timespec="seconds")
+    metadata = _lease_static_metadata(config, child_argv)
+    metadata["generated_at"] = generated_at
+    _validate_metadata_with_benchmark_lease(
+        benchmark_lease_script, metadata, generated_at_utc
+    )
+    benchmark_lease_argv = (
+        str(wrapper_python),
+        str(benchmark_lease_script),
+        f"--owner={owner_value}",
+        f"--purpose={purpose_value}",
+        "--run-id",
+        config.run_id,
+        "--namespace",
+        config.namespace,
+        "--port",
+        ",".join(str(port) for port in config.reserved_ports),
+        "--metadata-json",
+        str(metadata_output),
+        "--heartbeat-seconds",
+        heartbeat,
+        "--expected-duration-seconds",
+        expected_duration,
+        "--cleanup-grace-seconds",
+        cleanup_grace,
+        "--lock-path",
+        str(lock_path),
+        "--lease-path",
+        str(lease_path),
+        "--result-root",
+        str(result_root),
+        "--",
+        *child_argv,
+    )
+    if identity_reader(coordinator.source_directory) != observed_source:
+        raise HarnessError("source identity changed while preparing lease metadata")
+    _atomic_write_new_json(metadata_output, cast(Mapping[str, object], metadata))
+    return LeasePreparation(
+        metadata=metadata,
+        child_argv=child_argv,
+        benchmark_lease_argv=benchmark_lease_argv,
+        generated_at=generated_at,
+        minimum_cleanup_grace_seconds=minimum_grace,
+    )
+
+
+def prepare_lease_main(arguments: Sequence[str] | None = None) -> int:
+    args = parse_lease_preparation_args(arguments)
+    prepared = prepare_lease_metadata(
+        config_path=args.config,
+        metadata_output=args.metadata_output,
+        wrapper_python=args.wrapper_python,
+        child_python=args.child_python,
+        benchmark_lease_script=args.benchmark_lease_script,
+        harness_script=args.harness_script,
+        owner=args.owner,
+        purpose=args.purpose,
+        expected_duration_seconds=args.expected_duration_seconds,
+        heartbeat_seconds=args.heartbeat_seconds,
+        cleanup_grace_seconds=args.cleanup_grace_seconds,
+        lease_path=args.lease_path,
+        lock_path=args.lock_path,
+        result_root=args.result_root,
+    )
+    print(
+        json.dumps(
+            prepared.machine_output(args.metadata_output),
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+    return 0
 
 
 def host_preflight_main() -> int:
@@ -3799,6 +4426,8 @@ def main(arguments: Sequence[str] | None = None) -> int:
     normalized_arguments = list(sys.argv[1:] if arguments is None else arguments)
     if normalized_arguments == ["host-preflight"]:
         return host_preflight_main()
+    if normalized_arguments and normalized_arguments[0] == "prepare-lease":
+        return prepare_lease_main(normalized_arguments[1:])
     args = parse_args(normalized_arguments)
     if not args.config.is_absolute():
         raise HarnessError("--config must be an absolute path")
@@ -3813,6 +4442,9 @@ def main(arguments: Sequence[str] | None = None) -> int:
         lease_path=args.lease_path,
         lock_path=args.lock_path,
     )
+    result_directory_descriptor = _inherited_result_directory_descriptor(
+        Path(config.result_directory)
+    )
     latch = SignalLatch()
     managed_signals = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
     previous_handlers = {
@@ -3822,7 +4454,11 @@ def main(arguments: Sequence[str] | None = None) -> int:
     try:
         for signal_number in managed_signals:
             signal.signal(signal_number, latch.handle)
-        result = run_harness(config, SystemEffects(config), latch)
+        result = run_harness(
+            config,
+            SystemEffects(config, result_directory_descriptor),
+            latch,
+        )
     finally:
         for signal_number, previous_handler in previous_handlers.items():
             signal.signal(signal_number, previous_handler)

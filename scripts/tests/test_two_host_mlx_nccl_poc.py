@@ -11,12 +11,15 @@ import subprocess
 import sys
 import time
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Callable
 
 import pytest
 from pydantic import ValidationError
 
+import scripts.benchmark_lease as benchmark_lease
 import scripts.two_host_mlx_nccl_poc as poc
 from scripts.two_host_mlx_nccl_poc import (
     ApiConfig,
@@ -251,6 +254,89 @@ def make_config(tmp_path: Path) -> HarnessConfig:
             cuda_major=13,
             minimum_nvidia_driver_version="580.0",
         ),
+    )
+
+
+@dataclass(frozen=True)
+class LeasePreparationFixture:
+    config: HarnessConfig
+    config_path: Path
+    metadata_output: Path
+    wrapper_python: Path
+    child_python: Path
+    benchmark_lease_script: Path
+    harness_script: Path
+    lease_path: Path
+    lock_path: Path
+    result_root: Path
+
+
+def make_lease_preparation_fixture(tmp_path: Path) -> LeasePreparationFixture:
+    result_root = (tmp_path / "results").resolve()
+    result_root.mkdir()
+    source_directory = Path(poc.__file__).resolve().parents[1]
+    raw = make_config(tmp_path / "unused-result").model_dump(mode="json")
+    raw["result_directory"] = str(result_root / raw["run_id"])
+    raw["hosts"][0]["source_directory"] = str(source_directory)
+    raw["hosts"][0]["python_executable"] = sys.executable
+    raw["hosts"][0]["launch_argv"][3] = sys.executable
+    config = HarnessConfig.model_validate_json(json.dumps(raw))
+    config_path = (tmp_path / "strict-poc-config.json").resolve()
+    config_path.write_text(config.model_dump_json(), encoding="utf-8")
+    return LeasePreparationFixture(
+        config=config,
+        config_path=config_path,
+        metadata_output=(tmp_path / "lease-metadata.json").resolve(),
+        wrapper_python=Path(sys.executable),
+        child_python=Path(sys.executable),
+        benchmark_lease_script=(source_directory / "scripts" / "benchmark_lease.py"),
+        harness_script=Path(poc.__file__).resolve(),
+        lease_path=(tmp_path / "coordination" / "benchmark-lease.json").resolve(),
+        lock_path=(tmp_path / "coordination" / "benchmark.lock").resolve(),
+        result_root=result_root,
+    )
+
+
+def prepare_lease_fixture(
+    fixture: LeasePreparationFixture,
+    *,
+    config_path: Path | None = None,
+    metadata_output: Path | None = None,
+    wrapper_python: Path | None = None,
+    child_python: Path | None = None,
+    benchmark_lease_script: Path | None = None,
+    harness_script: Path | None = None,
+    lease_path: Path | None = None,
+    lock_path: Path | None = None,
+    result_root: Path | None = None,
+    owner: str = "/root/poc-metadata-cli",
+    purpose: str = "strict TP3 proof",
+    expected_duration_seconds: float = 600.0,
+    heartbeat_seconds: float = 10.0,
+    cleanup_grace_seconds: float = 300.0,
+    clock: Callable[[], datetime] | None = None,
+    source_identity: Callable[[str], SourceIdentity] | None = None,
+) -> poc.LeasePreparation:
+    identity = fixture.config.hosts[0].source
+    return poc.prepare_lease_metadata(
+        config_path=config_path or fixture.config_path,
+        metadata_output=metadata_output or fixture.metadata_output,
+        wrapper_python=wrapper_python or fixture.wrapper_python,
+        child_python=child_python or fixture.child_python,
+        benchmark_lease_script=(
+            benchmark_lease_script or fixture.benchmark_lease_script
+        ),
+        harness_script=harness_script or fixture.harness_script,
+        owner=owner,
+        purpose=purpose,
+        expected_duration_seconds=expected_duration_seconds,
+        heartbeat_seconds=heartbeat_seconds,
+        cleanup_grace_seconds=cleanup_grace_seconds,
+        lease_path=lease_path or fixture.lease_path,
+        lock_path=lock_path or fixture.lock_path,
+        result_root=result_root or fixture.result_root,
+        now=clock or (lambda: datetime.now(timezone.utc)),
+        source_identity=source_identity or (lambda _source_directory: identity),
     )
 
 
@@ -813,6 +899,618 @@ def test_active_lease_grace_covers_two_remote_start_markers(tmp_path: Path) -> N
             )
 
 
+def test_prepare_lease_writes_canonical_metadata_and_exact_wrapper_argv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = make_lease_preparation_fixture(tmp_path)
+    generated_at = datetime(2026, 7, 18, 12, 34, 56, tzinfo=timezone.utc)
+
+    prepared = prepare_lease_fixture(fixture, clock=lambda: generated_at)
+
+    written = json.loads(fixture.metadata_output.read_text(encoding="utf-8"))
+    assert written == prepared.metadata
+    assert written["generated_at"] == "2026-07-18T12:34:56+00:00"
+    assert written["command"] == list(prepared.child_argv)
+    assert prepared.child_argv == (
+        str(fixture.child_python),
+        str(fixture.harness_script),
+        "--config",
+        str(fixture.config_path),
+        "--lease-path",
+        str(fixture.lease_path),
+        "--lock-path",
+        str(fixture.lock_path),
+        "--result-dir",
+        fixture.config.result_directory,
+    )
+    parsed = benchmark_lease.build_parser().parse_args(
+        list(prepared.benchmark_lease_argv[2:])
+    )
+    parsed_command = tuple(parsed.command)
+    if parsed_command and parsed_command[0] == "--":
+        parsed_command = parsed_command[1:]
+    assert parsed_command == prepared.child_argv
+    assert parsed.run_id == fixture.config.run_id
+    assert parsed.namespace == fixture.config.namespace
+    assert benchmark_lease.parse_ports(parsed.port) == fixture.config.reserved_ports
+    assert parsed.metadata_json == fixture.metadata_output
+    assert parsed.result_root == fixture.result_root
+    assert parsed.cleanup_grace_seconds == 300.0
+    assert benchmark_lease.validate_run_metadata(written, now=generated_at) == written
+
+    def fixed_utc_now() -> datetime:
+        return generated_at
+
+    monkeypatch.setattr(benchmark_lease, "utc_now", fixed_utc_now)
+    lease = benchmark_lease.BenchmarkLease(
+        lock_path=parsed.lock_path,
+        lease_path=parsed.lease_path,
+        result_directory=parsed.result_root / parsed.run_id,
+        owner=parsed.owner,
+        purpose=parsed.purpose,
+        run_id=parsed.run_id,
+        namespace=parsed.namespace,
+        ports=benchmark_lease.parse_ports(parsed.port),
+        command=parsed_command,
+        metadata=written,
+        heartbeat_seconds=parsed.heartbeat_seconds,
+        expected_duration_seconds=parsed.expected_duration_seconds,
+        cleanup_grace_seconds=parsed.cleanup_grace_seconds,
+    )
+    assert lease.command == prepared.child_argv
+    assert lease.metadata == written
+    assert fixture.metadata_output.stat().st_mode & 0o777 == 0o644
+    assert not tuple(tmp_path.glob(".lease-metadata.json.*.tmp"))
+
+
+def test_prepare_lease_canonicalizes_symlinked_lock_parent_once(
+    tmp_path: Path,
+) -> None:
+    fixture = make_lease_preparation_fixture(tmp_path)
+    real_lock_parent = tmp_path / "real-lock-parent"
+    real_lock_parent.mkdir()
+    linked_lock_parent = tmp_path / "linked-lock-parent"
+    linked_lock_parent.symlink_to(real_lock_parent, target_is_directory=True)
+    requested_lock_path = linked_lock_parent / "benchmark.lock"
+    canonical_lock_path = real_lock_parent / "benchmark.lock"
+
+    prepared = prepare_lease_fixture(fixture, lock_path=requested_lock_path)
+
+    assert str(requested_lock_path) not in prepared.child_argv
+    assert str(canonical_lock_path) in prepared.child_argv
+    parsed = benchmark_lease.build_parser().parse_args(
+        list(prepared.benchmark_lease_argv[2:])
+    )
+    assert parsed.lock_path == canonical_lock_path
+    assert poc._canonical_prospective_path(
+        poc._DEFAULT_LOCK_PATH, "default lock path"
+    ) == poc._DEFAULT_LOCK_PATH.resolve(strict=False)
+
+
+def test_prepare_lease_emits_dash_prefixed_owner_values_without_argparse_ambiguity(
+    tmp_path: Path,
+) -> None:
+    fixture = make_lease_preparation_fixture(tmp_path)
+
+    prepared = prepare_lease_fixture(
+        fixture,
+        owner="-owner-thread",
+        purpose="-strict-proof",
+    )
+
+    parsed = benchmark_lease.build_parser().parse_args(
+        list(prepared.benchmark_lease_argv[2:])
+    )
+    assert parsed.owner == "-owner-thread"
+    assert parsed.purpose == "-strict-proof"
+
+
+def test_prepare_lease_cli_emits_machine_readable_exact_argv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fixture = make_lease_preparation_fixture(tmp_path)
+    identity = fixture.config.hosts[0].source
+
+    def source_identity_override(
+        _probe: poc.LinuxHostProbe, _source_directory: str
+    ) -> SourceIdentity:
+        return identity
+
+    monkeypatch.setattr(
+        poc.LinuxHostProbe,
+        "source_identity",
+        source_identity_override,
+    )
+
+    result = poc.main(
+        [
+            "prepare-lease",
+            "--config",
+            str(fixture.config_path),
+            "--metadata-output",
+            str(fixture.metadata_output),
+            "--wrapper-python",
+            str(fixture.wrapper_python),
+            "--child-python",
+            str(fixture.child_python),
+            "--benchmark-lease-script",
+            str(fixture.benchmark_lease_script),
+            "--harness-script",
+            str(fixture.harness_script),
+            "--owner",
+            "/root/poc-metadata-cli",
+            "--purpose",
+            "strict TP3 proof",
+            "--expected-duration-seconds",
+            "600",
+            "--heartbeat-seconds",
+            "10",
+            "--cleanup-grace-seconds",
+            "300",
+            "--lease-path",
+            str(fixture.lease_path),
+            "--lock-path",
+            str(fixture.lock_path),
+            "--result-root",
+            str(fixture.result_root),
+        ]
+    )
+
+    assert result == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["schema_version"] == 1
+    assert output["metadata_output"] == str(fixture.metadata_output)
+    assert (
+        output["child_argv"]
+        == json.loads(fixture.metadata_output.read_text(encoding="utf-8"))["command"]
+    )
+    wrapper_argv = output["benchmark_lease_argv"]
+    assert isinstance(wrapper_argv, list)
+    assert wrapper_argv[-len(output["child_argv"]) :] == output["child_argv"]
+
+
+@pytest.mark.parametrize(
+    "path_name",
+    [
+        "config",
+        "metadata_output",
+        "wrapper_python",
+        "child_python",
+        "benchmark_lease_script",
+        "harness_script",
+        "lease_path",
+        "lock_path",
+        "result_root",
+    ],
+)
+def test_prepare_lease_rejects_every_relative_operator_path(
+    tmp_path: Path, path_name: str
+) -> None:
+    fixture = make_lease_preparation_fixture(tmp_path)
+    relative = Path("relative-path")
+    config_path = relative if path_name == "config" else fixture.config_path
+    metadata_output = (
+        relative if path_name == "metadata_output" else fixture.metadata_output
+    )
+    wrapper_python = (
+        relative if path_name == "wrapper_python" else fixture.wrapper_python
+    )
+    child_python = relative if path_name == "child_python" else fixture.child_python
+    benchmark_script = (
+        relative
+        if path_name == "benchmark_lease_script"
+        else fixture.benchmark_lease_script
+    )
+    harness_script = (
+        relative if path_name == "harness_script" else fixture.harness_script
+    )
+    lease_path = relative if path_name == "lease_path" else fixture.lease_path
+    lock_path = relative if path_name == "lock_path" else fixture.lock_path
+    result_root = relative if path_name == "result_root" else fixture.result_root
+
+    with pytest.raises(HarnessError, match="absolute path"):
+        prepare_lease_fixture(
+            fixture,
+            config_path=config_path,
+            metadata_output=metadata_output,
+            wrapper_python=wrapper_python,
+            child_python=child_python,
+            benchmark_lease_script=benchmark_script,
+            harness_script=harness_script,
+            lease_path=lease_path,
+            lock_path=lock_path,
+            result_root=result_root,
+        )
+
+
+@pytest.mark.parametrize("result_kind", ["empty", "nonempty", "symlink"])
+def test_prepare_lease_refuses_any_existing_result_path(
+    tmp_path: Path, result_kind: str
+) -> None:
+    fixture = make_lease_preparation_fixture(tmp_path)
+    result_directory = Path(fixture.config.result_directory)
+    if result_kind == "symlink":
+        target = tmp_path / "existing-result-target"
+        target.mkdir()
+        result_directory.symlink_to(target, target_is_directory=True)
+    else:
+        result_directory.mkdir()
+        if result_kind == "nonempty":
+            (result_directory / "partial.json").write_text("{}", encoding="utf-8")
+
+    with pytest.raises(HarnessError, match="result directory already exists"):
+        prepare_lease_fixture(fixture)
+
+
+@pytest.mark.parametrize("output_kind", ["file", "symlink", "broken-symlink"])
+def test_prepare_lease_never_replaces_an_existing_output(
+    tmp_path: Path, output_kind: str
+) -> None:
+    fixture = make_lease_preparation_fixture(tmp_path)
+    if output_kind == "file":
+        fixture.metadata_output.write_text("operator-owned", encoding="utf-8")
+    else:
+        target = tmp_path / "operator-owned-target"
+        if output_kind == "symlink":
+            target.write_text("operator-owned", encoding="utf-8")
+        fixture.metadata_output.symlink_to(target)
+
+    with pytest.raises(HarnessError, match="metadata output already exists"):
+        prepare_lease_fixture(fixture)
+
+    assert fixture.metadata_output.is_symlink() == (output_kind != "file")
+    if output_kind == "file":
+        assert fixture.metadata_output.read_text(encoding="utf-8") == "operator-owned"
+
+
+def test_atomic_metadata_install_loses_collision_race_without_replacing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    metadata_output = (tmp_path / "metadata.json").resolve()
+    operator_target = (tmp_path / "operator-target.json").resolve()
+    operator_target.write_text("operator-owned", encoding="utf-8")
+    original_link = os.link
+
+    def race_link(
+        source: str,
+        destination: str,
+        *,
+        src_dir_fd: int | None = None,
+        dst_dir_fd: int | None = None,
+        follow_symlinks: bool = True,
+    ) -> None:
+        assert dst_dir_fd is not None
+        os.symlink(operator_target, destination, dir_fd=dst_dir_fd)
+        original_link(
+            source,
+            destination,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+            follow_symlinks=follow_symlinks,
+        )
+
+    monkeypatch.setattr(poc.os, "link", race_link)
+    with pytest.raises(HarnessError, match="metadata output already exists"):
+        poc._atomic_write_new_json(metadata_output, {"schema_version": 1})
+
+    assert metadata_output.is_symlink()
+    assert metadata_output.resolve() == operator_target
+    assert operator_target.read_text(encoding="utf-8") == "operator-owned"
+    assert not tuple(tmp_path.glob(".metadata.json.*.tmp"))
+
+
+def test_prepare_lease_rejects_symlinked_output_parent(tmp_path: Path) -> None:
+    fixture = make_lease_preparation_fixture(tmp_path)
+    real_parent = tmp_path / "real-output-parent"
+    real_parent.mkdir()
+    linked_parent = tmp_path / "linked-output-parent"
+    linked_parent.symlink_to(real_parent, target_is_directory=True)
+
+    with pytest.raises(HarnessError, match="must be canonical"):
+        prepare_lease_fixture(fixture, metadata_output=linked_parent / "metadata.json")
+
+    assert not (real_parent / "metadata.json").exists()
+
+
+def test_atomic_metadata_install_rejects_ancestor_replaced_after_validation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    trusted_ancestor = tmp_path / "trusted"
+    trusted_parent = trusted_ancestor / "metadata-parent"
+    trusted_parent.mkdir(parents=True)
+    moved_trusted_ancestor = tmp_path / "moved-trusted"
+    outside_ancestor = tmp_path / "outside"
+    outside_parent = outside_ancestor / "metadata-parent"
+    outside_parent.mkdir(parents=True)
+    metadata_output = trusted_parent / "metadata.json"
+    original_validation = poc._require_canonical_directory
+    swapped = False
+
+    def validate_then_swap(path: Path, description: str) -> None:
+        nonlocal swapped
+        original_validation(path, description)
+        if description == "metadata output parent" and not swapped:
+            trusted_ancestor.rename(moved_trusted_ancestor)
+            trusted_ancestor.symlink_to(outside_ancestor, target_is_directory=True)
+            swapped = True
+
+    monkeypatch.setattr(poc, "_require_canonical_directory", validate_then_swap)
+    with pytest.raises(HarnessError, match="without symlinks"):
+        poc._atomic_write_new_json(metadata_output, {"schema_version": 1})
+
+    assert swapped is True
+    assert not (outside_parent / metadata_output.name).exists()
+    assert not (
+        moved_trusted_ancestor / "metadata-parent" / metadata_output.name
+    ).exists()
+
+
+def test_prepare_lease_rejects_symlinked_config(tmp_path: Path) -> None:
+    fixture = make_lease_preparation_fixture(tmp_path)
+    linked_config = tmp_path / "linked-config.json"
+    linked_config.symlink_to(fixture.config_path)
+
+    with pytest.raises(HarnessError, match="must be canonical"):
+        prepare_lease_fixture(fixture, config_path=linked_config)
+
+
+@pytest.mark.parametrize("generated_path", ["metadata", "result", "lease", "lock"])
+def test_prepare_lease_keeps_generated_paths_outside_the_source_identity(
+    tmp_path: Path, generated_path: str
+) -> None:
+    fixture = make_lease_preparation_fixture(tmp_path)
+    source_directory = Path(poc.__file__).resolve().parents[1]
+    protected_path = source_directory / (
+        fixture.config.run_id
+        if generated_path == "result"
+        else f"poc-test-must-not-create-{generated_path}"
+    )
+    config_path = fixture.config_path
+    result_root = fixture.result_root
+    if generated_path == "result":
+        result_root = source_directory
+        raw = fixture.config.model_dump(mode="json")
+        raw["result_directory"] = str(result_root / fixture.config.run_id)
+        config = HarnessConfig.model_validate_json(json.dumps(raw))
+        config_path = (tmp_path / "source-result-config.json").resolve()
+        config_path.write_text(config.model_dump_json(), encoding="utf-8")
+
+    with pytest.raises(HarnessError, match="outside the source deployment"):
+        prepare_lease_fixture(
+            fixture,
+            config_path=config_path,
+            metadata_output=(
+                protected_path
+                if generated_path == "metadata"
+                else fixture.metadata_output
+            ),
+            lease_path=(
+                protected_path if generated_path == "lease" else fixture.lease_path
+            ),
+            lock_path=(
+                protected_path if generated_path == "lock" else fixture.lock_path
+            ),
+            result_root=result_root,
+        )
+
+    assert not protected_path.exists()
+
+
+def test_prepare_lease_rejects_config_result_root_mismatch(tmp_path: Path) -> None:
+    fixture = make_lease_preparation_fixture(tmp_path)
+    raw = fixture.config.model_dump(mode="json")
+    raw["result_directory"] = str(fixture.result_root / "different-run")
+    mismatched_config = HarnessConfig.model_validate_json(json.dumps(raw))
+    mismatched_path = (tmp_path / "mismatched-result-config.json").resolve()
+    mismatched_path.write_text(mismatched_config.model_dump_json(), encoding="utf-8")
+
+    with pytest.raises(HarnessError, match="result_root/run_id"):
+        prepare_lease_fixture(fixture, config_path=mismatched_path)
+
+
+@pytest.mark.parametrize(
+    "collision",
+    [
+        "metadata-result",
+        "metadata-lease",
+        "metadata-lock",
+        "result-lease",
+        "result-lock",
+        "lease-lock",
+    ],
+)
+def test_prepare_lease_requires_pairwise_distinct_generated_paths(
+    tmp_path: Path, collision: str
+) -> None:
+    fixture = make_lease_preparation_fixture(tmp_path)
+    result_directory = Path(fixture.config.result_directory)
+    metadata_output = fixture.metadata_output
+    lease_path = fixture.lease_path
+    lock_path = fixture.lock_path
+    if collision == "metadata-result":
+        metadata_output = result_directory
+    elif collision == "metadata-lease":
+        metadata_output = lease_path
+    elif collision == "metadata-lock":
+        metadata_output = lock_path
+    elif collision == "result-lease":
+        lease_path = result_directory
+    elif collision == "result-lock":
+        lock_path = result_directory
+    else:
+        lock_path = lease_path
+    metadata_output.parent.mkdir(parents=True, exist_ok=True)
+
+    with pytest.raises(HarnessError, match="pairwise distinct"):
+        prepare_lease_fixture(
+            fixture,
+            metadata_output=metadata_output,
+            lease_path=lease_path,
+            lock_path=lock_path,
+        )
+
+    assert not metadata_output.exists()
+
+
+@pytest.mark.parametrize(
+    ("mismatch", "message"),
+    [
+        ("wrapper", "benchmark lease script does not match"),
+        ("harness", "harness script does not match"),
+        ("python", "child Python does not match"),
+    ],
+)
+def test_prepare_lease_rejects_wrapper_config_invocation_mismatch(
+    tmp_path: Path, mismatch: str, message: str
+) -> None:
+    fixture = make_lease_preparation_fixture(tmp_path)
+    other_script = (tmp_path / "other-script.py").resolve()
+    other_script.write_text("pass\n", encoding="utf-8")
+
+    with pytest.raises(HarnessError, match=message):
+        prepare_lease_fixture(
+            fixture,
+            benchmark_lease_script=(
+                other_script
+                if mismatch == "wrapper"
+                else fixture.benchmark_lease_script
+            ),
+            harness_script=(
+                other_script if mismatch == "harness" else fixture.harness_script
+            ),
+            child_python=(
+                Path("/bin/true") if mismatch == "python" else fixture.child_python
+            ),
+        )
+
+
+def test_prepare_lease_rejects_non_python_wrapper_executable(tmp_path: Path) -> None:
+    fixture = make_lease_preparation_fixture(tmp_path)
+
+    with pytest.raises(HarnessError, match="wrapper Python must match"):
+        prepare_lease_fixture(fixture, wrapper_python=Path("/bin/true"))
+
+    assert not fixture.metadata_output.exists()
+
+
+def test_prepare_lease_rejects_configured_non_python_interpreter(
+    tmp_path: Path,
+) -> None:
+    fixture = make_lease_preparation_fixture(tmp_path)
+    raw = fixture.config.model_dump(mode="json")
+    raw["hosts"][0]["python_executable"] = "/bin/true"
+    raw["hosts"][0]["launch_argv"][3] = "/bin/true"
+    config = HarnessConfig.model_validate_json(json.dumps(raw))
+    config_path = (tmp_path / "non-python-config.json").resolve()
+    config_path.write_text(config.model_dump_json(), encoding="utf-8")
+
+    with pytest.raises(HarnessError, match="identity probe"):
+        prepare_lease_fixture(
+            fixture,
+            config_path=config_path,
+            wrapper_python=Path("/bin/true"),
+            child_python=Path("/bin/true"),
+        )
+
+    assert not fixture.metadata_output.exists()
+
+
+def test_prepare_lease_rejects_incompatible_host_source_identities(
+    tmp_path: Path,
+) -> None:
+    fixture = make_lease_preparation_fixture(tmp_path)
+    raw = fixture.config.model_dump(mode="json")
+    raw["hosts"][1]["source"]["commit"] = "b" * 40
+    incompatible = HarnessConfig.model_validate_json(json.dumps(raw))
+    incompatible_path = (tmp_path / "incompatible-source-config.json").resolve()
+    incompatible_path.write_text(incompatible.model_dump_json(), encoding="utf-8")
+
+    with pytest.raises(HarnessError, match="identical source identities"):
+        prepare_lease_fixture(fixture, config_path=incompatible_path)
+
+
+def test_prepare_lease_rejects_stale_or_changing_source_identity(
+    tmp_path: Path,
+) -> None:
+    fixture = make_lease_preparation_fixture(tmp_path)
+    stale = SourceIdentity(commit="b" * 40, dirty_file_hashes={})
+    with pytest.raises(HarnessError, match="source identity is stale"):
+        prepare_lease_fixture(fixture, source_identity=lambda _source_directory: stale)
+
+    identities = iter((fixture.config.hosts[0].source, stale))
+    with pytest.raises(HarnessError, match="source identity changed"):
+        prepare_lease_fixture(
+            fixture, source_identity=lambda _source_directory: next(identities)
+        )
+    assert not fixture.metadata_output.exists()
+
+
+def test_prepare_lease_enforces_the_shared_cleanup_bound(tmp_path: Path) -> None:
+    fixture = make_lease_preparation_fixture(tmp_path)
+    raw = fixture.config.model_dump(mode="json")
+    raw["timeouts"]["process_start_seconds"] = 1000.0
+    slow_config = HarnessConfig.model_validate_json(json.dumps(raw))
+    slow_config_path = (tmp_path / "slow-config.json").resolve()
+    slow_config_path.write_text(slow_config.model_dump_json(), encoding="utf-8")
+    assert poc.minimum_cleanup_grace_seconds(slow_config) > 1500.0
+
+    with pytest.raises(HarnessError, match="shorter than the proof cleanup bound"):
+        prepare_lease_fixture(
+            fixture,
+            config_path=slow_config_path,
+            cleanup_grace_seconds=1500.0,
+        )
+
+
+def test_cleanup_bound_counts_sequential_signal_and_delete_poll_delays(
+    tmp_path: Path,
+) -> None:
+    raw = make_config(tmp_path).model_dump(mode="json")
+    for timeout_name in (
+        "api_start_seconds",
+        "request_seconds",
+        "process_start_seconds",
+        "cleanup_seconds",
+    ):
+        raw["timeouts"][timeout_name] = 1.0
+    raw["timeouts"]["poll_seconds"] = 1000.0
+    slow_poll_config = HarnessConfig.model_validate_json(json.dumps(raw))
+
+    assert poc.minimum_cleanup_grace_seconds(slow_poll_config) > 2000.0
+
+
+@pytest.mark.parametrize(
+    ("duration", "heartbeat", "cleanup", "message"),
+    [
+        (0.0, 10.0, 300.0, "expected duration"),
+        (600.0, float("inf"), 300.0, "heartbeat interval"),
+        (600.0, 10.0, float("nan"), "cleanup grace"),
+    ],
+)
+def test_prepare_lease_rejects_nonpositive_or_nonfinite_timing(
+    tmp_path: Path,
+    duration: float,
+    heartbeat: float,
+    cleanup: float,
+    message: str,
+) -> None:
+    fixture = make_lease_preparation_fixture(tmp_path)
+    with pytest.raises(HarnessError, match=message):
+        prepare_lease_fixture(
+            fixture,
+            expected_duration_seconds=duration,
+            heartbeat_seconds=heartbeat,
+            cleanup_grace_seconds=cleanup,
+        )
+
+
+def test_prepare_lease_requires_offset_aware_clock(tmp_path: Path) -> None:
+    fixture = make_lease_preparation_fixture(tmp_path)
+    with pytest.raises(HarnessError, match="offset-aware"):
+        prepare_lease_fixture(fixture, clock=lambda: datetime(2026, 7, 18, 12, 34, 56))
+    assert not fixture.metadata_output.exists()
+
+
 def test_placement_validation_patches_only_the_reserved_nccl_port(
     tmp_path: Path,
 ) -> None:
@@ -1339,6 +2037,62 @@ def test_system_effects_preflight_uses_deployed_script_and_remote_argv(
     assert transported[-1] == shlex.join(
         ("python", "-c", "print('argument with spaces')")
     )
+
+
+def test_system_effects_result_output_stays_on_trusted_directory_descriptor(
+    tmp_path: Path,
+) -> None:
+    result_directory = tmp_path / "owned-result"
+    result_directory.mkdir()
+    raw = make_config(tmp_path).model_dump(mode="json")
+    raw["result_directory"] = str(result_directory)
+    config = HarnessConfig.model_validate_json(json.dumps(raw))
+    result_descriptor = os.open(
+        result_directory,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+    )
+    effects = SystemEffects(config, result_descriptor)
+    moved_owned_directory = tmp_path / "moved-owned-result"
+    outside_directory = tmp_path / "outside-result"
+    outside_directory.mkdir()
+    result_directory.rename(moved_owned_directory)
+    result_directory.symlink_to(outside_directory, target_is_directory=True)
+
+    try:
+        effects.write_result_json(
+            "benchmark-result.json",
+            {"schema_version": 1, "cleanup_succeeded": False},
+        )
+    finally:
+        os.close(result_descriptor)
+
+    assert (moved_owned_directory / "benchmark-result.json").is_file()
+    assert not (outside_directory / "benchmark-result.json").exists()
+
+
+def test_inherited_result_descriptor_must_match_configured_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result_directory = tmp_path / "owned-result"
+    result_directory.mkdir()
+    descriptor = os.open(
+        result_directory,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+    )
+    monkeypatch.setenv("EXO_BENCHMARK_RESULT_DIRECTORY_FD", str(descriptor))
+    try:
+        assert (
+            poc._inherited_result_directory_descriptor(result_directory) == descriptor
+        )
+        moved = tmp_path / "moved-result"
+        outside = tmp_path / "outside-result"
+        outside.mkdir()
+        result_directory.rename(moved)
+        result_directory.symlink_to(outside, target_is_directory=True)
+        with pytest.raises(HarnessError, match="identity changed"):
+            poc._inherited_result_directory_descriptor(result_directory)
+    finally:
+        os.close(descriptor)
 
 
 @pytest.mark.parametrize("host_index", [0, 1])

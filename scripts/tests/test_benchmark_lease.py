@@ -8,7 +8,7 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import cast
@@ -408,6 +408,38 @@ def test_lease_paths_must_be_absolute(tmp_path: Path) -> None:
         )
 
 
+def test_result_directory_is_bound_to_run_id_and_lease_paths_are_distinct(
+    tmp_path: Path,
+) -> None:
+    lease = make_lease(tmp_path)
+    with pytest.raises(ValueError, match="exact run_id"):
+        BenchmarkLease(
+            lock_path=lease.lock_path,
+            lease_path=lease.lease_path,
+            result_directory=lease.result_directory.parent / "wrong-run",
+            owner=lease.owner,
+            purpose=lease.purpose,
+            run_id=lease.run_id,
+            namespace=lease.namespace,
+            ports=lease.ports,
+            command=lease.command,
+            metadata=lease.metadata,
+        )
+    with pytest.raises(ValueError, match="must be distinct"):
+        BenchmarkLease(
+            lock_path=lease.lease_path,
+            lease_path=lease.lease_path,
+            result_directory=lease.result_directory,
+            owner=lease.owner,
+            purpose=lease.purpose,
+            run_id=lease.run_id,
+            namespace=lease.namespace,
+            ports=lease.ports,
+            command=lease.command,
+            metadata=lease.metadata,
+        )
+
+
 def test_metadata_freshness_is_revalidated_at_acquire(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -592,6 +624,7 @@ def test_cleanup_result_io_error_preserves_tombstone(
 ) -> None:
     lease = make_lease(tmp_path, allow_unconfirmed_cleanup_for_tests=False)
     original_read = benchmark_lease_module.read_json_object
+    original_result_read = benchmark_lease_module.read_json_object_at
     result_path = (
         lease.result_directory / benchmark_lease_module.BENCHMARK_RESULT_FILENAME
     )
@@ -604,12 +637,12 @@ def test_cleanup_result_io_error_preserves_tombstone(
         ),
     )
 
-    def fail_result_read(path: Path) -> dict[str, object]:
-        if path.name == benchmark_lease_module.BENCHMARK_RESULT_FILENAME:
+    def fail_result_read(directory_descriptor: int, filename: str) -> dict[str, object]:
+        if filename == benchmark_lease_module.BENCHMARK_RESULT_FILENAME:
             raise OSError("simulated result read error")
-        return original_read(path)
+        return original_result_read(directory_descriptor, filename)
 
-    monkeypatch.setattr(benchmark_lease_module, "read_json_object", fail_result_read)
+    monkeypatch.setattr(benchmark_lease_module, "read_json_object_at", fail_result_read)
     assert run_with_lease(lease) == benchmark_lease_module.FORCED_CLEANUP_RETURN_CODE
 
     lease_record = original_read(lease.lease_path)
@@ -845,6 +878,29 @@ def test_runtime_metadata_rejects_mismatched_ownership_token(tmp_path: Path) -> 
     )
 
 
+def test_special_file_json_inputs_fail_without_blocking(tmp_path: Path) -> None:
+    lease = make_lease(tmp_path)
+    lease.acquire()
+    runtime_path = (
+        lease.result_directory / benchmark_lease_module.RUNTIME_METADATA_FILENAME
+    )
+    os.mkfifo(runtime_path)
+
+    started = time.monotonic()
+    with pytest.raises(LeaseError, match="runtime-metadata.json"):
+        lease.update_heartbeat()
+    assert time.monotonic() - started < 1.0
+    lease.preserve_after_cleanup_failure("special-file runtime fragment")
+    lease.release()
+
+    standalone_fifo = tmp_path / "standalone.json"
+    os.mkfifo(standalone_fifo)
+    started = time.monotonic()
+    with pytest.raises(LeaseError, match="not a regular file"):
+        read_json_object(standalone_fifo)
+    assert time.monotonic() - started < 1.0
+
+
 def test_runtime_owner_token_cannot_change_after_first_snapshot(tmp_path: Path) -> None:
     lease = make_lease(tmp_path)
     lease.acquire()
@@ -903,15 +959,18 @@ def test_concurrent_stale_runtime_refresh_cannot_regress_cache(
     lease.update_heartbeat()
 
     original_read = benchmark_lease_module.read_json_object
+    original_result_read = benchmark_lease_module.read_json_object_at
     first_read_started = threading.Event()
     allow_first_read_to_finish = threading.Event()
     runtime_read_count = 0
     runtime_read_count_lock = threading.Lock()
 
-    def ordered_runtime_read(path: Path) -> dict[str, object]:
+    def ordered_runtime_read(
+        directory_descriptor: int, filename: str
+    ) -> dict[str, object]:
         nonlocal runtime_read_count
-        if path != runtime_path:
-            return original_read(path)
+        if filename != benchmark_lease_module.RUNTIME_METADATA_FILENAME:
+            return original_result_read(directory_descriptor, filename)
         with runtime_read_count_lock:
             runtime_read_count += 1
             read_number = runtime_read_count
@@ -922,7 +981,7 @@ def test_concurrent_stale_runtime_refresh_cannot_regress_cache(
         return initial
 
     monkeypatch.setattr(
-        benchmark_lease_module, "read_json_object", ordered_runtime_read
+        benchmark_lease_module, "read_json_object_at", ordered_runtime_read
     )
     errors: list[Exception] = []
 
@@ -1120,7 +1179,7 @@ def test_update_refuses_foreign_metadata(tmp_path: Path) -> None:
     lease.release()
 
 
-def test_acquire_releases_lock_when_metadata_write_fails(
+def test_acquire_releases_lock_and_retains_run_directory_when_metadata_write_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     lease = make_lease(tmp_path, run_id="failed")
@@ -1132,6 +1191,7 @@ def test_acquire_releases_lock_when_metadata_write_fails(
     monkeypatch.setattr(benchmark_lease_module, "atomic_write_json", fail_write)
     with pytest.raises(OSError, match="write failed"):
         lease.acquire()
+    assert lease.result_directory.is_dir()
 
     monkeypatch.setattr(benchmark_lease_module, "atomic_write_json", original_write)
     replacement = make_lease(tmp_path, run_id="replacement")
@@ -1139,7 +1199,40 @@ def test_acquire_releases_lock_when_metadata_write_fails(
         assert replacement.lease_path.exists()
 
 
-def test_nonempty_result_directory_is_never_reused(tmp_path: Path) -> None:
+def test_acquire_rollback_never_removes_a_replacement_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lease = make_lease(tmp_path, run_id="rollback-race")
+    moved_owned_directory = tmp_path / "moved-owned-result"
+    replacement_identity: tuple[int, int] | None = None
+
+    def replace_result_and_fail(_path: Path, _value: object) -> None:
+        nonlocal replacement_identity
+        lease.result_directory.rename(moved_owned_directory)
+        lease.result_directory.mkdir()
+        replacement_status = lease.result_directory.stat()
+        replacement_identity = (
+            replacement_status.st_dev,
+            replacement_status.st_ino,
+        )
+        raise OSError("write failed after result replacement")
+
+    monkeypatch.setattr(
+        benchmark_lease_module, "atomic_write_json", replace_result_and_fail
+    )
+    with pytest.raises(OSError, match="write failed after result replacement"):
+        lease.acquire()
+
+    assert replacement_identity is not None
+    observed_replacement = lease.result_directory.stat()
+    assert (observed_replacement.st_dev, observed_replacement.st_ino) == (
+        replacement_identity
+    )
+    assert moved_owned_directory.is_dir()
+    assert lease._result_directory_descriptor is None
+
+
+def test_existing_result_directory_is_never_reused(tmp_path: Path) -> None:
     lease = make_lease(tmp_path)
     lease.result_directory.mkdir(parents=True)
     existing_result = lease.result_directory / "existing.json"
@@ -1149,8 +1242,81 @@ def test_nonempty_result_directory_is_never_reused(tmp_path: Path) -> None:
         lease.acquire()
 
     existing_result.unlink()
+    with pytest.raises(LeaseError, match="use a new run ID"):
+        lease.acquire()
+
+    lease.result_directory.rmdir()
     with lease:
         assert lease.lease_path.exists()
+
+
+def test_result_directory_symlink_is_never_followed(tmp_path: Path) -> None:
+    lease = make_lease(tmp_path)
+    outside_directory = tmp_path / "outside-result"
+    outside_directory.mkdir()
+    lease.result_directory.parent.mkdir(parents=True)
+    lease.result_directory.symlink_to(outside_directory, target_is_directory=True)
+
+    with pytest.raises(LeaseError, match="use a new run ID"):
+        lease.acquire()
+
+    assert lease.result_directory.is_symlink()
+    assert not tuple(outside_directory.iterdir())
+    assert not lease.lease_path.exists()
+
+
+def test_result_root_symlink_is_never_followed(tmp_path: Path) -> None:
+    lease = make_lease(tmp_path)
+    outside_root = tmp_path / "outside-root"
+    outside_root.mkdir()
+    lease.result_directory.parent.symlink_to(outside_root, target_is_directory=True)
+
+    with pytest.raises(LeaseError, match="without symlinks"):
+        lease.acquire()
+
+    assert not (outside_root / lease.run_id).exists()
+    assert not lease.lease_path.exists()
+
+
+def test_wrapper_output_stays_in_owned_directory_after_path_replacement(
+    tmp_path: Path,
+) -> None:
+    lease = make_lease(tmp_path)
+    lease.acquire()
+    moved_owned_directory = tmp_path / "moved-owned-result"
+    outside_directory = tmp_path / "outside-result"
+    outside_directory.mkdir()
+    lease.result_directory.rename(moved_owned_directory)
+    lease.result_directory.symlink_to(outside_directory, target_is_directory=True)
+
+    with pytest.raises(LeaseError, match="identity failure"):
+        lease.write_manifest(status="completed", return_code=0, cleanup_succeeded=True)
+
+    manifest = read_json_object(
+        moved_owned_directory / benchmark_lease_module.MANIFEST_FILENAME
+    )
+    assert manifest["status"] == "wrapper_error"
+    assert manifest["cleanup_succeeded"] is False
+    assert not (outside_directory / benchmark_lease_module.MANIFEST_FILENAME).exists()
+    assert lease.result_directory.is_symlink()
+    lease.release()
+    assert read_json_object(lease.lease_path)["manual_clearance_required"] is True
+
+
+def test_child_inherits_trusted_result_directory_descriptor(tmp_path: Path) -> None:
+    lease = make_lease(tmp_path)
+    marker_name = "child-descriptor-marker"
+    child_script = (
+        "import os; "
+        "fd=int(os.environ['EXO_BENCHMARK_RESULT_DIRECTORY_FD']); "
+        f"out=os.open({marker_name!r},os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600,dir_fd=fd); "
+        "os.write(out,b'owned'); os.close(out)"
+    )
+    set_lease_command(lease, (sys.executable, "-c", child_script))
+
+    assert run_with_lease(lease) == 0
+
+    assert (lease.result_directory / marker_name).read_bytes() == b"owned"
 
 
 def test_heartbeat_failure_stops_command_and_records_wrapper_error(
@@ -1302,10 +1468,19 @@ def test_signal_during_popen_assignment_still_cleans_tracked_child(
     original_popen = benchmark_lease_module.subprocess.Popen
 
     def spawn_and_signal(
-        command: Sequence[str], *, start_new_session: bool
+        command: Sequence[str],
+        *,
+        start_new_session: bool,
+        env: Mapping[str, str],
+        pass_fds: tuple[int, ...],
     ) -> subprocess.Popen[bytes]:
         signal_state.record(signal.SIGTERM)
-        return original_popen(command, start_new_session=start_new_session)
+        return original_popen(
+            command,
+            start_new_session=start_new_session,
+            env=env,
+            pass_fds=pass_fds,
+        )
 
     monkeypatch.setattr(benchmark_lease_module.subprocess, "Popen", spawn_and_signal)
     assert run_managed_command(lease, signal_state) == 128 + signal.SIGTERM
@@ -1402,6 +1577,69 @@ def test_repeated_signals_keep_the_first_signal() -> None:
     signal_state.record(signal.SIGTERM)
     signal_state.record(signal.SIGHUP)
     assert signal_state.first_signal_number == signal.SIGTERM
+
+
+def test_cli_rejects_result_symlink_installed_before_acquire(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    run_id = "result-symlink-race"
+    namespace = "namespace-result-symlink-race"
+    result_root = tmp_path / "results"
+    result_directory = result_root / run_id
+    outside_directory = tmp_path / "outside-result"
+    child_marker = tmp_path / "child-ran"
+    command = (
+        sys.executable,
+        "-c",
+        f"from pathlib import Path; Path({str(child_marker)!r}).touch()",
+    )
+    metadata_path = tmp_path / "metadata.json"
+    atomic_write_json(
+        metadata_path,
+        make_local_metadata(
+            run_id=run_id,
+            namespace=namespace,
+            reserved_ports=(53001, 53002),
+            result_directory=result_directory,
+            command=command,
+        ),
+    )
+    result_root.mkdir()
+    outside_directory.mkdir()
+    result_directory.symlink_to(outside_directory, target_is_directory=True)
+    lease_path = tmp_path / "lease.json"
+
+    return_code = benchmark_lease_module.main(
+        (
+            "--owner",
+            "codex:test",
+            "--purpose",
+            "result-symlink-race-test",
+            "--run-id",
+            run_id,
+            "--namespace",
+            namespace,
+            "--port",
+            "53001,53002",
+            "--metadata-json",
+            str(metadata_path),
+            "--lock-path",
+            str(tmp_path / "benchmark.lock"),
+            "--lease-path",
+            str(lease_path),
+            "--result-root",
+            str(result_root),
+            "--",
+            *command,
+        )
+    )
+
+    assert return_code == 75
+    assert "use a new run ID" in capsys.readouterr().err
+    assert not child_marker.exists()
+    assert not tuple(outside_directory.iterdir())
+    assert not lease_path.exists()
+    assert result_directory.is_symlink()
 
 
 def test_sigterm_cleans_child_writes_manifest_and_releases_lease(
