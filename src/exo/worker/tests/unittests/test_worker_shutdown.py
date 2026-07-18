@@ -7,7 +7,7 @@ import pytest
 import exo.worker.main as worker_main
 from exo.shared.models.model_cards import ModelId
 from exo.shared.types.commands import ForwarderCommand, ForwarderDownloadCommand
-from exo.shared.types.common import NodeId
+from exo.shared.types.common import CommandId, NodeId
 from exo.shared.types.events import (
     Event,
     IndexedEvent,
@@ -17,7 +17,12 @@ from exo.shared.types.events import (
     TaskStatusUpdated,
 )
 from exo.shared.types.state import State
-from exo.shared.types.tasks import Shutdown, Task, TaskId, TaskStatus
+from exo.shared.types.tasks import Shutdown, Task, TaskId, TaskStatus, TextGeneration
+from exo.shared.types.text_generation import (
+    InputMessage,
+    InputMessageContent,
+    TextGenerationTaskParams,
+)
 from exo.shared.types.worker.instances import InstanceId
 from exo.shared.types.worker.runners import RunnerId, RunnerShutdown
 from exo.utils.channels import Receiver, Sender, channel
@@ -119,6 +124,46 @@ def _return_task_once(monkeypatch: pytest.MonkeyPatch, task: Task) -> None:
         return task
 
     monkeypatch.setattr(worker_main, "plan", fake_plan)
+
+
+@pytest.mark.anyio
+async def test_worker_does_not_republish_an_indexed_generation_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task = TextGeneration(
+        task_id=TaskId("generation-a"),
+        instance_id=InstanceId("instance-a"),
+        command_id=CommandId("command-a"),
+        task_params=TextGenerationTaskParams(
+            model=ModelId("mlx-community/Llama-3.2-1B-Instruct-4bit"),
+            input=[InputMessage(role="user", content=InputMessageContent("hello"))],
+        ),
+    )
+    planned = anyio.Event()
+    task_returned = False
+
+    def fake_plan(*_args: object, **_kwargs: object) -> Task | None:
+        nonlocal task_returned
+        planned.set()
+        if task_returned:
+            return None
+        task_returned = True
+        return task
+
+    monkeypatch.setattr(worker_main, "plan", fake_plan)
+    worker, event_sender, event_receiver = _make_worker()
+    worker.state = State(tasks={task.task_id: task})
+
+    async with anyio.create_task_group() as task_group:
+        task_group.start_soon(worker.plan_step)
+        await planned.wait()
+        await anyio.sleep(0.1)
+        assert not any(
+            isinstance(event, TaskCreated) for event in event_receiver.collect()
+        )
+        task_group.cancel_scope.cancel()
+
+    event_sender.close()
 
 
 @pytest.mark.anyio

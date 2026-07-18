@@ -411,7 +411,10 @@ class Worker:
                 continue
 
             logger.info(f"Worker plan: {task.__class__.__name__}")
-            await self.event_sender.send(TaskCreated(task_id=task.task_id, task=task))
+            if task.task_id not in self.state.tasks:
+                await self.event_sender.send(
+                    TaskCreated(task_id=task.task_id, task=task)
+                )
 
             # lets not kill the worker if a runner is unresponsive
             match task:

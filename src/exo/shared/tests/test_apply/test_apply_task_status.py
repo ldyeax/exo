@@ -190,15 +190,20 @@ def test_targeted_and_legacy_unscoped_statuses_remain_compatible() -> None:
 
 
 def test_duplicate_create_is_idempotent_and_delete_cleans_rank_statuses() -> None:
-    state, task, _ = _generation_state()
+    state, task, runner_ids = _generation_state()
     created = TaskCreated(task_id=task.task_id, task=task)
 
     assert apply_task_created(created, state) is state
+    state = _update(state, task.task_id, runner_ids[0], TaskStatus.Running)
+    assert state.tasks[task.task_id].task_status == TaskStatus.Running
+    assert apply_task_created(created, state) is state
+    assert state.tasks[task.task_id].task_status == TaskStatus.Running
+
     with pytest.raises(ValueError, match="conflicting data"):
         apply_task_created(
             TaskCreated(
                 task_id=task.task_id,
-                task=task.model_copy(update={"task_status": TaskStatus.Running}),
+                task=task.model_copy(update={"instance_id": InstanceId("other")}),
             ),
             state,
         )

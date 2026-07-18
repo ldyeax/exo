@@ -302,12 +302,18 @@ class RunnerSupervisor:
         logger.info(
             f"Runner process successfully terminated: {self.runner_process.exitcode}"
         )
+        self._stopped.set()
 
         if self._pending_shutdown_status is not None:
             self.status = self._pending_shutdown_status.runner_status
-            await self._event_sender.send(self._pending_shutdown_status)
-            self._shutdown_forwarded.set()
-        self._stopped.set()
+            try:
+                await self._event_sender.send(self._pending_shutdown_status)
+            except (ClosedResourceError, BrokenResourceError):
+                logger.warning(
+                    "Runner stopped, but its terminal status channel was already closed"
+                )
+            else:
+                self._shutdown_forwarded.set()
 
     async def start_task(self, task: Task):
         if task.task_id in self.pending:

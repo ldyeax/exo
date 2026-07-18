@@ -183,10 +183,19 @@ def apply_node_download_progress(event: NodeDownloadProgress, state: State) -> S
     return state.model_copy(update={"downloads": new_downloads})
 
 
+def _task_creation_identity(task: Task) -> Task:
+    updates: dict[str, object] = {"task_status": TaskStatus.Pending}
+    if isinstance(task, (TextGeneration, ImageGeneration, ImageEdits)):
+        updates.update(error_type=None, error_message=None)
+    return task.model_copy(update=updates)
+
+
 def apply_task_created(event: TaskCreated, state: State) -> State:
     existing_task = state.tasks.get(event.task_id)
     if existing_task is not None:
-        if existing_task != event.task:
+        if _task_creation_identity(existing_task) != _task_creation_identity(
+            event.task
+        ):
             raise ValueError(f"Task {event.task_id} was created with conflicting data")
         return state
 

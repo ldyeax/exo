@@ -171,6 +171,23 @@ async def test_terminal_status_is_forwarded_only_after_process_stop() -> None:
 
 
 @pytest.mark.anyio
+async def test_closed_terminal_channel_does_not_hide_confirmed_process_stop() -> None:
+    event_sender, _ = channel[Event]()
+    supervisor = await _make_supervisor(event_sender, _RunnerEventReceiver([]))
+    supervisor._pending_shutdown_status = RunnerStatusUpdated(  # pyright: ignore[reportPrivateUsage]
+        runner_id=supervisor.bound_instance.bound_runner_id,
+        runner_status=RunnerShutdown(),
+    )
+    event_sender.close()
+
+    with anyio.fail_after(2):
+        await supervisor._stop_process_and_forward_shutdown()  # pyright: ignore[reportPrivateUsage]
+        await supervisor.wait_for_stopped()
+
+    assert not supervisor.shutdown_was_forwarded()
+
+
+@pytest.mark.anyio
 async def test_forwarded_task_status_is_authoritatively_attributed() -> None:
     event_sender, event_receiver = channel[Event]()
     runner_events = _RunnerEventReceiver(
