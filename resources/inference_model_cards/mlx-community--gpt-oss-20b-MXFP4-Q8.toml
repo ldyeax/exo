@@ -1,4 +1,5 @@
 model_id = "mlx-community/gpt-oss-20b-MXFP4-Q8"
+revision = "773a7da77e569019bb0fd17a554b263738d669a3"
 n_layers = 24
 hidden_size = 2880
 num_key_value_heads = 8
@@ -12,7 +13,7 @@ reasoning_dialect = "channel"
 context_length = 131072
 backends = ["MlxMetal", "MlxCuda", "MlxCpu"]
 [storage_size]
-in_bytes = 12025908224
+in_bytes = 12076119168
 
 # Source: https://github.com/openai/gpt-oss/blob/main/README.md
 # Source: https://unsloth.ai/docs/models/gpt-oss-how-to-run-and-fine-tune

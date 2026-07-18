@@ -7,6 +7,8 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
+import tomlkit
+from anyio import Path as AsyncPath
 from pydantic import ValidationError
 
 from exo.download.download_utils import (
@@ -35,6 +37,68 @@ from exo.shared.types.worker.shards import PipelineShardMetadata
 MODEL_ID = ModelId("test-org/test-model")
 REVISION = "0123456789abcdef0123456789abcdef01234567"
 OTHER_REVISION = "89abcdef0123456789abcdef0123456789abcdef"
+
+LADDER_MODEL_CARDS: tuple[tuple[str, ModelId, str, int], ...] = (
+    (
+        "mlx-community--Llama-3.2-1B-Instruct-4bit.toml",
+        ModelId("mlx-community/Llama-3.2-1B-Instruct-4bit"),
+        "08231374eeacb049a0eade7922910865b8fce912",
+        695242752,
+    ),
+    (
+        "mlx-community--Llama-3.2-3B-Instruct-4bit.toml",
+        ModelId("mlx-community/Llama-3.2-3B-Instruct-4bit"),
+        "7f0dc925e0d0afb0322d96f9255cfddf2ba5636e",
+        1807423488,
+    ),
+    (
+        "mlx-community--Llama-3.1-8B-Instruct-4bit.toml",
+        ModelId("mlx-community/Llama-3.1-8B-Instruct-4bit"),
+        "90215b22ec18e72f623dde2ea7af4097025160e2",
+        4517404672,
+    ),
+    (
+        "mlx-community--gpt-oss-20b-MXFP4-Q8.toml",
+        ModelId("mlx-community/gpt-oss-20b-MXFP4-Q8"),
+        "773a7da77e569019bb0fd17a554b263738d669a3",
+        12076119168,
+    ),
+    (
+        "mlx-community--GLM-4.7-Flash-4bit.toml",
+        ModelId("mlx-community/GLM-4.7-Flash-4bit"),
+        "1454cffb1a21737e162f508e5bc70be9def89276",
+        16852202496,
+    ),
+    (
+        "mlx-community--Qwen3-Coder-30B-A3B-Instruct-4bit.toml",
+        ModelId("mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit"),
+        "6e302ea604ad9ab206367e2c501d1571023e7b6d",
+        17180913664,
+    ),
+    (
+        "mlx-community--Qwen3.5-35B-A3B-4bit.toml",
+        ModelId("mlx-community/Qwen3.5-35B-A3B-4bit"),
+        "1e20fd8d42056f870933bf98ca6211024744f7ec",
+        20391405152,
+    ),
+    (
+        "mlx-community--Llama-3.3-70B-Instruct-4bit.toml",
+        ModelId("mlx-community/Llama-3.3-70B-Instruct-4bit"),
+        "de2dfaf56839b7d0e834157d2401dee02726874d",
+        39688355840,
+    ),
+    (
+        "mlx-community--Qwen3-Coder-Next-4bit.toml",
+        ModelId("mlx-community/Qwen3-Coder-Next-4bit"),
+        "7b9321eabb85ce79625cac3f61ea691e4ea984b5",
+        44844060160,
+    ),
+)
+
+
+def _load_builtin_card(filename: str) -> ModelCard:
+    card_path = Path(str(model_cards._BUILTIN_CARD_DIRS[0])) / filename  # pyright: ignore[reportPrivateUsage]
+    return ModelCard.model_validate(tomlkit.loads(card_path.read_text()))
 
 
 def _card(revision: str = "main", vision: VisionCardConfig | None = None) -> ModelCard:
@@ -119,6 +183,34 @@ async def test_existing_builtin_cards_roundtrip_with_valid_revisions() -> None:
     assert loaded > 0
 
 
+@pytest.mark.parametrize(
+    ("filename", "model_id", "revision", "storage_size_bytes"),
+    LADDER_MODEL_CARDS,
+)
+def test_ladder_cards_are_pinned_to_verified_snapshots(
+    filename: str,
+    model_id: ModelId,
+    revision: str,
+    storage_size_bytes: int,
+) -> None:
+    card = _load_builtin_card(filename)
+
+    assert card.model_id == model_id
+    assert card.revision == revision
+    assert card.storage_size.in_bytes == storage_size_bytes
+
+
+def test_pinned_qwen35_card_inherits_revision_for_vision_weights() -> None:
+    filename = "mlx-community--Qwen3.5-35B-A3B-4bit.toml"
+    card = _load_builtin_card(filename)
+
+    assert card.vision is not None
+    assert card.vision.image_token_id == 248056
+    assert card.vision.model_type == "qwen3_5_moe"
+    assert card.vision.weights_repo == str(card.model_id)
+    assert card.vision.weights_revision == card.revision
+
+
 def test_vision_revisions_are_explicit_and_same_repo_inherits_main_pin() -> None:
     same_repo = _card(
         REVISION,
@@ -150,7 +242,9 @@ def test_vision_revisions_are_explicit_and_same_repo_inherits_main_pin() -> None
         end_layer=1,
         n_layers=1,
     )
-    vision_shard = ResumableShardDownloader._build_vision_shard(main_shard)
+    vision_shard = ResumableShardDownloader._build_vision_shard(  # pyright: ignore[reportPrivateUsage]
+        main_shard
+    )
     assert vision_shard.model_card.revision == OTHER_REVISION
     assert sibling.vision is not None
     assert sibling.vision.processor_revision == REVISION
@@ -173,7 +267,7 @@ async def test_revision_aware_card_cache_and_custom_filenames_do_not_collide(
     assert (tmp_path / f"{MODEL_ID.normalize()}.toml").is_file()
     pinned_path = tmp_path / f"{MODEL_ID.normalize()}--{REVISION}.toml"
     assert pinned_path.is_file()
-    assert (await ModelCard.load_from_path(pinned_path)).revision == REVISION
+    assert (await ModelCard.load_from_path(AsyncPath(pinned_path))).revision == REVISION
 
     with patch("exo.shared.models.model_cards.card_cache", cache):
         assert await ModelCard.load(MODEL_ID) == pinned_card
@@ -390,4 +484,5 @@ async def test_download_progress_and_file_listing_use_card_revision(
 
     assert target_dir == models_dir / f"{MODEL_ID.normalize()}--{REVISION}"
     assert progress.repo_revision == REVISION
+    assert fetch_file_list.await_args is not None
     assert fetch_file_list.await_args.args[:2] == (MODEL_ID, REVISION)
