@@ -460,11 +460,13 @@ class Worker:
                             )
                         )
                 case Shutdown(runner_id=runner_id):
-                    runner = self.runners.pop(runner_id)
+                    runner = self.runners[runner_id]
+                    graceful_shutdown_received = False
                     try:
                         with fail_after(RUNNER_SHUTDOWN_TIMEOUT_SECONDS):
                             await runner.start_task(task)
-                            await runner.wait_for_shutdown_forwarded()
+                            await runner.wait_for_shutdown_received()
+                            graceful_shutdown_received = True
                     except TimeoutError:
                         if task.task_id not in runner.completed:
                             await self.event_sender.send(
@@ -474,14 +476,29 @@ class Worker:
                                     runner_id=runner_id,
                                 )
                             )
+                    finally:
+                        runner.shutdown()
+
+                    await runner.wait_for_stopped()
+                    async with self._runner_lifecycle_lock:
+                        if self.runners.get(runner_id) is runner:
+                            del self.runners[runner_id]
+                        else:
+                            logger.warning(
+                                f"Runner ownership changed before shutdown for {runner_id}"
+                            )
+                            continue
+
+                    if (
+                        not graceful_shutdown_received
+                        and not runner.shutdown_was_forwarded()
+                    ):
                         await self.event_sender.send(
                             RunnerStatusUpdated(
                                 runner_id=runner_id,
                                 runner_status=RunnerShutdown(),
                             )
                         )
-                    finally:
-                        runner.shutdown()
                 case CancelTask(
                     cancelled_task_id=cancelled_task_id, runner_id=runner_id
                 ):
