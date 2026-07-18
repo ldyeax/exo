@@ -39,6 +39,7 @@ from exo.shared.types.worker.runners import (
     RunnerIdle,
     RunnerLoading,
     RunnerRunning,
+    RunnerShutdown,
     RunnerShuttingDown,
     RunnerStatus,
     RunnerWarmingUp,
@@ -195,6 +196,7 @@ class RunnerSupervisor:
     in_progress: dict[TaskId, Task] = field(default_factory=dict, init=False)
     completed: set[TaskId] = field(default_factory=set, init=False)
     cancelled: set[TaskId] = field(default_factory=set, init=False)
+    _shutdown_forwarded: anyio.Event = field(default_factory=anyio.Event, init=False)
     _cancel_watch_runner: anyio.CancelScope = field(
         default_factory=anyio.CancelScope, init=False
     )
@@ -275,6 +277,9 @@ class RunnerSupervisor:
     def shutdown(self):
         self._tg.cancel_tasks()
 
+    async def wait_for_shutdown_forwarded(self) -> None:
+        await self._shutdown_forwarded.wait()
+
     async def start_task(self, task: Task):
         if task.task_id in self.pending:
             logger.warning(
@@ -347,6 +352,10 @@ class RunnerSupervisor:
                         self.in_progress.pop(event.task_id, None)
                         self.completed.add(event.task_id)
                     await self._event_sender.send(event)
+                    if isinstance(event, RunnerStatusUpdated) and isinstance(
+                        event.runner_status, RunnerShutdown
+                    ):
+                        self._shutdown_forwarded.set()
         except (ClosedResourceError, BrokenResourceError):
             # this is the happy path shutdown - we don't need to spam log with it
             await self._check_runner()

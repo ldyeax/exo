@@ -30,6 +30,7 @@ from exo.shared.types.events import (
     InstanceDeleted,
     NodeDownloadProgress,
     NodeGatheredInfo,
+    RunnerStatusUpdated,
     TaskCreated,
     TaskStatusUpdated,
     TopologyEdgeCreated,
@@ -52,7 +53,7 @@ from exo.shared.types.text_generation import Base64Image, Base64ImageHash
 from exo.shared.types.topology import Connection, SocketConnection
 from exo.shared.types.worker.downloads import DownloadCompleted
 from exo.shared.types.worker.instances import InstanceId
-from exo.shared.types.worker.runners import RunnerId
+from exo.shared.types.worker.runners import RunnerId, RunnerShutdown
 from exo.utils.channels import Receiver, Sender, channel
 from exo.utils.info_gatherer.info_gatherer import GatheredInfo, InfoGatherer
 from exo.utils.info_gatherer.net_profile import check_reachable
@@ -60,6 +61,8 @@ from exo.utils.keyed_backoff import KeyedBackoff
 from exo.utils.task_group import TaskGroup
 from exo.worker.plan import plan
 from exo.worker.runner.supervisor import RunnerSupervisor
+
+RUNNER_SHUTDOWN_TIMEOUT_SECONDS = 3
 
 
 class Worker:
@@ -281,12 +284,21 @@ class Worker:
                 case Shutdown(runner_id=runner_id):
                     runner = self.runners.pop(runner_id)
                     try:
-                        with fail_after(3):
+                        with fail_after(RUNNER_SHUTDOWN_TIMEOUT_SECONDS):
                             await runner.start_task(task)
+                            await runner.wait_for_shutdown_forwarded()
                     except TimeoutError:
+                        if task.task_id not in runner.completed:
+                            await self.event_sender.send(
+                                TaskStatusUpdated(
+                                    task_id=task.task_id,
+                                    task_status=TaskStatus.TimedOut,
+                                )
+                            )
                         await self.event_sender.send(
-                            TaskStatusUpdated(
-                                task_id=task.task_id, task_status=TaskStatus.TimedOut
+                            RunnerStatusUpdated(
+                                runner_id=runner_id,
+                                runner_status=RunnerShutdown(),
                             )
                         )
                     finally:
