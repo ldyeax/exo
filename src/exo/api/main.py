@@ -142,10 +142,11 @@ from exo.shared.election import ElectionMessage
 from exo.shared.logging import InterceptLogger
 from exo.shared.models import model_cards
 from exo.shared.models.model_cards import (
-    HuggingFaceRevision,
     ModelCard,
     ModelId,
+    ModelSnapshotId,
     ModelTask,
+    model_snapshot_id,
 )
 from exo.shared.tracing import TraceEvent, compute_stats, export_trace, load_trace_file
 from exo.shared.types.chunks import (
@@ -1063,12 +1064,16 @@ class API:
             instance.shard_assignments.model_id == model_id
             for instance in self.state.instances.values()
         ):
-            # Check if model is actually downloaded
-            model_is_downloaded = any(
-                isinstance(download, DownloadCompleted)
-                and download.shard_metadata.model_card.model_id == model_id
-                for node_downloads in self.state.downloads.values()
-                for download in node_downloads
+            _ = await model_cards.card_cache.list_all()
+            try:
+                selected_card = model_cards.card_cache.get(model_id)
+            except ValueError:
+                selected_card = None
+            downloaded_snapshots = self._completed_model_snapshots()
+            model_is_downloaded = (
+                model_snapshot_id(selected_card) in downloaded_snapshots
+                if selected_card is not None
+                else any(snapshot[0] == model_id for snapshot in downloaded_snapshots)
             )
             if not model_is_downloaded:
                 await self._trigger_notify_user_to_download_model(model_id)
@@ -1751,16 +1756,12 @@ class API:
     async def ollama_tags(self) -> OllamaTagsResponse:
         """Returns list of models in Ollama tags format. We return the downloaded ones only."""
 
-        downloaded_model_ids: set[ModelId] = set()
-        for node_downloads in self.state.downloads.values():
-            for dl in node_downloads:
-                if isinstance(dl, DownloadCompleted):
-                    downloaded_model_ids.add(dl.shard_metadata.model_card.model_id)
+        downloaded_snapshots = self._completed_model_snapshots()
 
         cards = [
-            c
-            for c in await model_cards.card_cache.list_all()
-            if c.model_id in downloaded_model_ids
+            card
+            for card in await model_cards.card_cache.list_all()
+            if model_snapshot_id(card) in downloaded_snapshots
         ]
 
         now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -1851,23 +1852,24 @@ class API:
 
         return total_available
 
+    def _completed_model_snapshots(self) -> set[ModelSnapshotId]:
+        return {
+            model_snapshot_id(download.shard_metadata.model_card)
+            for node_downloads in self.state.downloads.values()
+            for download in node_downloads
+            if isinstance(download, DownloadCompleted)
+        }
+
     async def get_models(self, status: str | None = Query(default=None)) -> ModelList:
         """Returns list of available models, optionally filtered by being downloaded."""
         cards = await model_cards.card_cache.list_all()
 
         if status == "downloaded":
-            downloaded_models: set[tuple[ModelId, HuggingFaceRevision]] = set()
-            for node_downloads in self.state.downloads.values():
-                for dl in node_downloads:
-                    if isinstance(dl, DownloadCompleted):
-                        downloaded_card = dl.shard_metadata.model_card
-                        downloaded_models.add(
-                            (downloaded_card.model_id, downloaded_card.revision)
-                        )
+            downloaded_snapshots = self._completed_model_snapshots()
             cards = [
                 card
                 for card in cards
-                if (card.model_id, card.revision) in downloaded_models
+                if model_snapshot_id(card) in downloaded_snapshots
             ]
 
         return ModelList(
