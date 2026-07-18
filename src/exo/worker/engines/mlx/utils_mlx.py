@@ -67,6 +67,7 @@ from exo.worker.engines.mlx.auto_parallel import (
 )
 from exo.worker.engines.mlx.eos_token_ids import get_eos_token_ids_for_model
 from exo.worker.engines.mlx.types import Model
+from exo.worker.engines.mlx.vision_policy import get_mlx_vision_loading_mode
 from exo.worker.runner.bootstrap import logger
 
 EXO_MLX_DISTRIBUTED_BACKEND = "EXO_MLX_DISTRIBUTED_BACKEND"
@@ -225,8 +226,11 @@ def load_mlx_items(
     mx.clear_cache()
 
     vision_config = bound_instance.bound_shard.model_card.vision
+    vision_loading_mode = (
+        get_mlx_vision_loading_mode() if vision_config is not None else None
+    )
 
-    if vision_config is not None:
+    if vision_config is not None and vision_loading_mode != "disabled":
         from exo.worker.engines.mlx.vision import VisionProcessor
 
         vision_start_time = time.perf_counter()
@@ -234,16 +238,21 @@ def load_mlx_items(
             vision_processor: VisionProcessor | None = VisionProcessor(
                 vision_config, bound_instance.bound_shard.model_card.model_id
             )
-            vision_processor.load()
-            logger.info(
-                f"Time taken to load vision weights: {(time.perf_counter() - vision_start_time):.2f}s"
-            )
+            if vision_loading_mode == "eager":
+                vision_processor.load()
+                logger.info(
+                    f"Time taken to load vision weights: {(time.perf_counter() - vision_start_time):.2f}s"
+                )
+            else:
+                logger.info("Vision weights will load on the first vision request")
         except Exception as e:
             logger.opt(exception=e).error(
                 "Failed to load vision weights — disabling vision for this runner"
             )
             vision_processor = None
     else:
+        if vision_config is not None:
+            logger.info("Vision loading is disabled for this runner")
         vision_processor = None
 
     return cast(Model, model), tokenizer, vision_processor
