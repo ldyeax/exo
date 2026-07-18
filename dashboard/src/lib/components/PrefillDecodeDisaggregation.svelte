@@ -10,12 +10,11 @@
     updateInstanceLink,
     deleteInstanceLink,
     type Instance,
+    type InstanceWrapper,
   } from "$lib/stores/app.svelte";
   import { deriveBaseModel, deriveFamily } from "$lib/utils/model_family";
 
-  type InstanceWrapper = {
-    MlxRingInstance?: Instance;
-    MlxJacclInstance?: Instance;
+  type LinkedInstanceWrapper = InstanceWrapper & {
     VllmInstance?: Instance;
   };
 
@@ -42,10 +41,11 @@
     const rows: InstanceRow[] = [];
     const ids = nodeIdentities();
     for (const [id, raw] of Object.entries(instances())) {
-      const wrapper = raw as InstanceWrapper;
+      const wrapper = raw as LinkedInstanceWrapper;
       const inst =
         wrapper.MlxRingInstance ??
         wrapper.MlxJacclInstance ??
+        wrapper.MlxNcclInstance ??
         wrapper.VllmInstance;
       const modelId = inst?.shardAssignments?.modelId ?? "";
       const nodeToRunner = inst?.shardAssignments?.nodeToRunner ?? {};

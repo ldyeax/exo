@@ -1,6 +1,7 @@
 <script lang="ts">
   import type {
     DownloadProgress,
+    InstanceMeta,
     NodeInfo,
     PlacementPreview,
     TopologyEdge,
@@ -23,7 +24,7 @@
     } | null;
     nodes?: Record<string, NodeInfo>;
     sharding?: "Pipeline" | "Tensor";
-    runtime?: "MlxRing" | "MlxJaccl";
+    runtime?: InstanceMeta;
     onLaunch?: () => void;
     tags?: string[];
     apiPreview?: PlacementPreview | null;
@@ -347,7 +348,9 @@
   // Debug mode state
   const isDebugMode = $derived(debugMode());
   const topology = $derived(topologyData());
-  const isRdma = $derived(runtime === "MlxJaccl");
+  const usesCollectiveInterconnect = $derived(
+    runtime === "MlxJaccl" || runtime === "MlxNccl",
+  );
 
   // Get interface name for an IP from node data
   function getInterfaceForIp(nodeId: string, ip?: string): string | null {
@@ -568,21 +571,23 @@
         class="px-1.5 py-0.5 text-xs font-mono tracking-wider uppercase bg-exo-medium-gray/30 text-exo-light-gray border border-exo-medium-gray/40"
         title={sharding === "Pipeline"
           ? "Pipeline: splits model into sequential stages across devices. Lower network overhead."
-          : "Tensor: splits each layer across devices. Best with high-bandwidth connections (Thunderbolt)."}
+          : "Tensor: splits each layer across devices. Best with a high-bandwidth interconnect."}
       >
         {sharding}
       </span>
       <span
         class="px-1.5 py-0.5 text-xs font-mono tracking-wider uppercase bg-exo-medium-gray/30 text-exo-light-gray border border-exo-medium-gray/40"
         title={runtime === "MlxRing"
-          ? "Ring: standard networking. Works over any connection (Wi-Fi, Ethernet, Thunderbolt)."
-          : "RDMA: direct memory access over Thunderbolt. Significantly faster for multi-device inference."}
+          ? "Ring: standard networking. Works over any IP connection."
+          : runtime === "MlxJaccl"
+            ? "JACCL: Apple MLX collectives over supported direct interconnects."
+            : "NCCL: NVIDIA CUDA collectives over the configured network transport."}
       >
         {runtime === "MlxRing"
           ? "MLX Ring"
           : runtime === "MlxJaccl"
-            ? "MLX RDMA"
-            : runtime}
+            ? "MLX JACCL"
+            : "MLX NCCL"}
       </span>
     </div>
 
@@ -759,7 +764,7 @@
                     : "rgba(248,113,113,0.85)"}
                 >
                   {conn.arrow}
-                  {isRdma
+                  {usesCollectiveInterconnect
                     ? conn.iface || "?"
                     : `${conn.ip}${conn.iface ? ` (${conn.iface})` : ""}`}
                 </text>
@@ -778,7 +783,7 @@
                     : "rgba(248,113,113,0.85)"}
                 >
                   {conn.arrow}
-                  {isRdma
+                  {usesCollectiveInterconnect
                     ? conn.iface || "?"
                     : `${conn.ip}${conn.iface ? ` (${conn.iface})` : ""}`}
                 </text>
@@ -799,7 +804,7 @@
                     : "rgba(248,113,113,0.85)"}
                 >
                   {conn.arrow}
-                  {isRdma
+                  {usesCollectiveInterconnect
                     ? conn.iface || "?"
                     : `${conn.ip}${conn.iface ? ` (${conn.iface})` : ""}`}
                 </text>
@@ -820,7 +825,7 @@
                     : "rgba(248,113,113,0.85)"}
                 >
                   {conn.arrow}
-                  {isRdma
+                  {usesCollectiveInterconnect
                     ? conn.iface || "?"
                     : `${conn.ip}${conn.iface ? ` (${conn.iface})` : ""}`}
                 </text>
