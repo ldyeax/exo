@@ -185,13 +185,13 @@ class Worker:
             await anyio.sleep(1)
             target = dict(self.state.custom_model_cards)
             for model_id, card in target.items():
-                if card_cache.get(model_id) == card:
+                if card_cache.get(model_id, card.revision) == card:
                     continue
                 await card_cache.save(card)
 
             for card in await card_cache.list_all():
-                if card.model_id not in target:
-                    await card_cache.pop(card.model_id)
+                if card.is_custom and target.get(card.model_id) != card:
+                    await card_cache.pop(card.model_id, card.revision)
 
     async def plan_step(self):
         while True:

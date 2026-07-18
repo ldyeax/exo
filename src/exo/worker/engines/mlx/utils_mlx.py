@@ -194,7 +194,10 @@ def load_mlx_items(
 
     if group is None:
         logger.info(f"Single device used for {bound_instance.instance}")
-        model_path = build_model_path(bound_instance.bound_shard.model_card.model_id)
+        model_path = build_model_path(
+            bound_instance.bound_shard.model_card.model_id,
+            bound_instance.bound_shard.model_card.revision,
+        )
         start_time = time.perf_counter()
         model, _ = load_model(model_path, lazy=True, strict=False)
         # Eval layers one by one for progress reporting
@@ -239,7 +242,9 @@ def load_mlx_items(
         vision_start_time = time.perf_counter()
         try:
             vision_processor: VisionProcessor | None = VisionProcessor(
-                vision_config, bound_instance.bound_shard.model_card.model_id
+                vision_config,
+                bound_instance.bound_shard.model_card.model_id,
+                bound_instance.bound_shard.model_card.revision,
             )
             if vision_loading_mode == "eager":
                 vision_processor.load()
@@ -265,7 +270,9 @@ def shard_and_load(
     shard_metadata: ShardMetadata,
     group: mx.distributed.Group,
 ) -> Generator[ModelLoadingResponse, None, tuple[nn.Module, TokenizerWrapper]]:
-    model_path = build_model_path(shard_metadata.model_card.model_id)
+    model_path = build_model_path(
+        shard_metadata.model_card.model_id, shard_metadata.model_card.revision
+    )
 
     model, _ = load_model(model_path, lazy=True, strict=False)
     logger.debug(model)

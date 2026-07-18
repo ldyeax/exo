@@ -13,6 +13,7 @@ from exo.download.download_utils import (
 from exo.download.shard_downloader import ShardDownloader
 from exo.shared.models import model_cards
 from exo.shared.models.model_cards import (
+    HuggingFaceRevision,
     ModelCard,
     ModelId,
     ModelTask,
@@ -32,8 +33,10 @@ def exo_shard_downloader(
     )
 
 
-async def build_base_shard(model_id: ModelId) -> ShardMetadata:
-    model_card = await ModelCard.load(model_id)
+async def build_base_shard(
+    model_id: ModelId, revision: HuggingFaceRevision = "main"
+) -> ShardMetadata:
+    model_card = await ModelCard.load(model_id, revision)
     return PipelineShardMetadata(
         model_card=model_card,
         device_rank=0,
@@ -44,8 +47,10 @@ async def build_base_shard(model_id: ModelId) -> ShardMetadata:
     )
 
 
-async def build_full_shard(model_id: ModelId) -> PipelineShardMetadata:
-    base_shard = await build_base_shard(model_id)
+async def build_full_shard(
+    model_id: ModelId, revision: HuggingFaceRevision = "main"
+) -> PipelineShardMetadata:
+    base_shard = await build_base_shard(model_id, revision)
     return PipelineShardMetadata(
         model_card=base_shard.model_card,
         device_rank=base_shard.device_rank,
@@ -194,6 +199,7 @@ class ResumableShardDownloader(ShardDownloader):
         assert shard.model_card.vision is not None
         vision_card = ModelCard(
             model_id=ModelId(shard.model_card.vision.weights_repo),
+            revision=shard.model_card.vision.weights_revision,
             storage_size=Memory.from_bytes(0),
             n_layers=1,
             hidden_size=1,
@@ -243,10 +249,10 @@ class ResumableShardDownloader(ShardDownloader):
         self,
     ) -> AsyncIterator[tuple[Path, RepoDownloadProgress]]:
         async def _status_for_model(
-            model_id: ModelId,
+            model_id: ModelId, revision: HuggingFaceRevision
         ) -> tuple[Path, RepoDownloadProgress]:
             """Helper coroutine that builds the shard for a model and gets its download status."""
-            shard = await build_full_shard(model_id)
+            shard = await build_full_shard(model_id, revision)
             return await self._status_for_shard(shard)
 
         semaphore = asyncio.Semaphore(self.max_parallel_downloads)
@@ -255,7 +261,7 @@ class ResumableShardDownloader(ShardDownloader):
             model_card: ModelCard,
         ) -> tuple[Path, RepoDownloadProgress]:
             async with semaphore:
-                return await _status_for_model(model_card.model_id)
+                return await _status_for_model(model_card.model_id, model_card.revision)
 
         tasks = [
             create_task(download_with_semaphore(model_card))

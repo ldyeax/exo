@@ -1840,7 +1840,7 @@ class API:
 
         # Immediately update the local cache so the subsequent GET /models
         # returns the new model without waiting for the event round-trip.
-        model_cards.card_cache.cc[card.model_id] = card
+        model_cards.card_cache.add_to_memory(card)
 
         return ModelListModel(
             id=card.model_id,
