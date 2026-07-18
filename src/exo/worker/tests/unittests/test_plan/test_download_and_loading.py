@@ -117,6 +117,7 @@ def test_plan_loads_model_when_all_shards_downloaded_and_waiting():
 
     assert isinstance(result, LoadModel)
     assert result.instance_id == INSTANCE_1_ID
+    assert result.runner_id is None
 
 
 def test_plan_does_not_request_download_when_shard_already_downloaded():

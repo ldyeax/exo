@@ -432,6 +432,7 @@ class API:
             sharding=payload.sharding,
             instance_meta=payload.instance_meta,
             min_nodes=payload.min_nodes,
+            use_all_compute_resources=payload.use_all_compute_resources,
         )
         await self._send(command)
 
@@ -472,6 +473,7 @@ class API:
         sharding: Sharding = Sharding.Pipeline,
         instance_meta: InstanceMeta = InstanceMeta.MlxRing,
         min_nodes: int = 1,
+        use_all_compute_resources: bool = False,
     ) -> Instance:
         model_card = await ModelCard.load(model_id)
 
@@ -482,6 +484,7 @@ class API:
                     sharding=sharding,
                     instance_meta=instance_meta,
                     min_nodes=min_nodes,
+                    use_all_compute_resources=use_all_compute_resources,
                 ),
                 node_memory=self.state.node_memory,
                 node_network=self.state.node_network,
@@ -490,6 +493,7 @@ class API:
                 current_instances=self.state.instances,
                 download_status=self.state.downloads,
                 node_rdma_ctl=self.state.node_rdma_ctl,
+                node_compute_resources=self.state.node_compute_resources,
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -559,6 +563,7 @@ class API:
                     required_nodes=required_nodes,
                     download_status=self.state.downloads,
                     node_rdma_ctl=self.state.node_rdma_ctl,
+                    node_compute_resources=self.state.node_compute_resources,
                 )
             except ValueError as exc:
                 if (model_card.model_id, sharding, instance_meta, 0) not in seen:

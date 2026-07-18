@@ -1,4 +1,4 @@
-from typing import Self
+from typing import ClassVar, Self
 
 from pydantic import model_validator
 
@@ -8,12 +8,22 @@ from exo.utils.pydantic_ext import TaggedModel
 
 
 class ComputeResourceId(Id):
+    NVIDIA_GPU_PREFIX: ClassVar[str] = "nvidia-gpu:"
+
     @classmethod
     def from_nvidia_device_uuid(cls, device_uuid: str) -> Self:
         normalized_device_uuid = device_uuid.strip()
         if not normalized_device_uuid:
             raise ValueError("NVIDIA device UUID must not be empty")
-        return cls(f"nvidia-gpu:{normalized_device_uuid}")
+        return cls(f"{cls.NVIDIA_GPU_PREFIX}{normalized_device_uuid}")
+
+    def nvidia_device_uuid(self) -> str:
+        if not self.startswith(self.NVIDIA_GPU_PREFIX):
+            raise ValueError(f"Compute resource {self} is not an NVIDIA GPU")
+        device_uuid = self.removeprefix(self.NVIDIA_GPU_PREFIX)
+        if not device_uuid:
+            raise ValueError("NVIDIA compute resource must include a device UUID")
+        return device_uuid
 
 
 class NvidiaGpuComputeResource(TaggedModel):

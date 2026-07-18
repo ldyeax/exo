@@ -1,5 +1,6 @@
 import hashlib
 from collections import defaultdict
+from collections.abc import Mapping
 from datetime import datetime, timezone
 
 import anyio
@@ -40,11 +41,14 @@ from exo.shared.types.multiaddr import Multiaddr
 from exo.shared.types.state import State
 from exo.shared.types.tasks import (
     CancelTask,
+    ConnectToGroup,
     CreateRunner,
     DownloadModel,
     ImageEdits,
+    ImageGeneration,
     LoadModel,
     Shutdown,
+    StartWarmup,
     Task,
     TaskStatus,
     TextGeneration,
@@ -52,8 +56,13 @@ from exo.shared.types.tasks import (
 from exo.shared.types.text_generation import Base64Image, Base64ImageHash
 from exo.shared.types.topology import Connection, SocketConnection
 from exo.shared.types.worker.downloads import DownloadCompleted
-from exo.shared.types.worker.instances import InstanceId
-from exo.shared.types.worker.runners import RunnerId, RunnerShutdown
+from exo.shared.types.worker.instances import Instance, InstanceId
+from exo.shared.types.worker.runners import (
+    RunnerId,
+    RunnerReady,
+    RunnerRunning,
+    RunnerShutdown,
+)
 from exo.utils.channels import Receiver, Sender, channel
 from exo.utils.info_gatherer.info_gatherer import GatheredInfo, InfoGatherer
 from exo.utils.info_gatherer.net_profile import check_reachable
@@ -63,6 +72,45 @@ from exo.worker.plan import plan
 from exo.worker.runner.supervisor import RunnerSupervisor
 
 RUNNER_SHUTDOWN_TIMEOUT_SECONDS = 3
+
+
+def get_local_runner_ids_for_task(
+    task: Task,
+    instance: Instance,
+    node_id: NodeId,
+    runners: Mapping[RunnerId, RunnerSupervisor],
+) -> tuple[RunnerId, ...]:
+    match task:
+        case (
+            ConnectToGroup(runner_id=runner_id)
+            | LoadModel(runner_id=runner_id)
+            | StartWarmup(runner_id=runner_id)
+        ) if runner_id is not None:
+            return (runner_id,) if runner_id in runners else ()
+        case TextGeneration() | ImageEdits() | ImageGeneration():
+            return tuple(
+                runner_id
+                for runner_id, runner in runners.items()
+                if runner.bound_instance.instance.instance_id == instance.instance_id
+                and task.task_id not in runner.completed
+                and task.task_id not in runner.in_progress
+                and isinstance(runner.status, (RunnerReady, RunnerRunning))
+            )
+        case _:
+            runner_id = instance.shard_assignments.node_to_runner.get(node_id)
+            return () if runner_id is None else (runner_id,)
+
+
+async def start_local_runner_task(
+    task: Task,
+    instance: Instance,
+    node_id: NodeId,
+    runners: Mapping[RunnerId, RunnerSupervisor],
+) -> None:
+    runner_ids = get_local_runner_ids_for_task(task, instance, node_id, runners)
+    async with anyio.create_task_group() as task_group:
+        for runner_id in runner_ids:
+            task_group.start_soon(runners[runner_id].start_task, task)
 
 
 class Worker:
@@ -100,6 +148,7 @@ class Worker:
         self._instance_backoff: KeyedBackoff[InstanceId] = KeyedBackoff(
             base=0.5, cap=10.0
         )
+        self._runner_backoff: KeyedBackoff[RunnerId] = KeyedBackoff(base=0.5, cap=10.0)
         self._stopped: anyio.Event = anyio.Event()
 
     async def run(self):
@@ -149,6 +198,12 @@ class Worker:
 
                 if isinstance(event, InstanceDeleted):
                     self._instance_backoff.reset(event.instance_id)
+                    for runner_id, runner in self.runners.items():
+                        if (
+                            runner.bound_instance.instance.instance_id
+                            == event.instance_id
+                        ):
+                            self._runner_backoff.reset(runner_id)
 
                 # Buffer input image chunks for image editing
                 if isinstance(event, InputChunkReceived):
@@ -207,13 +262,24 @@ class Worker:
                 self.image_cache,
                 self._instance_backoff,
                 self._download_backoff,
+                self.state.node_compute_resources,
+                self._runner_backoff,
             )
             if task is None:
                 continue
 
             if isinstance(task, CreateRunner):
                 iid = task.instance_id
-                if self._instance_backoff.attempts(iid) >= EXO_MAX_INSTANCE_RETRIES:
+                runner_id = task.bound_instance.bound_runner_id
+                resource_bound = bool(
+                    task.bound_instance.instance.shard_assignments.compute_resource_to_runner
+                )
+                attempts = (
+                    self._runner_backoff.attempts(runner_id)
+                    if resource_bound
+                    else self._instance_backoff.attempts(iid)
+                )
+                if attempts >= EXO_MAX_INSTANCE_RETRIES:
                     logger.warning(
                         f"Instance {iid} exceeded {EXO_MAX_INSTANCE_RETRIES} retries, requesting deletion"
                     )
@@ -233,7 +299,12 @@ class Worker:
             match task:
                 case CreateRunner():
                     await self._create_supervisor(task)
-                    self._instance_backoff.record_attempt(task.instance_id)
+                    if task.bound_instance.instance.shard_assignments.compute_resource_to_runner:
+                        self._runner_backoff.record_attempt(
+                            task.bound_instance.bound_runner_id
+                        )
+                    else:
+                        self._instance_backoff.record_attempt(task.instance_id)
                     await self.event_sender.send(
                         TaskStatusUpdated(
                             task_id=task.task_id, task_status=TaskStatus.Complete
@@ -384,9 +455,12 @@ class Worker:
 
     async def _start_runner_task(self, task: Task):
         if (instance := self.state.instances.get(task.instance_id)) is not None:
-            await self.runners[
-                instance.shard_assignments.node_to_runner[self.node_id]
-            ].start_task(task)
+            await start_local_runner_task(
+                task,
+                instance,
+                self.node_id,
+                self.runners,
+            )
 
     async def _create_supervisor(self, task: CreateRunner) -> RunnerSupervisor:
         """Creates and stores a new AssignedRunner with initial downloading status."""

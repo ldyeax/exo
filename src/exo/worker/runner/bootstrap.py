@@ -64,7 +64,16 @@ def configure_runner_environment(
     infiniband_devices_path: Path = DEFAULT_INFINIBAND_DEVICES_PATH,
 ) -> None:
     if isinstance(bound_instance.instance, MlxNcclInstance):
-        os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
+        compute_resource_ids = bound_instance.bound_compute_resource_ids
+        if compute_resource_ids:
+            if len(compute_resource_ids) != 1:
+                raise ValueError(
+                    "MLX NCCL runners require exactly one compute resource"
+                )
+            device_uuid = compute_resource_ids[0].nvidia_device_uuid()
+            os.environ["CUDA_VISIBLE_DEVICES"] = device_uuid
+        else:
+            os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
         if _has_mlx4_infiniband_device(infiniband_devices_path):
             os.environ.setdefault("NCCL_GIN_ENABLE", "0")
             os.environ.setdefault("NCCL_GIN_TYPE", "0")

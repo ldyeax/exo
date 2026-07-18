@@ -23,6 +23,7 @@ from exo.shared.types.commands import (
     PlaceInstance,
 )
 from exo.shared.types.common import NodeId
+from exo.shared.types.compute_resources import ComputeResource
 from exo.shared.types.events import (
     Event,
     InstanceCreated,
@@ -116,6 +117,7 @@ def place_instance(
     required_nodes: set[NodeId] | None = None,
     download_status: Mapping[NodeId, Sequence[DownloadProgress]] | None = None,
     node_rdma_ctl: Mapping[NodeId, NodeRdmaCtlStatus] | None = None,
+    node_compute_resources: Mapping[NodeId, Sequence[ComputeResource]] | None = None,
 ) -> dict[InstanceId, Instance]:
     if (
         command.instance_meta == InstanceMeta.MlxNccl
@@ -147,6 +149,45 @@ def place_instance(
     if len(cycles_with_sufficient_memory) == 0:
         raise ValueError("No cycles found with sufficient memory")
 
+    placement_compute_resources = (
+        node_compute_resources
+        if command.instance_meta == InstanceMeta.MlxNccl and node_compute_resources
+        else None
+    )
+    if placement_compute_resources is not None:
+        cycles_with_sufficient_memory = [
+            cycle
+            for cycle in cycles_with_sufficient_memory
+            if all(placement_compute_resources.get(node_id) for node_id in cycle)
+        ]
+        if not cycles_with_sufficient_memory:
+            raise ValueError(
+                "No cycles found where every node advertises NVIDIA GPU compute "
+                "resources"
+            )
+
+    def selected_compute_resources(
+        cycle: Cycle,
+    ) -> dict[NodeId, Sequence[ComputeResource]] | None:
+        if placement_compute_resources is None:
+            return None
+        return {
+            node_id: (
+                sorted(
+                    placement_compute_resources[node_id],
+                    key=lambda resource: resource.resource_id,
+                )
+                if command.use_all_compute_resources
+                else [
+                    min(
+                        placement_compute_resources[node_id],
+                        key=lambda resource: resource.resource_id,
+                    )
+                ]
+            )
+            for node_id in cycle
+        }
+
     if command.sharding == Sharding.Tensor:
         if not command.model_card.supports_tensor:
             raise ValueError(
@@ -158,18 +199,35 @@ def place_instance(
         # KV heads, so the kv-head divisibility check doesn't apply.
         is_deepseek_v4 = command.model_card.base_model.startswith("DeepSeek V4")
         kv_heads = command.model_card.num_key_value_heads
+
+        def tensor_world_size(cycle: Cycle) -> int:
+            compute_resources = selected_compute_resources(cycle)
+            if compute_resources is None:
+                return len(cycle)
+            return sum(len(compute_resources[node_id]) for node_id in cycle)
+
         cycles_with_sufficient_memory = [
             cycle
             for cycle in cycles_with_sufficient_memory
-            if command.model_card.hidden_size % len(cycle) == 0
-            and (is_deepseek_v4 or kv_heads is None or kv_heads % len(cycle) == 0)
+            if command.model_card.hidden_size % tensor_world_size(cycle) == 0
+            and (
+                is_deepseek_v4
+                or kv_heads is None
+                or kv_heads % tensor_world_size(cycle) == 0
+            )
         ]
         if not cycles_with_sufficient_memory:
+            resource_policy = (
+                " using all advertised compute resources"
+                if placement_compute_resources is not None
+                and command.use_all_compute_resources
+                else ""
+            )
             raise ValueError(
                 f"No tensor sharding found for model with "
                 f"hidden_size={command.model_card.hidden_size}"
                 f"{f', num_key_value_heads={kv_heads}' if kv_heads is not None else ''}"
-                f" across candidate cycles"
+                f" across candidate cycles{resource_policy}"
             )
     if command.sharding == Sharding.Pipeline and command.model_card.model_id == ModelId(
         "mlx-community/DeepSeek-V3.1-8bit"
@@ -268,7 +326,11 @@ def place_instance(
         )
 
     shard_assignments = get_shard_assignments(
-        command.model_card, selected_cycle, command.sharding, node_memory
+        command.model_card,
+        selected_cycle,
+        command.sharding,
+        node_memory,
+        node_compute_resources=selected_compute_resources(selected_cycle),
     )
 
     cycle_digraph: Topology = topology.get_subgraph_from_nodes(selected_cycle.node_ids)
