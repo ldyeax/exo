@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import copy
 import fcntl
+import hashlib
+import importlib.machinery
 import io
 import json
 import os
@@ -32,6 +34,7 @@ from scripts.two_host_mlx_nccl_poc import (
     HostConfig,
     HostPreflightReport,
     HostPreflightRequest,
+    HostRuntimePin,
     HttpResponseError,
     JsonObject,
     JsonValue,
@@ -39,6 +42,7 @@ from scripts.two_host_mlx_nccl_poc import (
     ModelSnapshot,
     OwnedProcess,
     ProcessCleanup,
+    PythonAbiIdentity,
     RuntimeRequirements,
     SignalLatch,
     SourceIdentity,
@@ -55,6 +59,15 @@ MODEL_ID = "mlx-community/SmolLM2-135M-Instruct-8bit"
 REVISION = "0f0d9b8218915bc34d401e1a340b8c049d300d5e"
 WEIGHT_BYTES = 142_955_136
 RUNTIME_NODE_IDS = {"dwagon": "a1b2c3", "fwuff": "d4e5f6"}
+PYTHON_ABI = PythonAbiIdentity(
+    implementation="cpython",
+    major=3,
+    minor=13,
+    cache_tag="cpython-313",
+    soabi="cpython-313-x86_64-linux-gnu",
+    abiflags="",
+)
+EXO_RS_SHA_BY_HOST = {"dwagon": "a" * 64, "fwuff": "b" * 64}
 
 DWAGON_GPUS = (
     GpuIdentity(
@@ -77,7 +90,7 @@ FWUFF_GPUS = (
 )
 
 
-def _preflight_facts() -> dict[str, object]:
+def _preflight_facts(host_name: str = "dwagon") -> dict[str, object]:
     return {
         "load_average": "0.01 0.02 0.03 1/100 1",
         "memory": "MemTotal: 1 kB",
@@ -89,7 +102,7 @@ def _preflight_facts() -> dict[str, object]:
         "ip_routes_json": "[]",
         "cpu_frequency_policy": {"policy0.scaling_governor": "performance"},
         "runtime_versions": {
-            "python": "3.13",
+            "python": "3.13.14 (main, Jul  1 2026) [GCC 15.2.1]",
             "exo": "1.0.0",
             "mlx": "0.32.0",
             "mlx-cuda-12": None,
@@ -97,7 +110,13 @@ def _preflight_facts() -> dict[str, object]:
             "nvidia-nccl-cu12": None,
             "nvidia-nccl-cu13": "2.28.9",
         },
-        "exo_rs_artifact": {"path": "/opt/exo_rs.so", "sha256": "a" * 64},
+        "python_abi": PYTHON_ABI.model_dump(mode="json"),
+        "exo_rs_artifact": {
+            "module": "exo_rs.exo_rs",
+            "path": (f"/opt/{host_name}/exo_rs/exo_rs.cpython-313-x86_64-linux-gnu.so"),
+            "sha256": EXO_RS_SHA_BY_HOST[host_name],
+            "is_native_extension": True,
+        },
         "exo_import_origin": "/opt/exo/src/exo/__init__.py",
     }
 
@@ -253,6 +272,11 @@ def make_config(tmp_path: Path) -> HarnessConfig:
         runtime=RuntimeRequirements(
             cuda_major=13,
             minimum_nvidia_driver_version="580.0",
+            python_abi=PYTHON_ABI,
+            host_pins={
+                host_name: HostRuntimePin(exo_rs_native_sha256=sha256)
+                for host_name, sha256 in EXO_RS_SHA_BY_HOST.items()
+            },
         ),
     )
 
@@ -491,7 +515,7 @@ class FakeEffects:
                 for port in host.hca_ports
             ),
             amx_flags=("amx_bf16", "amx_int8", "amx_tile"),
-            facts=_preflight_facts(),
+            facts=_preflight_facts(host.name),
         )
 
     def probe_model(self, host: HostConfig, model: ModelSnapshot) -> ModelProbeResult:
@@ -700,6 +724,29 @@ def test_config_is_strict_and_requires_the_reserved_nccl_port(tmp_path: Path) ->
         HarnessConfig.model_validate_json(json.dumps(raw))
 
 
+@pytest.mark.parametrize("mutation", ["missing", "extra"])
+def test_config_requires_one_native_extension_pin_per_host(
+    tmp_path: Path, mutation: str
+) -> None:
+    raw = make_config(tmp_path).model_dump(mode="json")
+    host_pins = raw["runtime"]["host_pins"]
+    if mutation == "missing":
+        host_pins.pop("fwuff")
+    else:
+        host_pins["unused"] = {"exo_rs_native_sha256": "c" * 64}
+
+    with pytest.raises(ValidationError, match="exactly match configured hosts"):
+        HarnessConfig.model_validate_json(json.dumps(raw))
+
+
+def test_config_rejects_malformed_native_extension_pin(tmp_path: Path) -> None:
+    raw = make_config(tmp_path).model_dump(mode="json")
+    raw["runtime"]["host_pins"]["fwuff"]["exo_rs_native_sha256"] = "NOT-SHA256"
+
+    with pytest.raises(ValidationError, match="string_pattern_mismatch"):
+        HarnessConfig.model_validate_json(json.dumps(raw))
+
+
 @pytest.mark.parametrize("gid", ["10.0.0.1", "::", "fe80::", "not-a-gid"])
 def test_config_rejects_invalid_raw_verbs_gid(tmp_path: Path, gid: str) -> None:
     raw = make_config(tmp_path).model_dump(mode="json")
@@ -825,9 +872,38 @@ def test_active_lease_binding_requires_held_lock_and_exact_static_proof(
     metadata = validated["metadata"]
     assert isinstance(metadata, dict)
     assert metadata["command"] == list(command)
+    assert metadata["runtime_requirements"] == config.runtime.model_dump(mode="json")
     oracle = metadata["correctness_oracle"]
     assert isinstance(oracle, dict)
     assert oracle["expected_content_sha256"] == config.benchmark.expected_content_sha256
+
+
+@pytest.mark.parametrize("mutation", ["python_abi", "host_pin"])
+def test_active_lease_binds_runtime_abi_and_host_pins(
+    tmp_path: Path, mutation: str
+) -> None:
+    config = make_config(tmp_path)
+    config_path, lease_path, lock_path, _command, record = _active_lease_fixture(
+        config, tmp_path
+    )
+    raw = config.model_dump(mode="json")
+    if mutation == "python_abi":
+        raw["runtime"]["python_abi"]["abiflags"] = "d"
+    else:
+        raw["runtime"]["host_pins"]["fwuff"]["exo_rs_native_sha256"] = "c" * 64
+    changed_config = HarnessConfig.model_validate_json(json.dumps(raw))
+    config_path.write_text(changed_config.model_dump_json(), encoding="utf-8")
+    lease_path.write_text(json.dumps(record), encoding="utf-8")
+
+    with lock_path.open("r+") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with pytest.raises(HarnessError, match=r"metadata\.runtime_requirements"):
+            poc.validate_active_lease(
+                changed_config,
+                config_path=config_path,
+                lease_path=lease_path,
+                lock_path=lock_path,
+            )
 
 
 @pytest.mark.parametrize(
@@ -1785,6 +1861,195 @@ def test_different_supported_driver_versions_do_not_break_runtime_identity(
     assert result["status"] == "completed"
 
 
+def test_different_python_build_strings_with_same_abi_pass(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    effects = FakeEffects(config)
+    original_preflight = effects.run_preflight
+
+    def differing_python_build_preflight(
+        host: HostConfig, harness_config: HarnessConfig
+    ) -> HostPreflightReport:
+        report = original_preflight(host, harness_config)
+        if host.name != "fwuff":
+            return report
+        facts = dict(report.facts)
+        versions = dict(facts["runtime_versions"])
+        versions["python"] = "3.13.7 (main, Jun  1 2026) [GCC 15.2.0]"
+        facts["runtime_versions"] = versions
+        return report.model_copy(update={"facts": facts})
+
+    effects.run_preflight = differing_python_build_preflight  # type: ignore[method-assign]
+
+    result = run_harness(config, effects)
+
+    assert config.runtime.host_pins["dwagon"] != config.runtime.host_pins["fwuff"]
+    assert result["status"] == "completed"
+
+
+@pytest.mark.parametrize("distribution", ["mlx-cuda-12", "nvidia-nccl-cu12"])
+def test_inactive_cuda_runtime_versions_do_not_break_runtime_identity(
+    tmp_path: Path, distribution: str
+) -> None:
+    config = make_config(tmp_path)
+    effects = FakeEffects(config)
+    original_preflight = effects.run_preflight
+
+    def differing_inactive_runtime_preflight(
+        host: HostConfig, harness_config: HarnessConfig
+    ) -> HostPreflightReport:
+        report = original_preflight(host, harness_config)
+        if host.name != "fwuff":
+            return report
+        facts = dict(report.facts)
+        versions = dict(facts["runtime_versions"])
+        versions[distribution] = "999.0"
+        facts["runtime_versions"] = versions
+        return report.model_copy(update={"facts": facts})
+
+    effects.run_preflight = differing_inactive_runtime_preflight  # type: ignore[method-assign]
+
+    result = run_harness(config, effects)
+
+    assert result["status"] == "completed"
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["implementation", "major", "minor", "cache_tag", "soabi", "abiflags"],
+)
+def test_python_abi_mismatch_fails_before_process_start(
+    tmp_path: Path, mutation: str
+) -> None:
+    config = make_config(tmp_path)
+    effects = FakeEffects(config)
+    original_preflight = effects.run_preflight
+
+    def differing_python_abi_preflight(
+        host: HostConfig, harness_config: HarnessConfig
+    ) -> HostPreflightReport:
+        report = original_preflight(host, harness_config)
+        if host.name != "fwuff":
+            return report
+        facts = dict(report.facts)
+        python_abi = dict(facts["python_abi"])
+        if mutation == "implementation":
+            python_abi["implementation"] = "pypy"
+        elif mutation == "major":
+            python_abi.update(
+                {
+                    "major": 4,
+                    "cache_tag": "cpython-413",
+                    "soabi": "cpython-413-x86_64-linux-gnu",
+                }
+            )
+        elif mutation == "minor":
+            python_abi.update(
+                {
+                    "minor": 12,
+                    "cache_tag": "cpython-312",
+                    "soabi": "cpython-312-x86_64-linux-gnu",
+                }
+            )
+        elif mutation == "cache_tag":
+            python_abi["cache_tag"] = "cpython-313-debug"
+        elif mutation == "soabi":
+            python_abi["soabi"] = "cpython-313-aarch64-linux-gnu"
+        else:
+            python_abi["abiflags"] = "d"
+        facts["python_abi"] = python_abi
+        return report.model_copy(update={"facts": facts})
+
+    effects.run_preflight = differing_python_abi_preflight  # type: ignore[method-assign]
+
+    result = run_harness(config, effects)
+
+    assert result["status"] == "preflight_failed"
+    assert "Python ABI identity" in str(result["error"])
+    assert effects.started == []
+
+
+@pytest.mark.parametrize("mutation", ["wrong", "swapped"])
+def test_wrong_native_extension_host_pin_fails_before_process_start(
+    tmp_path: Path, mutation: str
+) -> None:
+    config = make_config(tmp_path)
+    effects = FakeEffects(config)
+    original_preflight = effects.run_preflight
+
+    def mismatched_native_hash_preflight(
+        host: HostConfig, harness_config: HarnessConfig
+    ) -> HostPreflightReport:
+        report = original_preflight(host, harness_config)
+        if host.name != "fwuff":
+            return report
+        facts = dict(report.facts)
+        artifact = dict(facts["exo_rs_artifact"])
+        artifact["sha256"] = (
+            "c" * 64 if mutation == "wrong" else EXO_RS_SHA_BY_HOST["dwagon"]
+        )
+        facts["exo_rs_artifact"] = artifact
+        return report.model_copy(update={"facts": facts})
+
+    effects.run_preflight = mismatched_native_hash_preflight  # type: ignore[method-assign]
+
+    result = run_harness(config, effects)
+
+    assert result["status"] == "preflight_failed"
+    assert "does not match the host pin" in str(result["error"])
+    assert effects.started == []
+
+
+@pytest.mark.parametrize(
+    "mutation", ["missing", "package", "source_module", "wrong_abi", "unhashed"]
+)
+def test_missing_or_non_native_exo_rs_artifact_fails_before_process_start(
+    tmp_path: Path, mutation: str
+) -> None:
+    config = make_config(tmp_path)
+    effects = FakeEffects(config)
+    original_preflight = effects.run_preflight
+
+    def invalid_native_artifact_preflight(
+        host: HostConfig, harness_config: HarnessConfig
+    ) -> HostPreflightReport:
+        report = original_preflight(host, harness_config)
+        if host.name != "dwagon":
+            return report
+        facts = dict(report.facts)
+        if mutation == "missing":
+            facts.pop("exo_rs_artifact")
+        else:
+            artifact = dict(facts["exo_rs_artifact"])
+            if mutation == "package":
+                artifact.update(
+                    {
+                        "module": "exo_rs",
+                        "path": "/opt/exo_rs/__init__.py",
+                        "is_native_extension": False,
+                    }
+                )
+            elif mutation == "source_module":
+                artifact.update(
+                    {
+                        "path": "/opt/exo_rs/exo_rs.py",
+                        "is_native_extension": False,
+                    }
+                )
+            elif mutation == "wrong_abi":
+                artifact["path"] = "/opt/exo_rs/exo_rs.cpython-312-x86_64-linux-gnu.so"
+            else:
+                artifact["sha256"] = None
+            facts["exo_rs_artifact"] = artifact
+        return report.model_copy(update={"facts": facts})
+
+    effects.run_preflight = invalid_native_artifact_preflight  # type: ignore[method-assign]
+
+    result = run_harness(config, effects)
+
+    assert result["status"] == "preflight_failed"
+    assert effects.started == []
+
+
 @pytest.mark.parametrize(
     "banner",
     [
@@ -1802,8 +2067,11 @@ def test_cuda_driver_major_rejects_unrelated_nvidia_version_labels() -> None:
     assert poc._cuda_driver_major_from_nvidia_smi("KMD Version: 610.43.03") is None
 
 
-def test_different_mlx_runtime_versions_fail_before_process_start(
-    tmp_path: Path,
+@pytest.mark.parametrize(
+    "distribution", ["exo", "mlx", "mlx-cuda-13", "nvidia-nccl-cu13"]
+)
+def test_different_required_runtime_versions_fail_before_process_start(
+    tmp_path: Path, distribution: str
 ) -> None:
     config = make_config(tmp_path)
     effects = FakeEffects(config)
@@ -1817,7 +2085,7 @@ def test_different_mlx_runtime_versions_fail_before_process_start(
             return report
         facts = dict(report.facts)
         versions = dict(facts["runtime_versions"])
-        versions["mlx"] = "999.0"
+        versions[distribution] = "999.0"
         facts["runtime_versions"] = versions
         return report.model_copy(update={"facts": facts})
 
@@ -1932,7 +2200,42 @@ class CleanHostProbe:
         return ()
 
     def facts(self) -> dict[str, object]:
-        return _preflight_facts()
+        return _preflight_facts(self.host.name)
+
+
+def test_native_extension_identity_hashes_submodule_not_package_initializer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    package_initializer = tmp_path / "__init__.py"
+    native_extension = tmp_path / "exo_rs.cpython-313-x86_64-linux-gnu.so"
+    package_initializer.write_bytes(b"package initializer")
+    native_extension.write_bytes(b"compiled exo_rs extension")
+    loader = importlib.machinery.ExtensionFileLoader(
+        "exo_rs.exo_rs", str(native_extension)
+    )
+    spec = importlib.machinery.ModuleSpec(
+        "exo_rs.exo_rs", loader, origin=str(native_extension)
+    )
+
+    def find_spec(module_name: str) -> importlib.machinery.ModuleSpec:
+        assert module_name == "exo_rs.exo_rs"
+        return spec
+
+    monkeypatch.setattr(poc.importlib.util, "find_spec", find_spec)
+
+    identity = poc.LinuxHostProbe(tmp_path / "infiniband").native_extension_identity(
+        "exo_rs.exo_rs"
+    )
+
+    native_sha256 = hashlib.sha256(native_extension.read_bytes()).hexdigest()
+    initializer_sha256 = hashlib.sha256(package_initializer.read_bytes()).hexdigest()
+    assert identity == {
+        "module": "exo_rs.exo_rs",
+        "path": str(native_extension.resolve()),
+        "sha256": native_sha256,
+        "is_native_extension": True,
+    }
+    assert identity["sha256"] != initializer_sha256
 
 
 def test_linux_hca_probe_accepts_raw_verbs_without_ipoib(tmp_path: Path) -> None:

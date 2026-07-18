@@ -23,6 +23,7 @@ import csv
 import fcntl
 import hashlib
 import http.client
+import importlib.machinery
 import importlib.metadata
 import importlib.util
 import ipaddress
@@ -38,6 +39,7 @@ import stat
 import statistics
 import subprocess
 import sys
+import sysconfig
 import threading
 import time
 import uuid
@@ -304,9 +306,24 @@ class TimeoutConfig(StrictModel):
     poll_seconds: float = Field(gt=0)
 
 
+class PythonAbiIdentity(StrictModel):
+    implementation: Literal["cpython"]
+    major: int = Field(ge=3)
+    minor: int = Field(ge=0)
+    cache_tag: str = Field(min_length=1)
+    soabi: str = Field(min_length=1)
+    abiflags: str
+
+
+class HostRuntimePin(StrictModel):
+    exo_rs_native_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
 class RuntimeRequirements(StrictModel):
     cuda_major: Literal[13]
     minimum_nvidia_driver_version: str
+    python_abi: PythonAbiIdentity
+    host_pins: dict[str, HostRuntimePin]
 
     @field_validator("minimum_nvidia_driver_version")
     @classmethod
@@ -357,6 +374,8 @@ class HarnessConfig(StrictModel):
             raise ValueError("host launch_order values must be unique")
         if len({host.discovery_port for host in self.hosts}) != 1:
             raise ValueError("both hosts must use one shared multicast discovery port")
+        if set(self.runtime.host_pins) != {host.name for host in self.hosts}:
+            raise ValueError("runtime host_pins must exactly match configured hosts")
         all_ports = (
             self.api.port,
             self.nccl_coordinator_port,
@@ -532,6 +551,34 @@ class LinuxHostProbe:
             while chunk := source.read(1024 * 1024):
                 digest.update(chunk)
         return digest.hexdigest()
+
+    def native_extension_identity(self, module_name: str) -> dict[str, JsonScalar]:
+        identity: dict[str, JsonScalar] = {
+            "module": module_name,
+            "path": None,
+            "sha256": None,
+            "is_native_extension": False,
+        }
+        try:
+            spec = importlib.util.find_spec(module_name)
+        except (ImportError, AttributeError, ValueError):
+            return identity
+        if spec is None or spec.origin is None:
+            return identity
+
+        artifact_path = Path(spec.origin).resolve()
+        identity["path"] = str(artifact_path)
+        is_native_extension = isinstance(
+            spec.loader, importlib.machinery.ExtensionFileLoader
+        ) and any(
+            artifact_path.name.endswith(suffix)
+            for suffix in importlib.machinery.EXTENSION_SUFFIXES
+        )
+        identity["is_native_extension"] = is_native_extension
+        if is_native_extension:
+            with contextlib.suppress(OSError):
+                identity["sha256"] = self._sha256_file(artifact_path)
+        return identity
 
     def source_identity(self, source_directory: str) -> SourceIdentity:
         commit = self._command(("git", "-C", source_directory, "rev-parse", "HEAD"))
@@ -842,14 +889,16 @@ class LinuxHostProbe:
                 )
             except importlib.metadata.PackageNotFoundError:
                 runtime_versions[distribution] = None
-        exo_rs_identity: dict[str, JsonScalar] = {"path": None, "sha256": None}
-        exo_rs_spec = importlib.util.find_spec("exo_rs")
-        if exo_rs_spec is not None and exo_rs_spec.origin is not None:
-            artifact_path = Path(exo_rs_spec.origin)
-            exo_rs_identity = {
-                "path": str(artifact_path),
-                "sha256": self._sha256_file(artifact_path),
-            }
+        soabi = cast(object, sysconfig.get_config_var("SOABI"))
+        python_abi: dict[str, JsonScalar] = {
+            "implementation": sys.implementation.name,
+            "major": sys.version_info.major,
+            "minor": sys.version_info.minor,
+            "cache_tag": sys.implementation.cache_tag,
+            "soabi": soabi if isinstance(soabi, str) else None,
+            "abiflags": sys.abiflags,
+        }
+        exo_rs_identity = self.native_extension_identity("exo_rs.exo_rs")
         exo_import_origin: JsonScalar = None
         exo_spec = importlib.util.find_spec("exo")
         if exo_spec is not None and exo_spec.origin is not None:
@@ -897,6 +946,7 @@ class LinuxHostProbe:
             ),
             "cpu_frequency_policy": frequency_policy,
             "runtime_versions": runtime_versions,
+            "python_abi": python_abi,
             "exo_rs_artifact": exo_rs_identity,
             "exo_import_origin": exo_import_origin,
         }
@@ -1359,6 +1409,7 @@ def _lease_static_metadata(config: HarnessConfig, command: Sequence[str]) -> Jso
         },
         "hosts": hosts,
         "models": models,
+        "runtime_requirements": cast(JsonValue, config.runtime.model_dump(mode="json")),
         "correctness_oracle": {
             "model_id": config.model.model_id,
             "revision": config.model.revision,
@@ -1704,13 +1755,10 @@ def validated_runtime_identity(
         raise HarnessError(f"runtime versions are missing on {host.name}")
     cuda_distribution = f"mlx-cuda-{config.runtime.cuda_major}"
     nccl_distribution = f"nvidia-nccl-cu{config.runtime.cuda_major}"
-    required_distributions = (
-        "python",
-        "exo",
-        "mlx",
-        cuda_distribution,
-        nccl_distribution,
-    )
+    required_distributions = ("exo", "mlx", cuda_distribution, nccl_distribution)
+    full_python_version = runtime_versions.get("python")
+    if not isinstance(full_python_version, str) or not full_python_version:
+        raise HarnessError(f"required runtime python is missing on {host.name}")
     for distribution in required_distributions:
         version = runtime_versions.get(distribution)
         if not isinstance(version, str) or not version:
@@ -1718,15 +1766,44 @@ def validated_runtime_identity(
                 f"required runtime {distribution} is missing on {host.name}"
             )
 
+    raw_python_abi = report.facts.get("python_abi")
+    if not isinstance(raw_python_abi, dict):
+        raise HarnessError(f"Python ABI identity is missing on {host.name}")
+    try:
+        python_abi = PythonAbiIdentity.model_validate(raw_python_abi)
+    except ValidationError as error:
+        raise HarnessError(f"Python ABI identity is invalid on {host.name}") from error
+    if python_abi != config.runtime.python_abi:
+        raise HarnessError(
+            f"Python ABI identity does not match the configured ABI on {host.name}"
+        )
+
     artifact = report.facts.get("exo_rs_artifact")
     if not isinstance(artifact, dict):
         raise HarnessError(f"exo_rs identity is missing on {host.name}")
+    if artifact.get("module") != "exo_rs.exo_rs":
+        raise HarnessError(f"exo_rs native module identity is invalid on {host.name}")
+    if artifact.get("is_native_extension") is not True:
+        raise HarnessError(f"exo_rs artifact is not a native extension on {host.name}")
+    artifact_path = artifact.get("path")
+    expected_extension_suffix = f".{python_abi.soabi}.so"
+    if (
+        not isinstance(artifact_path, str)
+        or not Path(artifact_path).is_absolute()
+        or not Path(artifact_path).name.endswith(expected_extension_suffix)
+    ):
+        raise HarnessError(
+            f"exo_rs native extension path does not match the Python ABI on {host.name}"
+        )
     artifact_sha = artifact.get("sha256")
     if (
         not isinstance(artifact_sha, str)
         or re.fullmatch(r"[0-9a-f]{64}", artifact_sha) is None
     ):
         raise HarnessError(f"exo_rs SHA-256 is missing on {host.name}")
+    expected_artifact_sha = config.runtime.host_pins[host.name].exo_rs_native_sha256
+    if artifact_sha != expected_artifact_sha:
+        raise HarnessError(f"exo_rs SHA-256 does not match the host pin on {host.name}")
 
     origin = report.facts.get("exo_import_origin")
     if not isinstance(origin, str) or not Path(origin).is_absolute():
@@ -1758,11 +1835,13 @@ def validated_runtime_identity(
         )
     relative_origin = str(resolved_origin.relative_to(source_directory))
     runtime_versions_json: JsonObject = {
-        distribution: version for distribution, version in runtime_versions.items()
+        distribution: runtime_versions[distribution]
+        for distribution in required_distributions
     }
     return {
         "runtime_versions": runtime_versions_json,
-        "exo_rs_sha256": artifact_sha,
+        "python_abi": cast(JsonValue, python_abi.model_dump(mode="json")),
+        "exo_rs_module": "exo_rs.exo_rs",
         "exo_import_relative_origin": relative_origin,
         "cuda_major": config.runtime.cuda_major,
     }
@@ -1831,6 +1910,7 @@ def validate_preflight(
     for fact_name in (
         "cpu_frequency_policy",
         "runtime_versions",
+        "python_abi",
         "exo_rs_artifact",
     ):
         fact = report.facts.get(fact_name)
@@ -3649,7 +3729,7 @@ def run_harness(
                 runtime_identity = observed_runtime_identity
             elif observed_runtime_identity != runtime_identity:
                 raise HarnessError(
-                    "native/Python runtime identity differs between the two hosts"
+                    "common Python/package runtime identity differs between the two hosts"
                 )
         preflight_complete = True
 
