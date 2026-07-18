@@ -21,8 +21,14 @@ from exo.shared.types.profiling import (
 )
 from exo.shared.types.state import State
 from exo.shared.types.topology import Connection, SocketConnection
-from exo.shared.types.worker.instances import InstanceMeta, MlxNcclInstance
-from exo.shared.types.worker.shards import Sharding
+from exo.shared.types.worker.instances import (
+    InstanceId,
+    InstanceMeta,
+    MlxNcclInstance,
+    MlxRingInstance,
+)
+from exo.shared.types.worker.runners import RunnerId, ShardAssignments
+from exo.shared.types.worker.shards import PipelineShardMetadata, Sharding
 
 
 def _memory() -> MemoryUsage:
@@ -241,3 +247,78 @@ async def test_create_instance_rejects_legacy_nccl_with_live_gpu_inventory() -> 
 
     assert raised.value.status_code == 400
     assert "explicit compute resource bindings" in str(raised.value.detail)
+
+
+async def test_create_instance_preserves_embedded_exact_model_revision() -> None:
+    node_id = NodeId("node-a")
+    runner_id = RunnerId("runner-a")
+    model_card = ModelCard(
+        model_id=ModelId("pinned-create-model"),
+        revision="a" * 40,
+        storage_size=Memory.from_bytes(9),
+        n_layers=1,
+        hidden_size=16,
+        supports_tensor=False,
+        tasks=[ModelTask.TextGeneration],
+        backends=[Backend.MlxMetal],
+    )
+    shard = PipelineShardMetadata(
+        model_card=model_card,
+        device_rank=0,
+        world_size=1,
+        start_layer=0,
+        end_layer=1,
+        n_layers=1,
+    )
+    instance = MlxRingInstance(
+        instance_id=InstanceId("pinned-create-instance"),
+        shard_assignments=ShardAssignments(
+            model_id=model_card.model_id,
+            runner_to_shard={runner_id: shard},
+            node_to_runner={node_id: runner_id},
+        ),
+        hosts_by_node={},
+        ephemeral_port=50000,
+    )
+    api = object.__new__(API)
+    api.state = State(node_memory={node_id: _memory()})
+
+    with (
+        patch.object(api, "_send", AsyncMock()) as send,
+        patch.object(
+            ModelCard,
+            "load",
+            AsyncMock(side_effect=AssertionError("must use embedded model card")),
+        ) as load,
+    ):
+        response = await api.create_instance(CreateInstanceParams(instance=instance))
+
+    load.assert_not_awaited()
+    send.assert_awaited_once()
+    assert response.model_card == model_card
+    assert response.model_card.revision == "a" * 40
+
+
+async def test_create_instance_rejects_empty_shard_assignments() -> None:
+    instance = MlxRingInstance(
+        instance_id=InstanceId("empty-create-instance"),
+        shard_assignments=ShardAssignments(
+            model_id=ModelId("empty-create-model"),
+            runner_to_shard={},
+            node_to_runner={},
+        ),
+        hosts_by_node={},
+        ephemeral_port=50000,
+    )
+    api = object.__new__(API)
+    api.state = State()
+
+    with (
+        patch.object(api, "_send", AsyncMock()) as send,
+        pytest.raises(HTTPException) as raised,
+    ):
+        await api.create_instance(CreateInstanceParams(instance=instance))
+
+    send.assert_not_awaited()
+    assert raised.value.status_code == 400
+    assert "without any shard assignments" in str(raised.value.detail)

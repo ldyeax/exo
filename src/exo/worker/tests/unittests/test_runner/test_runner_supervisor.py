@@ -7,8 +7,14 @@ import pytest
 from exo.shared.models.model_cards import ModelId
 from exo.shared.types.chunks import ErrorChunk
 from exo.shared.types.common import CommandId, NodeId
-from exo.shared.types.events import ChunkGenerated, Event, RunnerStatusUpdated
-from exo.shared.types.tasks import Task, TaskId, TextGeneration
+from exo.shared.types.events import (
+    ChunkGenerated,
+    Event,
+    RunnerStatusUpdated,
+    TaskAcknowledged,
+    TaskStatusUpdated,
+)
+from exo.shared.types.tasks import Task, TaskId, TaskStatus, TextGeneration
 from exo.shared.types.text_generation import (
     InputMessage,
     InputMessageContent,
@@ -128,6 +134,52 @@ async def test_wait_for_shutdown_forwarded_waits_for_terminal_status() -> None:
 
 
 @pytest.mark.anyio
+async def test_forwarded_task_status_is_authoritatively_attributed() -> None:
+    event_sender, event_receiver = channel[Event]()
+    runner_events = _RunnerEventReceiver(
+        [
+            TaskStatusUpdated(
+                task_id=TaskId("task-a"),
+                task_status=TaskStatus.Running,
+                runner_id=RunnerId("spoofed-runner"),
+            )
+        ]
+    )
+    supervisor = await _make_supervisor(event_sender, runner_events)
+
+    await supervisor._forward_events()  # pyright: ignore[reportPrivateUsage]
+    forwarded = await event_receiver.receive()
+
+    assert isinstance(forwarded, TaskStatusUpdated)
+    assert forwarded.runner_id == supervisor.bound_instance.bound_runner_id
+
+
+@pytest.mark.anyio
+async def test_task_ack_timeout_cleans_pending_and_late_ack_is_harmless() -> None:
+    event_sender, _ = channel[Event]()
+    runner_events = _RunnerEventReceiver([])
+    supervisor = await _make_supervisor(event_sender, runner_events)
+    supervisor.task_ack_timeout = 0.01
+    task = TextGeneration(
+        task_id=TaskId("timeout-task"),
+        instance_id=supervisor.bound_instance.instance.instance_id,
+        command_id=CommandId("timeout-command"),
+        task_params=TextGenerationTaskParams(
+            model=supervisor.shard_metadata.model_card.model_id,
+            input=[InputMessage(role="user", content=InputMessageContent("hi"))],
+        ),
+    )
+
+    with pytest.raises(TimeoutError):
+        await supervisor.start_task(task)
+
+    assert task.task_id not in supervisor.pending
+    runner_events.events.append(TaskAcknowledged(task_id=task.task_id))
+    await supervisor._forward_events()  # pyright: ignore[reportPrivateUsage]
+    assert supervisor.pending == {}
+
+
+@pytest.mark.anyio
 async def test_check_runner_emits_error_chunk_for_inflight_text_generation() -> None:
     event_sender, event_receiver = channel[Event]()
     task_sender, _ = mp_channel[Task]()
@@ -173,8 +225,14 @@ async def test_check_runner_emits_error_chunk_for_inflight_text_generation() -> 
 
     await supervisor._check_runner(RuntimeError("boom"))  # pyright: ignore[reportPrivateUsage]
 
+    got_task_status = await event_receiver.receive()
     got_chunk = await event_receiver.receive()
     got_status = await event_receiver.receive()
+
+    assert isinstance(got_task_status, TaskStatusUpdated)
+    assert got_task_status.task_id == task.task_id
+    assert got_task_status.task_status == TaskStatus.Failed
+    assert got_task_status.runner_id == bound_instance.bound_runner_id
 
     assert isinstance(got_chunk, ChunkGenerated)
     assert got_chunk.command_id == command_id

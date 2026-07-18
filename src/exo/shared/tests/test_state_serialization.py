@@ -3,9 +3,11 @@ import pytest
 from exo.shared.models.model_cards import ModelCard, ModelId, ModelTask
 from exo.shared.types.backends import Backend
 from exo.shared.types.common import Host, NodeId
+from exo.shared.types.events import TaskStatusUpdated
 from exo.shared.types.memory import Memory
 from exo.shared.types.multiaddr import Multiaddr
 from exo.shared.types.state import State
+from exo.shared.types.tasks import TaskId, TaskStatus
 from exo.shared.types.topology import Connection, SocketConnection
 from exo.shared.types.worker.instances import InstanceId, MlxNcclInstance
 from exo.shared.types.worker.runners import RunnerId, ShardAssignments
@@ -44,6 +46,38 @@ def test_state_serialization_roundtrip() -> None:
         restored_state.topology.to_snapshot().connections
     )
     assert restored_state.model_dump_json() == json_repr
+
+
+def test_old_and_rank_aware_task_status_json_are_compatible() -> None:
+    old_event = TaskStatusUpdated.model_validate_json(
+        '{"TaskStatusUpdated":{"taskId":"task-a","taskStatus":"Running"}}'
+    )
+    assert old_event.runner_id is None
+
+    new_event = TaskStatusUpdated(
+        task_id=TaskId("task-a"),
+        task_status=TaskStatus.Complete,
+        runner_id=RunnerId("runner-a"),
+    )
+    assert (
+        TaskStatusUpdated.model_validate_json(new_event.model_dump_json()) == new_event
+    )
+
+    legacy_state = State.model_validate_json("{}")
+    assert legacy_state.task_runner_statuses == {}
+
+    rank_aware_state = State(
+        task_runner_statuses={
+            TaskId("task-a"): {RunnerId("runner-a"): TaskStatus.Running}
+        }
+    )
+    restored_rank_aware_state = State.model_validate_json(
+        rank_aware_state.model_dump_json()
+    )
+    assert (
+        restored_rank_aware_state.task_runner_statuses
+        == rank_aware_state.task_runner_statuses
+    )
 
 
 def test_nccl_instance_state_serialization_roundtrip() -> None:

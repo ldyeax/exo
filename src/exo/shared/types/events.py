@@ -48,6 +48,7 @@ class TaskDeleted(BaseEvent):
 class TaskStatusUpdated(BaseEvent):
     task_id: TaskId
     task_status: TaskStatus
+    runner_id: RunnerId | None = None
 
 
 class TaskFailed(BaseEvent):

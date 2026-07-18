@@ -449,7 +449,15 @@ class API:
         self, payload: CreateInstanceParams
     ) -> CreateInstanceResponse:
         instance = payload.instance
-        model_card = await ModelCard.load(instance.shard_assignments.model_id)
+        try:
+            model_card = next(
+                iter(instance.shard_assignments.runner_to_shard.values())
+            ).model_card
+        except StopIteration as error:
+            raise HTTPException(
+                status_code=400,
+                detail="Cannot create an instance without any shard assignments",
+            ) from error
         try:
             validate_instance_compute_resources(
                 instance,
@@ -642,7 +650,9 @@ class API:
                     for _, node_id in sorted(
                         (
                             shard_assignments.runner_to_shard[
-                                shard_assignments.compute_resource_to_runner[resource_id]
+                                shard_assignments.compute_resource_to_runner[
+                                    resource_id
+                                ]
                             ].device_rank,
                             node_id,
                         )

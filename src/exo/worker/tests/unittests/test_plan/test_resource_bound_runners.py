@@ -11,7 +11,13 @@ from exo.shared.types.compute_resources import (
     ComputeResource,
     NvidiaGpuComputeResource,
 )
-from exo.shared.types.events import IndexedEvent, InstanceDeleted
+from exo.shared.types.events import (
+    Event,
+    IndexedEvent,
+    InstanceDeleted,
+    RunnerStatusUpdated,
+    TaskStatusUpdated,
+)
 from exo.shared.types.memory import Memory
 from exo.shared.types.state import State
 from exo.shared.types.tasks import (
@@ -31,6 +37,7 @@ from exo.shared.types.text_generation import (
 from exo.shared.types.worker.downloads import DownloadCompleted
 from exo.shared.types.worker.instances import BoundInstance, InstanceId, MlxNcclInstance
 from exo.shared.types.worker.runners import (
+    RunnerFailed,
     RunnerId,
     RunnerIdle,
     RunnerLoaded,
@@ -70,6 +77,18 @@ class _BlockingRunner(_RecordingRunner):
     async def start_task(self, task: Task) -> None:
         self.started.append(task)
         await anyio.sleep_forever()
+
+
+class _RaisingRunner(_RecordingRunner):
+    async def start_task(self, task: Task) -> None:
+        self.started.append(task)
+        raise RuntimeError("rank start failed")
+
+
+class _TimeoutRunner(_RecordingRunner):
+    async def start_task(self, task: Task) -> None:
+        self.started.append(task)
+        raise TimeoutError
 
 
 class _EventApplierTestWorker(Worker):
@@ -486,4 +505,127 @@ async def test_generation_task_start_timeout_is_contained_per_local_rank() -> No
     assert second_runner.started == [task]
     assert len(failures) == 1
     assert failures[0].runner_id == runner_ids[1]
+    assert failures[0].task_status == TaskStatus.TimedOut
     assert "Timed out after 0.01s" in failures[0].error_message
+
+
+@pytest.mark.parametrize(
+    ("failed_runner_type", "expected_task_status"),
+    [
+        (_RaisingRunner, TaskStatus.Failed),
+        (_TimeoutRunner, TaskStatus.TimedOut),
+    ],
+)
+@pytest.mark.anyio
+async def test_one_local_rank_failure_is_attributed_without_cancelling_sibling(
+    failed_runner_type: type[_RecordingRunner],
+    expected_task_status: TaskStatus,
+) -> None:
+    instance, runner_ids, _ = _resource_bound_instance()
+    task = TextGeneration(
+        task_id=TaskId("contained-generation-task"),
+        instance_id=instance.instance_id,
+        command_id=CommandId("contained-generation-command"),
+        task_params=TextGenerationTaskParams(
+            model=instance.shard_assignments.model_id,
+            input=[InputMessage(role="user", content=InputMessageContent("test"))],
+        ),
+    )
+    healthy_runner = _RecordingRunner(
+        BoundInstance(
+            instance=instance,
+            bound_runner_id=runner_ids[0],
+            bound_node_id=DWAGON,
+        )
+    )
+    failed_runner = failed_runner_type(
+        BoundInstance(
+            instance=instance,
+            bound_runner_id=runner_ids[1],
+            bound_node_id=DWAGON,
+        )
+    )
+    event_sender, event_receiver = channel[Event]()
+    worker = object.__new__(Worker)
+    worker.node_id = DWAGON
+    worker.state = State(instances={instance.instance_id: instance})
+    worker.runners = cast(
+        dict[RunnerId, RunnerSupervisor],
+        cast(
+            object,
+            {runner_ids[0]: healthy_runner, runner_ids[1]: failed_runner},
+        ),
+    )
+    worker.event_sender = event_sender
+
+    await worker._start_runner_task(task)  # pyright: ignore[reportPrivateUsage]
+
+    task_status = await event_receiver.receive()
+    runner_status = await event_receiver.receive()
+    assert healthy_runner.started == [task]
+    assert isinstance(task_status, TaskStatusUpdated)
+    assert task_status.runner_id == runner_ids[1]
+    assert task_status.task_status == expected_task_status
+    assert isinstance(runner_status, RunnerStatusUpdated)
+    assert runner_status.runner_id == runner_ids[1]
+    assert isinstance(runner_status.runner_status, RunnerFailed)
+
+
+def test_planner_keeps_dispatching_running_task_to_unfinished_local_rank() -> None:
+    instance, runner_ids, resources = _resource_bound_instance()
+    task = TextGeneration(
+        task_id=TaskId("partially-complete-generation-task"),
+        instance_id=instance.instance_id,
+        task_status=TaskStatus.Running,
+        command_id=CommandId("partially-complete-generation-command"),
+        task_params=TextGenerationTaskParams(
+            model=instance.shard_assignments.model_id,
+            input=[InputMessage(role="user", content=InputMessageContent("test"))],
+        ),
+    )
+    runners = {
+        runner_id: FakeRunnerSupervisor(
+            bound_instance=BoundInstance(
+                instance=instance,
+                bound_runner_id=runner_id,
+                bound_node_id=DWAGON,
+            ),
+            status=RunnerReady(),
+            completed={task.task_id} if rank == 0 else set(),
+        )
+        for rank, runner_id in enumerate(runner_ids[:2])
+    }
+    all_runners = {runner_id: RunnerReady() for runner_id in runner_ids}
+
+    planned = plan(
+        node_id=DWAGON,
+        runners=cast(Mapping[RunnerId, RunnerSupervisor], cast(object, runners)),
+        global_download_status={},
+        instances={instance.instance_id: instance},
+        all_runners=all_runners,
+        tasks={task.task_id: task},
+        input_chunk_buffer={},
+        image_cache={},
+        instance_backoff=KeyedBackoff(),
+        download_backoff=KeyedBackoff(),
+        node_compute_resources=resources,
+        runner_backoff=KeyedBackoff(),
+    )
+    assert planned is task
+
+    runners[runner_ids[1]].completed.add(task.task_id)
+    planned = plan(
+        node_id=DWAGON,
+        runners=cast(Mapping[RunnerId, RunnerSupervisor], cast(object, runners)),
+        global_download_status={},
+        instances={instance.instance_id: instance},
+        all_runners=all_runners,
+        tasks={task.task_id: task},
+        input_chunk_buffer={},
+        image_cache={},
+        instance_backoff=KeyedBackoff(),
+        download_backoff=KeyedBackoff(),
+        node_compute_resources=resources,
+        runner_backoff=KeyedBackoff(),
+    )
+    assert planned is None

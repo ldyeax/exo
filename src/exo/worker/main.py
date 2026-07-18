@@ -80,6 +80,7 @@ RUNNER_TASK_START_TIMEOUT_SECONDS = 30.0
 @dataclass(frozen=True)
 class RunnerTaskStartFailure:
     runner_id: RunnerId
+    task_status: TaskStatus
     error_message: str
 
 
@@ -128,6 +129,7 @@ async def start_local_runner_task(
             failures.append(
                 RunnerTaskStartFailure(
                     runner_id=runner_id,
+                    task_status=TaskStatus.TimedOut,
                     error_message=(
                         f"Timed out after {timeout_seconds:g}s while starting "
                         f"{task.__class__.__name__}"
@@ -138,6 +140,7 @@ async def start_local_runner_task(
             failures.append(
                 RunnerTaskStartFailure(
                     runner_id=runner_id,
+                    task_status=TaskStatus.Failed,
                     error_message=(
                         f"{type(error).__qualname__} while starting "
                         f"{task.__class__.__name__}: {error}"
@@ -145,8 +148,8 @@ async def start_local_runner_task(
                 )
             )
 
-    # All local ranks receive generation work before any shared task-completion
-    # update can suppress local dispatch. Global completion is still not rank-aware.
+    # Start every eligible local rank independently so one failed rank does not
+    # cancel a sibling that has already acknowledged the same generation task.
     async with anyio.create_task_group() as task_group:
         for runner_id in runner_ids:
             task_group.start_soon(start_runner_task, runner_id)
@@ -414,6 +417,7 @@ class Worker:
                                 TaskStatusUpdated(
                                     task_id=task.task_id,
                                     task_status=TaskStatus.TimedOut,
+                                    runner_id=runner_id,
                                 )
                             )
                         await self.event_sender.send(
@@ -522,6 +526,13 @@ class Worker:
                 logger.error(
                     f"Runner {failure.runner_id} task start failed: "
                     f"{failure.error_message}"
+                )
+                await self.event_sender.send(
+                    TaskStatusUpdated(
+                        task_id=task.task_id,
+                        task_status=failure.task_status,
+                        runner_id=failure.runner_id,
+                    )
                 )
                 await self.event_sender.send(
                     RunnerStatusUpdated(
