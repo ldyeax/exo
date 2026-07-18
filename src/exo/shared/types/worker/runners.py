@@ -115,4 +115,18 @@ class ShardAssignments(FrozenModel):
                 raise ValueError(
                     f"Compute resource {resource_id} is owned by unknown node {node_id}"
                 )
+
+        model_cards = [shard.model_card for shard in self.runner_to_shard.values()]
+        for model_card in model_cards:
+            if model_card.model_id != self.model_id:
+                raise ValueError(
+                    f"Shard model card {model_card.model_id} does not match "
+                    f"assignment model {self.model_id}"
+                )
+        if model_cards and any(
+            model_card != model_cards[0] for model_card in model_cards[1:]
+        ):
+            raise ValueError(
+                "All runner shards must carry the same complete model card and revision"
+            )
         return self

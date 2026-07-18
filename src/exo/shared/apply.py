@@ -41,7 +41,20 @@ from exo.shared.types.profiling import (
     ThunderboltBridgeStatus,
 )
 from exo.shared.types.state import State
-from exo.shared.types.tasks import Task, TaskId, TaskStatus
+from exo.shared.types.tasks import (
+    CancelTask,
+    ConnectToGroup,
+    CreateRunner,
+    ImageEdits,
+    ImageGeneration,
+    LoadModel,
+    Shutdown,
+    StartWarmup,
+    Task,
+    TaskId,
+    TaskStatus,
+    TextGeneration,
+)
 from exo.shared.types.topology import Connection, RDMAConnection
 from exo.shared.types.worker.downloads import DownloadProgress
 from exo.shared.types.worker.instances import Instance, InstanceId
@@ -170,15 +183,104 @@ def apply_node_download_progress(event: NodeDownloadProgress, state: State) -> S
 
 
 def apply_task_created(event: TaskCreated, state: State) -> State:
+    existing_task = state.tasks.get(event.task_id)
+    if existing_task is not None:
+        if existing_task != event.task:
+            raise ValueError(f"Task {event.task_id} was created with conflicting data")
+        return state
+
     new_tasks: Mapping[TaskId, Task] = {**state.tasks, event.task_id: event.task}
-    return state.model_copy(update={"tasks": new_tasks})
+    expected_runner_ids = _expected_task_runner_ids(event.task, state)
+    new_task_runner_statuses = {
+        **state.task_runner_statuses,
+        event.task_id: {
+            runner_id: event.task.task_status for runner_id in expected_runner_ids
+        },
+    }
+    return state.model_copy(
+        update={
+            "tasks": new_tasks,
+            "task_runner_statuses": new_task_runner_statuses,
+        }
+    )
 
 
 def apply_task_deleted(event: TaskDeleted, state: State) -> State:
     new_tasks: Mapping[TaskId, Task] = {
         tid: task for tid, task in state.tasks.items() if tid != event.task_id
     }
-    return state.model_copy(update={"tasks": new_tasks})
+    new_task_runner_statuses = {
+        task_id: statuses
+        for task_id, statuses in state.task_runner_statuses.items()
+        if task_id != event.task_id
+    }
+    return state.model_copy(
+        update={
+            "tasks": new_tasks,
+            "task_runner_statuses": new_task_runner_statuses,
+        }
+    )
+
+
+_TERMINAL_TASK_STATUSES = frozenset(
+    {
+        TaskStatus.Complete,
+        TaskStatus.TimedOut,
+        TaskStatus.Failed,
+        TaskStatus.Cancelled,
+    }
+)
+
+
+def _expected_task_runner_ids(task: Task, state: State) -> tuple[RunnerId, ...]:
+    instance = state.instances.get(task.instance_id)
+    match task:
+        case TextGeneration() | ImageGeneration() | ImageEdits():
+            if instance is None:
+                return ()
+            return tuple(instance.shard_assignments.runner_to_shard)
+        case CreateRunner(bound_instance=bound_instance):
+            return (bound_instance.bound_runner_id,)
+        case (
+            ConnectToGroup(runner_id=runner_id)
+            | LoadModel(runner_id=runner_id)
+            | StartWarmup(runner_id=runner_id)
+        ) if runner_id is not None:
+            return (runner_id,)
+        case CancelTask(runner_id=runner_id) | Shutdown(runner_id=runner_id):
+            return (runner_id,)
+        case _:
+            return ()
+
+
+def _advance_runner_task_status(
+    current: TaskStatus, incoming: TaskStatus
+) -> TaskStatus:
+    if current in _TERMINAL_TASK_STATUSES:
+        return current
+    if incoming in _TERMINAL_TASK_STATUSES:
+        return incoming
+    if current == TaskStatus.Running and incoming == TaskStatus.Pending:
+        return current
+    return incoming
+
+
+def _aggregate_runner_task_statuses(
+    statuses: Mapping[RunnerId, TaskStatus],
+) -> TaskStatus:
+    values = tuple(statuses.values())
+    for terminal_status in (
+        TaskStatus.Failed,
+        TaskStatus.TimedOut,
+        TaskStatus.Cancelled,
+    ):
+        if terminal_status in values:
+            return terminal_status
+    if values and all(status == TaskStatus.Complete for status in values):
+        return TaskStatus.Complete
+    if any(status != TaskStatus.Pending for status in values):
+        return TaskStatus.Running
+    return TaskStatus.Pending
 
 
 def apply_task_status_updated(event: TaskStatusUpdated, state: State) -> State:
@@ -186,16 +288,76 @@ def apply_task_status_updated(event: TaskStatusUpdated, state: State) -> State:
         # maybe should raise
         return state
 
-    update: dict[str, TaskStatus | None] = {
-        "task_status": event.task_status,
-    }
-    if event.task_status != TaskStatus.Failed:
+    task = state.tasks[event.task_id]
+    if event.runner_id is None:
+        next_status = (
+            task.task_status
+            if task.task_status in _TERMINAL_TASK_STATUSES
+            else event.task_status
+        )
+        update: dict[str, object] = {"task_status": next_status}
+        if next_status != TaskStatus.Failed:
+            update["error_type"] = None
+            update["error_message"] = None
+        updated_task = task.model_copy(update=update)
+        legacy_tasks: Mapping[TaskId, Task] = {
+            **state.tasks,
+            event.task_id: updated_task,
+        }
+        return state.model_copy(update={"tasks": legacy_tasks})
+
+    instance = state.instances.get(task.instance_id)
+    expected_runner_ids = _expected_task_runner_ids(task, state)
+    current_statuses = dict(state.task_runner_statuses.get(event.task_id, {}))
+    assigned_runner_ids: set[RunnerId] = (
+        set(instance.shard_assignments.runner_to_shard)
+        if instance is not None
+        else set()
+    )
+    known_runner_ids: set[RunnerId] = (
+        set(expected_runner_ids) or assigned_runner_ids or set(current_statuses)
+    )
+    if event.runner_id not in known_runner_ids:
+        raise ValueError(
+            f"Runner {event.runner_id} is not expected for task {event.task_id}"
+        )
+
+    if not current_statuses and expected_runner_ids:
+        current_statuses = {
+            runner_id: TaskStatus.Pending for runner_id in expected_runner_ids
+        }
+    if expected_runner_ids and event.runner_id not in expected_runner_ids:
+        raise ValueError(
+            f"Runner {event.runner_id} is not expected for task {event.task_id}"
+        )
+
+    current_runner_status = current_statuses.get(event.runner_id, TaskStatus.Pending)
+    current_statuses[event.runner_id] = _advance_runner_task_status(
+        current_runner_status, event.task_status
+    )
+    aggregate_status = _aggregate_runner_task_statuses(current_statuses)
+    next_status = (
+        task.task_status
+        if task.task_status in _TERMINAL_TASK_STATUSES
+        else aggregate_status
+    )
+    update = {"task_status": next_status}
+    if next_status != TaskStatus.Failed:
         update["error_type"] = None
         update["error_message"] = None
 
-    updated_task = state.tasks[event.task_id].model_copy(update=update)
+    updated_task = task.model_copy(update=update)
     new_tasks: Mapping[TaskId, Task] = {**state.tasks, event.task_id: updated_task}
-    return state.model_copy(update={"tasks": new_tasks})
+    new_task_runner_statuses = {
+        **state.task_runner_statuses,
+        event.task_id: current_statuses,
+    }
+    return state.model_copy(
+        update={
+            "tasks": new_tasks,
+            "task_runner_statuses": new_task_runner_statuses,
+        }
+    )
 
 
 def apply_task_failed(event: TaskFailed, state: State) -> State:

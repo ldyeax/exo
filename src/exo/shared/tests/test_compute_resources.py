@@ -144,3 +144,49 @@ def test_shard_assignments_reject_unknown_resource_owner() -> None:
             compute_resource_to_runner={resource_id: runner_id},
             compute_resource_to_node={resource_id: NodeId("node-b")},
         )
+
+
+def test_shard_assignments_reject_shard_model_id_mismatch() -> None:
+    shard = get_pipeline_shard_metadata(ModelId("shard-model"), device_rank=0)
+
+    with pytest.raises(ValueError, match="does not match assignment model"):
+        ShardAssignments(
+            model_id=ModelId("assignment-model"),
+            runner_to_shard={RunnerId("runner-a"): shard},
+            node_to_runner={NodeId("node-a"): RunnerId("runner-a")},
+        )
+
+
+@pytest.mark.parametrize(
+    "model_card_update",
+    [
+        {"revision": "b" * 40},
+        {"quantization": "different-quantization"},
+    ],
+)
+def test_shard_assignments_require_identical_full_model_cards(
+    model_card_update: dict[str, str],
+) -> None:
+    first_shard = get_pipeline_shard_metadata(
+        ModelId("same-model"), device_rank=0, world_size=2
+    )
+    second_shard = get_pipeline_shard_metadata(
+        ModelId("same-model"), device_rank=1, world_size=2
+    ).model_copy(
+        update={
+            "model_card": first_shard.model_card.model_copy(update=model_card_update)
+        }
+    )
+
+    with pytest.raises(ValueError, match="same complete model card and revision"):
+        ShardAssignments(
+            model_id=ModelId("same-model"),
+            runner_to_shard={
+                RunnerId("runner-a"): first_shard,
+                RunnerId("runner-b"): second_shard,
+            },
+            node_to_runner={
+                NodeId("node-a"): RunnerId("runner-a"),
+                NodeId("node-b"): RunnerId("runner-b"),
+            },
+        )

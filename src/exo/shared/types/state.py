@@ -21,7 +21,7 @@ from exo.shared.types.profiling import (
     SystemPerformanceProfile,
     ThunderboltBridgeStatus,
 )
-from exo.shared.types.tasks import Task, TaskId
+from exo.shared.types.tasks import Task, TaskId, TaskStatus
 from exo.shared.types.worker.downloads import DownloadProgress
 from exo.shared.types.worker.instances import Instance, InstanceId
 from exo.shared.types.worker.runners import RunnerId, RunnerStatus
@@ -48,6 +48,7 @@ class State(FrozenModel):
     runners: Mapping[RunnerId, RunnerStatus] = {}
     downloads: Mapping[NodeId, Sequence[DownloadProgress]] = {}
     tasks: Mapping[TaskId, Task] = {}
+    task_runner_statuses: Mapping[TaskId, Mapping[RunnerId, TaskStatus]] = {}
     last_seen: Mapping[NodeId, datetime] = {}
     topology: Topology = Field(default_factory=Topology)
     last_event_applied_idx: int = Field(default=-1, ge=-1)

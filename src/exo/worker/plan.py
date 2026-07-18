@@ -406,9 +406,6 @@ def _pending_tasks(
             if task.instance_id != runner.bound_instance.instance.instance_id:
                 continue
 
-            # the task status _should_ be set to completed by the LAST runner
-            # it is currently set by the first
-            # this is definitely a hack
             if task.task_id in runner.completed or task.task_id in runner.in_progress:
                 continue
 

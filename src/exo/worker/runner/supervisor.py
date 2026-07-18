@@ -57,6 +57,7 @@ from exo.worker.runner.diagnostics import (
 
 PREFILL_TIMEOUT_SECONDS = 60
 DECODE_TIMEOUT_SECONDS = 5
+TASK_ACK_TIMEOUT_SECONDS = 30.0
 
 
 @dataclass(eq=False)
@@ -190,6 +191,7 @@ class RunnerSupervisor:
     _task_sender: MpSender[Task]
     _event_sender: Sender[Event]
     _cancel_sender: MpSender[TaskId]
+    task_ack_timeout: float = TASK_ACK_TIMEOUT_SECONDS
     _tg: TaskGroup = field(default_factory=TaskGroup, init=False)
     status: RunnerStatus = field(default_factory=RunnerIdle, init=False)
     pending: dict[TaskId, anyio.Event] = field(default_factory=dict, init=False)
@@ -208,6 +210,7 @@ class RunnerSupervisor:
         bound_instance: BoundInstance,
         event_sender: Sender[Event],
         initialize_timeout: float = 400,
+        task_ack_timeout: float = TASK_ACK_TIMEOUT_SECONDS,
     ) -> Self:
         ev_send, ev_recv = mp_channel[Event | RunnerTerminationError]()
         task_sender, task_recv = mp_channel[Task]()
@@ -240,6 +243,7 @@ class RunnerSupervisor:
             _task_sender=task_sender,
             _cancel_sender=cancel_sender,
             _event_sender=event_sender,
+            task_ack_timeout=task_ack_timeout,
         )
 
         return self
@@ -292,16 +296,22 @@ class RunnerSupervisor:
             )
             return
         logger.info(f"Starting task {task}")
-        event = anyio.Event()
-        self.pending[task.task_id] = event
+        acknowledgement = anyio.Event()
+        self.pending[task.task_id] = acknowledgement
         self.in_progress[task.task_id] = task
         try:
             await self._task_sender.send_async(task)
-        except ClosedResourceError:
+        except ClosedResourceError as error:
+            self.pending.pop(task.task_id, None)
             self.in_progress.pop(task.task_id, None)
             logger.warning(f"Task {task} dropped, runner closed communication.")
-            return
-        await event.wait()
+            raise BrokenResourceError from error
+        try:
+            with anyio.fail_after(self.task_ack_timeout):
+                await acknowledgement.wait()
+        finally:
+            if self.pending.get(task.task_id) is acknowledgement:
+                self.pending.pop(task.task_id, None)
 
     async def cancel_task(self, task_id: TaskId):
         if task_id in self.completed:
@@ -332,23 +342,38 @@ class RunnerSupervisor:
                     if isinstance(event, RunnerStatusUpdated):
                         self.status = event.runner_status
                     if isinstance(event, TaskAcknowledged):
-                        self.pending.pop(event.task_id).set()
+                        acknowledgement = self.pending.pop(event.task_id, None)
+                        if acknowledgement is None:
+                            logger.debug(
+                                f"Ignoring late task acknowledgement for {event.task_id}"
+                            )
+                        else:
+                            acknowledgement.set()
                         continue
-                    if (
-                        isinstance(event, TaskStatusUpdated)
-                        and event.task_status == TaskStatus.Complete
-                    ):
-                        # If a task has just been completed, we should be working on it.
-                        assert isinstance(
-                            self.status,
-                            (
-                                RunnerRunning,
-                                RunnerWarmingUp,
-                                RunnerLoading,
-                                RunnerConnecting,
-                                RunnerShuttingDown,
-                            ),
+                    if isinstance(event, TaskStatusUpdated):
+                        event = event.model_copy(
+                            update={
+                                "runner_id": self.bound_instance.bound_runner_id,
+                            }
                         )
+                    if isinstance(event, TaskStatusUpdated) and event.task_status in {
+                        TaskStatus.Complete,
+                        TaskStatus.TimedOut,
+                        TaskStatus.Failed,
+                        TaskStatus.Cancelled,
+                    }:
+                        # If a task has just been completed, we should be working on it.
+                        if event.task_status == TaskStatus.Complete:
+                            assert isinstance(
+                                self.status,
+                                (
+                                    RunnerRunning,
+                                    RunnerWarmingUp,
+                                    RunnerLoading,
+                                    RunnerConnecting,
+                                    RunnerShuttingDown,
+                                ),
+                            )
                         self.in_progress.pop(event.task_id, None)
                         self.completed.add(event.task_id)
                     await self._event_sender.send(event)
@@ -360,8 +385,10 @@ class RunnerSupervisor:
             # this is the happy path shutdown - we don't need to spam log with it
             await self._check_runner()
         finally:
-            for tid in self.pending:
-                self.pending[tid].set()
+            pending_acknowledgements = tuple(self.pending.values())
+            self.pending.clear()
+            for acknowledgement in pending_acknowledgements:
+                acknowledgement.set()
 
     async def _watch_runner(self) -> None:
         with self._cancel_watch_runner:
@@ -414,24 +441,34 @@ class RunnerSupervisor:
             for d in self._runner_stdio_handler.diagnostics.diagnostics()
             if not isinstance(d, RunnerUnknown)
         ]
-        for task in self.in_progress.values():
-            if isinstance(task, (TextGeneration, ImageGeneration, ImageEdits)):
+        in_progress_tasks = tuple(self.in_progress.values())
+        try:
+            for task in in_progress_tasks:
                 with anyio.CancelScope(shield=True):
                     await self._event_sender.send(
-                        ChunkGenerated(
-                            command_id=task.command_id,
-                            chunk=ErrorChunk(
-                                model=self.shard_metadata.model_card.model_id,
-                                diagnostics=diagnostics,
-                                error_message=(
-                                    "Runner shutdown before completing command "
-                                    f"({cause})"
-                                ),
-                            ),
+                        TaskStatusUpdated(
+                            task_id=task.task_id,
+                            task_status=TaskStatus.Failed,
+                            runner_id=self.bound_instance.bound_runner_id,
                         )
                     )
-
-        try:
+                if isinstance(task, (TextGeneration, ImageGeneration, ImageEdits)):
+                    with anyio.CancelScope(shield=True):
+                        await self._event_sender.send(
+                            ChunkGenerated(
+                                command_id=task.command_id,
+                                chunk=ErrorChunk(
+                                    model=self.shard_metadata.model_card.model_id,
+                                    diagnostics=diagnostics,
+                                    error_message=(
+                                        "Runner shutdown before completing command "
+                                        f"({cause})"
+                                    ),
+                                ),
+                            )
+                        )
+            self.in_progress.clear()
+            self.completed.update(task.task_id for task in in_progress_tasks)
             self.status = RunnerFailed(
                 error_message=f"Terminated ({cause})", diagnostics=diagnostics
             )
