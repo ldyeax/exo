@@ -1,9 +1,11 @@
 import asyncio
+import contextlib
 import hashlib
 import os
 import random
 import shutil
 import ssl
+import tempfile
 import time
 import traceback
 from collections.abc import Awaitable, Mapping
@@ -21,7 +23,10 @@ from huggingface_hub import (
 )
 from loguru import logger
 from pydantic import (
+    BaseModel,
+    ConfigDict,
     TypeAdapter,
+    ValidationError,
 )
 
 from exo.download.huggingface_utils import (
@@ -36,7 +41,13 @@ from exo.shared.constants import (
     EXO_MODELS_DIRS,
     EXO_MODELS_READ_ONLY_DIRS,
 )
-from exo.shared.models.model_cards import ModelCard, ModelTask
+from exo.shared.models.model_cards import (
+    MODEL_REVISION_RECEIPT_FILENAME,
+    HuggingFaceRevision,
+    ModelCard,
+    ModelTask,
+    model_directory_name,
+)
 from exo.shared.types.common import ModelId
 from exo.shared.types.memory import Memory
 from exo.shared.types.worker.downloads import (
@@ -149,8 +160,180 @@ class InsufficientDiskSpaceError(Exception):
     """Raised when no writable model directory has enough free space."""
 
 
+class ModelRevisionMismatchError(Exception):
+    """Raised when a pinned model directory has no trustworthy revision receipt."""
+
+
+class _ModelRevisionReceipt(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    repo_id: str
+    revision: HuggingFaceRevision
+
+
+_REVISION_RECEIPT_FILENAME = MODEL_REVISION_RECEIPT_FILENAME
+_HUGGING_FACE_DOWNLOAD_METADATA_DIR = Path(".cache/huggingface/download")
+
+
+def _verify_model_revision_receipt(
+    model_dir: Path, model_id: ModelId, revision: HuggingFaceRevision
+) -> None:
+    if revision == "main":
+        if (model_dir / _REVISION_RECEIPT_FILENAME).exists():
+            raise ModelRevisionMismatchError(
+                f"Legacy main model directory {model_dir} contains a pinned revision "
+                "receipt and cannot be reused as main"
+            )
+        return
+
+    receipt_path = model_dir / _REVISION_RECEIPT_FILENAME
+    if not receipt_path.exists():
+        if not any(model_dir.iterdir()):
+            return
+        _verify_hugging_face_local_dir_metadata(model_dir, model_id, revision)
+        return
+    try:
+        receipt = _ModelRevisionReceipt.model_validate_json(receipt_path.read_text())
+    except (OSError, ValidationError) as error:
+        raise ModelRevisionMismatchError(
+            f"Pinned model directory {model_dir} has no valid revision receipt for "
+            f"{model_id}@{revision}"
+        ) from error
+    if receipt.repo_id != str(model_id) or receipt.revision != revision:
+        raise ModelRevisionMismatchError(
+            f"Pinned model directory {model_dir} belongs to "
+            f"{receipt.repo_id}@{receipt.revision}, not {model_id}@{revision}"
+        )
+
+
+def _bind_model_revision(
+    model_dir: Path, model_id: ModelId, revision: HuggingFaceRevision
+) -> None:
+    """Atomically bind an empty pinned directory before any files are reused."""
+    if revision == "main":
+        _verify_model_revision_receipt(model_dir, model_id, revision)
+        return
+
+    model_dir.mkdir(parents=True, exist_ok=True)
+    receipt_path = model_dir / _REVISION_RECEIPT_FILENAME
+    if receipt_path.exists():
+        _verify_model_revision_receipt(model_dir, model_id, revision)
+        return
+    if any(model_dir.iterdir()):
+        _verify_hugging_face_local_dir_metadata(model_dir, model_id, revision)
+
+    receipt = _ModelRevisionReceipt(repo_id=str(model_id), revision=revision)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{model_dir.name}.revision-", dir=model_dir.parent
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w") as temporary_file:
+            temporary_file.write(receipt.model_dump_json())
+            temporary_file.flush()
+            os.fsync(temporary_file.fileno())
+        with contextlib.suppress(FileExistsError):
+            os.link(temporary_path, receipt_path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+    _verify_model_revision_receipt(model_dir, model_id, revision)
+
+
+def _verify_hugging_face_local_dir_metadata(
+    model_dir: Path, model_id: ModelId, revision: HuggingFaceRevision
+) -> None:
+    """Verify an existing ``hf download --local-dir`` snapshot before adoption."""
+    metadata_root = model_dir / _HUGGING_FACE_DOWNLOAD_METADATA_DIR
+    model_files: list[Path] = []
+    for path in model_dir.rglob("*"):
+        relative_path = path.relative_to(model_dir)
+        if relative_path.is_relative_to(_HUGGING_FACE_DOWNLOAD_METADATA_DIR):
+            continue
+        if path.is_symlink():
+            raise ModelRevisionMismatchError(
+                f"Refusing to adopt pinned model directory {model_dir} with symlink {path}"
+            )
+        if path.is_file() and path.name != _REVISION_RECEIPT_FILENAME:
+            model_files.append(relative_path)
+
+    if not model_files:
+        raise ModelRevisionMismatchError(
+            f"Refusing to adopt nonempty pinned model directory {model_dir} without "
+            f"downloaded files for {model_id}@{revision}"
+        )
+
+    metadata_files = list(metadata_root.rglob("*.metadata"))
+    if not metadata_files:
+        raise ModelRevisionMismatchError(
+            f"Refusing to adopt pinned model directory {model_dir} without Hugging Face "
+            f"local-dir metadata for {model_id}@{revision}"
+        )
+
+    def metadata_revision(metadata_path: Path) -> str:
+        try:
+            first_line = metadata_path.read_text().splitlines()[0]
+        except (OSError, IndexError) as error:
+            raise ModelRevisionMismatchError(
+                f"Invalid Hugging Face metadata file {metadata_path}"
+            ) from error
+        return first_line
+
+    mixed_metadata = [
+        path for path in metadata_files if metadata_revision(path) != revision
+    ]
+    if mixed_metadata:
+        raise ModelRevisionMismatchError(
+            f"Pinned model directory {model_dir} contains Hugging Face metadata for a "
+            f"different revision: {mixed_metadata[0]}"
+        )
+
+    missing_metadata = [
+        relative_path
+        for relative_path in model_files
+        if not (metadata_root / f"{relative_path}.metadata").is_file()
+    ]
+    if missing_metadata:
+        raise ModelRevisionMismatchError(
+            f"Pinned model directory {model_dir} has files without Hugging Face revision "
+            f"metadata: {missing_metadata[0]}"
+        )
+
+
+def migrate_hugging_face_local_dir_to_pinned_revision(
+    models_dir: Path, model_id: ModelId, revision: HuggingFaceRevision
+) -> Path:
+    """Atomically move a verified legacy HF local-dir snapshot to its pinned path.
+
+    This performs no copy. The source is left untouched unless all model files
+    have exact, nonmixed Hugging Face commit metadata and the destination is absent.
+    """
+    validated_revision = _ModelRevisionReceipt(
+        repo_id=str(model_id), revision=revision
+    ).revision
+    if validated_revision == "main":
+        raise ValueError("Migration requires an exact 40-hex Hugging Face revision")
+
+    source = models_dir / model_directory_name(model_id)
+    destination = models_dir / model_directory_name(model_id, validated_revision)
+    if not source.is_dir():
+        raise FileNotFoundError(f"Legacy Hugging Face local-dir not found: {source}")
+    if destination.exists():
+        raise FileExistsError(f"Pinned model destination already exists: {destination}")
+    if (source / _REVISION_RECEIPT_FILENAME).exists():
+        raise ModelRevisionMismatchError(
+            f"Legacy source directory {source} already contains an Exo revision receipt"
+        )
+
+    _verify_hugging_face_local_dir_metadata(source, model_id, validated_revision)
+    source.rename(destination)
+    _bind_model_revision(destination, model_id, validated_revision)
+    return destination
+
+
 def resolve_existing_model(
-    model_id: ModelId, card: ModelCard | None = None
+    model_id: ModelId,
+    card: ModelCard | None = None,
+    revision: HuggingFaceRevision | None = None,
 ) -> Path | None:
     """Search all model directories for a complete, pre-existing model.
 
@@ -158,10 +341,20 @@ def resolve_existing_model(
     A candidate is only returned if ``is_model_directory_complete`` confirms
     all weight files are present.
     """
-    normalized = model_id.normalize()
+    if card is not None:
+        if revision is not None and revision != card.revision:
+            raise ValueError("card and explicit Hugging Face revisions disagree")
+        revision = card.revision
+    expected_revision = revision or "main"
+    directory_name = model_directory_name(model_id, expected_revision)
     for search_dir in (*EXO_MODELS_READ_ONLY_DIRS, *EXO_MODELS_DIRS):
-        candidate = search_dir / normalized
-        if candidate.is_dir() and is_model_directory_complete(candidate, card):
+        candidate = search_dir / directory_name
+        if candidate.is_dir() and is_model_directory_complete(
+            candidate,
+            card,
+            model_id=model_id,
+            revision=expected_revision,
+        ):
             return candidate
     return None
 
@@ -171,11 +364,11 @@ def is_read_only_model_dir(model_dir: Path) -> bool:
     return any(model_dir.is_relative_to(d) for d in EXO_MODELS_READ_ONLY_DIRS)
 
 
-def build_model_path(model_id: ModelId) -> Path:
-    found = resolve_existing_model(model_id)
+def build_model_path(model_id: ModelId, revision: HuggingFaceRevision = "main") -> Path:
+    found = resolve_existing_model(model_id, revision=revision)
     if found is not None:
         return found
-    return EXO_DEFAULT_MODELS_DIR / model_id.normalize()
+    return EXO_DEFAULT_MODELS_DIR / model_directory_name(model_id, revision)
 
 
 def select_download_dir(required_bytes: int) -> Path:
@@ -202,13 +395,15 @@ async def select_download_dir_for_shard(
     model_id: ModelId,
     filtered_file_list: list[FileListEntry],
     total_size: int,
+    revision: HuggingFaceRevision = "main",
 ) -> Path:
     for candidate_dir in EXO_MODELS_DIRS:
         if not candidate_dir.exists():
             continue
-        sub = candidate_dir / model_id.normalize()
+        sub = candidate_dir / model_directory_name(model_id, revision)
         if not await aios.path.isdir(sub):
             continue
+        await asyncio.to_thread(_verify_model_revision_receipt, sub, model_id, revision)
         existing_bytes = 0
         for file_entry in filtered_file_list:
             existing_bytes += await get_downloaded_size(sub / file_entry.path)
@@ -221,14 +416,17 @@ async def select_download_dir_for_shard(
     return select_download_dir(total_size)
 
 
-async def resolve_model_dir(model_id: ModelId) -> Path:
+async def resolve_model_dir(
+    model_id: ModelId, revision: HuggingFaceRevision = "main"
+) -> Path:
     """Return the directory for a model's files, creating it if needed.
 
     Checks all model directories for an existing complete model first,
     then falls back to the default models directory.
     """
-    target = await asyncio.to_thread(build_model_path, model_id)
+    target = await asyncio.to_thread(build_model_path, model_id, revision)
     await aios.makedirs(target, exist_ok=True)
+    await asyncio.to_thread(_bind_model_revision, target, model_id, revision)
     return target
 
 
@@ -244,10 +442,21 @@ async def delete_model(model_id: ModelId) -> bool:
     normalized = model_id.normalize()
     deleted = False
     for models_dir in EXO_MODELS_DIRS:
-        model_dir = models_dir / normalized
-        if await aios.path.exists(model_dir):
-            await asyncio.to_thread(shutil.rmtree, model_dir, ignore_errors=False)
-            deleted = True
+        if not await aios.path.isdir(models_dir):
+            continue
+        entries = await aios.scandir(models_dir)
+        for entry in entries:
+            suffix = entry.name.removeprefix(f"{normalized}--")
+            is_pinned = (
+                entry.name.startswith(f"{normalized}--")
+                and len(suffix) == 40
+                and all(character in "0123456789abcdef" for character in suffix)
+            )
+            if entry.name == normalized or is_pinned:
+                await asyncio.to_thread(
+                    shutil.rmtree, models_dir / entry.name, ignore_errors=False
+                )
+                deleted = True
 
     # Clear cache from default dir
     cache_dir = EXO_DEFAULT_MODELS_DIR / "caches" / normalized
@@ -290,9 +499,16 @@ def _scan_model_directory(
     entries_by_path: dict[str, FileListEntry] = {}
 
     if recursive:
-        for dirpath, _, filenames in os.walk(model_dir):
+        for dirpath, dirnames, filenames in os.walk(model_dir):
+            if Path(dirpath) == model_dir:
+                dirnames[:] = [
+                    directory for directory in dirnames if directory != ".cache"
+                ]
             for filename in filenames:
-                if filename.endswith(".partial"):
+                if (
+                    filename.endswith(".partial")
+                    or filename == _REVISION_RECEIPT_FILENAME
+                ):
                     continue
                 full_path = Path(dirpath) / filename
                 rel_path = str(full_path.relative_to(model_dir))
@@ -303,7 +519,11 @@ def _scan_model_directory(
                 )
     else:
         for item in model_dir.iterdir():
-            if item.is_file() and not item.name.endswith(".partial"):
+            if (
+                item.is_file()
+                and not item.name.endswith(".partial")
+                and item.name != _REVISION_RECEIPT_FILENAME
+            ):
                 entries_by_path[item.name] = FileListEntry(
                     type="file",
                     path=item.name,
@@ -335,10 +555,23 @@ def _scan_model_directory(
     return list(entries_by_path.values())
 
 
-def is_model_directory_complete(model_dir: Path, card: ModelCard | None = None) -> bool:
+def is_model_directory_complete(
+    model_dir: Path,
+    card: ModelCard | None = None,
+    *,
+    model_id: ModelId | None = None,
+    revision: HuggingFaceRevision = "main",
+) -> bool:
     """Check if a model directory contains all required weight files.
     Also checks for sibling weights repo.
     """
+    expected_model_id = card.model_id if card is not None else model_id
+    expected_revision = card.revision if card is not None else revision
+    if expected_model_id is not None:
+        _verify_model_revision_receipt(model_dir, expected_model_id, expected_revision)
+    elif expected_revision != "main":
+        raise ValueError("model_id is required to validate a pinned model directory")
+
     file_list = _scan_model_directory(model_dir, recursive=True)
     if file_list is None or not all(f.size is not None for f in file_list):
         return False
@@ -348,17 +581,16 @@ def is_model_directory_complete(model_dir: Path, card: ModelCard | None = None) 
         and card.vision.weights_repo != str(card.model_id)
     ):
         vision_id = ModelId(card.vision.weights_repo)
-        normalized = vision_id.normalize()
-        for search_dir in (*EXO_MODELS_READ_ONLY_DIRS, *EXO_MODELS_DIRS):
-            candidate = search_dir / normalized
-            if candidate.is_dir() and is_model_directory_complete(candidate):
-                return True
-        return False
+        return (
+            resolve_existing_model(vision_id, revision=card.vision.weights_revision)
+            is not None
+        )
     return True
 
 
 async def _build_file_list_from_local_directory(
     model_id: ModelId,
+    revision: HuggingFaceRevision = "main",
     recursive: bool = False,
 ) -> list[FileListEntry] | None:
     """Build a file list from locally existing model files.
@@ -367,10 +599,13 @@ async def _build_file_list_from_local_directory(
     a local directory must contain a *.safetensors.index.json and
     safetensors listed there.
     """
-    normalized = model_id.normalize()
+    directory_name = model_directory_name(model_id, revision)
     for search_dir in (*EXO_MODELS_READ_ONLY_DIRS, *EXO_MODELS_DIRS):
-        model_dir = search_dir / normalized
+        model_dir = search_dir / directory_name
         if await aios.path.exists(model_dir):
+            await asyncio.to_thread(
+                _verify_model_revision_receipt, model_dir, model_id, revision
+            )
             file_list = await asyncio.to_thread(
                 _scan_model_directory, model_dir, recursive
             )
@@ -381,7 +616,7 @@ async def _build_file_list_from_local_directory(
 
 async def fetch_file_list_with_cache(
     model_id: ModelId,
-    revision: str = "main",
+    revision: HuggingFaceRevision = "main",
     recursive: bool = False,
     skip_internet: bool = False,
     on_connection_lost: Callable[[], None] = lambda: None,
@@ -404,7 +639,7 @@ async def fetch_file_list_with_cache(
             async with aiofiles.open(cache_file, "r") as f:
                 return TypeAdapter(list[FileListEntry]).validate_json(await f.read())
         local_file_list = await _build_file_list_from_local_directory(
-            model_id, recursive
+            model_id, revision, recursive
         )
         if local_file_list is not None:
             logger.warning(
@@ -439,7 +674,7 @@ async def fetch_file_list_with_cache(
             async with aiofiles.open(cache_file, "r") as f:
                 return TypeAdapter(list[FileListEntry]).validate_json(await f.read())
         local_file_list = await _build_file_list_from_local_directory(
-            model_id, recursive
+            model_id, revision, recursive
         )
         if local_file_list is not None:
             logger.warning(
@@ -670,6 +905,7 @@ async def _download_file(
     on_progress: Callable[[int, int, bool], None] = lambda _, __, ___: None,
     skip_internet: bool = False,
 ) -> Path:
+    await asyncio.to_thread(_bind_model_revision, target_dir, model_id, revision)
     target_path = target_dir / path
 
     if await aios.path.exists(target_path):
@@ -805,11 +1041,14 @@ def calculate_repo_progress(
     )
 
 
-async def get_weight_map(model_id: ModelId, revision: str = "main") -> dict[str, str]:
-    target_dir = await resolve_model_dir(model_id)
+async def get_weight_map(
+    model_id: ModelId, revision: HuggingFaceRevision = "main"
+) -> dict[str, str]:
+    target_dir = await resolve_model_dir(model_id, revision)
 
     index_files_dir = snapshot_download(
         repo_id=model_id,
+        revision=revision,
         local_dir=target_dir,
         allow_patterns="*.safetensors.index.json",
     )
@@ -843,7 +1082,9 @@ async def resolve_allow_patterns(shard: ShardMetadata) -> list[str]:
     # (iii) Tensor parallel requires all files.
     return ["*"]
     try:
-        weight_map = await get_weight_map(str(shard.model_card.model_id))
+        weight_map = await get_weight_map(
+            shard.model_card.model_id, shard.model_card.revision
+        )
         return get_allow_patterns(weight_map, shard)
     except Exception:
         logger.error(f"Error getting weight map for {shard.model_card.model_id=}")
@@ -878,7 +1119,7 @@ async def download_shard(
         logger.debug(f"Downloading {shard.model_card.model_id=}")
 
     model_id = shard.model_card.model_id
-    revision = "main"
+    revision = shard.model_card.revision
 
     if not allow_patterns:
         allow_patterns = await resolve_allow_patterns(shard)
@@ -910,7 +1151,10 @@ async def download_shard(
             status="not_started",
             file_progress={},
         )
-        return EXO_DEFAULT_MODELS_DIR / model_id.normalize(), not_started_progress
+        return (
+            EXO_DEFAULT_MODELS_DIR / model_directory_name(model_id, revision),
+            not_started_progress,
+        )
     filtered_file_list = list(
         filter_repo_objects(
             file_list,
@@ -932,18 +1176,19 @@ async def download_shard(
     # Pick a writable directory with enough free space.
     total_size = sum(f.size or 0 for f in filtered_file_list)
     if skip_download:
-        existing = resolve_existing_model(model_id)
+        existing = resolve_existing_model(model_id, revision=revision)
         target_dir = (
             existing
             if existing is not None
-            else EXO_DEFAULT_MODELS_DIR / model_id.normalize()
+            else EXO_DEFAULT_MODELS_DIR / model_directory_name(model_id, revision)
         )
     else:
         models_dir = await select_download_dir_for_shard(
-            model_id, filtered_file_list, total_size
+            model_id, filtered_file_list, total_size, revision
         )
-        target_dir = models_dir / model_id.normalize()
+        target_dir = models_dir / model_directory_name(model_id, revision)
         await aios.makedirs(target_dir, exist_ok=True)
+        await asyncio.to_thread(_bind_model_revision, target_dir, model_id, revision)
     file_progress: dict[str, RepoFileDownloadProgress] = {}
 
     async def on_progress_wrapper(

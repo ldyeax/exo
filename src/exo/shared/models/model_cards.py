@@ -1,4 +1,5 @@
 import json
+import re
 from enum import Enum
 from typing import Annotated, Any
 
@@ -13,6 +14,7 @@ from pydantic import (
     BaseModel,
     Field,
     PositiveInt,
+    StringConstraints,
     ValidationError,
     ValidationInfo,
     field_validator,
@@ -40,28 +42,60 @@ _BUILTIN_CARD_DIRS = [
     Path(RESOURCES_DIR) / "image_model_cards",
 ]
 
+HuggingFaceRevision = Annotated[
+    str, StringConstraints(pattern=r"^(?:main|[0-9a-f]{40})$")
+]
+MODEL_REVISION_RECEIPT_FILENAME = ".exo-huggingface-revision.json"
+
+
+def validate_hugging_face_revision(revision: str) -> HuggingFaceRevision:
+    if revision == "main" or re.fullmatch(r"[0-9a-f]{40}", revision) is not None:
+        return revision
+    raise ValueError(
+        "Hugging Face revision must be 'main' or an exact lowercase 40-hex commit"
+    )
+
+
+def model_directory_name(
+    model_id: ModelId, revision: HuggingFaceRevision = "main"
+) -> str:
+    revision = validate_hugging_face_revision(revision)
+    normalized = model_id.normalize()
+    return normalized if revision == "main" else f"{normalized}--{revision}"
+
 
 class _CardCache:
     def __init__(self):
-        self.cc: dict[ModelId, "ModelCard"] = {}
+        self.cc: dict[tuple[ModelId, HuggingFaceRevision], "ModelCard"] = {}
 
-    def get(self, model_id: ModelId) -> "ModelCard | None":
-        return self.cc.get(model_id)
+    def get(
+        self, model_id: ModelId, revision: HuggingFaceRevision = "main"
+    ) -> "ModelCard | None":
+        revision = validate_hugging_face_revision(revision)
+        return self.cc.get((model_id, revision))
+
+    def add_to_memory(self, card: "ModelCard") -> None:
+        self.cc[(card.model_id, card.revision)] = card
 
     async def save(self, card: "ModelCard"):
-        self.cc[card.model_id] = card
+        self.add_to_memory(card)
         try:
             await card.save_to_custom_dir()
         except OSError as e:
             logger.warning(f"failed to save custom model card ({e.strerror})")
 
-    async def pop(self, model_id: ModelId) -> "ModelCard | None":
+    async def pop(
+        self, model_id: ModelId, revision: HuggingFaceRevision = "main"
+    ) -> "ModelCard | None":
         """Delete a user-added custom model card. Returns True if deleted."""
-        card_path = _custom_cards_dir / (ModelId(model_id).normalize() + ".toml")
+        revision = validate_hugging_face_revision(revision)
+        card_path = _custom_cards_dir / (
+            model_directory_name(ModelId(model_id), revision) + ".toml"
+        )
         try:
             if await card_path.exists():
                 await card_path.unlink()
-                return self.cc.pop(model_id, None)
+                return self.cc.pop((model_id, revision), None)
         except OSError as e:
             logger.warning(f"failed to delete custom model card ({e.strerror})")
 
@@ -79,8 +113,8 @@ class _CardCache:
                 card = await ModelCard.load_from_path(toml_file)
                 if is_custom:
                     card = card.model_copy(update={"is_custom": True})
-                if self.get(card.model_id) is None:
-                    self.cc[card.model_id] = card
+                if self.get(card.model_id, card.revision) is None:
+                    self.add_to_memory(card)
             except (ValidationError, TOMLKitError) as e:
                 logger.opt(exception=e).warning(
                     f"failed to validate model card at {toml_file}"
@@ -95,9 +129,17 @@ class _CardCache:
 card_cache = _CardCache()
 
 
-def detect_vision_from_config(model_id: ModelId) -> "VisionCardConfig | None":
-    normalized = model_id.normalize()
-    for model_dir in [d / normalized for d in EXO_MODELS_DIRS]:
+def detect_vision_from_config(
+    model_id: ModelId, revision: HuggingFaceRevision = "main"
+) -> "VisionCardConfig | None":
+    # Pinned cards get vision metadata from their pinned config fetch. Avoid
+    # inspecting an unverified local directory during Pydantic validation.
+    if revision != "main":
+        return None
+    directory_name = model_directory_name(model_id, revision)
+    for model_dir in [d / directory_name for d in EXO_MODELS_DIRS]:
+        if (model_dir / MODEL_REVISION_RECEIPT_FILENAME).exists():
+            continue
         config_path = model_dir / "config.json"
         if not config_path.exists():
             continue
@@ -105,7 +147,7 @@ def detect_vision_from_config(model_id: ModelId) -> "VisionCardConfig | None":
             with open(config_path) as f:
                 raw = json.load(f)  # type: ignore
             return ConfigData.model_validate(
-                raw, context={"model_id": str(model_id)}
+                raw, context={"model_id": str(model_id), "revision": revision}
             ).vision
         except Exception:
             continue
@@ -135,8 +177,10 @@ class VisionCardConfig(FrozenModel):
     image_token_id: int
     model_type: str
     weights_repo: str = ""
+    weights_revision: HuggingFaceRevision = "main"
     image_token: str | None = None
     processor_repo: str | None = None
+    processor_revision: HuggingFaceRevision = "main"
 
 
 class SamplingValues(FrozenModel):
@@ -156,6 +200,7 @@ class SamplingDefaults(SamplingValues):
 
 class ModelCard(FrozenModel):
     model_id: ModelId
+    revision: HuggingFaceRevision = "main"
     storage_size: Memory
     n_layers: PositiveInt
     hidden_size: PositiveInt
@@ -179,18 +224,27 @@ class ModelCard(FrozenModel):
     @model_validator(mode="after")
     def _autodetect_vision(self) -> "ModelCard":
         if self.vision is None:
-            detected = detect_vision_from_config(self.model_id)
+            detected = detect_vision_from_config(self.model_id, self.revision)
             if detected is not None:
                 object.__setattr__(self, "vision", detected)
         return self
 
     @model_validator(mode="after")
     def _fill_vision_weights_repo(self) -> "ModelCard":
-        if self.vision is not None and not self.vision.weights_repo:
+        if self.vision is None:
+            return self
+
+        weights_repo = self.vision.weights_repo or str(self.model_id)
+        updates: dict[str, str] = {}
+        if not self.vision.weights_repo:
+            updates["weights_repo"] = weights_repo
+        if weights_repo == str(self.model_id):
+            updates["weights_revision"] = self.revision
+        if updates:
             object.__setattr__(
                 self,
                 "vision",
-                self.vision.model_copy(update={"weights_repo": str(self.model_id)}),
+                self.vision.model_copy(update=updates),
             )
         return self
 
@@ -212,7 +266,10 @@ class ModelCard(FrozenModel):
 
     async def save_to_custom_dir(self) -> None:
         await aios.makedirs(str(_custom_cards_dir), exist_ok=True)
-        await self.save(_custom_cards_dir / (self.model_id.normalize() + ".toml"))
+        await self.save(
+            _custom_cards_dir
+            / (model_directory_name(self.model_id, self.revision) + ".toml")
+        )
 
     @staticmethod
     async def load_from_path(path: Path) -> "ModelCard":
@@ -222,30 +279,37 @@ class ModelCard(FrozenModel):
 
     # Is it okay that model card.load defaults to network access if the card doesn't exist? do we want to be more explicit here?
     @staticmethod
-    async def load(model_id: ModelId) -> "ModelCard":
-        if card_cache.get(model_id) is None:
+    async def load(
+        model_id: ModelId, revision: HuggingFaceRevision = "main"
+    ) -> "ModelCard":
+        revision = validate_hugging_face_revision(revision)
+        if card_cache.get(model_id, revision) is None:
             await card_cache.refresh()
-        if (mc := card_cache.get(model_id)) is not None:
+        if (mc := card_cache.get(model_id, revision)) is not None:
             return mc
 
-        mc = await ModelCard.fetch_from_hf(model_id)
+        mc = await ModelCard.fetch_from_hf(model_id, revision)
         await mc.save_to_custom_dir()
         return mc
 
     @staticmethod
-    async def fetch_from_hf(model_id: ModelId) -> "ModelCard":
+    async def fetch_from_hf(
+        model_id: ModelId, revision: HuggingFaceRevision = "main"
+    ) -> "ModelCard":
         """Fetches storage size and number of layers for a Hugging Face model, returns Pydantic ModelMeta.
 
         This is a pure fetch — it does NOT save to disk or update the cache.
         Persistence is handled by the event-sourcing layer (worker event handler).
         """
+        revision = validate_hugging_face_revision(revision)
         # TODO: failure if files do not exist
-        config_data = await fetch_config_data(model_id)
+        config_data = await fetch_config_data(model_id, revision)
         num_layers = config_data.layer_count
-        mem_size_bytes = await fetch_safetensors_size(model_id)
+        mem_size_bytes = await fetch_safetensors_size(model_id, revision)
 
         return ModelCard(
             model_id=ModelId(model_id),
+            revision=revision,
             storage_size=mem_size_bytes,
             n_layers=num_layers,
             hidden_size=config_data.hidden_size or 0,
@@ -334,22 +398,25 @@ class ConfigData(BaseModel):
                 image_token_id=int(image_token_id),  # pyright: ignore[reportAny]
                 model_type=model_type,
                 weights_repo=info.context["model_id"],  # type: ignore
+                weights_revision=info.context.get("revision", "main"),  # type: ignore
             )
 
         return data
 
 
-async def fetch_config_data(model_id: ModelId) -> ConfigData:
+async def fetch_config_data(
+    model_id: ModelId, revision: HuggingFaceRevision = "main"
+) -> ConfigData:
     """Downloads and parses config.json for a model."""
     from exo.download.download_utils import (
         download_file_with_retry,
         resolve_model_dir,
     )
 
-    target_dir = await resolve_model_dir(model_id)
+    target_dir = await resolve_model_dir(model_id, revision)
     config_path = await download_file_with_retry(
         model_id,
-        "main",
+        revision,
         "config.json",
         target_dir,
         lambda curr_bytes, total_bytes, is_renamed: logger.debug(
@@ -358,11 +425,14 @@ async def fetch_config_data(model_id: ModelId) -> ConfigData:
     )
     async with aiofiles.open(config_path, "r") as f:
         return ConfigData.model_validate_json(
-            await f.read(), context={"model_id": str(model_id)}
+            await f.read(),
+            context={"model_id": str(model_id), "revision": revision},
         )
 
 
-async def fetch_safetensors_size(model_id: ModelId) -> Memory:
+async def fetch_safetensors_size(
+    model_id: ModelId, revision: HuggingFaceRevision = "main"
+) -> Memory:
     """Gets model size from safetensors index or falls back to HF API."""
     from exo.download.download_utils import (
         download_file_with_retry,
@@ -370,10 +440,10 @@ async def fetch_safetensors_size(model_id: ModelId) -> Memory:
     )
     from exo.shared.types.worker.downloads import ModelSafetensorsIndex
 
-    target_dir = await resolve_model_dir(model_id)
+    target_dir = await resolve_model_dir(model_id, revision)
     index_path = await download_file_with_retry(
         model_id,
-        "main",
+        revision,
         "model.safetensors.index.json",
         target_dir,
         lambda curr_bytes, total_bytes, is_renamed: logger.debug(
@@ -387,7 +457,7 @@ async def fetch_safetensors_size(model_id: ModelId) -> Memory:
     if metadata is not None and metadata.total_size is not None:
         return Memory.from_bytes(metadata.total_size)
 
-    info = model_info(model_id)
+    info = model_info(model_id, revision=revision)
     if info.safetensors is None:
         raise ValueError(f"No safetensors info found for {model_id}")
     return Memory.from_bytes(info.safetensors.total)

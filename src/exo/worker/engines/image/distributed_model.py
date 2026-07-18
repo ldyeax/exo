@@ -83,7 +83,7 @@ class DistributedImageModel:
         cls, shard: ShardMetadata, group: mx.distributed.Group | None
     ) -> "DistributedImageModel":
         model_id = shard.model_card.model_id
-        model_path = build_model_path(model_id)
+        model_path = build_model_path(model_id, shard.model_card.revision)
 
         if not isinstance(shard, (PipelineShardMetadata, CfgShardMetadata)):
             raise ValueError(

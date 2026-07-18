@@ -23,7 +23,7 @@ from safetensors import safe_open
 from transformers import AutoImageProcessor
 
 from exo.download.download_utils import build_model_path
-from exo.shared.models.model_cards import VisionCardConfig
+from exo.shared.models.model_cards import HuggingFaceRevision, VisionCardConfig
 from exo.shared.types.common import ModelId
 from exo.shared.types.text_generation import Base64Image, TextGenerationTaskParams
 from exo.worker.engines.mlx.cache import encode_prompt
@@ -199,10 +199,17 @@ class VisionResult:
 
 
 class VisionEncoder:
-    def __init__(self, config: VisionCardConfig, model_id: ModelId):
+    def __init__(
+        self,
+        config: VisionCardConfig,
+        model_id: ModelId,
+        model_revision: HuggingFaceRevision = "main",
+    ):
         self._config = config
-        self._main_model_path = build_model_path(model_id)
-        self._model_path = build_model_path(ModelId(config.weights_repo))
+        self._main_model_path = build_model_path(model_id, model_revision)
+        self._model_path = build_model_path(
+            ModelId(config.weights_repo), config.weights_revision
+        )
         self._vision_tower: nn.Module | None = None
         self._projector: nn.Module | None = None
         self._processor: "ImageProcessor | None" = None
@@ -337,7 +344,11 @@ class VisionEncoder:
             self._load_weights_from_model_repo()
 
         if processor_repo:
-            repo = str(build_model_path(ModelId(processor_repo)))
+            repo = str(
+                build_model_path(
+                    ModelId(processor_repo), self._config.processor_revision
+                )
+            )
         else:
             repo = str(self._model_path)
         try:
@@ -725,9 +736,14 @@ class VisionProcessor:
     4. Provide media regions for prefix caching
     """
 
-    def __init__(self, config: VisionCardConfig, model_id: ModelId):
+    def __init__(
+        self,
+        config: VisionCardConfig,
+        model_id: ModelId,
+        model_revision: HuggingFaceRevision = "main",
+    ):
         self.vision_config = config
-        self._encoder = VisionEncoder(config, model_id)
+        self._encoder = VisionEncoder(config, model_id, model_revision)
         self._feature_cache: dict[str, tuple[mx.array, list[int]]] = {}
         self._feature_cache_max = 32
 
