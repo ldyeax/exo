@@ -19,9 +19,21 @@ from exo.worker.engines.mlx.eos_token_ids import get_eos_token_ids_for_model
             ModelId("mlx-community/GLM-5-MXFP4-Q8"),
             [154820, 154827, 154829],
         ),
+        (
+            ModelId("mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit"),
+            [151645, 151643],
+        ),
+        (
+            ModelId("mlx-community/Qwen3-Coder-Next-4bit"),
+            [151645, 151643],
+        ),
+        (
+            ModelId("mlx-community/Qwen3-Next-80B-A3B-Instruct-4bit"),
+            [151645, 151643],
+        ),
     ],
 )
-def test_glm_eos_token_ids_match_tokenizer_family(
+def test_eos_token_ids_match_model_generation_config(
     model_id: ModelId, expected_eos_token_ids: list[int]
 ) -> None:
     assert get_eos_token_ids_for_model(model_id) == expected_eos_token_ids

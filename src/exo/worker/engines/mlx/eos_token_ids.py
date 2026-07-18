@@ -20,6 +20,9 @@ def get_eos_token_ids_for_model(model_id: ModelId) -> list[int] | None:
     ):
         # <|im_end|> and <|endoftext|>.
         return [248046, 248044]
+    if "qwen3-coder" in model_id_lower or "qwen3-next" in model_id_lower:
+        # Qwen3 Coder/Next generation configs declare both tokens as EOS.
+        return [151645, 151643]
     if "gemma-4" in model_id_lower or "gemma-3" in model_id_lower:
         return [1, 106, 50]
     return None
