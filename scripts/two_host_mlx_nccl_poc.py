@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""Leased two-host, three-rank MLX/NCCL proof-of-concept harness.
+"""Leased two-host MLX/NCCL proof and benchmark harness.
 
 This command is intentionally narrower than the general benchmark tooling.  It
-accepts one exact model snapshot, starts exactly two Exo nodes, validates a
-two-GPU plus one-GPU Tensor/NCCL placement, and owns the resulting instance for
-the complete create/benchmark/delete lifecycle.
+accepts one exact model snapshot, starts exactly two Exo nodes, validates an
+explicit ordered Tensor/NCCL placement, and owns the resulting instance for the
+complete create/benchmark/delete lifecycle.
 
-This first hardware-specific proof requires the complete physical GPU inventory
-to be exactly two coordinator GPUs plus one worker GPU. General selected-subset
-support is deliberately outside this harness.
+This hardware-specific harness requires the complete physical GPU inventory to
+be exactly two coordinator GPUs plus one worker GPU.  The ordered selection may
+use one coordinator GPU plus the worker GPU for TP2, or all three GPUs for TP3.
 
 The command must be run underneath ``scripts/benchmark_lease.py``.  It does not
 acquire the global benchmark lease itself.
@@ -62,6 +62,7 @@ from pydantic import (
 JsonScalar: TypeAlias = str | int | float | bool | None
 JsonValue: TypeAlias = JsonScalar | list["JsonValue"] | dict[str, "JsonValue"]
 JsonObject: TypeAlias = dict[str, JsonValue]
+QueryParameters: TypeAlias = Mapping[str, str | Sequence[str]]
 
 _HEX_REVISION = re.compile(r"[0-9a-f]{40}")
 _SAFE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
@@ -364,7 +365,7 @@ class RuntimeRequirements(StrictModel):
 
 
 class HarnessConfig(StrictModel):
-    schema_version: Literal[1]
+    schema_version: Literal[2]
     run_id: str
     namespace: str
     result_directory: str
@@ -373,6 +374,7 @@ class HarnessConfig(StrictModel):
     reserved_ports: tuple[int, ...]
     model: ModelSnapshot
     hosts: tuple[HostConfig, ...]
+    requested_compute_resource_ids: tuple[str, ...]
     benchmark: BenchmarkConfig
     timeouts: TimeoutConfig
     runtime: RuntimeRequirements
@@ -400,6 +402,27 @@ class HarnessConfig(StrictModel):
         all_gpu_uuids = [gpu.device_uuid for host in self.hosts for gpu in host.gpus]
         if len(set(all_gpu_uuids)) != 3:
             raise ValueError("all three GPU UUIDs must be unique")
+        physical_resources = {
+            gpu.resource_id: host.name for host in self.hosts for gpu in host.gpus
+        }
+        requested_resources = self.requested_compute_resource_ids
+        if len(requested_resources) < 2:
+            raise ValueError("proof requires at least two selected compute resources")
+        if len(set(requested_resources)) != len(requested_resources):
+            raise ValueError("requested compute resources must be unique")
+        if not set(requested_resources).issubset(physical_resources):
+            raise ValueError(
+                "requested compute resources must belong to configured GPUs"
+            )
+        selected_hosts = {
+            physical_resources[resource] for resource in requested_resources
+        }
+        if selected_hosts != {host.name for host in self.hosts}:
+            raise ValueError(
+                "requested compute resources must cover both configured hosts"
+            )
+        if physical_resources[requested_resources[0]] != coordinator.name:
+            raise ValueError("tensor rank zero must use a coordinator-host GPU")
         if len({host.launch_order for host in self.hosts}) != 2:
             raise ValueError("host launch_order values must be unique")
         if len({host.discovery_port for host in self.hosts}) != 1:
@@ -425,6 +448,28 @@ class HarnessConfig(StrictModel):
         for host in self.hosts:
             _validate_launch_contract(host, self)
         return self
+
+    @property
+    def tensor_world_size(self) -> int:
+        return len(self.requested_compute_resource_ids)
+
+
+def _gpu_owners(config: HarnessConfig) -> dict[str, tuple[HostConfig, GpuIdentity]]:
+    return {gpu.resource_id: (host, gpu) for host in config.hosts for gpu in host.gpus}
+
+
+def _selected_gpus_by_host(
+    config: HarnessConfig,
+) -> dict[str, tuple[GpuIdentity, ...]]:
+    owners = _gpu_owners(config)
+    return {
+        host.name: tuple(
+            owners[resource_id][1]
+            for resource_id in config.requested_compute_resource_ids
+            if owners[resource_id][0].name == host.name
+        )
+        for host in config.hosts
+    }
 
 
 class ModelProbeResult(StrictModel):
@@ -1381,7 +1426,18 @@ def _lease_static_metadata(config: HarnessConfig, command: Sequence[str]) -> Jso
             "paths": model_paths,
         }
     ]
+    selected_gpus_by_host = _selected_gpus_by_host(config)
     gpu_bindings: JsonObject = {
+        host.name: [
+            {
+                "uuid": gpu.device_uuid,
+                "pci_address": gpu.pci_bus_id,
+            }
+            for gpu in selected_gpus_by_host[host.name]
+        ]
+        for host in config.hosts
+    }
+    physical_gpu_inventory: JsonObject = {
         host.name: [
             {
                 "uuid": gpu.device_uuid,
@@ -1457,7 +1513,11 @@ def _lease_static_metadata(config: HarnessConfig, command: Sequence[str]) -> Jso
             "expected_completion_tokens": (config.benchmark.expected_completion_tokens),
             "expected_finish_reason": config.benchmark.expected_finish_reason,
         },
+        "requested_compute_resource_ids": [
+            resource_id for resource_id in config.requested_compute_resource_ids
+        ],
         "gpu_bindings": gpu_bindings,
+        "physical_gpu_inventory": physical_gpu_inventory,
         "cpu_bindings": cpu_bindings,
         "hca_bindings": hca_bindings,
         "source_deployments": source_deployments,
@@ -1630,7 +1690,7 @@ def validate_and_patch_placement(
     config: HarnessConfig,
     runtime_node_ids: Mapping[str, str],
 ) -> tuple[JsonObject, str, tuple[str, ...], tuple[str, ...]]:
-    """Validate the exact 2+1 topology and change only the NCCL port."""
+    """Validate the explicit tensor topology and change only the NCCL port."""
     outer = _object(placement, "placement")
     inner = _tagged(outer, "MlxNcclInstance", "placement")
     instance_id = _string(inner.get("instanceId"), "instance ID")
@@ -1657,18 +1717,25 @@ def validate_and_patch_placement(
         node_id: _string(value, f"representative for node {node_id}")
         for node_id, value in nodes.items()
     }
-    if len(runners) != 3 or len(set(node_representatives.values())) != 2:
-        raise HarnessError("placement must contain three ranks and two representatives")
+    world_size = config.tensor_world_size
+    if len(runners) != world_size or len(set(node_representatives.values())) != 2:
+        raise HarnessError(
+            "placement must contain the selected tensor ranks and two representatives"
+        )
 
-    expected_resources = {
+    physical_resource_owners = {
         gpu.resource_id: runtime_node_ids[host.name]
         for host in config.hosts
         for gpu in host.gpus
     }
+    expected_resources = {
+        resource_id: physical_resource_owners[resource_id]
+        for resource_id in config.requested_compute_resource_ids
+    }
     if set(resource_to_runner) != set(expected_resources):
-        raise HarnessError("placement compute resources do not match configured GPUs")
+        raise HarnessError("placement compute resources do not match the selected GPUs")
     if resource_to_node != expected_resources:
-        raise HarnessError("placement GPU ownership does not match the 2+1 host layout")
+        raise HarnessError("placement GPU ownership does not match the selected layout")
     if set(resource_to_runner.values()) != set(runners):
         raise HarnessError("placement must bind exactly one compute resource per rank")
     for node_id, representative in node_representatives.items():
@@ -1688,6 +1755,7 @@ def validate_and_patch_placement(
             raise HarnessError("node representative must own its configured GPU")
 
     ranks: set[int] = set()
+    rank_by_runner: dict[str, int] = {}
     for runner_id, tagged_shard in runners.items():
         shard = _tagged(tagged_shard, "TensorShardMetadata", f"shard {runner_id}")
         card = _object(shard.get("modelCard"), f"shard {runner_id} modelCard")
@@ -1696,16 +1764,34 @@ def validate_and_patch_placement(
         if card.get("revision") != config.model.revision:
             raise HarnessError(f"runner {runner_id} has the wrong model revision")
         rank = shard.get("deviceRank")
-        world_size = shard.get("worldSize")
-        if not isinstance(rank, int) or isinstance(rank, bool) or world_size != 3:
+        shard_world_size = shard.get("worldSize")
+        if (
+            not isinstance(rank, int)
+            or isinstance(rank, bool)
+            or shard_world_size != config.tensor_world_size
+        ):
             raise HarnessError(f"runner {runner_id} has invalid tensor rank metadata")
         if shard.get("startLayer") != 0 or shard.get("endLayer") != shard.get(
             "nLayers"
         ):
             raise HarnessError(f"runner {runner_id} is not a full-layer tensor shard")
         ranks.add(rank)
-    if ranks != {0, 1, 2}:
-        raise HarnessError("tensor ranks must be contiguous 0, 1, 2")
+        rank_by_runner[runner_id] = rank
+    expected_ranks = set(range(config.tensor_world_size))
+    if ranks != expected_ranks:
+        raise HarnessError("tensor ranks must be contiguous from zero to world size")
+    ordered_runners = tuple(
+        _string(
+            resource_to_runner.get(resource_id),
+            f"runner for selected resource {resource_id}",
+        )
+        for resource_id in config.requested_compute_resource_ids
+    )
+    for expected_rank, runner_id in enumerate(ordered_runners):
+        if rank_by_runner[runner_id] != expected_rank:
+            raise HarnessError(
+                "placement rank order does not match requested compute resources"
+            )
 
     coordinator = _object(inner.get("ncclCoordinator"), "ncclCoordinator")
     _string(coordinator.get("ip"), "NCCL coordinator IP")
@@ -1718,8 +1804,8 @@ def validate_and_patch_placement(
     return (
         patched,
         instance_id,
-        tuple(runners),
-        tuple(expected_resources),
+        ordered_runners,
+        config.requested_compute_resource_ids,
     )
 
 
@@ -2005,7 +2091,7 @@ class HarnessEffects(Protocol):
         method: str,
         path: str,
         *,
-        params: Mapping[str, str] | None = None,
+        params: QueryParameters | None = None,
         body: JsonObject | None = None,
     ) -> JsonValue: ...
 
@@ -2060,7 +2146,7 @@ class SignalAwareEffects:
         method: str,
         path: str,
         *,
-        params: Mapping[str, str] | None = None,
+        params: QueryParameters | None = None,
         body: JsonObject | None = None,
     ) -> JsonValue:
         self._latch.checkpoint()
@@ -3036,13 +3122,13 @@ class SystemEffects:
         method: str,
         path: str,
         *,
-        params: Mapping[str, str] | None = None,
+        params: QueryParameters | None = None,
         body: JsonObject | None = None,
     ) -> JsonValue:
         if not path.startswith("/"):
             path = "/" + path
         if params:
-            path = f"{path}?{urlencode(params)}"
+            path = f"{path}?{urlencode(params, doseq=True)}"
         connection = http.client.HTTPConnection(
             self._config.api.host,
             self._config.api.port,
@@ -3286,7 +3372,7 @@ def wait_for_owned_runners_ready(
         effects,
         timeout_seconds=config.timeouts.runner_ready_seconds,
         poll_seconds=config.timeouts.poll_seconds,
-        description="all three owned runners to reach RunnerReady",
+        description="all selected owned runners to reach RunnerReady",
         processes=processes,
         check=runners_are_ready,
     )
@@ -3618,23 +3704,24 @@ def validate_nccl_logs(
     expected_ranks_by_host: dict[str, set[int]] = {
         host.name: set() for host in config.hosts
     }
-    for host in config.hosts:
-        for gpu in host.gpus:
-            runner_id = _string(
-                resource_to_runner.get(gpu.resource_id),
-                f"runner for logged resource {gpu.resource_id}",
-            )
-            rank_bindings.append(
-                {
-                    "host_name": host.name,
-                    "gpu_uuid": gpu.device_uuid,
-                    "resource_id": gpu.resource_id,
-                    "runner_id": runner_id,
-                    "rank": rank_by_runner[runner_id],
-                    "world_size": 3,
-                }
-            )
-            expected_ranks_by_host[host.name].add(rank_by_runner[runner_id])
+    gpu_owners = _gpu_owners(config)
+    for resource_id in config.requested_compute_resource_ids:
+        host, gpu = gpu_owners[resource_id]
+        runner_id = _string(
+            resource_to_runner.get(resource_id),
+            f"runner for logged resource {resource_id}",
+        )
+        rank_bindings.append(
+            {
+                "host_name": host.name,
+                "gpu_uuid": gpu.device_uuid,
+                "resource_id": resource_id,
+                "runner_id": runner_id,
+                "rank": rank_by_runner[runner_id],
+                "world_size": config.tensor_world_size,
+            }
+        )
+        expected_ranks_by_host[host.name].add(rank_by_runner[runner_id])
 
     combined_logs = "\n".join(logs_by_host.values())
     fatal_patterns = (
@@ -3647,14 +3734,15 @@ def validate_nccl_logs(
         if re.search(pattern, combined_logs, flags=re.IGNORECASE):
             raise HarnessError(f"owned NCCL logs contain forbidden marker {pattern}")
 
+    world_size = config.tensor_world_size
     rank_pattern = re.compile(
-        r"\brank\s*[:=]?\s*([0-2])\b[^\n]{0,200}"
-        r"\b(?:nranks|world(?:_size|\s+size)?)\s*[:=]?\s*3\b",
+        r"\brank\s*[:=]?\s*([0-9]+)\b[^\n]{0,200}"
+        rf"\b(?:nranks|world(?:_size|\s+size)?)\s*[:=]?\s*{world_size}\b",
         flags=re.IGNORECASE,
     )
     reverse_rank_pattern = re.compile(
-        r"\b(?:nranks|world(?:_size|\s+size)?)\s*[:=]?\s*3\b"
-        r"[^\n]{0,200}\brank\s*[:=]?\s*([0-2])\b",
+        rf"\b(?:nranks|world(?:_size|\s+size)?)\s*[:=]?\s*{world_size}\b"
+        r"[^\n]{0,200}\brank\s*[:=]?\s*([0-9]+)\b",
         flags=re.IGNORECASE,
     )
     observed_ranks = {
@@ -3669,8 +3757,11 @@ def validate_nccl_logs(
                 match = pattern.search(line)
                 if match is not None:
                     initialized_ranks.add(int(match.group(1)))
-    if observed_ranks != {0, 1, 2} or initialized_ranks != {0, 1, 2}:
-        raise HarnessError("NCCL logs do not prove initialized ranks 0, 1, 2 of 3")
+    expected_ranks = set(range(world_size))
+    if observed_ranks != expected_ranks or initialized_ranks != expected_ranks:
+        raise HarnessError(
+            "NCCL logs do not prove every initialized rank in the configured world"
+        )
 
     host_evidence: JsonObject = {}
     for host in config.hosts:
@@ -3759,7 +3850,7 @@ def validate_nccl_logs(
         "evidence_scope": "functional_transport_and_rank_initialization",
         "performance_comparable": False,
         "hca_payload_counter_deltas_verified": False,
-        "world_size": 3,
+        "world_size": world_size,
         "observed_ranks": [rank for rank in sorted(observed_ranks)],
         "initialized_ranks": [rank for rank in sorted(initialized_ranks)],
         "rank_bindings": rank_bindings,
@@ -3862,7 +3953,10 @@ def run_harness(
                 "sharding": "Tensor",
                 "instance_meta": "MlxNccl",
                 "min_nodes": "2",
-                "use_all_compute_resources": "true",
+                "use_all_compute_resources": "false",
+                "requested_compute_resource_ids": (
+                    config.requested_compute_resource_ids
+                ),
             },
         )
         (
@@ -3979,6 +4073,7 @@ def run_harness(
     else:
         status = "completed"
 
+    selected_gpus_by_host = _selected_gpus_by_host(config)
     fragment_value = _validated_json_value(
         {
             "schema_version": 1,
@@ -4039,6 +4134,14 @@ def run_harness(
                     "runtime_node_id": runtime_node_ids.get(host.name),
                     "gpu_uuids": [gpu.device_uuid for gpu in host.gpus],
                     "gpu_pci_bus_ids": [gpu.pci_bus_id for gpu in host.gpus],
+                    "physical_gpu_uuids": [gpu.device_uuid for gpu in host.gpus],
+                    "physical_gpu_pci_bus_ids": [gpu.pci_bus_id for gpu in host.gpus],
+                    "selected_gpu_uuids": [
+                        gpu.device_uuid for gpu in selected_gpus_by_host[host.name]
+                    ],
+                    "selected_gpu_pci_bus_ids": [
+                        gpu.pci_bus_id for gpu in selected_gpus_by_host[host.name]
+                    ],
                     "cpu_set": list(host.cpu_set),
                     "numa_nodes": list(host.numa_nodes),
                     "hca_ports": [
@@ -4055,6 +4158,9 @@ def run_harness(
             "owned_instance_id": owned_instance_id,
             "owned_runner_ids": list(owned_runner_ids),
             "owned_compute_resource_ids": list(owned_resource_ids),
+            "requested_compute_resource_ids": list(
+                config.requested_compute_resource_ids
+            ),
             "request": deterministic_request(config),
             "warmup_count": config.benchmark.warmup_count,
             "sample_count": config.benchmark.sample_count,

@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 from pydantic import ValidationError
@@ -43,6 +44,7 @@ from scripts.two_host_mlx_nccl_poc import (
     OwnedProcess,
     ProcessCleanup,
     PythonAbiIdentity,
+    QueryParameters,
     RuntimeRequirements,
     SignalLatch,
     SourceIdentity,
@@ -255,7 +257,7 @@ def make_config(tmp_path: Path) -> HarnessConfig:
         launch_order=1,
     )
     return HarnessConfig(
-        schema_version=1,
+        schema_version=2,
         run_id=run_id,
         namespace=namespace,
         result_directory=str(tmp_path),
@@ -269,6 +271,9 @@ def make_config(tmp_path: Path) -> HarnessConfig:
             expected_manifest_sha256=poc.model_manifest_sha256(TEST_MODEL_MANIFEST),
         ),
         hosts=(dwagon, fwuff),
+        requested_compute_resource_ids=tuple(
+            gpu.resource_id for host in (dwagon, fwuff) for gpu in host.gpus
+        ),
         benchmark=BenchmarkConfig(
             prompt="Reply with exactly: NCCL proof complete.",
             expected_content_sha256=(
@@ -303,6 +308,17 @@ def make_config(tmp_path: Path) -> HarnessConfig:
             distribution_versions=RUNTIME_DISTRIBUTION_VERSIONS,
         ),
     )
+
+
+def make_tp2_config(
+    tmp_path: Path, coordinator_gpu: GpuIdentity = DWAGON_GPUS[0]
+) -> HarnessConfig:
+    raw = make_config(tmp_path).model_dump(mode="json")
+    raw["requested_compute_resource_ids"] = [
+        coordinator_gpu.resource_id,
+        FWUFF_GPUS[0].resource_id,
+    ]
+    return HarnessConfig.model_validate_json(json.dumps(raw))
 
 
 @dataclass(frozen=True)
@@ -429,19 +445,30 @@ def make_placement(
     config: HarnessConfig,
     runtime_node_ids: Mapping[str, str] = RUNTIME_NODE_IDS,
 ) -> JsonObject:
-    runner_ids = ("runner-0", "runner-1", "runner-2")
-    node_ids = (
-        runtime_node_ids[config.hosts[0].name],
-        runtime_node_ids[config.hosts[1].name],
-    )
-    resource_ids = tuple(gpu.resource_id for host in config.hosts for gpu in host.gpus)
+    runner_ids = tuple(f"runner-{rank}" for rank in range(config.tensor_world_size))
+    resource_ids = config.requested_compute_resource_ids
+    resource_to_node = {
+        gpu.resource_id: runtime_node_ids[host.name]
+        for host in config.hosts
+        for gpu in host.gpus
+        if gpu.resource_id in resource_ids
+    }
+    resource_to_runner = dict(zip(resource_ids, runner_ids, strict=True))
+    node_to_runner = {
+        runtime_node_ids[host.name]: next(
+            resource_to_runner[resource_id]
+            for resource_id in resource_ids
+            if resource_to_node[resource_id] == runtime_node_ids[host.name]
+        )
+        for host in config.hosts
+    }
     runner_to_shard: JsonObject = {}
     for rank, runner_id in enumerate(runner_ids):
         runner_to_shard[runner_id] = {
             "TensorShardMetadata": {
                 "modelCard": {"modelId": MODEL_ID, "revision": REVISION},
                 "deviceRank": rank,
-                "worldSize": 3,
+                "worldSize": config.tensor_world_size,
                 "startLayer": 0,
                 "endLayer": 30,
                 "nLayers": 30,
@@ -453,20 +480,9 @@ def make_placement(
             "shardAssignments": {
                 "modelId": MODEL_ID,
                 "runnerToShard": runner_to_shard,
-                "nodeToRunner": {
-                    node_ids[0]: runner_ids[0],
-                    node_ids[1]: runner_ids[2],
-                },
-                "computeResourceToRunner": {
-                    resource_ids[0]: runner_ids[0],
-                    resource_ids[1]: runner_ids[1],
-                    resource_ids[2]: runner_ids[2],
-                },
-                "computeResourceToNode": {
-                    resource_ids[0]: node_ids[0],
-                    resource_ids[1]: node_ids[0],
-                    resource_ids[2]: node_ids[1],
-                },
+                "nodeToRunner": node_to_runner,
+                "computeResourceToRunner": resource_to_runner,
+                "computeResourceToNode": resource_to_node,
             },
             "ncclCoordinator": {"ip": "192.168.40.248", "port": 59999},
         }
@@ -594,18 +610,22 @@ class FakeEffects:
             },
             "argv": list(host.launch_argv),
         }
-        rank_offset = 0
-        ranks_by_host: dict[str, list[int]] = {}
-        for configured_host in self.config.hosts:
-            ranks_by_host[configured_host.name] = list(
-                range(rank_offset, rank_offset + len(configured_host.gpus))
-            )
-            rank_offset += len(configured_host.gpus)
+        owner_by_resource = {
+            gpu.resource_id: configured_host.name
+            for configured_host in self.config.hosts
+            for gpu in configured_host.gpus
+        }
+        ranks_by_host: dict[str, list[int]] = {
+            configured_host.name: [] for configured_host in self.config.hosts
+        }
+        for rank, resource_id in enumerate(self.config.requested_compute_resource_ids):
+            ranks_by_host[owner_by_resource[resource_id]].append(rank)
         hca_text = " ".join(f"{port.device}:{port.port}" for port in host.hca_ports)
         lines = ["EXO_POC_LAUNCH " + json.dumps(launch_receipt, sort_keys=True)]
         lines.append(f"test NCCL INFO NET/IB : Using {hca_text}")
         lines.extend(
-            f"test NCCL INFO comm 0x1 rank {rank} nranks 3 - Init COMPLETE"
+            "test NCCL INFO comm 0x1 "
+            f"rank {rank} nranks {self.config.tensor_world_size} - Init COMPLETE"
             for rank in ranks_by_host[host.name]
         )
         if host.transport == "ssh":
@@ -617,7 +637,7 @@ class FakeEffects:
         method: str,
         path: str,
         *,
-        params: Mapping[str, str] | None = None,
+        params: QueryParameters | None = None,
         body: JsonObject | None = None,
     ) -> JsonValue:
         if method == "GET" and path == "/node_id":
@@ -637,7 +657,10 @@ class FakeEffects:
                 "sharding": "Tensor",
                 "instance_meta": "MlxNccl",
                 "min_nodes": "2",
-                "use_all_compute_resources": "true",
+                "use_all_compute_resources": "false",
+                "requested_compute_resource_ids": (
+                    self.config.requested_compute_resource_ids
+                ),
             }
             return copy.deepcopy(self.placement)
         if method == "GET" and path == "/state/instances/owned-instance":
@@ -742,6 +765,60 @@ def test_config_is_strict_and_requires_the_reserved_nccl_port(tmp_path: Path) ->
     raw["reserved_ports"].remove(config.nccl_coordinator_port)
     with pytest.raises(ValidationError, match="must be reserved"):
         HarnessConfig.model_validate_json(json.dumps(raw))
+
+
+@pytest.mark.parametrize(
+    ("requested_resources", "message"),
+    [
+        ((DWAGON_GPUS[0].resource_id,), "at least two"),
+        (
+            (
+                DWAGON_GPUS[0].resource_id,
+                DWAGON_GPUS[0].resource_id,
+                FWUFF_GPUS[0].resource_id,
+            ),
+            "must be unique",
+        ),
+        (
+            (DWAGON_GPUS[0].resource_id, "NvidiaGpu:GPU-unknown"),
+            "belong to configured GPUs",
+        ),
+        (
+            (DWAGON_GPUS[0].resource_id, DWAGON_GPUS[1].resource_id),
+            "cover both configured hosts",
+        ),
+        (
+            (FWUFF_GPUS[0].resource_id, DWAGON_GPUS[0].resource_id),
+            "rank zero must use a coordinator-host GPU",
+        ),
+    ],
+)
+def test_config_rejects_invalid_explicit_compute_resource_selection(
+    tmp_path: Path,
+    requested_resources: tuple[str, ...],
+    message: str,
+) -> None:
+    raw = make_config(tmp_path).model_dump(mode="json")
+    raw["requested_compute_resource_ids"] = list(requested_resources)
+
+    with pytest.raises(ValidationError, match=message):
+        HarnessConfig.model_validate_json(json.dumps(raw))
+
+
+def test_tp2_cluster_inventory_still_requires_the_unused_physical_gpu(
+    tmp_path: Path,
+) -> None:
+    config = make_tp2_config(tmp_path)
+    resources: JsonObject = {
+        RUNTIME_NODE_IDS["dwagon"]: [_resource_json(DWAGON_GPUS[0])],
+        RUNTIME_NODE_IDS["fwuff"]: [_resource_json(FWUFF_GPUS[0])],
+    }
+    backends: JsonObject = {
+        runtime_node_id: ["MlxCuda"] for runtime_node_id in RUNTIME_NODE_IDS.values()
+    }
+
+    with pytest.raises(HarnessError, match="GPU inventory"):
+        poc.validate_cluster_inventory(resources, backends, config)
 
 
 @pytest.mark.parametrize("mutation", ["missing", "extra"])
@@ -1622,6 +1699,74 @@ def test_prepare_lease_requires_offset_aware_clock(tmp_path: Path) -> None:
     assert not fixture.metadata_output.exists()
 
 
+def test_system_effects_encodes_selected_resources_as_repeated_query_parameters(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = make_tp2_config(tmp_path)
+    captured_path: str | None = None
+
+    class FakeResponse:
+        status = 200
+        reason = "OK"
+
+        def read(self) -> bytes:
+            return b"{}"
+
+    class FakeConnection:
+        def __init__(self, host: str, port: int, timeout: float) -> None:
+            assert (host, port, timeout) == (
+                config.api.host,
+                config.api.port,
+                config.timeouts.request_seconds,
+            )
+
+        def request(
+            self,
+            method: str,
+            path: str,
+            body: str | None = None,
+            headers: Mapping[str, str] | None = None,
+        ) -> None:
+            nonlocal captured_path
+            assert method == "GET"
+            assert body is None
+            assert headers == {"Accept": "application/json"}
+            captured_path = path
+
+        def getresponse(self) -> FakeResponse:
+            return FakeResponse()
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(poc.http.client, "HTTPConnection", FakeConnection)
+    directory_descriptor = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        effects = SystemEffects(config, directory_descriptor)
+        response = effects.request_json(
+            "GET",
+            "/instance/placement",
+            params={
+                "model_id": config.model.model_id,
+                "requested_compute_resource_ids": (
+                    config.requested_compute_resource_ids
+                ),
+            },
+        )
+    finally:
+        os.close(directory_descriptor)
+
+    assert response == {}
+    assert captured_path is not None
+    parsed = urlsplit(captured_path)
+    assert parsed.path == "/instance/placement"
+    query = parse_qs(parsed.query, strict_parsing=True)
+    assert query["model_id"] == [config.model.model_id]
+    assert query["requested_compute_resource_ids"] == list(
+        config.requested_compute_resource_ids
+    )
+
+
 def test_placement_validation_patches_only_the_reserved_nccl_port(
     tmp_path: Path,
 ) -> None:
@@ -1639,9 +1784,77 @@ def test_placement_validation_patches_only_the_reserved_nccl_port(
     assert patched == expected
     assert instance_id == "owned-instance"
     assert runners == ("runner-0", "runner-1", "runner-2")
-    assert set(resources) == {
-        gpu.resource_id for host in config.hosts for gpu in host.gpus
+    assert resources == config.requested_compute_resource_ids
+
+
+def test_tp2_placement_preserves_requested_rank_order_and_excludes_unused_gpu(
+    tmp_path: Path,
+) -> None:
+    config = make_tp2_config(tmp_path, coordinator_gpu=DWAGON_GPUS[1])
+    placement = make_placement(config)
+
+    patched, instance_id, runners, resources = validate_and_patch_placement(
+        placement, config, RUNTIME_NODE_IDS
+    )
+
+    assert instance_id == "owned-instance"
+    assert runners == ("runner-0", "runner-1")
+    assert resources == (
+        DWAGON_GPUS[1].resource_id,
+        FWUFF_GPUS[0].resource_id,
+    )
+    inner = patched["MlxNcclInstance"]
+    assert isinstance(inner, dict)
+    assignments = inner["shardAssignments"]
+    assert isinstance(assignments, dict)
+    resource_to_runner = assignments["computeResourceToRunner"]
+    assert isinstance(resource_to_runner, dict)
+    assert resource_to_runner == {
+        DWAGON_GPUS[1].resource_id: "runner-0",
+        FWUFF_GPUS[0].resource_id: "runner-1",
     }
+    assert DWAGON_GPUS[0].resource_id not in resource_to_runner
+
+
+def test_tp2_placement_rejects_rank_order_different_from_requested_resources(
+    tmp_path: Path,
+) -> None:
+    config = make_tp2_config(tmp_path)
+    placement = make_placement(config)
+    inner = placement["MlxNcclInstance"]
+    assert isinstance(inner, dict)
+    assignments = inner["shardAssignments"]
+    assert isinstance(assignments, dict)
+    runner_to_shard = assignments["runnerToShard"]
+    assert isinstance(runner_to_shard, dict)
+    for runner_id, rank in (("runner-0", 1), ("runner-1", 0)):
+        shard = runner_to_shard[runner_id]
+        assert isinstance(shard, dict)
+        tensor = shard["TensorShardMetadata"]
+        assert isinstance(tensor, dict)
+        tensor["deviceRank"] = rank
+
+    with pytest.raises(HarnessError, match="rank order"):
+        validate_and_patch_placement(placement, config, RUNTIME_NODE_IDS)
+
+
+def test_tp2_placement_rejects_wrong_tensor_world_size(tmp_path: Path) -> None:
+    config = make_tp2_config(tmp_path)
+    placement = make_placement(config)
+    inner = placement["MlxNcclInstance"]
+    assert isinstance(inner, dict)
+    assignments = inner["shardAssignments"]
+    assert isinstance(assignments, dict)
+    runner_to_shard = assignments["runnerToShard"]
+    assert isinstance(runner_to_shard, dict)
+    shard = runner_to_shard["runner-1"]
+    assert isinstance(shard, dict)
+    tensor = shard["TensorShardMetadata"]
+    assert isinstance(tensor, dict)
+    tensor["worldSize"] = 3
+
+    with pytest.raises(HarnessError, match="invalid tensor rank metadata"):
+        validate_and_patch_placement(placement, config, RUNTIME_NODE_IDS)
 
 
 @pytest.mark.parametrize("mutation", ["revision", "resource_owner", "rank"])
@@ -1694,6 +1907,29 @@ def test_nccl_log_evidence_binds_initialized_ranks_to_each_host(
     assert isinstance(hosts, dict)
     assert hosts["dwagon"]["initialized_ranks"] == [0, 1]
     assert hosts["fwuff"]["initialized_ranks"] == [2]
+
+
+def test_tp2_nccl_log_evidence_uses_selected_world_and_gpu_bindings(
+    tmp_path: Path,
+) -> None:
+    config = make_tp2_config(tmp_path, coordinator_gpu=DWAGON_GPUS[1])
+    owner_token = "owned-log-token"
+    logs = _owned_nccl_logs(config, owner_token)
+
+    evidence = poc.validate_nccl_logs(config, make_placement(config), logs, owner_token)
+
+    assert evidence["world_size"] == 2
+    assert evidence["observed_ranks"] == [0, 1]
+    hosts = evidence["hosts"]
+    assert isinstance(hosts, dict)
+    assert hosts["dwagon"]["initialized_ranks"] == [0]
+    assert hosts["fwuff"]["initialized_ranks"] == [1]
+    rank_bindings = evidence["rank_bindings"]
+    assert isinstance(rank_bindings, list)
+    assert [binding["resource_id"] for binding in rank_bindings] == list(
+        config.requested_compute_resource_ids
+    )
+    assert all(binding["world_size"] == 2 for binding in rank_bindings)
 
 
 @pytest.mark.parametrize("mutation", ["socket", "missing_rank", "wrong_host"])
@@ -1749,7 +1985,7 @@ def test_runner_failed_aborts_readiness_immediately(tmp_path: Path) -> None:
         method: str,
         path: str,
         *,
-        params: Mapping[str, str] | None = None,
+        params: QueryParameters | None = None,
         body: JsonObject | None = None,
     ) -> JsonValue:
         if path == "/state/runners/runner-1":
@@ -1803,6 +2039,37 @@ def test_cleanup_requires_runners_resource_leases_and_assignments_to_be_gone(
         "owned-instance",
         ("runner-0", "runner-1", "runner-2"),
         resources,
+    )
+
+
+def test_tp2_cleanup_ignores_the_unselected_physical_gpu(tmp_path: Path) -> None:
+    config = make_tp2_config(tmp_path)
+    selected_resources = config.requested_compute_resource_ids
+    unused_resource = DWAGON_GPUS[1].resource_id
+    base_state: JsonObject = {
+        "instances": {},
+        "runners": {},
+        "retiringComputeResources": {},
+        "prefillServerPorts": {},
+    }
+    unused_retiring = copy.deepcopy(base_state)
+    unused_retiring["retiringComputeResources"] = {unused_resource: "unrelated-runner"}
+    assert cleanup_state_is_clear(
+        unused_retiring,
+        "owned-instance",
+        ("runner-0", "runner-1"),
+        selected_resources,
+    )
+
+    selected_retiring = copy.deepcopy(base_state)
+    selected_retiring["retiringComputeResources"] = {
+        selected_resources[0]: "unrelated-runner"
+    }
+    assert not cleanup_state_is_clear(
+        selected_retiring,
+        "owned-instance",
+        ("runner-0", "runner-1"),
+        selected_resources,
     )
 
 
@@ -1860,6 +2127,51 @@ def test_full_harness_uses_deterministic_requests_and_owned_cleanup(
     assert "owner_processes" not in runtime_metadata
     assert len(runtime_metadata["owned_processes"]) == 2
     assert effects.writes["benchmark-result.json"] == result
+
+
+def test_full_tp2_harness_records_selected_and_physical_gpu_bindings(
+    tmp_path: Path,
+) -> None:
+    config = make_tp2_config(tmp_path, coordinator_gpu=DWAGON_GPUS[1])
+    effects = FakeEffects(config)
+
+    result = run_harness(config, effects)
+
+    assert result["status"] == "completed"
+    assert result["owned_runner_ids"] == ["runner-0", "runner-1"]
+    assert result["owned_compute_resource_ids"] == list(
+        config.requested_compute_resource_ids
+    )
+    assert result["requested_compute_resource_ids"] == list(
+        config.requested_compute_resource_ids
+    )
+    resource_bindings = result["resource_bindings"]
+    assert isinstance(resource_bindings, dict)
+    dwagon_bindings = resource_bindings["dwagon"]
+    assert isinstance(dwagon_bindings, dict)
+    physical_uuids = [gpu.device_uuid for gpu in DWAGON_GPUS]
+    assert dwagon_bindings["gpu_uuids"] == physical_uuids
+    assert dwagon_bindings["physical_gpu_uuids"] == physical_uuids
+    assert dwagon_bindings["selected_gpu_uuids"] == [DWAGON_GPUS[1].device_uuid]
+    log_evidence = result["nccl_log_evidence"]
+    assert isinstance(log_evidence, dict)
+    assert log_evidence["world_size"] == 2
+    assert log_evidence["initialized_ranks"] == [0, 1]
+
+    lease_metadata = poc._lease_static_metadata(config, ("python", "harness"))
+    selected_bindings = lease_metadata["gpu_bindings"]
+    physical_inventory = lease_metadata["physical_gpu_inventory"]
+    assert isinstance(selected_bindings, dict)
+    assert isinstance(physical_inventory, dict)
+    assert selected_bindings["dwagon"] == [
+        {
+            "uuid": DWAGON_GPUS[1].device_uuid,
+            "pci_address": DWAGON_GPUS[1].pci_bus_id,
+        }
+    ]
+    assert physical_inventory["dwagon"] == [
+        {"uuid": gpu.device_uuid, "pci_address": gpu.pci_bus_id} for gpu in DWAGON_GPUS
+    ]
 
 
 def test_different_supported_driver_versions_do_not_break_runtime_identity(
