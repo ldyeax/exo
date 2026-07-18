@@ -9,6 +9,7 @@ from exo.shared.models.model_cards import ModelCard
 from exo.shared.topology import Topology, TopologySnapshot
 from exo.shared.types.backends import Backend
 from exo.shared.types.common import ModelId, NodeId
+from exo.shared.types.compute_resources import ComputeResource
 from exo.shared.types.instance_link import InstanceLink, InstanceLinkId
 from exo.shared.types.profiling import (
     DiskUsage,
@@ -61,6 +62,7 @@ class State(FrozenModel):
     node_thunderbolt_bridge: Mapping[NodeId, ThunderboltBridgeStatus] = {}
     node_rdma_ctl: Mapping[NodeId, NodeRdmaCtlStatus] = {}
     node_backends: Mapping[NodeId, list[Backend]] = {}
+    node_compute_resources: Mapping[NodeId, Sequence[ComputeResource]] = {}
 
     # Detected cycles where all nodes have Thunderbolt bridge enabled (>2 nodes)
     thunderbolt_bridge_cycles: Sequence[Sequence[NodeId]] = []

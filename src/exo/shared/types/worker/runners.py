@@ -4,6 +4,7 @@ from pydantic import model_validator
 
 from exo.shared.models.model_cards import ModelId
 from exo.shared.types.common import Id, NodeId
+from exo.shared.types.compute_resources import ComputeResourceId
 from exo.shared.types.worker.shards import ShardMetadata
 from exo.utils.pydantic_ext import FrozenModel, TaggedModel
 from exo.worker.runner.diagnostics import KnownRunnerDiagnostic
@@ -87,6 +88,7 @@ class ShardAssignments(FrozenModel):
     model_id: ModelId
     runner_to_shard: Mapping[RunnerId, ShardMetadata]
     node_to_runner: Mapping[NodeId, RunnerId]
+    compute_resource_to_runner: Mapping[ComputeResourceId, RunnerId] = {}
 
     @model_validator(mode="after")
     def validate_runners_exist(self) -> "ShardAssignments":
@@ -94,5 +96,11 @@ class ShardAssignments(FrozenModel):
             if runner_id not in self.runner_to_shard:
                 raise ValueError(
                     f"Runner {runner_id} in node_to_runner does not exist in runner_to_shard"
+                )
+        for resource_id, runner_id in self.compute_resource_to_runner.items():
+            if runner_id not in self.runner_to_shard:
+                raise ValueError(
+                    f"Runner {runner_id} assigned to compute resource {resource_id} "
+                    "does not exist in runner_to_shard"
                 )
         return self

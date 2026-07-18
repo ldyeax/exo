@@ -15,6 +15,7 @@ from pydantic import ValidationError
 
 from exo.shared.constants import EXO_CONFIG_FILE, EXO_DEFAULT_MODELS_DIR
 from exo.shared.types.backends import Backend
+from exo.shared.types.compute_resources import ComputeResource
 from exo.shared.types.memory import Memory
 from exo.shared.types.profiling import (
     DiskUsage,
@@ -32,6 +33,10 @@ from exo.utils.pydantic_ext import TaggedModel
 from exo.utils.task_group import TaskGroup
 
 from .macmon import MacmonMetrics
+from .nvidia_compute_resources import (
+    gather_nvidia_gpu_compute_resources,
+    has_nvidia_gpu,
+)
 from .system_info import (
     get_friendly_name,
     get_model_and_chip,
@@ -355,18 +360,7 @@ async def _gather_iface_map() -> dict[str, str] | None:
 
 
 def _has_nvml_cuda() -> bool:
-    try:
-        import pynvml as nvml  # pyright: ignore[reportMissingModuleSource]
-    except ImportError:
-        return False
-    try:
-        nvml.nvmlInit()
-        try:
-            return nvml.nvmlDeviceGetCount() > 0
-        finally:
-            nvml.nvmlShutdown()
-    except Exception:
-        return False
+    return has_nvidia_gpu()
 
 
 class NodeBackends(TaggedModel):
@@ -383,6 +377,15 @@ class NodeBackends(TaggedModel):
         return cls(backends=backends)
 
 
+class NodeComputeResources(TaggedModel):
+    resources: Sequence[ComputeResource]
+
+    @classmethod
+    async def gather(cls) -> Self:
+        resources = await to_thread.run_sync(gather_nvidia_gpu_compute_resources)
+        return cls(resources=resources)
+
+
 GatheredInfo = (
     MacmonMetrics
     | MemoryUsage
@@ -396,6 +399,7 @@ GatheredInfo = (
     | StaticNodeInformation
     | NodeDiskUsage
     | NodeBackends
+    | NodeComputeResources
 )
 
 
@@ -460,6 +464,7 @@ class InfoGatherer:
                 await self.info_sender.send(nc)
 
             await self.info_sender.send(await NodeBackends.gather())
+            await self.info_sender.send(await NodeComputeResources.gather())
 
     def shutdown(self):
         self._tg.cancel_tasks()

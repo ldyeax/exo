@@ -5,6 +5,7 @@ from pydantic import model_validator
 
 from exo.shared.models.model_cards import ModelTask
 from exo.shared.types.common import Host, Id, NodeId
+from exo.shared.types.compute_resources import ComputeResourceId
 from exo.shared.types.worker.runners import RunnerId, ShardAssignments, ShardMetadata
 from exo.shared.types.worker.shards import TensorShardMetadata
 from exo.utils.pydantic_ext import FrozenModel, TaggedModel
@@ -102,6 +103,14 @@ class BoundInstance(FrozenModel):
         shard = self.instance.shard(self.bound_runner_id)
         assert shard is not None
         return shard
+
+    @property
+    def bound_compute_resource_ids(self) -> tuple[ComputeResourceId, ...]:
+        return tuple(
+            resource_id
+            for resource_id, runner_id in self.instance.shard_assignments.compute_resource_to_runner.items()
+            if runner_id == self.bound_runner_id
+        )
 
     @property
     def is_image_model(self) -> bool:
