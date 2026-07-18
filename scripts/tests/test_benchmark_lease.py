@@ -329,6 +329,49 @@ def test_metadata_requires_complete_fresh_reproducibility_context() -> None:
     with pytest.raises(LeaseError, match="must match git.dirty_file_hashes"):
         validate_run_metadata(mismatched_dirty_source_metadata)
 
+
+def test_metadata_accepts_exact_raw_verbs_gid_as_hca_identity() -> None:
+    metadata = make_metadata()
+    bindings = cast(dict[str, list[dict[str, object]]], metadata["hca_bindings"])
+    bindings["dwagon"] = [
+        {"device": "mlx4_0", "port": 1, "gid": "fe80::10:e000:166:3a19"}
+    ]
+
+    validated = validate_run_metadata(metadata)
+
+    validated_bindings = cast(
+        dict[str, list[dict[str, object]]], validated["hca_bindings"]
+    )
+    assert validated_bindings["dwagon"][0]["gid"] == "fe80::10:e000:166:3a19"
+
+
+@pytest.mark.parametrize(
+    "binding",
+    [
+        {"device": "mlx4_0", "port": 1},
+        {
+            "device": "mlx4_0",
+            "port": 1,
+            "ip_address": "10.0.0.1",
+            "gid": "fe80::1",
+        },
+        {"device": "mlx4_0", "port": 1, "gid": "not-a-gid"},
+        {"device": "mlx4_0", "port": 1, "gid": "0.0.0.1"},
+        {"device": "mlx4_0", "port": 1, "gid": "::"},
+        {"device": "mlx4_0", "port": 1, "gid": "fe80::"},
+        {"device": "mlx4_0", "port": 1, "ip_address": "not-an-address"},
+    ],
+)
+def test_metadata_rejects_ambiguous_or_invalid_hca_identity(
+    binding: dict[str, object],
+) -> None:
+    metadata = make_metadata()
+    bindings = cast(dict[str, list[dict[str, object]]], metadata["hca_bindings"])
+    bindings["dwagon"] = [binding]
+
+    with pytest.raises(LeaseError, match="ip_address|gid|IP address"):
+        validate_run_metadata(metadata)
+
     extra_host_metadata = make_metadata()
     gpu_bindings = cast(dict[str, object], extra_host_metadata["gpu_bindings"])
     gpu_bindings["unexpected"] = []

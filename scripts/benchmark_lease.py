@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import fcntl
+import ipaddress
 import json
 import math
 import os
@@ -302,10 +303,34 @@ def validate_run_metadata(
                     f"metadata.hca_bindings.{host_name}[{index}].port must be "
                     "a positive integer"
                 )
+            ip_address = binding.get("ip_address")
+            gid = binding.get("gid")
+            if (ip_address is None) == (gid is None):
+                raise LeaseError(
+                    f"metadata.hca_bindings.{host_name}[{index}] must contain "
+                    "exactly one of ip_address or gid"
+                )
+            address_field = "ip_address" if ip_address is not None else "gid"
             _require_nonempty_string(
-                binding.get("ip_address"),
-                f"hca_bindings.{host_name}[{index}].ip_address",
+                binding.get(address_field),
+                f"hca_bindings.{host_name}[{index}].{address_field}",
             )
+            try:
+                parsed_address = ipaddress.ip_address(str(binding[address_field]))
+            except ValueError as error:
+                raise LeaseError(
+                    f"metadata.hca_bindings.{host_name}[{index}].{address_field} "
+                    "must be an IP address"
+                ) from error
+            if address_field == "gid" and (
+                parsed_address.version != 6
+                or parsed_address.is_unspecified
+                or int(parsed_address) & ((1 << 64) - 1) == 0
+            ):
+                raise LeaseError(
+                    f"metadata.hca_bindings.{host_name}[{index}].gid must be a "
+                    "port-specific IPv6 GID"
+                )
 
         deployment = _require_mapping(
             source_deployments[host_name], f"source_deployments.{host_name}"

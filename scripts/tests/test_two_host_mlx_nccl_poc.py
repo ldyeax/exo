@@ -178,7 +178,7 @@ def make_config(tmp_path: Path) -> HarnessConfig:
         source=source,
         model_path=f"{dwagon_parent}/{MODEL_ID.replace('/', '--')}--{REVISION}",
         gpus=DWAGON_GPUS,
-        hca_ports=(HcaPort(device="mlx4_0", port=1, ip_address="10.0.0.1"),),
+        hca_ports=(HcaPort(device="mlx4_0", port=1, gid="fe80::1"),),
         cpu_set=(0, 1),
         numa_nodes=(0,),
         launch_argv=_launch_arguments(
@@ -202,7 +202,7 @@ def make_config(tmp_path: Path) -> HarnessConfig:
         source=source,
         model_path=f"{fwuff_parent}/{MODEL_ID.replace('/', '--')}--{REVISION}",
         gpus=FWUFF_GPUS,
-        hca_ports=(HcaPort(device="mlx4_0", port=2, ip_address="10.0.0.2"),),
+        hca_ports=(HcaPort(device="mlx4_0", port=2, gid="fe80::2"),),
         cpu_set=(4, 5),
         numa_nodes=(0,),
         launch_argv=_launch_arguments(
@@ -483,9 +483,9 @@ class FakeEffects:
                     physical_state="5: LinkUp",
                     link_layer="InfiniBand",
                     lid="1",
-                    gids=("fe80::1",),
-                    net_devices=(f"ib{port.port}",),
-                    ip_addresses=(port.ip_address,),
+                    gids=(port.gid,),
+                    net_devices=(),
+                    ip_addresses=(),
                     counters={"port_rcv_data": "1"},
                 )
                 for port in host.hca_ports
@@ -697,6 +697,15 @@ def test_config_is_strict_and_requires_the_reserved_nccl_port(tmp_path: Path) ->
     raw = config.model_dump(mode="json")
     raw["reserved_ports"].remove(config.nccl_coordinator_port)
     with pytest.raises(ValidationError, match="must be reserved"):
+        HarnessConfig.model_validate_json(json.dumps(raw))
+
+
+@pytest.mark.parametrize("gid", ["10.0.0.1", "::", "fe80::", "not-a-gid"])
+def test_config_rejects_invalid_raw_verbs_gid(tmp_path: Path, gid: str) -> None:
+    raw = make_config(tmp_path).model_dump(mode="json")
+    raw["hosts"][0]["hca_ports"][0]["gid"] = gid
+
+    with pytest.raises(ValidationError, match="gid"):
         HarnessConfig.model_validate_json(json.dumps(raw))
 
 
@@ -1610,7 +1619,7 @@ def test_nccl_log_evidence_requires_one_line_proving_merged_rails(
 ) -> None:
     raw = make_config(tmp_path).model_dump(mode="json")
     raw["hosts"][0]["hca_ports"].append(
-        {"device": "mlx4_1", "port": 1, "ip_address": "10.0.1.1"}
+        {"device": "mlx4_1", "port": 1, "gid": "fe80::3"}
     )
     raw["hosts"][0]["environment"]["NCCL_IB_HCA"] = "=mlx4_0:1,mlx4_1:1"
     config = HarnessConfig.model_validate_json(json.dumps(raw))
@@ -1881,9 +1890,9 @@ class CleanHostProbe:
                 physical_state="5: LinkUp",
                 link_layer="InfiniBand",
                 lid="1",
-                gids=("fe80::1",),
-                net_devices=(f"ib{port.port}",),
-                ip_addresses=(port.ip_address,),
+                gids=(port.gid,),
+                net_devices=(),
+                ip_addresses=(),
                 counters={"port_rcv_data": "1"},
             )
             for port in ports
@@ -1909,6 +1918,36 @@ class CleanHostProbe:
         return _preflight_facts()
 
 
+def test_linux_hca_probe_accepts_raw_verbs_without_ipoib(tmp_path: Path) -> None:
+    port_root = tmp_path / "mlx4_0" / "ports" / "1"
+    (port_root / "gids").mkdir(parents=True)
+    (port_root / "gid_attrs" / "ndevs" / "0").mkdir(parents=True)
+    (port_root / "counters").mkdir()
+    for name, value in (
+        ("state", "4: ACTIVE\n"),
+        ("rate", "40 Gb/sec (4X QDR)\n"),
+        ("phys_state", "5: LinkUp\n"),
+        ("link_layer", "InfiniBand\n"),
+        ("lid", "0x1\n"),
+    ):
+        (port_root / name).write_text(value, encoding="utf-8")
+    (port_root / "gids" / "0").write_text(
+        "fe80:0000:0000:0000:0010:e000:0166:3a19\n", encoding="utf-8"
+    )
+    (port_root / "gids" / "1").write_text("fe80::\n", encoding="utf-8")
+    (port_root / "counters" / "port_rcv_data").write_text("1\n", encoding="utf-8")
+
+    observed = poc.LinuxHostProbe(tmp_path).hca_port_observations(
+        (HcaPort(device="mlx4_0", port=1, gid="fe80::10:e000:166:3a19"),)
+    )
+
+    assert len(observed) == 1
+    assert observed[0].gids == ("fe80::10:e000:166:3a19",)
+    assert observed[0].net_devices == ()
+    assert observed[0].ip_addresses == ()
+    assert observed[0].counters == {"port_rcv_data": "1"}
+
+
 def test_builtin_preflight_contract_is_strict_and_self_contained(
     tmp_path: Path,
 ) -> None:
@@ -1929,8 +1968,8 @@ def test_builtin_preflight_contract_is_strict_and_self_contained(
     assert report.checked_udp_ports == config.reserved_ports
 
 
-@pytest.mark.parametrize("mutation", ["inactive", "wrong_ip"])
-def test_preflight_rejects_inactive_hca_or_unassigned_configured_ip(
+@pytest.mark.parametrize("mutation", ["inactive", "wrong_gid", "zero_lid"])
+def test_preflight_accepts_raw_verbs_without_ipoib_and_rejects_bad_identity(
     tmp_path: Path, mutation: str
 ) -> None:
     config = make_config(tmp_path)
@@ -1944,10 +1983,10 @@ def test_preflight_rejects_inactive_hca_or_unassigned_configured_ip(
             first = observations[0]
             if mutation == "inactive":
                 observations[0] = first.model_copy(update={"state": "4: INACTIVE"})
+            elif mutation == "wrong_gid":
+                observations[0] = first.model_copy(update={"gids": ("fe80::ffff",)})
             else:
-                observations[0] = first.model_copy(
-                    update={"ip_addresses": ("10.255.255.254",)}
-                )
+                observations[0] = first.model_copy(update={"lid": "0x0000"})
             return tuple(observations)
 
     report = collect_host_preflight(

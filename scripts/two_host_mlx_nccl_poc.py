@@ -160,12 +160,19 @@ class GpuIdentity(StrictModel):
 class HcaPort(StrictModel):
     device: str = Field(min_length=1)
     port: int = Field(ge=1)
-    ip_address: str
+    gid: str
 
-    @field_validator("ip_address")
+    @field_validator("gid")
     @classmethod
-    def validate_ip_address(cls, value: str) -> str:
-        return str(ipaddress.ip_address(value))
+    def validate_gid(cls, value: str) -> str:
+        parsed = ipaddress.ip_address(value)
+        if (
+            parsed.version != 6
+            or parsed.is_unspecified
+            or int(parsed) & ((1 << 64) - 1) == 0
+        ):
+            raise ValueError("gid must be a port-specific IPv6 address")
+        return str(parsed)
 
 
 class SourceIdentity(StrictModel):
@@ -490,6 +497,12 @@ def _parse_id_ranges(value: str) -> tuple[int, ...]:
 class LinuxHostProbe:
     """Read-only Linux facts used by the internal host-preflight subprocess."""
 
+    def __init__(
+        self,
+        infiniband_class_path: Path = Path("/sys/class/infiniband"),
+    ) -> None:
+        self._infiniband_class_path = infiniband_class_path
+
     @staticmethod
     def _command(
         arguments: Sequence[str],
@@ -616,22 +629,32 @@ class LinuxHostProbe:
     ) -> tuple[HcaPortObservation, ...]:
         observations: list[HcaPortObservation] = []
         for port in ports:
-            root = (
-                Path("/sys/class/infiniband") / port.device / "ports" / str(port.port)
-            )
+            root = self._infiniband_class_path / port.device / "ports" / str(port.port)
             try:
                 state = (root / "state").read_text().strip()
                 rate = (root / "rate").read_text().strip()
                 physical_state = (root / "phys_state").read_text().strip()
                 link_layer = (root / "link_layer").read_text().strip()
                 lid = (root / "lid").read_text().strip()
-                gids = tuple(
-                    path.read_text().strip()
-                    for path in sorted((root / "gids").glob("[0-9]*"))
-                )
+                observed_gids: set[str] = set()
+                for path in sorted((root / "gids").glob("[0-9]*")):
+                    try:
+                        parsed_gid = ipaddress.ip_address(path.read_text().strip())
+                    except (OSError, ValueError):
+                        continue
+                    if (
+                        parsed_gid.version == 6
+                        and not parsed_gid.is_unspecified
+                        and int(parsed_gid) & ((1 << 64) - 1) != 0
+                    ):
+                        observed_gids.add(str(parsed_gid))
+                gids = tuple(sorted(observed_gids))
                 observed_net_devices: set[str] = set()
                 for path in sorted((root / "gid_attrs" / "ndevs").glob("[0-9]*")):
-                    net_device = path.read_text().strip()
+                    try:
+                        net_device = path.read_text().strip()
+                    except OSError:
+                        continue
                     if net_device:
                         observed_net_devices.add(net_device)
                 net_devices = tuple(sorted(observed_net_devices))
@@ -930,9 +953,8 @@ def collect_host_preflight(
         or port.link_layer.lower() != "infiniband"
         or port.lid in {"unknown", "0", "0x0", "0x0000"}
         or not port.gids
-        or not port.net_devices
         or not port.counters
-        or configured.ip_address not in port.ip_addresses
+        or configured.gid not in port.gids
         for port, configured in zip(hca_observations, host.hca_ports, strict=True)
     ):
         conflicts.append("selected InfiniBand port detail is incomplete or not LinkUp")
@@ -1296,7 +1318,7 @@ def _lease_static_metadata(config: HarnessConfig, command: Sequence[str]) -> Jso
             {
                 "device": port.device,
                 "port": port.port,
-                "ip_address": port.ip_address,
+                "gid": port.gid,
             }
             for port in host.hca_ports
         ]
@@ -1777,10 +1799,10 @@ def validate_preflight(
     if any(
         not _ib_state_is(port.physical_state, "LINKUP")
         or port.link_layer.lower() != "infiniband"
+        or port.lid in {"unknown", "0", "0x0", "0x0000"}
         or not port.gids
-        or not port.net_devices
         or not port.counters
-        or configured.ip_address not in port.ip_addresses
+        or configured.gid not in port.gids
         for port, configured in zip(report.hca_ports, host.hca_ports, strict=True)
     ):
         raise HarnessError(f"InfiniBand detail is incomplete on {host.name}")
