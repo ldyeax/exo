@@ -45,6 +45,7 @@ _BUILTIN_CARD_DIRS = [
 HuggingFaceRevision = Annotated[
     str, StringConstraints(pattern=r"^(?:main|[0-9a-f]{40})$")
 ]
+type ModelSnapshotId = tuple[ModelId, HuggingFaceRevision]
 MODEL_REVISION_RECEIPT_FILENAME = ".exo-huggingface-revision.json"
 
 
@@ -346,6 +347,10 @@ class ModelCard(FrozenModel):
                 Backend
             ),  # all backends — we don't know what an arbitrary HF model supports; let placement gate decide
         )
+
+
+def model_snapshot_id(model_card: ModelCard) -> ModelSnapshotId:
+    return model_card.model_id, model_card.revision
 
 
 class ConfigData(BaseModel):

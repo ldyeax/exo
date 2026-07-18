@@ -2,8 +2,9 @@
 
 from collections.abc import Mapping, Sequence
 
+from exo.shared.models.model_cards import ModelSnapshotId, model_snapshot_id
 from exo.shared.types.chunks import InputImageChunk
-from exo.shared.types.common import CommandId, ModelId, NodeId
+from exo.shared.types.common import CommandId, NodeId
 from exo.shared.types.compute_resources import ComputeResource
 from exo.shared.types.tasks import (
     CancelTask,
@@ -56,7 +57,7 @@ def plan(
     input_chunk_buffer: Mapping[CommandId, Mapping[int, InputImageChunk]],
     image_cache: Mapping[Base64ImageHash, Base64Image],
     instance_backoff: KeyedBackoff[InstanceId],
-    download_backoff: KeyedBackoff[ModelId],
+    download_backoff: KeyedBackoff[ModelSnapshotId],
     node_compute_resources: Mapping[NodeId, Sequence[ComputeResource]] | None = None,
     runner_backoff: KeyedBackoff[RunnerId] | None = None,
 ) -> Task | None:
@@ -200,25 +201,25 @@ def _model_needs_download(
     node_id: NodeId,
     runners: Mapping[RunnerId, RunnerSupervisor],
     global_download_status: Mapping[NodeId, Sequence[DownloadProgress]],
-    download_backoff: KeyedBackoff[ModelId],
+    download_backoff: KeyedBackoff[ModelSnapshotId],
 ) -> DownloadModel | None:
     local_downloads = global_download_status.get(node_id, [])
     download_status = {
-        dp.shard_metadata.model_card.model_id: dp for dp in local_downloads
+        model_snapshot_id(dp.shard_metadata.model_card): dp for dp in local_downloads
     }
 
     for runner in runners.values():
-        model_id = runner.bound_instance.bound_shard.model_card.model_id
+        snapshot_id = model_snapshot_id(runner.bound_instance.bound_shard.model_card)
         if (
             isinstance(runner.status, RunnerIdle)
             and (
-                model_id not in download_status
+                snapshot_id not in download_status
                 or not isinstance(
-                    download_status[model_id],
+                    download_status[snapshot_id],
                     (DownloadOngoing, DownloadCompleted, DownloadFailed),
                 )
             )
-            and download_backoff.should_proceed(model_id)
+            and download_backoff.should_proceed(snapshot_id)
         ):
             # We don't invalidate download_status randomly in case a file gets deleted on disk
             return DownloadModel(
@@ -288,12 +289,16 @@ def _load_model(
     for runner in runners.values():
         instance = runner.bound_instance.instance
         shard_assignments = instance.shard_assignments
+        target_snapshot_id = model_snapshot_id(
+            runner.bound_instance.bound_shard.model_card
+        )
 
         all_local_downloads_complete = all(
             nid in global_download_status
             and any(
                 isinstance(dp, DownloadCompleted)
-                and dp.shard_metadata.model_card.model_id == shard_assignments.model_id
+                and model_snapshot_id(dp.shard_metadata.model_card)
+                == target_snapshot_id
                 for dp in global_download_status[nid]
             )
             for nid in shard_assignments.node_to_runner

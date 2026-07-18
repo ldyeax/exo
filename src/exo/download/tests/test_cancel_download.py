@@ -6,12 +6,21 @@ from collections.abc import AsyncIterator, Awaitable
 from datetime import timedelta
 from pathlib import Path
 from typing import Callable
+from unittest.mock import AsyncMock
+
+import anyio
+from pytest import MonkeyPatch
 
 from exo.download.coordinator import DownloadCoordinator
 from exo.download.download_utils import RepoDownloadProgress
 from exo.download.impl_shard_downloader import SingletonShardDownloader
 from exo.download.shard_downloader import ShardDownloader
-from exo.shared.models.model_cards import ModelCard, ModelId, ModelTask
+from exo.shared.models.model_cards import (
+    ModelCard,
+    ModelId,
+    ModelTask,
+    model_snapshot_id,
+)
 from exo.shared.types.backends import Backend
 from exo.shared.types.commands import (
     CancelDownload,
@@ -27,6 +36,7 @@ from exo.utils.channels import Receiver, Sender, channel
 
 NODE_ID = NodeId("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 MODEL_ID = ModelId("test-org/test-model")
+REVISION = "0123456789abcdef0123456789abcdef01234567"
 
 
 def _make_shard(model_id: ModelId = MODEL_ID) -> ShardMetadata:
@@ -170,13 +180,19 @@ async def _wait_for_pending(
         return None
 
 
-async def test_cancel_active_download_transitions_to_pending() -> None:
+async def test_cancel_active_download_transitions_to_pending(
+    monkeypatch: MonkeyPatch,
+) -> None:
     """Cancelling an in-progress download should emit a DownloadPending event
     and remove the model from active_downloads."""
     slow_downloader = SlowShardDownloader()
     coordinator, cmd_send, event_recv = _setup_coordinator(slow_downloader)
     shard = _make_shard()
+    snapshot_id = model_snapshot_id(shard.model_card)
     origin = SystemId("test")
+    monkeypatch.setattr(
+        "exo.download.coordinator.to_thread.run_sync", AsyncMock(return_value=None)
+    )
 
     coordinator_task = asyncio.create_task(coordinator.run())
     try:
@@ -217,10 +233,10 @@ async def test_cancel_active_download_transitions_to_pending() -> None:
         await asyncio.sleep(0.05)
 
         # Model should no longer be in active_downloads
-        assert MODEL_ID not in coordinator.active_downloads
+        assert snapshot_id not in coordinator.active_downloads
         # But should still be in download_status as pending
-        assert MODEL_ID in coordinator.download_status
-        assert isinstance(coordinator.download_status[MODEL_ID], DownloadPending)
+        assert snapshot_id in coordinator.download_status
+        assert isinstance(coordinator.download_status[snapshot_id], DownloadPending)
     finally:
         await coordinator.shutdown()
         coordinator_task.cancel()
@@ -249,8 +265,8 @@ async def test_cancel_nonexistent_download_is_noop() -> None:
         assert pending is None, "Cancel of non-existent download should not emit events"
 
         # Coordinator state should be empty
-        assert MODEL_ID not in coordinator.active_downloads
-        assert MODEL_ID not in coordinator.download_status
+        assert not coordinator.active_downloads
+        assert not coordinator.download_status
     finally:
         await coordinator.shutdown()
         coordinator_task.cancel()
@@ -258,12 +274,58 @@ async def test_cancel_nonexistent_download_is_noop() -> None:
             await coordinator_task
 
 
-async def test_cancel_then_resume_download() -> None:
+async def test_model_wide_cancel_cancels_every_tracked_revision() -> None:
+    slow_downloader = SlowShardDownloader()
+    coordinator, _cmd_send, _event_recv = _setup_coordinator(slow_downloader)
+    main_shard = _make_shard()
+    pinned_shard = main_shard.model_copy(
+        update={
+            "model_card": main_shard.model_card.model_copy(
+                update={"revision": REVISION}
+            )
+        }
+    )
+    main_snapshot_id = model_snapshot_id(main_shard.model_card)
+    pinned_snapshot_id = model_snapshot_id(pinned_shard.model_card)
+    main_scope = anyio.CancelScope()
+    pinned_scope = anyio.CancelScope()
+    coordinator.active_downloads = {
+        main_snapshot_id: main_scope,
+        pinned_snapshot_id: pinned_scope,
+    }
+    coordinator.download_status = {
+        main_snapshot_id: DownloadPending(
+            node_id=NODE_ID,
+            shard_metadata=main_shard,
+        ),
+        pinned_snapshot_id: DownloadPending(
+            node_id=NODE_ID,
+            shard_metadata=pinned_shard,
+        ),
+    }
+
+    await coordinator._cancel_download(MODEL_ID)  # pyright: ignore[reportPrivateUsage]
+
+    assert main_scope.cancel_called
+    assert pinned_scope.cancel_called
+    assert coordinator.download_status[main_snapshot_id].model_directory.endswith(
+        MODEL_ID.normalize()
+    )
+    assert coordinator.download_status[pinned_snapshot_id].model_directory.endswith(
+        f"--{REVISION}"
+    )
+
+
+async def test_cancel_then_resume_download(monkeypatch: MonkeyPatch) -> None:
     """After cancelling, re-issuing StartDownload should restart the download."""
     slow_downloader = SlowShardDownloader()
     coordinator, cmd_send, event_recv = _setup_coordinator(slow_downloader)
     shard = _make_shard()
+    snapshot_id = model_snapshot_id(shard.model_card)
     origin = SystemId("test")
+    monkeypatch.setattr(
+        "exo.download.coordinator.to_thread.run_sync", AsyncMock(return_value=None)
+    )
 
     coordinator_task = asyncio.create_task(coordinator.run())
     try:
@@ -301,7 +363,7 @@ async def test_cancel_then_resume_download() -> None:
 
         # The download should restart
         await asyncio.wait_for(slow_downloader.download_started.wait(), timeout=2.0)
-        assert MODEL_ID in coordinator.active_downloads, (
+        assert snapshot_id in coordinator.active_downloads, (
             "Model should be actively downloading again after resume"
         )
     finally:

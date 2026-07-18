@@ -12,7 +12,7 @@ from exo.master.placement_utils import (
     get_shard_assignments,
     get_smallest_cycles,
 )
-from exo.shared.models.model_cards import ModelId
+from exo.shared.models.model_cards import ModelCard, ModelId, model_snapshot_id
 from exo.shared.topology import Topology
 from exo.shared.types.backends import Backend
 from exo.shared.types.commands import (
@@ -211,12 +211,13 @@ def add_instance_to_placements(
 
 def _get_node_download_fraction(
     node_id: NodeId,
-    model_id: ModelId,
+    model_card: ModelCard,
     download_status: Mapping[NodeId, Sequence[DownloadProgress]],
 ) -> float:
-    """Return the download fraction (0.0–1.0) for a model on a given node."""
+    """Return the download fraction for an exact model snapshot on a node."""
+    target_snapshot_id = model_snapshot_id(model_card)
     for progress in download_status.get(node_id, []):
-        if progress.shard_metadata.model_card.model_id != model_id:
+        if model_snapshot_id(progress.shard_metadata.model_card) != target_snapshot_id:
             continue
         match progress:
             case DownloadCompleted():
@@ -238,12 +239,12 @@ def _get_node_download_fraction(
 
 def _cycle_download_score(
     cycle: Cycle,
-    model_id: ModelId,
+    model_card: ModelCard,
     download_status: Mapping[NodeId, Sequence[DownloadProgress]],
 ) -> float:
     """Sum of download fractions across all nodes in a cycle."""
     return sum(
-        _get_node_download_fraction(node_id, model_id, download_status)
+        _get_node_download_fraction(node_id, model_card, download_status)
         for node_id in cycle
     )
 
@@ -497,9 +498,7 @@ def place_instance(
     selected_cycle = max(
         candidate_cycles,
         key=lambda cycle: (
-            _cycle_download_score(
-                cycle, command.model_card.model_id, resolved_download_status
-            ),
+            _cycle_download_score(cycle, command.model_card, resolved_download_status),
             sum(
                 (node_memory[node_id].ram_available for node_id in cycle),
                 start=Memory(),
@@ -655,12 +654,16 @@ def cancel_unnecessary_downloads(
     download_status: Mapping[NodeId, Sequence[DownloadProgress]],
 ) -> Sequence[DownloadCommand]:
     commands: list[DownloadCommand] = []
-    currently_downloading = [
-        (k, v.shard_metadata.model_card.model_id)
-        for k, vs in download_status.items()
-        for v in vs
-        if isinstance(v, (DownloadOngoing))
-    ]
+    # CancelDownload is model-id-wide, so deduplicate multiple revisions while
+    # preserving state order and keep all of them if any matching instance is active.
+    currently_downloading = tuple(
+        dict.fromkeys(
+            (node_id, progress.shard_metadata.model_card.model_id)
+            for node_id, progress_by_model in download_status.items()
+            for progress in progress_by_model
+            if isinstance(progress, DownloadOngoing)
+        )
+    )
     active_models = set(
         (
             node_id,

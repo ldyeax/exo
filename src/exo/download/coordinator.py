@@ -21,7 +21,13 @@ from exo.routing.event_router import (
 )
 from exo.shared.constants import EXO_DEFAULT_MODELS_DIR, EXO_MODELS_READ_ONLY_DIRS
 from exo.shared.models import model_cards
-from exo.shared.models.model_cards import ModelId
+from exo.shared.models.model_cards import (
+    ModelCard,
+    ModelId,
+    ModelSnapshotId,
+    model_directory_name,
+    model_snapshot_id,
+)
 from exo.shared.types.commands import (
     CancelDownload,
     DeleteDownload,
@@ -55,21 +61,28 @@ class DownloadCoordinator:
     offline: bool = False
 
     # Local state
-    download_status: dict[ModelId, DownloadProgress] = field(default_factory=dict)
-    active_downloads: dict[ModelId, anyio.CancelScope] = field(default_factory=dict)
+    download_status: dict[ModelSnapshotId, DownloadProgress] = field(
+        default_factory=dict
+    )
+    active_downloads: dict[ModelSnapshotId, anyio.CancelScope] = field(
+        default_factory=dict
+    )
 
     _tg: TaskGroup = field(init=False, default_factory=TaskGroup)
     _stopped: anyio.Event = field(init=False, default_factory=anyio.Event)
 
     # Per-model throttle for download progress events
-    _last_progress_time: dict[ModelId, float] = field(default_factory=dict)
+    _last_progress_time: dict[ModelSnapshotId, float] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self.shard_downloader.on_progress(self._download_progress_callback)
 
     @staticmethod
-    def _default_model_dir(model_id: ModelId) -> str:
-        return str(EXO_DEFAULT_MODELS_DIR / model_id.normalize())
+    def _default_model_dir(model_card: ModelCard) -> str:
+        return str(
+            EXO_DEFAULT_MODELS_DIR
+            / model_directory_name(model_card.model_id, model_card.revision)
+        )
 
     def _completed_from_path(
         self,
@@ -88,7 +101,9 @@ class DownloadCoordinator:
     async def _download_progress_callback(
         self, callback_shard: ShardMetadata, progress: RepoDownloadProgress
     ) -> None:
-        model_id = callback_shard.model_card.model_id
+        model_card = callback_shard.model_card
+        model_id = model_card.model_id
+        snapshot_id = model_snapshot_id(model_card)
         throttle_interval_secs = 1.0
 
         try:
@@ -105,16 +120,16 @@ class DownloadCoordinator:
                         shard_metadata=callback_shard,
                         node_id=self.node_id,
                         total=progress.total,
-                        model_directory=self._default_model_dir(model_id),
+                        model_directory=self._default_model_dir(model_card),
                     )
-                self.download_status[model_id] = completed
+                self.download_status[snapshot_id] = completed
                 await self.event_sender.send(
                     NodeDownloadProgress(download_progress=completed)
                 )
-                self._last_progress_time.pop(model_id, None)
+                self._last_progress_time.pop(snapshot_id, None)
             elif (
                 progress.status == "in_progress"
-                and current_time() - self._last_progress_time.get(model_id, 0.0)
+                and current_time() - self._last_progress_time.get(snapshot_id, 0.0)
                 > throttle_interval_secs
             ):
                 ongoing = DownloadOngoing(
@@ -123,13 +138,13 @@ class DownloadCoordinator:
                     download_progress=map_repo_download_progress_to_download_progress_data(
                         progress
                     ),
-                    model_directory=self._default_model_dir(model_id),
+                    model_directory=self._default_model_dir(model_card),
                 )
-                self.download_status[model_id] = ongoing
+                self.download_status[snapshot_id] = ongoing
                 await self.event_sender.send(
                     NodeDownloadProgress(download_progress=ongoing)
                 )
-                self._last_progress_time[model_id] = current_time()
+                self._last_progress_time[snapshot_id] = current_time()
         except (BrokenResourceError, ClosedResourceError):
             logger.debug(
                 f"Event stream closed while sending download progress for {model_id}, skipping update"
@@ -173,10 +188,17 @@ class DownloadCoordinator:
                         await self._cancel_download(model_id)
 
     async def _cancel_download(self, model_id: ModelId) -> None:
-        if model_id in self.active_downloads and model_id in self.download_status:
-            logger.info(f"Cancelling download for {model_id}")
-            self.active_downloads[model_id].cancel()
-            current_status = self.download_status[model_id]
+        active_snapshot_ids = tuple(
+            snapshot_id
+            for snapshot_id in self.active_downloads
+            if snapshot_id[0] == model_id
+        )
+        for snapshot_id in active_snapshot_ids:
+            logger.info(f"Cancelling download for {snapshot_id[0]} at {snapshot_id[1]}")
+            self.active_downloads[snapshot_id].cancel()
+            current_status = self.download_status.get(snapshot_id)
+            if current_status is None:
+                continue
             downloaded = Memory()
             total = Memory()
             if isinstance(current_status, DownloadOngoing):
@@ -185,24 +207,28 @@ class DownloadCoordinator:
             pending = DownloadPending(
                 shard_metadata=current_status.shard_metadata,
                 node_id=self.node_id,
-                model_directory=self._default_model_dir(model_id),
+                model_directory=self._default_model_dir(
+                    current_status.shard_metadata.model_card
+                ),
                 downloaded=downloaded,
                 total=total,
             )
-            self.download_status[model_id] = pending
+            self.download_status[snapshot_id] = pending
             await self.event_sender.send(
                 NodeDownloadProgress(download_progress=pending)
             )
 
     async def _start_download(self, shard: ShardMetadata) -> None:
-        model_id = shard.model_card.model_id
+        model_card = shard.model_card
+        model_id = model_card.model_id
+        snapshot_id = model_snapshot_id(model_card)
 
         # Check if already downloading, complete, or recently failed
-        if model_id in self.download_status:
-            status = self.download_status[model_id]
+        if snapshot_id in self.download_status:
+            status = self.download_status[snapshot_id]
             if isinstance(status, (DownloadOngoing, DownloadCompleted, DownloadFailed)):
                 logger.debug(
-                    f"Download for {model_id} already in progress, complete, or failed, skipping"
+                    f"Download for {model_id} at {model_card.revision} already in progress, complete, or failed, skipping"
                 )
                 return
 
@@ -215,7 +241,7 @@ class DownloadCoordinator:
             completed = self._completed_from_path(
                 shard, found_path, shard.model_card.storage_size
             )
-            self.download_status[model_id] = completed
+            self.download_status[snapshot_id] = completed
             await self.event_sender.send(
                 NodeDownloadProgress(download_progress=completed)
             )
@@ -225,9 +251,9 @@ class DownloadCoordinator:
         progress = DownloadPending(
             shard_metadata=shard,
             node_id=self.node_id,
-            model_directory=self._default_model_dir(model_id),
+            model_directory=self._default_model_dir(model_card),
         )
-        self.download_status[model_id] = progress
+        self.download_status[snapshot_id] = progress
         await self.event_sender.send(NodeDownloadProgress(download_progress=progress))
 
         # Check initial status from downloader
@@ -248,9 +274,9 @@ class DownloadCoordinator:
                     shard_metadata=shard,
                     node_id=self.node_id,
                     total=initial_progress.total,
-                    model_directory=self._default_model_dir(model_id),
+                    model_directory=self._default_model_dir(model_card),
                 )
-            self.download_status[model_id] = completed
+            self.download_status[snapshot_id] = completed
             await self.event_sender.send(
                 NodeDownloadProgress(download_progress=completed)
             )
@@ -264,9 +290,9 @@ class DownloadCoordinator:
                 shard_metadata=shard,
                 node_id=self.node_id,
                 error_message=f"Model files not found locally in offline mode: {model_id}",
-                model_directory=self._default_model_dir(model_id),
+                model_directory=self._default_model_dir(model_card),
             )
-            self.download_status[model_id] = failed
+            self.download_status[snapshot_id] = failed
             await self.event_sender.send(NodeDownloadProgress(download_progress=failed))
             return
 
@@ -276,7 +302,9 @@ class DownloadCoordinator:
     def _start_download_task(
         self, shard: ShardMetadata, initial_progress: RepoDownloadProgress
     ) -> None:
-        model_id = shard.model_card.model_id
+        model_card = shard.model_card
+        model_id = model_card.model_id
+        snapshot_id = model_snapshot_id(model_card)
 
         # Emit ongoing status
         status = DownloadOngoing(
@@ -285,9 +313,9 @@ class DownloadCoordinator:
             download_progress=map_repo_download_progress_to_download_progress_data(
                 initial_progress
             ),
-            model_directory=self._default_model_dir(model_id),
+            model_directory=self._default_model_dir(model_card),
         )
-        self.download_status[model_id] = status
+        self.download_status[snapshot_id] = status
         self.event_sender.send_nowait(NodeDownloadProgress(download_progress=status))
 
         async def download_wrapper(cancel_scope: anyio.CancelScope) -> None:
@@ -300,9 +328,9 @@ class DownloadCoordinator:
                     shard_metadata=shard,
                     node_id=self.node_id,
                     error_message=str(e),
-                    model_directory=self._default_model_dir(model_id),
+                    model_directory=self._default_model_dir(model_card),
                 )
-                self.download_status[model_id] = failed
+                self.download_status[snapshot_id] = failed
                 await self.event_sender.send(
                     NodeDownloadProgress(download_progress=failed)
                 )
@@ -310,24 +338,35 @@ class DownloadCoordinator:
                 # ignore cancellation - let cleanup do its thing
                 pass
             finally:
-                self.active_downloads.pop(model_id, None)
+                self.active_downloads.pop(snapshot_id, None)
 
         scope = anyio.CancelScope()
         self._tg.start_soon(download_wrapper, scope)
-        self.active_downloads[model_id] = scope
+        self.active_downloads[snapshot_id] = scope
 
     async def _delete_download(self, model_id: ModelId) -> None:
-        # Protect read-only models from deletion
-        if model_id in self.download_status:
-            current = self.download_status[model_id]
-            if isinstance(current, DownloadCompleted) and current.read_only:
+        tracked_snapshot_ids = tuple(
+            snapshot_id
+            for snapshot_id in self.download_status
+            if snapshot_id[0] == model_id
+        )
+
+        # delete_model is model-wide, so one read-only snapshot protects every
+        # tracked revision from a partially successful delete operation.
+        for snapshot_id in tracked_snapshot_ids:
+            status = self.download_status[snapshot_id]
+            if isinstance(status, DownloadCompleted) and status.read_only:
                 logger.warning(f"Refusing to delete read-only model {model_id}")
                 return
 
-        # Cancel if active
-        if model_id in self.active_downloads:
-            logger.info(f"Cancelling active download for {model_id} before deletion")
-            self.active_downloads[model_id].cancel()
+        # Cancel every active revision because the command and disk deletion are
+        # intentionally model-id-wide for protocol compatibility.
+        for snapshot_id, cancel_scope in tuple(self.active_downloads.items()):
+            if snapshot_id[0] == model_id:
+                logger.info(
+                    f"Cancelling active download for {snapshot_id[0]} at {snapshot_id[1]} before deletion"
+                )
+                cancel_scope.cancel()
 
         # Delete from disk
         logger.info(f"Deleting model files for {model_id}")
@@ -338,18 +377,21 @@ class DownloadCoordinator:
         else:
             logger.warning(f"Model {model_id} was not found on disk")
 
-        # Emit pending status to reset UI state, then remove from local tracking
-        if model_id in self.download_status:
-            current_status = self.download_status[model_id]
+        # Emit pending status for every tracked revision, then clear local state.
+        for snapshot_id in tracked_snapshot_ids:
+            current_status = self.download_status[snapshot_id]
             pending = DownloadPending(
                 shard_metadata=current_status.shard_metadata,
                 node_id=self.node_id,
-                model_directory=self._default_model_dir(model_id),
+                model_directory=self._default_model_dir(
+                    current_status.shard_metadata.model_card
+                ),
             )
             await self.event_sender.send(
                 NodeDownloadProgress(download_progress=pending)
             )
-            del self.download_status[model_id]
+            del self.download_status[snapshot_id]
+            self._last_progress_time.pop(snapshot_id, None)
 
     async def _emit_existing_download_progress(self) -> None:
         while True:
@@ -361,10 +403,12 @@ class DownloadCoordinator:
                     _,
                     progress,
                 ) in self.shard_downloader.get_shard_download_status():
-                    model_id = progress.shard.model_card.model_id
+                    model_card = progress.shard.model_card
+                    model_id = model_card.model_id
+                    snapshot_id = model_snapshot_id(model_card)
 
                     # Active downloads emit progress via the callback — don't overwrite
-                    if model_id in self.active_downloads:
+                    if snapshot_id in self.active_downloads:
                         continue
 
                     if progress.status == "complete":
@@ -382,13 +426,13 @@ class DownloadCoordinator:
                                 node_id=self.node_id,
                                 shard_metadata=progress.shard,
                                 total=progress.total,
-                                model_directory=self._default_model_dir(model_id),
+                                model_directory=self._default_model_dir(model_card),
                             )
                     elif progress.status in ["in_progress", "not_started"]:
                         # TODO(ciaran): temporary solution
                         # Don't downgrade a model that is already confirmed complete.
                         if isinstance(
-                            self.download_status.get(model_id), DownloadCompleted
+                            self.download_status.get(snapshot_id), DownloadCompleted
                         ):
                             continue
                         # The per-file size check compares local files against
@@ -412,7 +456,7 @@ class DownloadCoordinator:
                             status = DownloadPending(
                                 node_id=self.node_id,
                                 shard_metadata=progress.shard,
-                                model_directory=self._default_model_dir(model_id),
+                                model_directory=self._default_model_dir(model_card),
                                 downloaded=progress.downloaded,
                                 total=progress.total,
                             )
@@ -423,12 +467,12 @@ class DownloadCoordinator:
                                 download_progress=map_repo_download_progress_to_download_progress_data(
                                     progress
                                 ),
-                                model_directory=self._default_model_dir(model_id),
+                                model_directory=self._default_model_dir(model_card),
                             )
                     else:
                         continue
 
-                    self.download_status[progress.shard.model_card.model_id] = status
+                    self.download_status[snapshot_id] = status
                     await self.event_sender.send(
                         NodeDownloadProgress(download_progress=status)
                     )
@@ -436,10 +480,11 @@ class DownloadCoordinator:
                 if EXO_MODELS_READ_ONLY_DIRS:
                     for card in await model_cards.card_cache.list_all():
                         mid = card.model_id
-                        if mid in self.active_downloads:
+                        snapshot_id = model_snapshot_id(card)
+                        if snapshot_id in self.active_downloads:
                             continue
                         if isinstance(
-                            self.download_status.get(mid),
+                            self.download_status.get(snapshot_id),
                             (DownloadCompleted, DownloadOngoing, DownloadFailed),
                         ):
                             continue
@@ -460,7 +505,7 @@ class DownloadCoordinator:
                                     path_shard, found, card.storage_size
                                 )
                             )
-                            self.download_status[mid] = path_completed
+                            self.download_status[snapshot_id] = path_completed
                             await self.event_sender.send(
                                 NodeDownloadProgress(download_progress=path_completed)
                             )
