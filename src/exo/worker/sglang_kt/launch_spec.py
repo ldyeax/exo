@@ -9,7 +9,6 @@ from exo.shared.types.worker.sglang_kt import (
     GpuUuid,
     HcaDevice,
     KTransformersMethod,
-    NetworkPort,
     ResourceIndex,
     SglangKtLaunchPlan,
     SglangKtStageSpec,
@@ -26,7 +25,9 @@ GLM_5_2_FULL_INDEXER_LAYER_STARTS: Final = frozenset(
 # SGLang submodule pins the matching fork revision below.
 SUPPORTED_KTRANSFORMERS_REVISION: Final = "ce7c3ddbe93f7ac1f992375eed54058bbc512646"
 SUPPORTED_SGLANG_REVISION: Final = "8b636f9008dbad58c0a8e481b03e794739e6c146"
-REQUIRED_TRANSFORMERS_VERSION: Final = "5.3.0"
+REQUIRED_TRANSFORMERS_DISTRIBUTION: Final = "transformers-kt"
+REQUIRED_TRANSFORMERS_VERSION: Final = "5.6.0.post1"
+GLM_5_2_KV_CACHE_DTYPE: Final = "fp8_e4m3"
 
 EnvironmentVariable = tuple[str, str]
 
@@ -92,10 +93,6 @@ class SglangKtProcessLaunchSpec(FrozenModel):
         return self.plan.distributed_coordinator
 
     @property
-    def nccl_port(self) -> NetworkPort:
-        return self.stage.nccl_port
-
-    @property
     def model_id(self) -> ModelId:
         return self.plan.model_id
 
@@ -154,8 +151,6 @@ class SglangKtProcessLaunchSpec(FrozenModel):
             stage.service_endpoint.ip,
             "--port",
             str(stage.service_endpoint.port),
-            "--nccl-port",
-            str(stage.nccl_port),
             "--context-length",
             str(self.plan.context_length),
             "--max-running-requests",
@@ -163,7 +158,7 @@ class SglangKtProcessLaunchSpec(FrozenModel):
             "--attention-backend",
             "nsa",
             "--kv-cache-dtype",
-            "fp8_e4m3",
+            GLM_5_2_KV_CACHE_DTYPE,
             "--disable-shared-experts-fusion",
             "--tool-call-parser",
             "glm47",
@@ -251,7 +246,16 @@ def _validate_supported_plan(plan: SglangKtLaunchPlan) -> None:
             f"invalid starts: {invalid_pipeline_starts}"
         )
     for stage in plan.stages:
+        if stage.model_path != stage.ktransformers_weight_path:
+            raise ValueError(
+                "the audited GLM-5.2 runtime requires model_path and "
+                "ktransformers_weight_path to match"
+            )
         if stage.ktransformers_method != "FP8":
             raise ValueError("GLM-5.2-FP8 stages require KTransformers method FP8")
+        if len(plan.stages) > 1 and stage.max_deferred_experts_per_token != 0:
+            raise ValueError(
+                "pipeline GLM-5.2 stages require deferred expert work to be disabled"
+            )
         if not stage.hca_devices:
             raise ValueError("SGLang-KT InfiniBand stages require hca_devices")

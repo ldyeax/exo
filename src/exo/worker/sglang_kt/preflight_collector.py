@@ -1,3 +1,4 @@
+import hashlib
 import os
 import re
 import socket
@@ -25,6 +26,8 @@ from exo.worker.sglang_kt.preflight import (
     SglangKtHostPreflightObservation,
     SglangKtModelSnapshotReceiptObservation,
     SglangKtRuntimeObservation,
+    SglangKtRuntimeValidationReceiptObservation,
+    Sha256Digest,
 )
 
 _DEFAULT_NUMA_NODES_PATH = Path("/sys/devices/system/node")
@@ -36,6 +39,7 @@ _RUNTIME_PROBE_TIMEOUT_SECONDS = 15.0
 # It deliberately uses only the standard library and reports partial facts when a
 # package is absent. The evaluator turns every absent fact into a failed check.
 _RUNTIME_PROBE_SCRIPT = r"""
+import importlib
 import importlib.metadata
 import importlib.util
 import json
@@ -93,6 +97,15 @@ def distribution_version(distribution_name):
         return None
 
 
+def module_version(module_name):
+    try:
+        module = importlib.import_module(module_name)
+        version = getattr(module, "__version__", None)
+        return version if isinstance(version, str) and version else None
+    except Exception:
+        return None
+
+
 print(json.dumps({
     "executable": sys.executable,
     "python_implementation": platform.python_implementation(),
@@ -103,7 +116,8 @@ print(json.dumps({
     },
     "sglang_revision": source_revision("sglang"),
     "ktransformers_revision": source_revision("ktransformers"),
-    "transformers_version": distribution_version("transformers"),
+    "transformers_distribution_version": distribution_version("transformers-kt"),
+    "transformers_module_version": module_version("transformers"),
 }))
 """.strip()
 
@@ -174,8 +188,6 @@ class SglangKtHostInventoryProbe(Protocol):
 class SglangKtPortProbe(Protocol):
     def can_bind_endpoint(self, endpoint: Host) -> bool: ...
 
-    def can_bind_local_port(self, port: NetworkPort) -> bool: ...
-
 
 def _run_runtime_command(
     command: tuple[str, ...], timeout_seconds: float
@@ -228,6 +240,8 @@ class SglangKtModelSnapshotCompatibility(FrozenModel):
 
     weight_format: Literal["safetensors"]
     ktransformers_method: KTransformersMethod
+    config_sha256: Sha256Digest
+    full_indexer_layer_starts: tuple[ResourceIndex, ...]
 
 
 type ModelSnapshotCompatibilityVerifier = Callable[
@@ -261,7 +275,22 @@ class _Glm52Fp8ModelConfig(BaseModel):
     num_nextn_predict_layers: Literal[1]
     index_topk_freq: Annotated[int, Field(gt=1)]
     index_share_for_mtp_iteration: Literal[True]
+    indexer_types: tuple[Literal["full", "shared"], ...]
     quantization_config: _Glm52Fp8QuantizationConfig
+
+    @model_validator(mode="after")
+    def validate_indexer_types(self) -> "_Glm52Fp8ModelConfig":
+        if len(self.indexer_types) != self.num_hidden_layers:
+            raise ValueError("indexer_types must describe every hidden layer")
+        full_starts = tuple(
+            index
+            for index, indexer_type in enumerate(self.indexer_types)
+            if indexer_type == "full"
+        )
+        expected_full_starts = (0, 1, 2, *range(6, self.num_hidden_layers, 4))
+        if full_starts != expected_full_starts:
+            raise ValueError("indexer_types does not match audited GLM-5.2 IndexShare")
+        return self
 
 
 def verify_glm_5_2_fp8_model_snapshot_compatibility(
@@ -273,14 +302,19 @@ def verify_glm_5_2_fp8_model_snapshot_compatibility(
 
     del model_id, revision
     try:
-        _Glm52Fp8ModelConfig.model_validate_json(
-            (path / "config.json").read_text(encoding="utf-8")
-        )
+        config_bytes = (path / "config.json").read_bytes()
+        config = _Glm52Fp8ModelConfig.model_validate_json(config_bytes)
     except (OSError, UnicodeError, ValidationError):
         return None
     return SglangKtModelSnapshotCompatibility(
         weight_format="safetensors",
         ktransformers_method="FP8",
+        config_sha256=hashlib.sha256(config_bytes).hexdigest(),
+        full_indexer_layer_starts=tuple(
+            index
+            for index, indexer_type in enumerate(config.indexer_types)
+            if indexer_type == "full"
+        ),
     )
 
 
@@ -353,6 +387,8 @@ class LocalSglangKtFilesystemProbe:
             revision=revision,
             weight_format=compatibility.weight_format,
             ktransformers_method=compatibility.ktransformers_method,
+            config_sha256=compatibility.config_sha256,
+            full_indexer_layer_starts=compatibility.full_indexer_layer_starts,
             receipt_verified=True,
             snapshot_complete=snapshot_complete is True,
         )
@@ -482,12 +518,6 @@ class SocketSglangKtPortProbe:
         except Exception:
             return False
 
-    def can_bind_local_port(self, port: NetworkPort) -> bool:
-        try:
-            return self._bind_probe("0.0.0.0", port) is True
-        except Exception:
-            return False
-
 
 def collect_sglang_kt_local_host_preflight_observation(
     process_specs: tuple[SglangKtProcessLaunchSpec, ...],
@@ -497,6 +527,9 @@ def collect_sglang_kt_local_host_preflight_observation(
     filesystem_probe: SglangKtFilesystemProbe,
     inventory_probe: SglangKtHostInventoryProbe,
     port_probe: SglangKtPortProbe,
+    runtime_validation_receipts: Sequence[
+        SglangKtRuntimeValidationReceiptObservation
+    ] = (),
 ) -> SglangKtHostPreflightObservation:
     """Collect one host observation from explicitly supplied local effects."""
 
@@ -528,15 +561,21 @@ def collect_sglang_kt_local_host_preflight_observation(
         for endpoint in _planned_bind_endpoints(process_specs)
         if _is_observed_bind_endpoint_available(port_probe, endpoint)
     )
-    available_local_ports = tuple(
-        port
-        for port in _unique(spec.nccl_port for spec in process_specs)
-        if _is_observed_local_port_available(port_probe, port)
+    supplied_validation_receipts = tuple(runtime_validation_receipts)
+    planned_gpu_uuids = {spec.gpu_uuid for spec in process_specs}
+    observed_gpu_uuids = {resource.device_uuid for resource in inventory.gpu_resources}
+    receipt_gpu_uuids = tuple(
+        receipt.gpu_uuid for receipt in supplied_validation_receipts
     )
-
+    if len(set(receipt_gpu_uuids)) != len(receipt_gpu_uuids) or any(
+        gpu_uuid not in planned_gpu_uuids or gpu_uuid not in observed_gpu_uuids
+        for gpu_uuid in receipt_gpu_uuids
+    ):
+        supplied_validation_receipts = ()
     return SglangKtHostPreflightObservation(
         node_id=node_id,
         runtime=runtime,
+        runtime_validation_receipts=supplied_validation_receipts,
         readable_directories=readable_directories,
         model_snapshot_receipts=model_snapshot_receipts,
         gpu_uuids=tuple(resource.device_uuid for resource in inventory.gpu_resources),
@@ -544,7 +583,6 @@ def collect_sglang_kt_local_host_preflight_observation(
         memory_nodes=inventory.memory_nodes,
         hca_devices=inventory.hca_devices,
         available_bind_endpoints=available_bind_endpoints,
-        available_local_ports=available_local_ports,
     )
 
 
@@ -682,16 +720,6 @@ def _is_observed_bind_endpoint_available(
 ) -> bool:
     try:
         return port_probe.can_bind_endpoint(endpoint) is True
-    except Exception:
-        return False
-
-
-def _is_observed_local_port_available(
-    port_probe: SglangKtPortProbe,
-    port: NetworkPort,
-) -> bool:
-    try:
-        return port_probe.can_bind_local_port(port) is True
     except Exception:
         return False
 

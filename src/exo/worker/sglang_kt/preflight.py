@@ -9,13 +9,33 @@ from exo.shared.types.worker.sglang_kt import (
     GpuUuid,
     HcaDevice,
     KTransformersMethod,
-    NetworkPort,
     ResourceIndex,
 )
 from exo.utils.pydantic_ext import FrozenModel
-from exo.worker.sglang_kt.launch_spec import SglangKtProcessLaunchSpec
+from exo.worker.sglang_kt.launch_spec import (
+    GLM_5_2_KV_CACHE_DTYPE,
+    REQUIRED_TRANSFORMERS_VERSION,
+    SglangKtProcessLaunchSpec,
+)
 
 ObservedText = Annotated[str, StringConstraints(min_length=1)]
+Sha256Digest = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
+SglangKtRuntimeCapability = Literal[
+    "kt_tp_group_local_broadcast_v1",
+    "glm52_nsa_sm86_short_forward_v1",
+    "kt_physical_numa_mapping_v1",
+    "kt_process_cpu_affinity_v1",
+    "kt_fp8_amx_executed_v1",
+]
+REQUIRED_RUNTIME_CAPABILITIES: frozenset[SglangKtRuntimeCapability] = frozenset(
+    (
+        "kt_tp_group_local_broadcast_v1",
+        "glm52_nsa_sm86_short_forward_v1",
+        "kt_physical_numa_mapping_v1",
+        "kt_process_cpu_affinity_v1",
+        "kt_fp8_amx_executed_v1",
+    )
+)
 PreflightCheck = Literal[
     "host_observation",
     "python_executable",
@@ -23,7 +43,9 @@ PreflightCheck = Literal[
     "python_version",
     "sglang_revision",
     "ktransformers_revision",
-    "transformers_version",
+    "transformers_distribution_version",
+    "transformers_module_version",
+    "runtime_validation_receipt",
     "model_path",
     "ktransformers_weight_path",
     "model_revision_receipt",
@@ -34,7 +56,6 @@ PreflightCheck = Literal[
     "hca_devices",
     "service_endpoint",
     "distributed_coordinator",
-    "nccl_port",
 ]
 
 
@@ -65,7 +86,51 @@ class SglangKtRuntimeObservation(FrozenModel):
     python_version: SglangKtPythonVersionObservation | None = None
     sglang_revision: GitRevision | None = None
     ktransformers_revision: GitRevision | None = None
-    transformers_version: ObservedText | None = None
+    transformers_distribution_version: ObservedText | None = None
+    transformers_module_version: ObservedText | None = None
+
+
+@final
+class SglangKtRuntimeValidationReceiptObservation(FrozenModel):
+    """Evidence from a target-specific runtime smoke test on one GPU.
+
+    The version-only runtime probe never creates this receipt. A future
+    validator must execute the named checks on the exact stack and checkpoint
+    before the external process group can pass preflight.
+    """
+
+    gpu_uuid: GpuUuid
+    gpu_compute_capability: tuple[PositiveInt, ResourceIndex]
+    cpu_cores: tuple[ResourceIndex, ...]
+    memory_nodes: tuple[ResourceIndex, ...]
+    executed_cpu_backend: Literal["AMX"]
+    model_id: ModelId
+    model_revision: GitRevision
+    model_config_sha256: Sha256Digest
+    sglang_revision: GitRevision
+    ktransformers_revision: GitRevision
+    transformers_distribution_version: ObservedText
+    transformers_module_version: ObservedText
+    torch_version: ObservedText
+    cuda_version: ObservedText
+    sgl_kernel_build_id: ObservedText
+    deep_gemm_build_id: ObservedText
+    kv_cache_dtype: Literal["fp8_e4m3"]
+    capabilities: tuple[SglangKtRuntimeCapability, ...]
+
+    @model_validator(mode="after")
+    def validate_capabilities(self) -> "SglangKtRuntimeValidationReceiptObservation":
+        if len(set(self.capabilities)) != len(self.capabilities):
+            raise ValueError("runtime validation capabilities must be unique")
+        if not self.cpu_cores or len(set(self.cpu_cores)) != len(self.cpu_cores):
+            raise ValueError("validated runtime CPU cores must be nonempty and unique")
+        if not self.memory_nodes or len(set(self.memory_nodes)) != len(
+            self.memory_nodes
+        ):
+            raise ValueError(
+                "validated runtime memory nodes must be nonempty and unique"
+            )
+        return self
 
 
 @final
@@ -77,8 +142,19 @@ class SglangKtModelSnapshotReceiptObservation(FrozenModel):
     revision: GitRevision
     weight_format: Literal["safetensors"]
     ktransformers_method: KTransformersMethod
+    config_sha256: Sha256Digest
+    full_indexer_layer_starts: tuple[ResourceIndex, ...]
     receipt_verified: bool
     snapshot_complete: bool
+
+    @model_validator(mode="after")
+    def validate_indexer_boundaries(self) -> "SglangKtModelSnapshotReceiptObservation":
+        starts = self.full_indexer_layer_starts
+        if not starts or starts[0] != 0 or tuple(sorted(set(starts))) != starts:
+            raise ValueError(
+                "full_indexer_layer_starts must be sorted, unique, and begin at zero"
+            )
+        return self
 
 
 @final
@@ -91,6 +167,9 @@ class SglangKtHostPreflightObservation(FrozenModel):
 
     node_id: NodeId
     runtime: SglangKtRuntimeObservation
+    runtime_validation_receipts: tuple[
+        SglangKtRuntimeValidationReceiptObservation, ...
+    ] = ()
     readable_directories: tuple[AbsoluteRuntimePath, ...] = ()
     model_snapshot_receipts: tuple[SglangKtModelSnapshotReceiptObservation, ...] = ()
     gpu_uuids: tuple[GpuUuid, ...] = ()
@@ -98,7 +177,6 @@ class SglangKtHostPreflightObservation(FrozenModel):
     memory_nodes: tuple[ResourceIndex, ...] = ()
     hca_devices: tuple[HcaDevice, ...] = ()
     available_bind_endpoints: tuple[Host, ...] = ()
-    available_local_ports: tuple[NetworkPort, ...] = ()
 
     @model_validator(mode="after")
     def validate_unambiguous_facts(self) -> "SglangKtHostPreflightObservation":
@@ -108,7 +186,6 @@ class SglangKtHostPreflightObservation(FrozenModel):
             ("cpu_cores", self.cpu_cores),
             ("memory_nodes", self.memory_nodes),
             ("hca_devices", self.hca_devices),
-            ("available_local_ports", self.available_local_ports),
         )
         for collection_name, values in collections:
             if len(set(values)) != len(values):
@@ -125,6 +202,12 @@ class SglangKtHostPreflightObservation(FrozenModel):
         )
         if len(set(receipt_paths)) != len(receipt_paths):
             raise ValueError("model snapshot receipt paths must be unique")
+
+        validation_gpu_uuids = tuple(
+            receipt.gpu_uuid for receipt in self.runtime_validation_receipts
+        )
+        if len(set(validation_gpu_uuids)) != len(validation_gpu_uuids):
+            raise ValueError("runtime validation receipt GPU UUIDs must be unique")
         return self
 
 
@@ -211,6 +294,7 @@ def evaluate_sglang_kt_preflight(
         observation = observations[0]
         _evaluate_runtime(process_spec, observation.runtime, failures)
         _evaluate_paths_and_receipt(process_spec, observation, failures)
+        _evaluate_runtime_validation(process_spec, observation, failures)
         _evaluate_resources(process_spec, observation, failures)
         _evaluate_ports(process_spec, observation, failures)
 
@@ -273,14 +357,26 @@ def _evaluate_runtime(
                 "the installed KTransformers source revision is not the pinned runtime"
             ),
         )
-    if runtime.transformers_version != process_spec.required_transformers_version:
+    if (
+        runtime.transformers_distribution_version
+        != process_spec.required_transformers_version
+    ):
         _record_failure(
             failures,
             process_spec,
-            "transformers_version",
+            "transformers_distribution_version",
             expected=(process_spec.required_transformers_version,),
-            observed=_optional_observed(runtime.transformers_version),
-            detail="the installed Transformers package version is not supported",
+            observed=_optional_observed(runtime.transformers_distribution_version),
+            detail="the installed transformers-kt distribution is not supported",
+        )
+    if runtime.transformers_module_version != REQUIRED_TRANSFORMERS_VERSION:
+        _record_failure(
+            failures,
+            process_spec,
+            "transformers_module_version",
+            expected=(REQUIRED_TRANSFORMERS_VERSION,),
+            observed=_optional_observed(runtime.transformers_module_version),
+            detail="the imported transformers module version is not supported",
         )
 
 
@@ -349,6 +445,10 @@ def _evaluate_snapshot_receipt(
         and receipt.revision == process_spec.expected_model_revision
         and receipt.weight_format == "safetensors"
         and receipt.ktransformers_method == process_spec.ktransformers_method
+        and all(
+            stage.start_layer in receipt.full_indexer_layer_starts
+            for stage in process_spec.plan.stages
+        )
         and receipt.receipt_verified
         and receipt.snapshot_complete
     )
@@ -361,6 +461,9 @@ def _evaluate_snapshot_receipt(
                 receipt.revision,
                 receipt.weight_format,
                 receipt.ktransformers_method,
+                receipt.config_sha256,
+                "full_indexer_layer_starts="
+                + ",".join(str(start) for start in receipt.full_indexer_layer_starts),
                 f"receipt_verified={receipt.receipt_verified}",
                 f"snapshot_complete={receipt.snapshot_complete}",
             )
@@ -374,12 +477,114 @@ def _evaluate_snapshot_receipt(
                 process_spec.expected_model_revision,
                 "safetensors",
                 process_spec.ktransformers_method,
+                "config_sha256=<verified>",
+                "pipeline starts on verified full indexers",
                 "receipt_verified=True",
                 "snapshot_complete=True",
             ),
             observed=observed,
             detail=detail,
         )
+
+
+def _evaluate_runtime_validation(
+    process_spec: SglangKtProcessLaunchSpec,
+    observation: SglangKtHostPreflightObservation,
+    failures: list[SglangKtPreflightFailure],
+) -> None:
+    validation_receipt = next(
+        (
+            receipt
+            for receipt in observation.runtime_validation_receipts
+            if receipt.gpu_uuid == process_spec.gpu_uuid
+        ),
+        None,
+    )
+    snapshot_receipt = next(
+        (
+            receipt
+            for receipt in observation.model_snapshot_receipts
+            if receipt.model_path == process_spec.model_path
+        ),
+        None,
+    )
+    receipt_matches = (
+        validation_receipt is not None
+        and snapshot_receipt is not None
+        and validation_receipt.gpu_compute_capability == (8, 6)
+        and validation_receipt.cpu_cores == process_spec.cpu_cores
+        and validation_receipt.memory_nodes == process_spec.memory_nodes
+        and validation_receipt.executed_cpu_backend == "AMX"
+        and validation_receipt.model_id == process_spec.model_id
+        and validation_receipt.model_revision == process_spec.expected_model_revision
+        and validation_receipt.model_config_sha256 == snapshot_receipt.config_sha256
+        and validation_receipt.sglang_revision == process_spec.expected_sglang_revision
+        and validation_receipt.ktransformers_revision
+        == process_spec.expected_ktransformers_revision
+        and validation_receipt.transformers_distribution_version
+        == process_spec.required_transformers_version
+        and validation_receipt.transformers_module_version
+        == process_spec.required_transformers_version
+        and validation_receipt.kv_cache_dtype == GLM_5_2_KV_CACHE_DTYPE
+        and REQUIRED_RUNTIME_CAPABILITIES.issubset(validation_receipt.capabilities)
+    )
+    if receipt_matches:
+        return
+
+    observed = (
+        ("<missing>",)
+        if validation_receipt is None
+        else (
+            validation_receipt.gpu_uuid,
+            "compute_capability="
+            + ".".join(
+                str(component)
+                for component in validation_receipt.gpu_compute_capability
+            ),
+            "cpu_cores=" + ",".join(str(core) for core in validation_receipt.cpu_cores),
+            "memory_nodes="
+            + ",".join(str(node) for node in validation_receipt.memory_nodes),
+            "executed_cpu_backend=" + validation_receipt.executed_cpu_backend,
+            str(validation_receipt.model_id),
+            validation_receipt.model_revision,
+            validation_receipt.model_config_sha256,
+            validation_receipt.sglang_revision,
+            validation_receipt.ktransformers_revision,
+            validation_receipt.transformers_distribution_version,
+            validation_receipt.transformers_module_version,
+            validation_receipt.torch_version,
+            validation_receipt.cuda_version,
+            validation_receipt.sgl_kernel_build_id,
+            validation_receipt.deep_gemm_build_id,
+            validation_receipt.kv_cache_dtype,
+            *validation_receipt.capabilities,
+        )
+    )
+    _record_failure(
+        failures,
+        process_spec,
+        "runtime_validation_receipt",
+        expected=(
+            process_spec.gpu_uuid,
+            "compute_capability=8.6",
+            "cpu_cores=" + ",".join(str(core) for core in process_spec.cpu_cores),
+            "memory_nodes=" + ",".join(str(node) for node in process_spec.memory_nodes),
+            "executed_cpu_backend=AMX",
+            str(process_spec.model_id),
+            process_spec.expected_model_revision,
+            "model_config_sha256=<snapshot receipt>",
+            process_spec.expected_sglang_revision,
+            process_spec.expected_ktransformers_revision,
+            process_spec.required_transformers_version,
+            GLM_5_2_KV_CACHE_DTYPE,
+            *tuple(sorted(REQUIRED_RUNTIME_CAPABILITIES)),
+        ),
+        observed=observed,
+        detail=(
+            "the exact GPU/runtime stack lacks bound PP=3 broadcast, SM86 NSA, "
+            "physical-NUMA, process-affinity, and executed-AMX validation evidence"
+        ),
+    )
 
 
 def _evaluate_resources(
@@ -490,16 +695,6 @@ def _evaluate_ports(
                 ),
                 detail="the distributed coordinator endpoint is not available",
             )
-
-    if process_spec.nccl_port not in observation.available_local_ports:
-        _record_failure(
-            failures,
-            process_spec,
-            "nccl_port",
-            expected=(str(process_spec.nccl_port),),
-            observed=tuple(str(port) for port in observation.available_local_ports),
-            detail="the planned NCCL setup port is not available on the host",
-        )
 
 
 def _optional_observed(value: object | None) -> tuple[str, ...]:

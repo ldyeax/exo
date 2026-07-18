@@ -30,7 +30,6 @@ def make_stage(
     gpu_suffix: int,
     service_ip: str,
     service_port: int,
-    nccl_port: int,
     cpu_cores: tuple[int, ...],
     memory_node: int,
     hca_devices: tuple[str, ...],
@@ -43,9 +42,8 @@ def make_stage(
         node_id=NodeId(node_id),
         gpu_uuid=f"GPU-00000000-0000-0000-0000-{gpu_suffix:012x}",
         service_endpoint=Host(ip=service_ip, port=service_port),
-        nccl_port=nccl_port,
         model_path="/var/lib/exo/models/glm-5.2-fp8",
-        ktransformers_weight_path="/var/lib/exo/models/glm-5.2-fp8-kt",
+        ktransformers_weight_path="/var/lib/exo/models/glm-5.2-fp8",
         cpu_cores=cpu_cores,
         memory_nodes=(memory_node,),
         cpu_infer_threads=len(cpu_cores),
@@ -84,7 +82,6 @@ def make_plan(
                 gpu_suffix=1,
                 service_ip="192.168.40.248",
                 service_port=30_000,
-                nccl_port=31_000,
                 cpu_cores=tuple(range(30)),
                 memory_node=0,
                 hca_devices=hca_devices,
@@ -98,7 +95,6 @@ def make_plan(
                 gpu_suffix=2,
                 service_ip="192.168.40.248",
                 service_port=30_001,
-                nccl_port=31_001,
                 cpu_cores=tuple(range(30, 58)),
                 memory_node=1,
                 hca_devices=("mlx4_0:2",),
@@ -112,7 +108,6 @@ def make_plan(
                 gpu_suffix=3,
                 service_ip="192.168.40.249",
                 service_port=30_002,
-                nccl_port=31_000,
                 cpu_cores=tuple(range(20)),
                 memory_node=0,
                 hca_devices=("mlx4_0:1",),
@@ -158,7 +153,7 @@ def test_builds_three_logical_nodes_for_two_physical_hosts() -> None:
         assert argument_value(spec.arguments, "--port") == str(
             spec.service_endpoint.port
         )
-        assert argument_value(spec.arguments, "--nccl-port") == str(spec.nccl_port)
+        assert "--nccl-port" not in spec.arguments
 
 
 def test_builds_pinned_glm_5_2_ktransformers_arguments() -> None:
@@ -267,6 +262,35 @@ def test_rejects_unverified_runtime_combinations(
 def test_rejects_non_absolute_python_executable() -> None:
     with pytest.raises(ValidationError, match="executable"):
         build_glm_5_2_fp8_process_launch_specs(make_plan(), "python")
+
+
+@pytest.mark.parametrize(
+    ("stage_update", "error_message"),
+    [
+        (
+            {"ktransformers_weight_path": "/var/lib/exo/models/separate-weights"},
+            "model_path and ktransformers_weight_path to match",
+        ),
+        (
+            {"max_deferred_experts_per_token": 1},
+            "deferred expert work to be disabled",
+        ),
+    ],
+)
+def test_rejects_unaudited_pipeline_runtime_options(
+    stage_update: dict[str, object], error_message: str
+) -> None:
+    plan = make_plan()
+    stages = (
+        plan.stages[0].model_copy(update=stage_update),
+        *plan.stages[1:],
+    )
+
+    with pytest.raises(ValueError, match=error_message):
+        build_glm_5_2_fp8_process_launch_specs(
+            plan.model_copy(update={"stages": stages}),
+            PYTHON_EXECUTABLE,
+        )
 
 
 def test_rejects_pipeline_start_on_shared_indexer_layer() -> None:

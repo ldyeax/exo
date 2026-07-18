@@ -70,7 +70,6 @@ class SglangKtStageSpec(FrozenModel):
     node_id: NodeId
     gpu_uuid: GpuUuid
     service_endpoint: Host
-    nccl_port: NetworkPort
     model_path: AbsoluteRuntimePath
     ktransformers_weight_path: AbsoluteRuntimePath
     cpu_cores: tuple[ResourceIndex, ...]
@@ -134,7 +133,6 @@ class SglangKtLaunchPlan(FrozenModel):
         seen_gpu_uuids: set[str] = set()
         seen_service_endpoints: set[tuple[str, int]] = set()
         cpu_cores_by_node: dict[NodeId, set[int]] = {}
-        nccl_ports_by_node: dict[NodeId, set[int]] = {}
 
         for expected_rank, stage in enumerate(self.stages):
             if stage.pipeline_rank != expected_rank:
@@ -158,13 +156,6 @@ class SglangKtLaunchPlan(FrozenModel):
                     "pipeline stages on the same node must use disjoint cpu_cores"
                 )
             assigned_cpu_cores.update(stage.cpu_cores)
-
-            assigned_nccl_ports = nccl_ports_by_node.setdefault(stage.node_id, set())
-            if stage.nccl_port in assigned_nccl_ports:
-                raise ValueError(
-                    "pipeline stages on the same node must use distinct nccl_port values"
-                )
-            assigned_nccl_ports.add(stage.nccl_port)
 
             seen_gpu_uuids.add(stage.gpu_uuid)
             seen_service_endpoints.add(service_endpoint)

@@ -23,6 +23,7 @@ from exo.worker.sglang_kt.preflight import (
     SglangKtPreflightPassed,
     SglangKtPythonVersionObservation,
     SglangKtRuntimeObservation,
+    SglangKtRuntimeValidationReceiptObservation,
     evaluate_sglang_kt_preflight,
 )
 from exo.worker.sglang_kt.preflight_collector import (
@@ -39,6 +40,9 @@ from exo.worker.tests.unittests.test_sglang_kt_launch_spec import (
     PYTHON_EXECUTABLE,
     make_plan,
 )
+
+CONFIG_SHA256 = "a" * 64
+FULL_INDEXER_LAYER_STARTS = (0, 1, 2, *range(6, 78, 4))
 
 
 def make_specs() -> tuple[SglangKtProcessLaunchSpec, ...]:
@@ -57,6 +61,10 @@ def make_glm_5_2_fp8_config() -> dict[str, object]:
         "num_nextn_predict_layers": 1,
         "index_topk_freq": 4,
         "index_share_for_mtp_iteration": True,
+        "indexer_types": tuple(
+            "full" if index in FULL_INDEXER_LAYER_STARTS else "shared"
+            for index in range(78)
+        ),
         "quantization_config": {
             "activation_scheme": "dynamic",
             "fmt": "e4m3",
@@ -100,7 +108,39 @@ def make_runtime(spec: SglangKtProcessLaunchSpec) -> SglangKtRuntimeObservation:
         ),
         sglang_revision=spec.expected_sglang_revision,
         ktransformers_revision=spec.expected_ktransformers_revision,
-        transformers_version=spec.required_transformers_version,
+        transformers_distribution_version=spec.required_transformers_version,
+        transformers_module_version=spec.required_transformers_version,
+    )
+
+
+def make_runtime_validation_receipt(
+    spec: SglangKtProcessLaunchSpec,
+) -> SglangKtRuntimeValidationReceiptObservation:
+    return SglangKtRuntimeValidationReceiptObservation(
+        gpu_uuid=spec.gpu_uuid,
+        gpu_compute_capability=(8, 6),
+        cpu_cores=spec.cpu_cores,
+        memory_nodes=spec.memory_nodes,
+        executed_cpu_backend="AMX",
+        model_id=spec.model_id,
+        model_revision=spec.expected_model_revision,
+        model_config_sha256=CONFIG_SHA256,
+        sglang_revision=spec.expected_sglang_revision,
+        ktransformers_revision=spec.expected_ktransformers_revision,
+        transformers_distribution_version=spec.required_transformers_version,
+        transformers_module_version=spec.required_transformers_version,
+        torch_version="2.10.0+cu130",
+        cuda_version="13.0",
+        sgl_kernel_build_id="sgl-kernel-test-build",
+        deep_gemm_build_id="deep-gemm-test-build",
+        kv_cache_dtype="fp8_e4m3",
+        capabilities=(
+            "kt_tp_group_local_broadcast_v1",
+            "glm52_nsa_sm86_short_forward_v1",
+            "kt_physical_numa_mapping_v1",
+            "kt_process_cpu_affinity_v1",
+            "kt_fp8_amx_executed_v1",
+        ),
     )
 
 
@@ -153,6 +193,8 @@ class SuccessfulFilesystemProbe:
             revision=revision,
             weight_format="safetensors",
             ktransformers_method="FP8",
+            config_sha256=CONFIG_SHA256,
+            full_indexer_layer_starts=FULL_INDEXER_LAYER_STARTS,
             receipt_verified=True,
             snapshot_complete=True,
         )
@@ -180,6 +222,8 @@ class IncompatibleFilesystemProbe:
             revision=revision,
             weight_format="safetensors",
             ktransformers_method=("BF16" if self.mode == "wrong_method" else "FP8"),
+            config_sha256=CONFIG_SHA256,
+            full_indexer_layer_starts=FULL_INDEXER_LAYER_STARTS,
             receipt_verified=True,
             snapshot_complete=True,
         )
@@ -201,14 +245,9 @@ class StaticInventoryProbe:
 @dataclass
 class SuccessfulPortProbe:
     endpoint_calls: list[Host] = field(default_factory=list)
-    port_calls: list[NetworkPort] = field(default_factory=list)
 
     def can_bind_endpoint(self, endpoint: Host) -> bool:
         self.endpoint_calls.append(endpoint)
-        return True
-
-    def can_bind_local_port(self, port: NetworkPort) -> bool:
-        self.port_calls.append(port)
         return True
 
 
@@ -246,6 +285,9 @@ def collect_successful_observation(
         filesystem_probe=filesystem_probe,
         inventory_probe=inventory_probe,
         port_probe=port_probe,
+        runtime_validation_receipts=tuple(
+            make_runtime_validation_receipt(spec) for spec in specs
+        ),
     )
     return observation, filesystem_probe, inventory_probe, port_probe
 
@@ -265,19 +307,12 @@ def test_collects_exact_facts_for_multiple_local_process_specs() -> None:
     assert dwagon.cpu_cores == (*specs[0].cpu_cores, *specs[1].cpu_cores)
     assert dwagon.memory_nodes == (0, 1)
     assert dwagon.hca_devices == ("mlx4_0:1", "mlx4_0:2")
-    assert dwagon.readable_directories == (
-        specs[0].model_path,
-        specs[0].ktransformers_weight_path,
-    )
+    assert dwagon.readable_directories == (specs[0].model_path,)
     assert tuple(receipt.model_path for receipt in dwagon.model_snapshot_receipts) == (
         specs[0].model_path,
-        specs[0].ktransformers_weight_path,
     )
-    assert filesystem_probe.readable_calls == [
-        specs[0].model_path,
-        specs[0].ktransformers_weight_path,
-    ]
-    assert len(filesystem_probe.snapshot_calls) == 2
+    assert filesystem_probe.readable_calls == [specs[0].model_path]
+    assert len(filesystem_probe.snapshot_calls) == 1
     assert inventory_probe.calls == [
         (make_gpu_resource(specs[0]), make_gpu_resource(specs[1]))
     ]
@@ -286,7 +321,6 @@ def test_collects_exact_facts_for_multiple_local_process_specs() -> None:
         specs[1].service_endpoint,
         specs[0].distributed_coordinator,
     ]
-    assert port_probe.port_calls == [specs[0].nccl_port, specs[1].nccl_port]
 
 
 @pytest.mark.parametrize("mode", ["missing", "wrong_method", "wrong_path"])
@@ -306,6 +340,40 @@ def test_collector_omits_unestablished_or_incompatible_snapshot_facts(
     )
 
     assert observation.model_snapshot_receipts == ()
+    assert observation.runtime_validation_receipts == ()
+
+
+def test_collector_never_infers_runtime_validation_from_versions() -> None:
+    spec = make_specs()[0]
+
+    observation = collect_sglang_kt_local_host_preflight_observation(
+        (spec,),
+        gpu_resources=(make_gpu_resource(spec),),
+        runtime_probe=StaticRuntimeProbe(make_runtime(spec)),
+        filesystem_probe=SuccessfulFilesystemProbe(),
+        inventory_probe=StaticInventoryProbe(make_inventory((spec,))),
+        port_probe=SuccessfulPortProbe(),
+    )
+
+    assert observation.runtime == make_runtime(spec)
+    assert observation.runtime_validation_receipts == ()
+
+
+def test_collector_discards_validation_receipt_for_an_unobserved_gpu() -> None:
+    spec = make_specs()[0]
+    other_spec = make_specs()[1]
+
+    observation = collect_sglang_kt_local_host_preflight_observation(
+        (spec,),
+        gpu_resources=(make_gpu_resource(spec),),
+        runtime_probe=StaticRuntimeProbe(make_runtime(spec)),
+        filesystem_probe=SuccessfulFilesystemProbe(),
+        inventory_probe=StaticInventoryProbe(make_inventory((spec,))),
+        port_probe=SuccessfulPortProbe(),
+        runtime_validation_receipts=(make_runtime_validation_receipt(other_spec),),
+    )
+
+    assert observation.runtime_validation_receipts == ()
 
 
 def test_shared_model_and_ktransformers_path_is_probed_once() -> None:
@@ -373,6 +441,8 @@ def test_external_runtime_probe_parses_only_the_external_python_payload() -> Non
     assert command[:3] == (spec.executable, "-I", "-c")
     assert 'source_revision("sglang")' in command[3]
     assert 'source_revision("ktransformers")' in command[3]
+    assert 'distribution_version("transformers-kt")' in command[3]
+    assert 'module_version("transformers")' in command[3]
     assert '"status"' in command[3]
     assert '"--untracked-files=no"' in command[3]
     assert timeout_seconds == 15.0
@@ -412,7 +482,8 @@ def test_external_runtime_probe_leaves_no_git_source_revisions_unobserved() -> N
         ),
         sglang_revision=None,
         ktransformers_revision=None,
-        transformers_version=spec.required_transformers_version,
+        transformers_distribution_version=spec.required_transformers_version,
+        transformers_module_version=spec.required_transformers_version,
     )
     command_runner = RecordingRuntimeCommandRunner(
         SglangKtRuntimeCommandResult(
@@ -442,6 +513,8 @@ def test_default_glm_5_2_fp8_compatibility_verifier_accepts_exact_config(
     assert receipt is not None
     assert receipt.weight_format == "safetensors"
     assert receipt.ktransformers_method == "FP8"
+    assert receipt.full_indexer_layer_starts == FULL_INDEXER_LAYER_STARTS
+    assert len(receipt.config_sha256) == 64
     assert receipt.receipt_verified
     assert receipt.snapshot_complete
 
@@ -469,6 +542,8 @@ def test_default_glm_5_2_fp8_compatibility_verifier_rejects_malformed_json(
         {"num_nextn_predict_layers": 0},
         {"index_topk_freq": 1},
         {"index_share_for_mtp_iteration": False},
+        {"indexer_types": ("full",) * 78},
+        {"indexer_types": ("full",) * 77},
         {
             "quantization_config": {
                 "activation_scheme": "static",
@@ -542,6 +617,8 @@ def test_local_filesystem_probe_preserves_receipt_and_completeness_distinction()
             SglangKtModelSnapshotCompatibility(
                 weight_format="safetensors",
                 ktransformers_method="FP8",
+                config_sha256=CONFIG_SHA256,
+                full_indexer_layer_starts=FULL_INDEXER_LAYER_STARTS,
             )
         ),
         readable_directory_checker=check_directory,
@@ -576,6 +653,8 @@ def test_local_filesystem_probe_fails_closed_when_an_injected_check_raises() -> 
             SglangKtModelSnapshotCompatibility(
                 weight_format="safetensors",
                 ktransformers_method="FP8",
+                config_sha256=CONFIG_SHA256,
+                full_indexer_layer_starts=FULL_INDEXER_LAYER_STARTS,
             )
         ),
         readable_directory_checker=raise_error,
@@ -705,13 +784,7 @@ def test_socket_port_probe_uses_only_the_injected_bind_effect() -> None:
     probe = SocketSglangKtPortProbe(bind_probe)
 
     assert probe.can_bind_endpoint(Host(ip="192.0.2.10", port=30_000))
-    assert probe.can_bind_local_port(31_000)
-    assert not probe.can_bind_local_port(31_001)
-    assert calls == [
-        ("192.0.2.10", 30_000),
-        ("0.0.0.0", 31_000),
-        ("0.0.0.0", 31_001),
-    ]
+    assert calls == [("192.0.2.10", 30_000)]
 
 
 class ExplodingProbe:
@@ -745,10 +818,6 @@ class ExplodingProbe:
         del endpoint
         raise RuntimeError("injected port failure")
 
-    def can_bind_local_port(self, port: NetworkPort) -> bool:
-        del port
-        raise RuntimeError("injected port failure")
-
 
 def test_collector_omits_every_fact_whose_injected_probe_failed() -> None:
     spec = make_specs()[0]
@@ -770,7 +839,6 @@ def test_collector_omits_every_fact_whose_injected_probe_failed() -> None:
     assert observation.memory_nodes == ()
     assert observation.hca_devices == ()
     assert observation.available_bind_endpoints == ()
-    assert observation.available_local_ports == ()
     assert observation.model_snapshot_receipts == ()
 
 

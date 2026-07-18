@@ -22,7 +22,6 @@ def make_stage(
     memory_node: int,
     service_ip: str | None = None,
     service_port: int | None = None,
-    nccl_port: int | None = None,
 ) -> SglangKtStageSpec:
     if service_ip is None:
         service_ip = "192.168.40.248" if node_id == "dwagon" else "192.168.40.249"
@@ -36,7 +35,6 @@ def make_stage(
             ip=service_ip,
             port=30_000 + pipeline_rank if service_port is None else service_port,
         ),
-        nccl_port=31_000 + pipeline_rank if nccl_port is None else nccl_port,
         model_path="/var/lib/exo/models/glm-5.2-fp8",
         ktransformers_weight_path="/var/lib/exo/models/glm-5.2-fp8",
         cpu_cores=cpu_cores,
@@ -117,7 +115,6 @@ def test_stage_rejects_oversubscribed_cpu_threads() -> None:
             node_id=NodeId("dwagon"),
             gpu_uuid="GPU-00000000-0000-0000-0000-000000000001",
             service_endpoint=Host(ip="192.168.40.248", port=30_000),
-            nccl_port=31_000,
             model_path="/model",
             ktransformers_weight_path="/weights",
             cpu_cores=(0,),
@@ -277,32 +274,4 @@ def test_launch_plan_rejects_duplicate_service_endpoints() -> None:
     )
 
     with pytest.raises(ValidationError, match="distinct service endpoints"):
-        make_plan(stages)
-
-
-def test_launch_plan_rejects_same_node_nccl_port_collision() -> None:
-    stages = (
-        make_stage(
-            0,
-            0,
-            30,
-            node_id="dwagon",
-            gpu_suffix=1,
-            cpu_cores=(0,),
-            memory_node=0,
-            nccl_port=31_000,
-        ),
-        make_stage(
-            1,
-            30,
-            78,
-            node_id="dwagon",
-            gpu_suffix=2,
-            cpu_cores=(1,),
-            memory_node=1,
-            nccl_port=31_000,
-        ),
-    )
-
-    with pytest.raises(ValidationError, match="distinct nccl_port values"):
         make_plan(stages)

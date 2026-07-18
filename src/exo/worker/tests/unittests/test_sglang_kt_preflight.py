@@ -13,12 +13,16 @@ from exo.worker.sglang_kt.preflight import (
     SglangKtPreflightPassed,
     SglangKtPythonVersionObservation,
     SglangKtRuntimeObservation,
+    SglangKtRuntimeValidationReceiptObservation,
     evaluate_sglang_kt_preflight,
 )
 from exo.worker.tests.unittests.test_sglang_kt_launch_spec import (
     PYTHON_EXECUTABLE,
     make_plan,
 )
+
+CONFIG_SHA256 = "a" * 64
+FULL_INDEXER_LAYER_STARTS = (0, 1, 2, *range(6, 78, 4))
 
 
 def make_specs() -> tuple[SglangKtProcessLaunchSpec, ...]:
@@ -36,7 +40,39 @@ def make_runtime(spec: SglangKtProcessLaunchSpec) -> SglangKtRuntimeObservation:
         ),
         sglang_revision=spec.expected_sglang_revision,
         ktransformers_revision=spec.expected_ktransformers_revision,
-        transformers_version=spec.required_transformers_version,
+        transformers_distribution_version=spec.required_transformers_version,
+        transformers_module_version=spec.required_transformers_version,
+    )
+
+
+def make_runtime_validation_receipt(
+    spec: SglangKtProcessLaunchSpec,
+) -> SglangKtRuntimeValidationReceiptObservation:
+    return SglangKtRuntimeValidationReceiptObservation(
+        gpu_uuid=spec.gpu_uuid,
+        gpu_compute_capability=(8, 6),
+        cpu_cores=spec.cpu_cores,
+        memory_nodes=spec.memory_nodes,
+        executed_cpu_backend="AMX",
+        model_id=spec.model_id,
+        model_revision=spec.expected_model_revision,
+        model_config_sha256=CONFIG_SHA256,
+        sglang_revision=spec.expected_sglang_revision,
+        ktransformers_revision=spec.expected_ktransformers_revision,
+        transformers_distribution_version=spec.required_transformers_version,
+        transformers_module_version=spec.required_transformers_version,
+        torch_version="2.10.0+cu130",
+        cuda_version="13.0",
+        sgl_kernel_build_id="sgl-kernel-test-build",
+        deep_gemm_build_id="deep-gemm-test-build",
+        kv_cache_dtype="fp8_e4m3",
+        capabilities=(
+            "kt_tp_group_local_broadcast_v1",
+            "glm52_nsa_sm86_short_forward_v1",
+            "kt_physical_numa_mapping_v1",
+            "kt_process_cpu_affinity_v1",
+            "kt_fp8_amx_executed_v1",
+        ),
     )
 
 
@@ -56,6 +92,9 @@ def make_host_observation(
     return SglangKtHostPreflightObservation(
         node_id=first_spec.node_id,
         runtime=make_runtime(first_spec),
+        runtime_validation_receipts=tuple(
+            make_runtime_validation_receipt(spec) for spec in host_specs
+        ),
         readable_directories=tuple(dict.fromkeys((*model_paths, *weight_paths))),
         model_snapshot_receipts=tuple(
             SglangKtModelSnapshotReceiptObservation(
@@ -64,6 +103,8 @@ def make_host_observation(
                 revision=first_spec.expected_model_revision,
                 weight_format="safetensors",
                 ktransformers_method=first_spec.ktransformers_method,
+                config_sha256=CONFIG_SHA256,
+                full_indexer_layer_starts=FULL_INDEXER_LAYER_STARTS,
                 receipt_verified=True,
                 snapshot_complete=True,
             )
@@ -85,7 +126,6 @@ def make_host_observation(
                 else ()
             ),
         ),
-        available_local_ports=tuple(spec.nccl_port for spec in host_specs),
     )
 
 
@@ -117,6 +157,88 @@ def test_valid_observations_release_the_complete_process_group() -> None:
     )
 
 
+def test_version_only_runtime_facts_cannot_release_the_process_group() -> None:
+    specs = make_specs()
+    observations = tuple(
+        observation.model_copy(update={"runtime_validation_receipts": ()})
+        for observation in make_observations(specs)
+    )
+
+    result = evaluate_sglang_kt_preflight(specs, observations)
+
+    assert isinstance(result, SglangKtPreflightFailed)
+    assert all(
+        checks_for_rank(result, rank) == ("runtime_validation_receipt",)
+        for rank in range(3)
+    )
+
+
+@pytest.mark.parametrize(
+    "receipt_update",
+    (
+        {"gpu_compute_capability": (9, 0)},
+        {"cpu_cores": (999,)},
+        {"memory_nodes": (999,)},
+        {"model_config_sha256": "b" * 64},
+        {"sglang_revision": "c" * 40},
+        {"transformers_distribution_version": "5.6.0.post2"},
+        {"capabilities": ("kt_tp_group_local_broadcast_v1",)},
+    ),
+)
+def test_stale_or_incomplete_runtime_validation_receipt_fails_closed(
+    receipt_update: dict[str, object],
+) -> None:
+    specs = make_specs()
+    dwagon, fwuff = make_observations(specs)
+    first_receipt = dwagon.runtime_validation_receipts[0].model_copy(
+        update=receipt_update
+    )
+    dwagon = dwagon.model_copy(
+        update={
+            "runtime_validation_receipts": (
+                first_receipt,
+                dwagon.runtime_validation_receipts[1],
+            )
+        }
+    )
+
+    result = evaluate_sglang_kt_preflight(specs, (dwagon, fwuff))
+
+    assert isinstance(result, SglangKtPreflightFailed)
+    assert checks_for_rank(result, 0) == ("runtime_validation_receipt",)
+    assert checks_for_rank(result, 1) == ()
+    assert checks_for_rank(result, 2) == ()
+
+
+def test_snapshot_receipt_boundaries_must_authorize_every_pipeline_start() -> None:
+    specs = make_specs()
+    dwagon, fwuff = make_observations(specs)
+    incomplete_boundaries = tuple(
+        start for start in FULL_INDEXER_LAYER_STARTS if start != 58
+    )
+    dwagon_receipt = dwagon.model_snapshot_receipts[0].model_copy(
+        update={"full_indexer_layer_starts": incomplete_boundaries}
+    )
+    fwuff_receipt = fwuff.model_snapshot_receipts[0].model_copy(
+        update={"full_indexer_layer_starts": incomplete_boundaries}
+    )
+
+    result = evaluate_sglang_kt_preflight(
+        specs,
+        (
+            dwagon.model_copy(update={"model_snapshot_receipts": (dwagon_receipt,)}),
+            fwuff.model_copy(update={"model_snapshot_receipts": (fwuff_receipt,)}),
+        ),
+    )
+
+    assert isinstance(result, SglangKtPreflightFailed)
+    for rank in range(3):
+        assert checks_for_rank(result, rank) == (
+            "model_revision_receipt",
+            "ktransformers_weight_revision_receipt",
+        )
+
+
 def test_runtime_mismatches_are_aggregated_for_each_affected_stage() -> None:
     specs = make_specs()
     dwagon, fwuff = make_observations(specs)
@@ -130,7 +252,8 @@ def test_runtime_mismatches_are_aggregated_for_each_affected_stage() -> None:
         ),
         sglang_revision="5" * 40,
         ktransformers_revision="6" * 40,
-        transformers_version="5.3.1",
+        transformers_distribution_version="5.6.0.post2",
+        transformers_module_version="5.6.0.post2",
     )
     dwagon = dwagon.model_copy(update={"runtime": bad_runtime})
 
@@ -143,7 +266,8 @@ def test_runtime_mismatches_are_aggregated_for_each_affected_stage() -> None:
         "python_version",
         "sglang_revision",
         "ktransformers_revision",
-        "transformers_version",
+        "transformers_distribution_version",
+        "transformers_module_version",
     )
     assert checks_for_rank(result, 0) == expected_checks
     assert checks_for_rank(result, 1) == expected_checks
@@ -170,7 +294,8 @@ def test_unobserved_runtime_facts_fail_closed() -> None:
         "python_version",
         "sglang_revision",
         "ktransformers_revision",
-        "transformers_version",
+        "transformers_distribution_version",
+        "transformers_module_version",
     )
     assert checks_for_rank(result, 0) == expected_checks
     assert all(
@@ -196,6 +321,7 @@ def test_missing_stage_resources_and_ports_fail_as_one_group() -> None:
         "ktransformers_weight_path",
         "model_revision_receipt",
         "ktransformers_weight_revision_receipt",
+        "runtime_validation_receipt",
         "gpu_uuid",
         "cpu_cores",
         "memory_nodes",
@@ -205,9 +331,8 @@ def test_missing_stage_resources_and_ports_fail_as_one_group() -> None:
     assert checks_for_rank(result, 0) == (
         *common_checks,
         "distributed_coordinator",
-        "nccl_port",
     )
-    assert checks_for_rank(result, 1) == (*common_checks, "nccl_port")
+    assert checks_for_rank(result, 1) == common_checks
     assert checks_for_rank(result, 2) == ()
 
 
@@ -220,28 +345,31 @@ def test_model_receipt_must_match_path_model_revision_and_completeness() -> None
         revision="9" * 40,
         weight_format="safetensors",
         ktransformers_method="FP8",
+        config_sha256=CONFIG_SHA256,
+        full_indexer_layer_starts=FULL_INDEXER_LAYER_STARTS,
         receipt_verified=False,
         snapshot_complete=False,
     )
-    weight_receipt = next(
-        receipt
-        for receipt in dwagon.model_snapshot_receipts
-        if receipt.model_path == specs[0].ktransformers_weight_path
-    )
-    dwagon = dwagon.model_copy(
-        update={"model_snapshot_receipts": (bad_receipt, weight_receipt)}
-    )
+    dwagon = dwagon.model_copy(update={"model_snapshot_receipts": (bad_receipt,)})
 
     result = evaluate_sglang_kt_preflight(specs, (dwagon, fwuff))
 
     assert isinstance(result, SglangKtPreflightFailed)
-    assert checks_for_rank(result, 0) == ("model_revision_receipt",)
-    assert checks_for_rank(result, 1) == ("model_revision_receipt",)
+    assert checks_for_rank(result, 0) == (
+        "model_revision_receipt",
+        "ktransformers_weight_revision_receipt",
+    )
+    assert checks_for_rank(result, 1) == (
+        "model_revision_receipt",
+        "ktransformers_weight_revision_receipt",
+    )
     assert result.failures[0].expected == (
         "zai-org/GLM-5.2-FP8",
         specs[0].expected_model_revision,
         "safetensors",
         "FP8",
+        "config_sha256=<verified>",
+        "pipeline starts on verified full indexers",
         "receipt_verified=True",
         "snapshot_complete=True",
     )
@@ -250,6 +378,9 @@ def test_model_receipt_must_match_path_model_revision_and_completeness() -> None
         "9" * 40,
         "safetensors",
         "FP8",
+        CONFIG_SHA256,
+        "full_indexer_layer_starts="
+        + ",".join(str(start) for start in FULL_INDEXER_LAYER_STARTS),
         "receipt_verified=False",
         "snapshot_complete=False",
     )
@@ -258,47 +389,49 @@ def test_model_receipt_must_match_path_model_revision_and_completeness() -> None
 def test_ktransformers_weight_receipt_must_be_exact_and_compatible() -> None:
     specs = make_specs()
     dwagon, fwuff = make_observations(specs)
-    model_receipt = next(
-        receipt
-        for receipt in dwagon.model_snapshot_receipts
-        if receipt.model_path == specs[0].model_path
-    )
     bad_weight_receipt = SglangKtModelSnapshotReceiptObservation(
         model_path=specs[0].ktransformers_weight_path,
         model_id=specs[0].model_id,
         revision=specs[0].expected_model_revision,
         weight_format="safetensors",
         ktransformers_method="BF16",
+        config_sha256=CONFIG_SHA256,
+        full_indexer_layer_starts=FULL_INDEXER_LAYER_STARTS,
         receipt_verified=True,
         snapshot_complete=True,
     )
     dwagon = dwagon.model_copy(
         update={
-            "model_snapshot_receipts": (model_receipt, bad_weight_receipt),
+            "model_snapshot_receipts": (bad_weight_receipt,),
         }
     )
 
     result = evaluate_sglang_kt_preflight(specs, (dwagon, fwuff))
 
     assert isinstance(result, SglangKtPreflightFailed)
-    assert checks_for_rank(result, 0) == ("ktransformers_weight_revision_receipt",)
-    assert checks_for_rank(result, 1) == ("ktransformers_weight_revision_receipt",)
+    assert checks_for_rank(result, 0) == (
+        "model_revision_receipt",
+        "ktransformers_weight_revision_receipt",
+    )
+    assert checks_for_rank(result, 1) == (
+        "model_revision_receipt",
+        "ktransformers_weight_revision_receipt",
+    )
 
 
-def test_each_planned_port_requires_an_injected_availability_fact() -> None:
+def test_each_planned_endpoint_requires_an_injected_availability_fact() -> None:
     specs = make_specs()
     dwagon, fwuff = make_observations(specs)
     dwagon = dwagon.model_copy(
         update={
             "available_bind_endpoints": (specs[0].service_endpoint,),
-            "available_local_ports": (specs[1].nccl_port,),
         }
     )
 
     result = evaluate_sglang_kt_preflight(specs, (dwagon, fwuff))
 
     assert isinstance(result, SglangKtPreflightFailed)
-    assert checks_for_rank(result, 0) == ("distributed_coordinator", "nccl_port")
+    assert checks_for_rank(result, 0) == ("distributed_coordinator",)
     assert checks_for_rank(result, 1) == ("service_endpoint",)
 
 
