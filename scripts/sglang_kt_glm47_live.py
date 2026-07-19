@@ -8,6 +8,8 @@ that can be tested without importing either runtime.
 from __future__ import annotations
 
 import contextlib
+import ctypes
+import errno
 import fcntl
 import hashlib
 import os
@@ -61,12 +63,20 @@ _ALLOWED_REINTRODUCED_LIVE_ENVIRONMENT_NAMES: Final = frozenset(
         "SGLANG_KT_HYBRID_TIMING",
     }
 )
-_MEMFD_REQUIRED_SEAL_NAMES: Final = (
-    "F_SEAL_SEAL",
-    "F_SEAL_SHRINK",
-    "F_SEAL_GROW",
-    "F_SEAL_WRITE",
+# Stable Linux UAPI values remain valid when a portable CPython omits wrappers.
+_LINUX_MEMFD_CONSTANTS: Final = (
+    ("MFD_CLOEXEC", 0x0001),
+    ("MFD_ALLOW_SEALING", 0x0002),
 )
+_LINUX_FCNTL_CONSTANTS: Final = (
+    ("F_ADD_SEALS", 1024 + 9),
+    ("F_GET_SEALS", 1024 + 10),
+    ("F_SEAL_SEAL", 0x0001),
+    ("F_SEAL_SHRINK", 0x0002),
+    ("F_SEAL_GROW", 0x0004),
+    ("F_SEAL_WRITE", 0x0008),
+)
+_MISSING_UAPI_CONSTANT: Final = object()
 _PROCESS_GROUP_TERMINATION_GRACE_SECONDS: Final = 0.1
 
 
@@ -78,6 +88,13 @@ class _WaitIdResult(Protocol):
     si_pid: int
     si_status: int
     si_code: int
+
+
+class _CtypesMemfdCreate(Protocol):
+    argtypes: object
+    restype: object
+
+    def __call__(self, name: bytes, flags: int, /) -> int: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -367,29 +384,87 @@ def _terminate_and_reap_owned_process_group(
         ) from error
 
 
+def _require_linux_uapi_constants(
+    module: object,
+    expected_constants: tuple[tuple[str, int], ...],
+) -> tuple[int, ...]:
+    if sys.platform != "linux":
+        raise Glm47LiveValidationError("sealed memfd support requires Linux")
+    values: list[int] = []
+    for name, expected in expected_constants:
+        observed = cast(object, getattr(module, name, _MISSING_UAPI_CONSTANT))
+        if observed is not _MISSING_UAPI_CONSTANT and (
+            type(observed) is not int or observed != expected
+        ):
+            raise Glm47LiveValidationError(
+                f"Python exposes an unexpected Linux UAPI value for {name}"
+            )
+        values.append(expected)
+    return tuple(values)
+
+
 def _memfd_creation_flags() -> int:
-    cloexec = getattr(os, "MFD_CLOEXEC", None)
-    allow_sealing = getattr(os, "MFD_ALLOW_SEALING", None)
-    if type(cloexec) is not int or type(allow_sealing) is not int:
-        raise Glm47LiveValidationError("sealed memfd support is unavailable")
+    cloexec, allow_sealing = _require_linux_uapi_constants(
+        os,
+        _LINUX_MEMFD_CONSTANTS,
+    )
     return cloexec | allow_sealing
 
 
+def _create_sealable_memfd(name: str) -> int:
+    if not name or not name.isascii() or "\0" in name or len(name) > 249:
+        raise ValueError("memfd name must be a bounded nonempty ASCII string")
+    flags = _memfd_creation_flags()
+    memfd_create_value = getattr(os, "memfd_create", None)
+    try:
+        if callable(memfd_create_value):
+            memfd_create = cast(Callable[[str, int], int], memfd_create_value)
+            descriptor = memfd_create(name, flags)
+        else:
+            try:
+                libc = ctypes.CDLL(None, use_errno=True)
+            except OSError as error:
+                raise Glm47LiveValidationError(
+                    "cannot load libc for sealed memfd creation"
+                ) from error
+            libc_memfd_create_value = getattr(libc, "memfd_create", None)
+            if not callable(libc_memfd_create_value):
+                raise Glm47LiveValidationError("libc memfd creation is unavailable")
+            libc_memfd_create = cast(
+                _CtypesMemfdCreate,
+                libc_memfd_create_value,
+            )
+            libc_memfd_create.argtypes = (ctypes.c_char_p, ctypes.c_uint)
+            libc_memfd_create.restype = ctypes.c_int
+            ctypes.set_errno(0)
+            descriptor = libc_memfd_create(name.encode("ascii"), flags)
+            if descriptor < 0:
+                error_number = ctypes.get_errno() or errno.EIO
+                raise OSError(error_number, os.strerror(error_number))
+    except OSError as error:
+        raise Glm47LiveValidationError("cannot create sealed memfd") from error
+    if type(descriptor) is not int or descriptor < 3:
+        if type(descriptor) is int and descriptor >= 0:
+            os.close(descriptor)
+        raise Glm47LiveValidationError(
+            "sealed memfd creation returned an unsafe descriptor"
+        )
+    return descriptor
+
+
 def _seal_child_evidence(file_descriptor: int) -> None:
-    add_seals = getattr(fcntl, "F_ADD_SEALS", None)
-    get_seals = getattr(fcntl, "F_GET_SEALS", None)
-    required_seals = tuple(
-        getattr(fcntl, name, None) for name in _MEMFD_REQUIRED_SEAL_NAMES
+    (
+        add_seals,
+        get_seals,
+        seal_seal,
+        seal_shrink,
+        seal_grow,
+        seal_write,
+    ) = _require_linux_uapi_constants(
+        fcntl,
+        _LINUX_FCNTL_CONSTANTS,
     )
-    if (
-        type(add_seals) is not int
-        or type(get_seals) is not int
-        or any(type(value) is not int for value in required_seals)
-    ):
-        raise Glm47LiveValidationError("memfd sealing is unavailable")
-    seals = 0
-    for seal in cast(tuple[int, ...], required_seals):
-        seals |= seal
+    seals = seal_seal | seal_shrink | seal_grow | seal_write
     try:
         fcntl.fcntl(file_descriptor, add_seals, seals)
         observed_seals = fcntl.fcntl(file_descriptor, get_seals)
@@ -397,6 +472,16 @@ def _seal_child_evidence(file_descriptor: int) -> None:
         raise Glm47LiveValidationError("cannot seal child evidence") from error
     if observed_seals & seals != seals:
         raise Glm47LiveValidationError("child evidence seals are incomplete")
+
+
+def require_disposable_child_evidence_transport() -> None:
+    """Fail before model inspection unless anonymous evidence can be sealed."""
+
+    descriptor = _create_sealable_memfd("exo-glm47-evidence-probe")
+    try:
+        _seal_child_evidence(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def run_disposable_live_child(
@@ -415,14 +500,7 @@ def run_disposable_live_child(
         raise ValueError("disposable child command must use an absolute executable")
     if not evidence_descriptor_argument.startswith("--"):
         raise ValueError("child evidence descriptor argument must be a long option")
-    memfd_create_value = getattr(os, "memfd_create", None)
-    if not callable(memfd_create_value):
-        raise Glm47LiveValidationError("memfd creation is unavailable")
-    memfd_create = cast(Callable[[str, int], int], memfd_create_value)
-    descriptor = memfd_create(
-        "exo-glm47-model-evidence",
-        _memfd_creation_flags(),
-    )
+    descriptor = _create_sealable_memfd("exo-glm47-model-evidence")
     process: subprocess.Popen[bytes] | None = None
     try:
         child_command = (

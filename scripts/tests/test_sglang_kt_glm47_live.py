@@ -319,6 +319,97 @@ def test_disposable_child_evidence_is_visible_only_after_clean_exit(
     assert evidence.sha256 == hashlib.sha256(evidence.contents).hexdigest()
 
 
+def test_disposable_child_uses_libc_when_python_omits_memfd_uapi(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    child = tmp_path / "stripped-python-child.py"
+    child.write_text(
+        "import os, sys\n"
+        "fd = int(sys.argv[sys.argv.index('--evidence-fd') + 1])\n"
+        'os.write(fd, b\'{"transport":"libc"}\')\n'
+        "os.fsync(fd)\n"
+    )
+    for name in ("memfd_create", "MFD_CLOEXEC", "MFD_ALLOW_SEALING"):
+        monkeypatch.delattr(live.os, name, raising=False)
+    for name in (
+        "F_ADD_SEALS",
+        "F_GET_SEALS",
+        "F_SEAL_SEAL",
+        "F_SEAL_SHRINK",
+        "F_SEAL_GROW",
+        "F_SEAL_WRITE",
+    ):
+        monkeypatch.delattr(live.fcntl, name, raising=False)
+
+    live.require_disposable_child_evidence_transport()
+    evidence = live.run_disposable_live_child(
+        (sys.executable, str(child)),
+        evidence_descriptor_argument="--evidence-fd",
+        environment=os.environ.copy(),
+    )
+
+    assert evidence.contents == b'{"transport":"libc"}'
+
+
+def test_disposable_child_fails_closed_without_python_or_libc_memfd(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delattr(live.os, "memfd_create", raising=False)
+    monkeypatch.setattr(live.ctypes, "CDLL", lambda *_args, **_kwargs: object())
+
+    with pytest.raises(
+        live.Glm47LiveValidationError,
+        match="libc memfd creation is unavailable",
+    ):
+        live.require_disposable_child_evidence_transport()
+
+
+def test_disposable_child_normalizes_missing_libc_errno(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FailedMemfdCreate:
+        argtypes: object = None
+        restype: object = None
+
+        def __call__(self, _name: bytes, _flags: int, /) -> int:
+            live.ctypes.set_errno(0)
+            return -1
+
+    class FailedLibc:
+        memfd_create = FailedMemfdCreate()
+
+    monkeypatch.delattr(live.os, "memfd_create", raising=False)
+    monkeypatch.setattr(
+        live.ctypes,
+        "CDLL",
+        lambda *_args, **_kwargs: FailedLibc(),
+    )
+
+    with pytest.raises(
+        live.Glm47LiveValidationError,
+        match="cannot create sealed memfd",
+    ) as caught:
+        live.require_disposable_child_evidence_transport()
+
+    assert isinstance(caught.value.__cause__, OSError)
+    assert caught.value.__cause__.errno == errno.EIO
+
+
+@pytest.mark.parametrize("exposed_value", (None, 99))
+def test_disposable_child_rejects_unexpected_linux_uapi_constant(
+    monkeypatch: pytest.MonkeyPatch,
+    exposed_value: object,
+) -> None:
+    monkeypatch.setattr(live.os, "MFD_CLOEXEC", exposed_value, raising=False)
+
+    with pytest.raises(
+        live.Glm47LiveValidationError,
+        match="unexpected Linux UAPI value for MFD_CLOEXEC",
+    ):
+        live.require_disposable_child_evidence_transport()
+
+
 def test_forked_descendant_cannot_mutate_sealed_child_evidence(
     tmp_path: Path,
 ) -> None:

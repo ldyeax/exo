@@ -77,6 +77,7 @@ from scripts.sglang_kt_glm47_live import (
     calculate_validator_bundle,
     load_bound_kernel_runtime_receipt,
     require_current_process_binding,
+    require_disposable_child_evidence_transport,
     run_disposable_live_child,
     validator_bundle_paths,
     write_disposable_child_evidence,
@@ -937,6 +938,7 @@ def run_parent_live_validation(
         raise Glm47ModelValidationError(
             "parent validation cannot accept an internal evidence descriptor"
         )
+    require_disposable_child_evidence_transport()
     preflight = perform_execution_preflight(arguments)
     process_spec = preflight.process.process_spec
     kernel_runtime = load_bound_kernel_runtime_receipt(

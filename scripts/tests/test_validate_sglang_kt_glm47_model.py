@@ -884,6 +884,44 @@ def test_internal_child_rejects_binding_before_backend_import(
     assert not parsed.output.exists()
 
 
+def test_parent_rejects_evidence_transport_before_model_preflight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    arguments, *_rest = write_inputs(tmp_path)
+    parsed = validator.parse_arguments(arguments)
+    model_preflight_started = False
+
+    def reject_evidence_transport() -> None:
+        raise validator.Glm47LiveValidationError("evidence transport unavailable")
+
+    def start_model_preflight(
+        _arguments: object,
+    ) -> validator.Glm47ModelExecutionPreflight:
+        nonlocal model_preflight_started
+        model_preflight_started = True
+        raise AssertionError("model preflight must not start")
+
+    monkeypatch.setattr(
+        validator,
+        "require_disposable_child_evidence_transport",
+        reject_evidence_transport,
+    )
+    monkeypatch.setattr(
+        validator,
+        "perform_execution_preflight",
+        start_model_preflight,
+    )
+
+    with pytest.raises(
+        validator.Glm47LiveValidationError,
+        match="evidence transport unavailable",
+    ):
+        validator.run_parent_live_validation(parsed)
+
+    assert model_preflight_started is False
+
+
 def test_publisher_creates_one_canonical_receipt_without_replacement(
     tmp_path: Path,
 ) -> None:
