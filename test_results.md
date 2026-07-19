@@ -27,9 +27,9 @@ source of truth. Update this file in the same commit that records each new test.
 ## Current summary
 
 - Latest published proof-harness source: clean commit
-  `53e18bddcc018aae4f0194dc4a0b4678a60c5779`.
+  `65a04353b5b3e396053865afb47983ff636dc21c`.
 - Latest completed live-validation source: clean commit
-  `0af521134ed44de519456e13000d8395c4e165c3`.
+  `d9ff2920481c3aeefa797ef70b3dd5b5be947c6f`.
 - Completed ladder rungs: Llama 3.2 1B, Llama 3.2 3B, Llama 3.1 8B,
   GPT-OSS 20B, and GLM-4.7 Flash.
 - Latest reportable model result: GLM-4.7 Flash TP=2 passed exact TP1 output equality,
@@ -43,22 +43,23 @@ source of truth. Update this file in the same commit that records each new test.
   packaged contract covering every launch-relevant file, all 48 indexed
   shards, and their Hugging Face revision metadata. A leased full rehash
   verified that 62.4 GB contract on the shared read-only snapshot.
-- Latest hybrid attempt: CPU-control v6 used the rebuilt runtime containing the
-  GLM Lite inherited-state fix, loaded all 48 GLM-4.7 Flash BF16 shards, and
-  emitted wrapper coverage for routed layers 1-46. The former `is_hash` failure
-  did not recur. The public validator then reported only `live GLM-4.7 backend
-  failed`; code-path inspection, not a directly preserved child error, points to
-  the trace collector selecting a null `hidden_states` field instead of the
-  non-null `next_token_logits` from the real model-forward result. Cleanup and
-  containment passed; no model receipt or performance result was produced.
+- Latest hybrid attempt: CPU-control v7 loaded all 48 GLM-4.7 Flash BF16 shards
+  and its model child passed. The immutable receipt proves AMX-BF16 execution,
+  exact wrappers on routed layers 1-46, a repeated layer-one CPU expert oracle,
+  and finite extend/decode logits with stable routing masks. Native runtime
+  diagnostics also wrote to stdout, so the outer harness rejected the 194-line
+  stream before receipt binding instead of accepting its final JSON line.
+  Cleanup and containment passed; the outer result remains nonreportable and
+  non-comparable despite the valid child receipt.
 - Historical Ornith AMXINT8 conversion and serving receipts were recovered and
   hashed below. They inform the GLM hybrid-runtime work but are not Exo tests.
-- Commit `53e18bdd` fixes validator-side trace selection, preserves nested backend
-  errors in public diagnostics, and pins the current v6 kernel receipt while
-  retaining the superseded v4 receipt as historical evidence. The broad GLM
-  producer/consumer/lease slice passes 744 tests; repository-wide Basedpyright
-  and Ruff pass, and all six changed Python files are formatted.
-- Next work: run a fresh immutable CPU-control v7 proof with the existing
+- Commit `65a04353` routes the disposable backend child's OS-level stdout to the
+  validator's stderr while retaining the sealed memfd evidence channel. The
+  parent now reserves stdout for one JSON control response, and the harness keeps
+  rejecting prefixed, suffixed, or multiple JSON records instead of parsing the
+  last line. The broad focused slice passes 749 tests; repository-wide
+  Basedpyright and Ruff pass, and changed Python files are formatted.
+- Next work: run a fresh immutable CPU-control v8 proof with the existing
   corrected native runtime. No native runtime rebuild is required. Run the mixed
   AMX-BF16/RTX-3090 PP1 correctness gate only after CPU-control produces an
   admitted receipt.
@@ -86,6 +87,7 @@ test total.
 | GLM v3 receipt-failure regression slice | **PASS** | 275 tests passed on 2026-07-19 across the harness, lease, model validator, live bindings, kernel receipt, model receipt, and receipt integration; strict targeted Basedpyright reported 0 errors/warnings and repository-wide Ruff passed |
 | Portable-Python sealed-evidence regression slice | **PASS** | 325 harness/lease/backend/live/receipt/reference/trace/model tests passed on 2026-07-19; repository-wide Ruff and touched formatting passed. A trivial disposable child also passed under the exact immutable CPython 3.12.13 overlay with libc memfd creation, all four required seals, and canonical evidence SHA-256 `af4daf371da4cad51875b9db9f1ed82c20c4a6f61dbba07518acb31451d2cf48`. |
 | GLM v6 trace-evidence correction | **PASS** | Commit `53e18bdd` captures non-null `next_token_logits` for `MODEL_FORWARD`, captures non-null wrapper `hidden_states`, preserves exact nested backend errors, and admits the exact current v6 kernel receipt while auditing v4 as superseded. The broad focused slice passed 744 tests; repository-wide Basedpyright reported 0 errors/warnings, repository-wide Ruff passed, and all six changed Python files passed `ruff format --check`. |
+| GLM runtime diagnostic/protocol isolation | **PASS** | Commit `65a04353` redirects the disposable backend child's inherited file descriptor 1 to the parent validator's stderr while sealed memfd remains the evidence transport. Regressions prove native `os.write(1, ...)` and fd2 diagnostics cannot pollute stdout, a clean single JSON response is accepted, and prefix/suffix/two-record contamination remains rejected. The focused validator/live/harness slice passed 128 tests and the broad focused slice passed 749 tests; repository-wide Basedpyright reported 0 errors/warnings/notes, repository-wide Ruff passed, the three changed Python files passed `ruff format --check`, and `git diff --check` passed. |
 | GLM-4.7 packaged-contract wheel inclusion | **PASS (artifact)** | `uv build --wheel` produced `exo-0.3.70-py3-none-any.whl`; its package contains the exact 16,218-byte `exo/worker/sglang_kt/manifests/glm47_flash_bf16_7dd20894.json` resource |
 | Changed GLM-4.7 Flash Python files, strict targeted type checks and Ruff | **PASS** | Three targeted Basedpyright configurations reported 0 errors; repository-wide `ruff check` passed; all 16 changed Python files passed `ruff format --check` on 2026-07-19 |
 | Repository-wide Basedpyright | **PASS** | `uv run --no-sync basedpyright` reported 0 errors, 0 warnings, and 0 notes after synchronizing the locked workspace environment |
@@ -404,14 +406,15 @@ above.
 | `glm47-kt-cpu-control-dwagon-20260719-v4` | **EXPECTED FAIL (diagnostic)** | Clean source `14340320` proved the transient-service cwd fix and early strict kernel-receipt admission. Generator and fresh CUDA/AMX validation passed in 0.370 s and 7.605 s; the model stage then failed in 45.349 s before child creation because pinned CPython 3.12.13 exposed no callable `os.memfd_create`. No model construction, model-load GPU allocation, forward, or model receipt occurred. Result/manifest/runtime-metadata/kernel-receipt/process-spec SHA-256: `05732f405f7c5cc622d5a539a10d362fa464718abafac4869971c86861ca2125` / `657aa82595d4bbe4e2d908eb75e7813b9fc83419deaf6f07d13dded7b208de8d` / `4e3def2938ecf98a885add0d5c3caad7066bf2678291436968e0cd1c27214807` / `8bdb2453c7d9e47381df2ce24642e867b3283c5f8638d852659bdbdd5caaf31c` / `99b41e60975a189b65d6627c004f7543dfbd53410b032f788c27ad7d29d7a01a`. Result was nonreportable/non-comparable; cleanup was unforced and the lease, lock, cgroups, unit, processes, GPU, and scratch were clean. `profiler=none`; the run did not use the unsafe profiler drivers, although preflight observed the already-loaded `pax` and `sep5` modules. |
 | `glm47-kt-cpu-control-dwagon-20260719-v5` | **EXPECTED FAIL (diagnostic)** | Clean source `ca732fe6` passed generation in 0.368 s and fresh CUDA/AMX validation in 8.393 s. The 144.213 s model stage used sealed memfd evidence successfully, independently verified the immutable 62,444,175,504-byte checkpoint in parent and child, loaded all 48 BF16 shards, built KT/AMX wrappers for routed layers 1-46, and passed the layer-one AMX probe twice against its FP32 reference. The first real eight-token extend then failed before expert dispatch at `deepseek_v2.py:770`: `Glm4MoeLiteSparseMoeBlock` lacks `is_hash`. Zero experts were GPU-resident; weights used 4.52 GB, the 4,096-token BF16 KV cache used 0.21 GB, and 18.46 GB remained available, directly disproving the claimed unavoidable 2 GB ceiling for this split. No extend result, decode, model receipt, performance result, or InfiniBand traffic was produced. Result/manifest/runtime-metadata/kernel-receipt/process-spec SHA-256: `0ae112e4acd713270914a2a51ac7a344d4d9224933881ed7168c2f2a1fa14010` / `dfc1ad00e53bdab4f3c3e9eddb4dda8be993802bb1f748dafce51571b94787f9` / `28f50e5d2ce61a494de9ee793504c71eca467b248da9e25f63bb7087008225f7` / `0fe16ea3d3a67e63c216ea69adfa23b79c7402b09e77c258746a204f8a8b6933` / `54a8d049f1ec26d73cfd8e9f85f526bb1c626a9bae0598bbf3adf19420215d4f`; canonical process-spec SHA-256 `8718ec41c3f4cad77baa50759a9ea0e002bfb500b11537f295540f4d2c9ac6f8`. Cleanup was unforced and complete; the lease, lock, cgroup/unit, owned processes, ports, GPU, and scratch were clean. `profiler=none`; loaded `pax`/`sep5` modules were observed but never used. |
 | `glm47-kt-cpu-control-dwagon-20260719-v6` | **EXPECTED FAIL (diagnostic)** | Immutable source `0af52113` used the corrected SGLang `42504e598...` build and overlay. Its immutable deployment is `/var/lib/exo/deployments/glm47-kt-cpu-control-dwagon-20260719-v6`. Generation passed in 0.370105447 s and fresh CUDA/AMX validation passed in 8.024723519 s. The 131.365563637 s model stage loaded all 48 BF16 shards, emitted exact wrapper coverage for layers 1-46, and did not reproduce the former `is_hash` failure. Weight loading took 18.08 s; model weights occupied 4.52 GB, the 4,096-token BF16 KV cache occupied 0.21 GB, and 18.46 GB remained available. The public wrapper retained only `live GLM-4.7 backend failed`. Code-path inspection therefore provides the current, explicitly unverified diagnosis: SGLang's model-forward result contains non-null `next_token_logits` and `hidden_states=None`, while the trace collector tests field presence before nullness and tries to snapshot `hidden_states`, leading internally to `builtins.NoneType is missing dtype`. No verified extend/decode trace, model receipt, performance result, or InfiniBand traffic was produced; status was `validation_failed`, return code 1, and the result is nonreportable/non-comparable. Result/manifest/runtime-metadata/kernel-receipt/process-spec-file SHA-256: `50008be5e03d3b92c30db19a610eb44b9b4d7d5b33f2e8701b4cdd6f9635d465` / `41dd13ccd7e170455b2b66b83012935254ad559ce3a88e96ee007670add98486` / `bebca51f18b18a9f01403f724f50828fe43eb4203f5dc659c140b82e246a63c0` / `5cfffa1e450f0dbcded077f7496e5b9d3094bed1f73aeab370f2ebb2775867c6` / `c282b9e51c8540141648ea62787640d84d2f3a201bfef17889b8a6ba337b3838`; canonical process-spec SHA-256 `bdeed9d41a5a573b8406980bbfe10a53e22671ac8a007684c87d40d64c8fa94a`. Config SHA-256 was `2dddf4ea4efa364bb83a5028d6302c0708646ae366847f3fb5846b01ee5def5e`; orchestrator/validator SHA-256 values were `53d23cc5458fe6a6f92e9f3751cebbf6bcf3f8a78d7f2e439e435d5db0eba2db` / `c8424ab5b9c39258b468e34e200d92f7524cbe9f829dfff2f07167dd57b1bd94`. Cleanup was unforced and complete; the lease, lock, unit, owned processes, ports, GPU, and scratch were clean. `profiler=none`; the unsafe profiler was not invoked. |
+| `glm47-kt-cpu-control-dwagon-20260719-v7` | **EXPECTED FAIL (diagnostic)** | Clean source `d9ff2920` used the corrected native build/overlay and immutable deployment `/var/lib/exo/deployments/glm47-kt-cpu-control-dwagon-20260719-v7`. Generation and fresh CUDA/AMX validation passed in 0.380145077 s and 8.474109744 s. The 188.229354069 s model child returned 0 and published a valid 29,006-byte receipt: all 48 BF16 shards loaded; layers 1-46 used `NativeMoEWrapper` / `AMXBF16_MOE` / `kt_ep` with zero resident GPU experts and stable mask `50680b69...`; every wrapper ran once for extend and decode. The layer-one experts 0-3 ran entirely on CPU twice with deterministic output and relative L1 error `0.0035165481 < 0.02`. The eight-token extend produced finite FP32 `[1,154880]` logits, argmax 3764, KV 0-to-8, and logits SHA-256 `a4e959ff...`; decode produced argmax 10, KV 8-to-9, and logits SHA-256 `008e5ae3...`. Weight loading took 19.38 s; model weights occupied 4.52 GB, the 4,096-token BF16 KV cache occupied 0.21 GB, and 18.46 GB remained available. However, native Gloo/BF16/CPUInfer/AMX diagnostics occupied the first 193 lines of the 194-line stdout stream before the valid final JSON response. The strict outer harness rejected the whole stream before its six-field receipt-binding step, so outer status is `validation_failed`, `model_checkpoint_verified=false`, and the run is nonreportable/non-comparable. An offline current-source receipt load and pure admission-binding audit passed, but the full launch-time 62.4 GB rehash was not repeated during that audit and does not convert the outer result. Model/kernel/canonical-process-spec/raw-process-spec/model-contract SHA-256: `2800220a897b77d720ad4da01fd83629418265d671285cd726f6a82c36c08b90` / `a2031382a7754b5515b23413b07d9890854957fc84c412b7d09b69ecb25b83a5` / `c4889b5f1e0d29c50e76e057451a50fc15e46bb4ca11076c6803852fe60d03fb` / `7d5e85d7906206ee9f47a9e94d48cdb2594f21c8c50a37594122664ce1212a39` / `4e7333f341ddc5855aa4253d454e3210d84427fae0159eb956104ff00c437479`. Result/manifest/runtime-metadata/config SHA-256: `4cbcb1eaace84749336a295fc03d7bf3a03ba6c28e5eefc39212d45467c51121` / `360f74c8f902307dc218bc1c1099fca51f60d5741b0fc27c21829bd59fe41b4b` / `892f3792033e3fbc4c39cc933bd42494cf7687d0fc9544011536b02c4c361a0b` / `7f211abd648412a8184b598eefcf5b6a4ae7eadf845f3f888fd2c27d002d86f2`; orchestrator/validator SHA-256 `87165caefa568653eb1c9d855d66c174daa70391911a1325479d7b207c89150d` / `6aabd10392e84f20ec1ff2305241cfcd04a934c1ab56b4592f73159be6dac1dc`. Model stdout/stderr and kernel stdout/stderr SHA-256: `fd737984a14055bc0a46d07b56012fb2a9edd1f3f1590a8292d45f3d0eacb1d7` / `11913d305fd9a5b4acf197249bd0a587140d4274bca90d9880ce642c24d92f41` / `c68d0886ef2912165e765f017533c982f6aaad6bcece4d404af28d3cfee6636e` / `e0ac13c829ddff8b29a7df65ad0d8302f3b2db4cf682fd9b0874e992df05617b`. No InfiniBand traffic was expected under `metadata_only`. Cleanup was unforced and complete; `profiler=none` and the unsafe profiler was not invoked. |
 
 The prepared but never executed `glm47-kt-cpu-control-dwagon-20260719-v2`
 deployment predates cgroup containment and its 15-minute metadata window has
-expired. It is retained as an unused artifact only. V3 through v6 are completed
-diagnostic artifacts and must not be reused. Patch only the validator-side trace
-selection/error propagation, publish a fresh immutable deployment, and prepare
-v7 against the already pinned corrected runtime; no native runtime rebuild is
-needed for this diagnosis. V4's
+expired. It is retained as an unused artifact only. V3 through v7 are completed
+diagnostic artifacts and must not be reused. Commit `65a04353` isolates native
+runtime diagnostics from the strict stdout control protocol. Publish a fresh
+immutable deployment and prepare v8 against the already pinned corrected runtime;
+no native runtime rebuild is needed for this diagnosis. V4's
 canonical process-spec/config SHA-256 values are
 `f5c954368c0e66bdb5ba494cb4dcf3176da1bc054369f0516051d71924530de5` and
 `212791580cee9e8a028d5b0b8237ddfc474385bbc3455537b45d13b59ad9428d`.
@@ -580,12 +583,11 @@ canonical process-spec/config SHA-256 values are
 
 ## Pending tests
 
-1. Publish a fresh immutable deployment from `53e18bdd` and run CPU-control v7
-   against the existing corrected native runtime. The committed collector now
-   snapshots non-null `next_token_logits` for `MODEL_FORWARD`, snapshots non-null
-   wrapper `hidden_states`, preserves nested backend errors, and covers the real
-   `hidden_states=None` result shape. Keep kernel capability evidence separate
-   from model admission.
+1. Publish a fresh immutable deployment from `65a04353` and run CPU-control v8
+   against the existing corrected native runtime. The disposable backend child
+   now sends inherited native diagnostics to stderr while sealed memfd remains
+   the evidence channel and stdout remains a single strict JSON response. Keep
+   kernel capability evidence separate from model admission.
 2. Run the fail-closed 0-expert BF16 CPU-routed control and the mixed 1/4
    resident-GPU-expert controls with complete 46-layer wrapper and routing
    evidence.
