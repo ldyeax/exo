@@ -27,9 +27,9 @@ source of truth. Update this file in the same commit that records each new test.
 ## Current summary
 
 - Latest published proof-harness source: clean commit
-  `f333c6d5f335483dae46050fc196baf92a262d4c`.
+  `5ddf2aa7da02c1c8d7942a3ce1f45f7ff58063a7`.
 - Latest completed live-benchmark source: clean commit
-  `f7687d6cfc8c232655c317146dd20ff5bc04aa55`.
+  `b4c9710f7dc063d7e7eab9474b6d1f6ece99b5f3`.
 - Completed ladder rungs: Llama 3.2 1B, Llama 3.2 3B, Llama 3.1 8B,
   GPT-OSS 20B, and GLM-4.7 Flash.
 - Latest live result: GLM-4.7 Flash TP=2 passed exact TP1 output equality,
@@ -43,10 +43,15 @@ source of truth. Update this file in the same commit that records each new test.
   packaged contract covering every launch-relevant file, all 48 indexed
   shards, and their Hugging Face revision metadata. A leased full rehash
   verified that 62.4 GB contract on the shared read-only snapshot.
+- Latest hybrid attempt: CPU-control v3 passed generator and CUDA/AMX kernel
+  execution, then failed closed before model construction because the transient
+  service recorded `/` as its working directory. Cleanup and containment passed;
+  commit `5ddf2aa7` fixes the launch directory and makes receipt admission precede
+  the expensive checkpoint scan.
 - Historical Ornith AMXINT8 conversion and serving receipts were recovered and
   hashed below. They inform the GLM hybrid-runtime work but are not Exo tests.
-- Next work: prepare a fresh cgroup-contained CPU-control model proof from
-  `f333c6d5`, then run the mixed AMX-BF16/RTX-3090 PP1 correctness gate. The
+- Next work: prepare a fresh cgroup-contained CPU-control v4 proof from
+  `5ddf2aa7`, then run the mixed AMX-BF16/RTX-3090 PP1 correctness gate. The
   Qwen3-Coder ladder rung is deferred until that hybrid path has trustworthy
   live model evidence.
 
@@ -70,6 +75,7 @@ test total.
 | Dedicated leased GLM-4.7 live-validation harness | **PASS (software)** | 37 focused tests cover immutable preparation, exact runtime/GPU/HCA binding, kernel/model result semantics, descriptor-anchored scratch cleanup, delegated cgroup-v2 placement, pre-exec attachment, identity replacement, and fail-closed process/cgroup cleanup; strict targeted Basedpyright and Ruff pass |
 | Lease plus GLM containment contract slice | **PASS (software)** | 103 tests validate the optional static containment contract, exact systemd invocation/UID/owner-token leaf binding, one-way runtime binding, immutable evidence, final result reconciliation, and backward compatibility for leases without containment |
 | Broad GLM producer/consumer and lease regression slice | **PASS** | 672 tests passed on 2026-07-19 after cgroup containment and lease-evidence binding were added |
+| GLM v3 receipt-failure regression slice | **PASS** | 275 tests passed on 2026-07-19 across the harness, lease, model validator, live bindings, kernel receipt, model receipt, and receipt integration; strict targeted Basedpyright reported 0 errors/warnings and repository-wide Ruff passed |
 | GLM-4.7 packaged-contract wheel inclusion | **PASS (artifact)** | `uv build --wheel` produced `exo-0.3.70-py3-none-any.whl`; its package contains the exact 16,218-byte `exo/worker/sglang_kt/manifests/glm47_flash_bf16_7dd20894.json` resource |
 | Changed GLM-4.7 Flash Python files, strict targeted type checks and Ruff | **PASS** | Three targeted Basedpyright configurations reported 0 errors; repository-wide `ruff check` passed; all 16 changed Python files passed `ruff format --check` on 2026-07-19 |
 | Repository-wide Basedpyright in the existing `.venv` | **BLOCKED** | The environment cannot resolve installed project dependencies (including `httpx`, AnyIO, and pytest), producing dependency-driven diagnostics across the untouched tree; `uv run` could not complete the pinned MLX wheel acquisition |
@@ -379,11 +385,13 @@ above.
 | Attempt | Result | Evidence and lesson |
 | --- | --- | --- |
 | `glm47-kt-cpu-control-dwagon-20260719-v1` | **EXPECTED FAIL (preflight)** | The generator and fresh overlay kernel validation passed, then the model validator rejected the exact snapshot before hashing or loading because its 117 files and 6 directories were writable (`0644`/`0755`). No model receipt was created. The revision-pinned NFS snapshot on fwuff was subsequently made immutable (`0444` files, `0555` directories) without changing content. Result/manifest/runtime-metadata/kernel-receipt SHA-256: `d061131a2bbdca73fd9f7659cb977bb72aea9a0d4a553e49d5d8e684fbc868ed` / `4417fb1c5b484873891e2c879329e56b3f480a2659d018c40718251a972bc611` / `954feef4b3a2be0148614b58db273498dd92492f28d3fc6bb0ed21eea27cf7ed` / `742f5838e9457e86caacab6ba06d0ff2ee8b6aa598677651d2ba4733654dc45f`. Cleanup was unforced; lease, lock, GPU processes, and scratch were clean. |
+| `glm47-kt-cpu-control-dwagon-20260719-v3` | **EXPECTED FAIL (diagnostic)** | Clean source `b4c9710f` ran in the delegated systemd/cgroup-v2 containment. The generator passed in 0.401 s and the fresh kernel validator passed CUDA BF16, direct AMX BF16 qlen 1/16, and the CUDA-stream bridge in 8.121 s. The model validator then spent 588.969 s verifying the immutable 62.4 GB snapshot before strict receipt admission rejected only `host.process.cwd="/"`; the transient service had inherited systemd's root working directory, while execution-path evidence intentionally excludes `/`. No model construction, GPU allocation, forward, or model receipt occurred. Commit `5ddf2aa7` sets the immutable deployment as the service working directory and admits the kernel receipt before model traversal. Result/manifest/runtime-metadata/kernel-receipt/process-spec SHA-256: `47043acfd362e7e7825568b095cd201b59a162d74a695ef83f2ec523223035a8` / `0fd6e8c7a6f0199d46a945f5ac93bf1b0fd292b17b61554777c7287b1ece073d` / `508a93c38589171c2feffd194096d9b77f07acc9f19e213d7a0a23b028433a9c` / `a034ee6ca9d4062fc2a8ba2787ad6ac9c9c3bf3e80217f22d9cea7eb4fe09aa2` / `0f86db96dcc2dc6ff7e0565359cea5a2af57389fe2edb68c1de14a1882e00142`. Result was nonreportable and non-comparable; cgroup kill/empty/removal, unit collection, lease/lock release, scratch removal, and idle GPUs were all verified. |
 
 The prepared but never executed `glm47-kt-cpu-control-dwagon-20260719-v2`
 deployment predates cgroup containment and its 15-minute metadata window has
-expired. It is retained as an unused artifact only; prepare v3 or later from
-commit `f333c6d5` before the next live attempt.
+expired. It is retained as an unused artifact only. V3 is a completed diagnostic
+artifact and must not be reused; prepare v4 or later from `5ddf2aa7` before the
+next live attempt.
 
 ### File-backed GLM-4.7 admission checkpoint
 
