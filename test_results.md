@@ -21,7 +21,9 @@ source of truth. Update this file in the same commit that records each new test.
 
 ## Current summary
 
-- Latest live-benchmark source: clean commit
+- Latest published proof-harness source: clean commit
+  `57a57e1221a5f1199cc90e9dc9391ec925395f2c`.
+- Latest completed live-benchmark source: clean commit
   `8bee9f933c24ba88b6dd5cefc705d56aaa5a2231`.
 - Completed ladder rungs: Llama 3.2 1B, Llama 3.2 3B, Llama 3.1 8B, and the
   first MoE rung, GPT-OSS 20B.
@@ -50,6 +52,7 @@ test total.
 | GPT-OSS TP1 oracle admission | **PASS** | 40 tests at `8bee9f93` |
 | Chat-template date pin, including `strftime_now()` | **PASS** | 5 tests at `8bee9f93` |
 | GPT-OSS exact revision card | **PASS** | 1 focused test at `8bee9f93` |
+| GLM-4.7 Flash TP1/TP2 proof contract | **PASS** | 293 focused tests at `57a57e12`; full fake five-request GLM lifecycle passed, GPT request digest remained `1359d4d3e31a1b4630dbe3c7c5e3c4a2b0d9797b31df79a5f6b1edeaa9d8bcc7` |
 | Targeted strict Basedpyright configurations for changed slices | **PASS** | 0 errors |
 | Ruff checks and formatting for changed slices | **PASS** | Available local checks passed |
 | Dashboard production build | **PASS** | `npm run build` passed |
@@ -134,10 +137,7 @@ health/error deltas and `dual_rail_payload_verified=true`.
 
 ## Pending tests
 
-1. Admit the exact GLM-4.7 Flash snapshot to the TP1 oracle, pin the chat-template
-   date in TP1 and TP2, and send `enable_thinking=false` in both proof requests.
-2. Run GLM-4.7 Flash exact staging, deterministic TP1, then strict TP=2 with
+1. Run GLM-4.7 Flash exact staging, deterministic TP1, then strict TP=2 with
    TP1 equality, ownership-safe cleanup, and per-rail HCA payload evidence.
-3. Repeat the same progression for Qwen3-Coder 30B A3B and Qwen3.5 35B A3B.
-4. Re-run the preserved QDR receipts after the ConnectX-5 EDR hardware swap.
-
+2. Repeat the same progression for Qwen3-Coder 30B A3B and Qwen3.5 35B A3B.
+3. Re-run the preserved QDR receipts after the ConnectX-5 EDR hardware swap.
