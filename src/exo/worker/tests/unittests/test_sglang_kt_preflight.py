@@ -6,10 +6,12 @@ from exo.worker.sglang_kt.launch_spec import (
     GLM_4_7_FLASH_BF16_CONFIG_SHA256,
     GLM_4_7_FLASH_BF16_MODEL_CONTRACT_SHA256,
     GLM_4_7_FLASH_CPU_ROUTED_EXPERTS_TARGET_PROFILE,
+    GLM_4_7_FLASH_SERVING_BASELINE_TARGET_PROFILE,
     GLM_4_7_FLASH_TARGET_PROFILES,
     SglangKtProcessLaunchSpec,
     build_glm_4_7_flash_bf16_cpu_routed_experts_process_launch_specs,
     build_glm_4_7_flash_bf16_process_launch_specs,
+    build_glm_4_7_flash_bf16_serving_baseline_process_launch_specs,
     build_glm_5_2_fp8_process_launch_specs,
     calculate_sglang_kt_process_launch_spec_sha256,
 )
@@ -36,6 +38,7 @@ from exo.worker.tests.unittests.test_sglang_kt_launch_spec import (
     PYTHON_EXECUTABLE,
     make_glm_4_7_flash_bf16_cpu_routed_experts_plan,
     make_glm_4_7_flash_bf16_plan,
+    make_glm_4_7_flash_bf16_serving_baseline_plan,
     make_plan,
 )
 
@@ -738,6 +741,21 @@ def test_flash_cpu_routed_experts_control_requires_exact_execution_receipt() -> 
         == GLM_4_7_FLASH_WRAPPED_EXPERT_LAYERS
         == tuple(range(1, 47))
     )
+
+
+def test_flash_serving_baseline_requires_exact_hybrid_execution_receipt() -> None:
+    (spec,) = build_glm_4_7_flash_bf16_serving_baseline_process_launch_specs(
+        make_glm_4_7_flash_bf16_serving_baseline_plan(), PYTHON_EXECUTABLE
+    )
+    observation = make_host_observation((spec,))
+    (receipt,) = model_runtime_receipts(observation)
+
+    result = evaluate_sglang_kt_preflight((spec,), (observation,))
+
+    assert isinstance(result, SglangKtPreflightPassed)
+    assert receipt.target_profile == GLM_4_7_FLASH_SERVING_BASELINE_TARGET_PROFILE
+    assert receipt.resident_gpu_experts == 4
+    assert "kt_bf16_cpu_gpu_hybrid_executed_v1" in receipt.capabilities
 
 
 @pytest.mark.parametrize(

@@ -53,6 +53,11 @@ source of truth. Update this file in the same commit that records each new test.
   in-place Triton fused-MoE invocation a fresh clone of the pristine dispatch
   input, and both combined, CPU, and GPU repeats were bitwise identical without
   relaxing admission tolerances.
+- The instrumentation-free GLM-4.7 serving baseline profile is implemented but
+  has not run on hardware. It strips hybrid timing and expert-distribution
+  recording, disables radix caching and CUDA graphs, and strips inherited
+  `SGLANG_*` variables so no tuner output can enter the untuned control. A fresh
+  model-execution receipt is required for its exact process-spec digest.
 - Historical Ornith AMXINT8 conversion and serving receipts were recovered and
   hashed below. They inform the GLM hybrid-runtime work but are not Exo tests.
 - Commit `65a04353` routes the disposable backend child's OS-level stdout to the
@@ -95,6 +100,7 @@ test total.
 | GLM-4.7 BF16 one-resident hybrid model admission | **PASS** | Hybrid1 v2 completed normally with a bound 30,474-byte model receipt, `model_checkpoint_verified=true`, `reportable=true`, and clean unforced cleanup. Its six common capabilities plus `kt_bf16_cpu_gpu_hybrid_executed_v1` bind exact layers 1-46, AMX-BF16 CPU experts, one RTX 3090 expert per layer, deterministic component/merged evidence, and real extend/decode. `performance_comparable=false`: this is a correctness/admission proof. |
 | GLM-4.7 BF16 four-resident hybrid model admission | **PASS** | Hybrid4 v1 completed normally with a bound 30,752-byte model receipt, `model_checkpoint_verified=true`, `reportable=true`, and clean unforced cleanup. The independently loaded receipt derives the same narrow seven mixed-route capabilities while binding resident experts 0-3 on every routed layer, a GPU 0/1 plus AMX CPU 4/5 oracle, exact repeats/merge, and real extend/decode. `performance_comparable=false`: stage timings are not throughput data. |
 | SGLang-KTransformers process-wide NUMA binding | **PASS (software)** | The local process supervisor now renders one exact `/usr/bin/numactl --physcpubind <cores> --membind <nodes> ...` command, so the configured memory-node policy applies to the whole SGLang server as well as the KTransformers worker-pool arguments. All 29 focused supervisor lifecycle tests pass. A fresh model-execution receipt is required before this changed launch source is admitted on hardware. |
+| GLM-4.7 instrumentation-free serving baseline contract | **PASS (software)** | The dedicated profile preserves the pinned BF16/SM86/PP1 model and runtime contract while removing diagnostic timing/distribution hooks and inherited tuner variables. It disables radix caching and CUDA graphs for the first matched control, requires 1-63 GPU-resident experts, and keeps the prior hybrid4 canonical process-spec digest unchanged. The focused launch, generator, preflight, and model-validator slice passed 218 tests; targeted strict Basedpyright reported 0 errors, and Ruff/format checks passed. No serving or performance claim is made. |
 | GLM-4.7 packaged-contract wheel inclusion | **PASS (artifact)** | `uv build --wheel` produced `exo-0.3.70-py3-none-any.whl`; its package contains the exact 16,218-byte `exo/worker/sglang_kt/manifests/glm47_flash_bf16_7dd20894.json` resource |
 | Changed GLM-4.7 Flash Python files, strict targeted type checks and Ruff | **PASS** | Three targeted Basedpyright configurations reported 0 errors; repository-wide `ruff check` passed; all 16 changed Python files passed `ruff format --check` on 2026-07-19 |
 | Repository-wide Basedpyright | **PASS** | `uv run --no-sync basedpyright` reported 0 errors, 0 warnings, and 0 notes after synchronizing the locked workspace environment |

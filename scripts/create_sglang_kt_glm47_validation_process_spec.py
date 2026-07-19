@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Create one pinned, inert GLM-4.7 validation process specification."""
+"""Create one pinned, inert GLM-4.7 validation or serving process spec."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ import sys
 from contextlib import suppress
 from ipaddress import IPv4Address
 from pathlib import Path, PurePosixPath
-from typing import Final
+from typing import Final, Literal
 
 from pydantic import ValidationError
 
@@ -33,11 +33,13 @@ from exo.worker.sglang_kt.launch_spec import (
     GLM_4_7_FLASH_KTRANSFORMERS_REVISION,
     GLM_4_7_FLASH_LAYER_COUNT,
     GLM_4_7_FLASH_MAX_TOTAL_TOKENS,
+    GLM_4_7_FLASH_SERVING_BASELINE_TARGET_PROFILE,
     GLM_4_7_FLASH_SGLANG_REVISION,
     GLM_4_7_FLASH_TARGET_PROFILE,
     SglangKtProcessLaunchSpec,
     build_glm_4_7_flash_bf16_cpu_routed_experts_process_launch_specs,
     build_glm_4_7_flash_bf16_process_launch_specs,
+    build_glm_4_7_flash_bf16_serving_baseline_process_launch_specs,
     calculate_sglang_kt_process_launch_spec_sha256,
 )
 from exo.worker.sglang_kt.receipt_io import (
@@ -63,6 +65,7 @@ class ProcessSpecCreationError(RuntimeError):
 
 
 class Glm47ValidationProcessSpecArguments(argparse.Namespace):
+    launch_mode: Literal["validation", "serving_baseline"]
     model_path: Path
     runtime_python: Path
     output: Path
@@ -185,6 +188,11 @@ def parse_arguments(
     arguments: list[str] | None = None,
 ) -> Glm47ValidationProcessSpecArguments:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--launch-mode",
+        choices=("validation", "serving_baseline"),
+        default="validation",
+    )
     parser.add_argument("--model-path", required=True, type=_absolute_normalized_path)
     parser.add_argument(
         "--runtime-python", required=True, type=_absolute_normalized_path
@@ -223,13 +231,28 @@ def _argument_value(arguments: tuple[str, ...], option: str) -> str:
 def _validate_generated_spec(process_spec: SglangKtProcessLaunchSpec) -> None:
     plan = process_spec.plan
     stage = process_spec.stage
-    expected_profile = (
-        GLM_4_7_FLASH_CPU_ROUTED_EXPERTS_TARGET_PROFILE
-        if stage.resident_gpu_experts == 0
-        else GLM_4_7_FLASH_TARGET_PROFILE
-    )
+    expected_profile = plan.target_profile
+    if expected_profile == GLM_4_7_FLASH_SERVING_BASELINE_TARGET_PROFILE:
+        profile_arguments_are_valid = (
+            stage.resident_gpu_experts > 0
+            and "--disable-radix-cache" in process_spec.arguments
+            and "--record-kt-gpu-expert-distribution" not in process_spec.arguments
+            and "SGLANG_KT_HYBRID_TIMING" not in dict(process_spec.environment)
+        )
+    else:
+        profile_arguments_are_valid = (
+            expected_profile
+            == (
+                GLM_4_7_FLASH_CPU_ROUTED_EXPERTS_TARGET_PROFILE
+                if stage.resident_gpu_experts == 0
+                else GLM_4_7_FLASH_TARGET_PROFILE
+            )
+            and "--disable-radix-cache" not in process_spec.arguments
+            and "--record-kt-gpu-expert-distribution" in process_spec.arguments
+            and dict(process_spec.environment).get("SGLANG_KT_HYBRID_TIMING") == "1"
+        )
     if (
-        plan.target_profile != expected_profile
+        not profile_arguments_are_valid
         or plan.model_id != GLM_4_7_FLASH_BF16_MODEL_ID
         or plan.model_revision != GLM_4_7_FLASH_BF16_MODEL_REVISION
         or plan.sglang_revision != GLM_4_7_FLASH_SGLANG_REVISION
@@ -269,11 +292,18 @@ def create_process_spec(
     if arguments.output == arguments.runtime_python:
         raise ProcessSpecCreationError("output must differ from the runtime executable")
 
-    target_profile = (
-        GLM_4_7_FLASH_CPU_ROUTED_EXPERTS_TARGET_PROFILE
-        if arguments.resident_gpu_experts == 0
-        else GLM_4_7_FLASH_TARGET_PROFILE
-    )
+    if arguments.launch_mode == "serving_baseline":
+        if arguments.resident_gpu_experts == 0:
+            raise ProcessSpecCreationError(
+                "serving baseline requires at least one resident GPU expert"
+            )
+        target_profile = GLM_4_7_FLASH_SERVING_BASELINE_TARGET_PROFILE
+    else:
+        target_profile = (
+            GLM_4_7_FLASH_CPU_ROUTED_EXPERTS_TARGET_PROFILE
+            if arguments.resident_gpu_experts == 0
+            else GLM_4_7_FLASH_TARGET_PROFILE
+        )
     stage = SglangKtStageSpec(
         pipeline_rank=0,
         start_layer=0,
@@ -307,7 +337,11 @@ def create_process_spec(
         rank_zero_endpoint=arguments.service_endpoint,
         stages=(stage,),
     )
-    if arguments.resident_gpu_experts == 0:
+    if target_profile == GLM_4_7_FLASH_SERVING_BASELINE_TARGET_PROFILE:
+        process_specs = build_glm_4_7_flash_bf16_serving_baseline_process_launch_specs(
+            plan, str(arguments.runtime_python)
+        )
+    elif arguments.resident_gpu_experts == 0:
         process_specs = (
             build_glm_4_7_flash_bf16_cpu_routed_experts_process_launch_specs(
                 plan, str(arguments.runtime_python)

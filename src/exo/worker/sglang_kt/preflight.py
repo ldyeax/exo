@@ -18,6 +18,7 @@ from exo.worker.sglang_kt.launch_spec import (
     GLM_4_7_FLASH_BF16_CONFIG_SHA256,
     GLM_4_7_FLASH_CPU_ROUTED_EXPERTS_TARGET_PROFILE,
     GLM_4_7_FLASH_KV_CACHE_DTYPE,
+    GLM_4_7_FLASH_SERVING_BASELINE_TARGET_PROFILE,
     GLM_4_7_FLASH_TARGET_PROFILE,
     GLM_4_7_FLASH_TARGET_PROFILES,
     GLM_5_2_KV_CACHE_DTYPE,
@@ -975,7 +976,10 @@ def _evaluate_runtime_validation(
             GLM_4_7_FLASH_CPU_ROUTED_EXPERTS_REQUIRED_RUNTIME_CAPABILITIES
         )
         expected_wrapped_expert_layers = GLM_4_7_FLASH_WRAPPED_EXPERT_LAYERS
-    elif process_spec.target_profile == GLM_4_7_FLASH_TARGET_PROFILE:
+    elif process_spec.target_profile in (
+        GLM_4_7_FLASH_TARGET_PROFILE,
+        GLM_4_7_FLASH_SERVING_BASELINE_TARGET_PROFILE,
+    ):
         expected_cpu_backend = "AMX_BF16"
         expected_kv_cache_dtype = GLM_4_7_FLASH_KV_CACHE_DTYPE
         required_capabilities = GLM_4_7_FLASH_REQUIRED_RUNTIME_CAPABILITIES

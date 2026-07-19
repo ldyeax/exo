@@ -46,10 +46,14 @@ GLM_4_7_FLASH_TARGET_PROFILE: Final[SglangKtTargetProfile] = (
 GLM_4_7_FLASH_CPU_ROUTED_EXPERTS_TARGET_PROFILE: Final[SglangKtTargetProfile] = (
     "glm47_flash_bf16_sm86_cpu_routed_experts_control_v1"
 )
+GLM_4_7_FLASH_SERVING_BASELINE_TARGET_PROFILE: Final[SglangKtTargetProfile] = (
+    "glm47_flash_bf16_sm86_serving_baseline_v1"
+)
 GLM_4_7_FLASH_TARGET_PROFILES: Final = frozenset(
     (
         GLM_4_7_FLASH_TARGET_PROFILE,
         GLM_4_7_FLASH_CPU_ROUTED_EXPERTS_TARGET_PROFILE,
+        GLM_4_7_FLASH_SERVING_BASELINE_TARGET_PROFILE,
     )
 )
 
@@ -232,12 +236,11 @@ class SglangKtProcessLaunchSpec(FrozenModel):
             str(self.plan.max_concurrent_requests),
         )
         if self.target_profile in GLM_4_7_FLASH_TARGET_PROFILES:
-            return (
+            glm47_arguments = (
                 *common_arguments,
                 "--chunked-prefill-size",
                 str(GLM_4_7_FLASH_CHUNKED_PREFILL_SIZE),
                 "--disable-cuda-graph",
-                "--record-kt-gpu-expert-distribution",
                 "--attention-backend",
                 self.attention_backend,
                 "--kv-cache-dtype",
@@ -251,6 +254,9 @@ class SglangKtProcessLaunchSpec(FrozenModel):
                 "GLM-4.7-Flash",
                 "--trust-remote-code",
             )
+            if self.target_profile == GLM_4_7_FLASH_SERVING_BASELINE_TARGET_PROFILE:
+                return (*glm47_arguments, "--disable-radix-cache")
+            return (*glm47_arguments, "--record-kt-gpu-expert-distribution")
         return (
             *common_arguments,
             "--attention-backend",
@@ -274,6 +280,8 @@ class SglangKtProcessLaunchSpec(FrozenModel):
             ("PYTORCH_ALLOC_CONF", "expandable_segments:True"),
         )
         if self.target_profile in GLM_4_7_FLASH_TARGET_PROFILES:
+            if self.target_profile == GLM_4_7_FLASH_SERVING_BASELINE_TARGET_PROFILE:
+                return common_environment
             return (
                 *common_environment,
                 ("SGLANG_KT_HYBRID_TIMING", "1"),
@@ -375,6 +383,20 @@ def build_glm_4_7_flash_bf16_cpu_routed_experts_process_launch_specs(
         raise ValueError(
             "GLM-4.7-Flash CPU-routed-experts builder requires target profile "
             f"{GLM_4_7_FLASH_CPU_ROUTED_EXPERTS_TARGET_PROFILE}"
+        )
+    return build_sglang_kt_process_launch_specs(plan, python_executable)
+
+
+def build_glm_4_7_flash_bf16_serving_baseline_process_launch_specs(
+    plan: SglangKtLaunchPlan,
+    python_executable: str,
+) -> tuple[SglangKtProcessLaunchSpec, ...]:
+    """Build the receipt-gated, instrumentation-free serving baseline."""
+
+    if plan.target_profile != GLM_4_7_FLASH_SERVING_BASELINE_TARGET_PROFILE:
+        raise ValueError(
+            "GLM-4.7-Flash serving builder requires target profile "
+            f"{GLM_4_7_FLASH_SERVING_BASELINE_TARGET_PROFILE}"
         )
     return build_sglang_kt_process_launch_specs(plan, python_executable)
 
@@ -510,7 +532,11 @@ def _validate_glm_4_7_flash_bf16_plan(plan: SglangKtLaunchPlan) -> None:
             "GPU experts"
         )
     if (
-        plan.target_profile == GLM_4_7_FLASH_TARGET_PROFILE
+        plan.target_profile
+        in (
+            GLM_4_7_FLASH_TARGET_PROFILE,
+            GLM_4_7_FLASH_SERVING_BASELINE_TARGET_PROFILE,
+        )
         and not 1 <= stage.resident_gpu_experts < GLM_4_7_FLASH_ROUTED_EXPERT_COUNT
     ):
         raise ValueError(

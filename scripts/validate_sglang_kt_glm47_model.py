@@ -42,6 +42,7 @@ from exo.worker.sglang_kt.launch_spec import (
     GLM_4_7_FLASH_LAYER_COUNT,
     GLM_4_7_FLASH_MAX_TOTAL_TOKENS,
     GLM_4_7_FLASH_ROUTED_EXPERT_COUNT,
+    GLM_4_7_FLASH_SERVING_BASELINE_TARGET_PROFILE,
     GLM_4_7_FLASH_SGLANG_REVISION,
     GLM_4_7_FLASH_TARGET_PROFILE,
     SglangKtProcessLaunchSpec,
@@ -499,6 +500,7 @@ def _validate_glm47_process_spec(process_spec: SglangKtProcessLaunchSpec) -> Non
     if plan.target_profile not in {
         GLM_4_7_FLASH_TARGET_PROFILE,
         GLM_4_7_FLASH_CPU_ROUTED_EXPERTS_TARGET_PROFILE,
+        GLM_4_7_FLASH_SERVING_BASELINE_TARGET_PROFILE,
     }:
         raise Glm47ModelValidationError("process spec is not a GLM-4.7 profile")
     if process_spec.pipeline_rank != 0 or len(plan.stages) != 1:

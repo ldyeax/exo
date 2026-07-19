@@ -20,6 +20,7 @@ from exo.worker.sglang_kt.launch_spec import (
     GLM_4_7_FLASH_KTRANSFORMERS_REVISION,
     GLM_4_7_FLASH_LAYER_COUNT,
     GLM_4_7_FLASH_MAX_TOTAL_TOKENS,
+    GLM_4_7_FLASH_SERVING_BASELINE_TARGET_PROFILE,
     GLM_4_7_FLASH_SGLANG_REVISION,
     GLM_4_7_FLASH_TARGET_PROFILE,
     SglangKtProcessLaunchSpec,
@@ -47,8 +48,11 @@ def cli_arguments(
     distributed_coordinator: str = "192.0.2.10:29510",
     service_endpoint: str = "192.0.2.10:30100",
     output: Path | None = None,
+    launch_mode: str = "validation",
 ) -> list[str]:
     return [
+        "--launch-mode",
+        launch_mode,
         "--model-path",
         MODEL_PATH,
         "--runtime-python",
@@ -87,6 +91,7 @@ def parsed_arguments(
     distributed_coordinator: str = "192.0.2.10:29510",
     service_endpoint: str = "192.0.2.10:30100",
     output: Path | None = None,
+    launch_mode: str = "validation",
 ) -> creator.Glm47ValidationProcessSpecArguments:
     return creator.parse_arguments(
         cli_arguments(
@@ -99,6 +104,7 @@ def parsed_arguments(
             distributed_coordinator=distributed_coordinator,
             service_endpoint=service_endpoint,
             output=output,
+            launch_mode=launch_mode,
         )
     )
 
@@ -197,6 +203,29 @@ def test_zero_residents_selects_cpu_control_profile(tmp_path: Path) -> None:
     )
     assert process_spec.stage.resident_gpu_experts == 0
     assert argument_value(process_spec.arguments, "--kt-num-gpu-experts") == "0"
+
+
+def test_serving_mode_selects_instrumentation_free_profile(tmp_path: Path) -> None:
+    process_spec = creator.create_process_spec(
+        parsed_arguments(tmp_path, launch_mode="serving_baseline")
+    )
+
+    assert process_spec.target_profile == GLM_4_7_FLASH_SERVING_BASELINE_TARGET_PROFILE
+    assert "--disable-cuda-graph" in process_spec.arguments
+    assert "--disable-radix-cache" in process_spec.arguments
+    assert "--record-kt-gpu-expert-distribution" not in process_spec.arguments
+    assert "SGLANG_KT_HYBRID_TIMING" not in dict(process_spec.environment)
+
+
+def test_serving_mode_rejects_zero_residents(tmp_path: Path) -> None:
+    with pytest.raises(creator.ProcessSpecCreationError, match="at least one"):
+        creator.create_process_spec(
+            parsed_arguments(
+                tmp_path,
+                resident_gpu_experts="0",
+                launch_mode="serving_baseline",
+            )
+        )
 
 
 def test_zero_and_nonzero_residents_call_the_corresponding_builder(

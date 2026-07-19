@@ -14,6 +14,7 @@ from exo.worker.sglang_kt.launch_spec import (
     GLM_4_7_FLASH_BF16_MODEL_REVISION,
     GLM_4_7_FLASH_CPU_ROUTED_EXPERTS_TARGET_PROFILE,
     GLM_4_7_FLASH_KTRANSFORMERS_REVISION,
+    GLM_4_7_FLASH_SERVING_BASELINE_TARGET_PROFILE,
     GLM_4_7_FLASH_SGLANG_REVISION,
     GLM_4_7_FLASH_TARGET_PROFILE,
     GLM_5_2_FULL_INDEXER_LAYER_STARTS,
@@ -26,6 +27,7 @@ from exo.worker.sglang_kt.launch_spec import (
     SglangKtProcessLaunchSpec,
     build_glm_4_7_flash_bf16_cpu_routed_experts_process_launch_specs,
     build_glm_4_7_flash_bf16_process_launch_specs,
+    build_glm_4_7_flash_bf16_serving_baseline_process_launch_specs,
     build_glm_5_2_fp8_process_launch_specs,
     calculate_sglang_kt_process_launch_spec_sha256,
 )
@@ -185,6 +187,13 @@ def make_glm_4_7_flash_bf16_cpu_routed_experts_plan() -> SglangKtLaunchPlan:
     )
 
 
+def make_glm_4_7_flash_bf16_serving_baseline_plan() -> SglangKtLaunchPlan:
+    plan = make_glm_4_7_flash_bf16_plan()
+    return plan.model_copy(
+        update={"target_profile": GLM_4_7_FLASH_SERVING_BASELINE_TARGET_PROFILE}
+    )
+
+
 def argument_value(arguments: tuple[str, ...], option: str) -> str:
     return arguments[arguments.index(option) + 1]
 
@@ -341,6 +350,21 @@ def test_builds_fail_closed_glm_4_7_flash_bf16_hybrid_smoke() -> None:
         ("PYTORCH_ALLOC_CONF", "expandable_segments:True"),
         ("SGLANG_KT_HYBRID_TIMING", "1"),
     )
+    assert all(not name.startswith("NCCL_") for name, _value in spec.environment)
+    assert SglangKtProcessLaunchSpec.model_validate_json(spec.model_dump_json()) == spec
+
+
+def test_builds_instrumentation_free_glm_4_7_serving_baseline() -> None:
+    (spec,) = build_glm_4_7_flash_bf16_serving_baseline_process_launch_specs(
+        make_glm_4_7_flash_bf16_serving_baseline_plan(),
+        PYTHON_EXECUTABLE,
+    )
+
+    assert spec.target_profile == GLM_4_7_FLASH_SERVING_BASELINE_TARGET_PROFILE
+    assert "--disable-cuda-graph" in spec.arguments
+    assert "--disable-radix-cache" in spec.arguments
+    assert "--record-kt-gpu-expert-distribution" not in spec.arguments
+    assert "SGLANG_KT_HYBRID_TIMING" not in dict(spec.environment)
     assert all(not name.startswith("NCCL_") for name, _value in spec.environment)
     assert SglangKtProcessLaunchSpec.model_validate_json(spec.model_dump_json()) == spec
 

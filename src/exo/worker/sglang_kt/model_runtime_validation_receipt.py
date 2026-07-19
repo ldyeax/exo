@@ -34,6 +34,7 @@ from exo.worker.sglang_kt.launch_spec import (
     GLM_4_7_FLASH_KTRANSFORMERS_REVISION,
     GLM_4_7_FLASH_MAX_TOTAL_TOKENS,
     GLM_4_7_FLASH_ROUTED_EXPERT_COUNT,
+    GLM_4_7_FLASH_SERVING_BASELINE_TARGET_PROFILE,
     GLM_4_7_FLASH_SGLANG_REVISION,
     GLM_4_7_FLASH_TARGET_PROFILE,
     REQUIRED_TRANSFORMERS_DISTRIBUTION_VERSION,
@@ -318,6 +319,7 @@ class _RuntimeLaunchSummary(_StrictModel):
         if self.target_profile not in (
             GLM_4_7_FLASH_TARGET_PROFILE,
             GLM_4_7_FLASH_CPU_ROUTED_EXPERTS_TARGET_PROFILE,
+            GLM_4_7_FLASH_SERVING_BASELINE_TARGET_PROFILE,
         ):
             raise ValueError("model receipt target profile is not GLM-4.7 Flash")
         if self.gpu_compute_capability != _EXPECTED_GPU_COMPUTE_CAPABILITY:

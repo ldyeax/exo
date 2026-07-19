@@ -43,6 +43,7 @@ SglangKtTargetProfile = Literal[
     "glm52_fp8_pp3_sm86_v1",
     "glm47_flash_bf16_sm86_smoke_v1",
     "glm47_flash_bf16_sm86_cpu_routed_experts_control_v1",
+    "glm47_flash_bf16_sm86_serving_baseline_v1",
 ]
 
 
