@@ -392,10 +392,10 @@ class MpReceiver[T]:
             while True:
                 try:
                     item = self._state.buffer.get()
-                except (TypeError, OSError):
+                except (TypeError, OSError, ValueError):
                     # Queue pipe can get closed while we are blocked on get().
-                    # The underlying connection._handle becomes None, causing
-                    # TypeError in read(handle, remaining).
+                    # Depending on the Python version and timing, this raises
+                    # TypeError, OSError, or an explicit closed-queue ValueError.
                     raise ClosedResourceError from None
                 if isinstance(item, _MpFlush):
                     self._state.flush_acknowledged.release()

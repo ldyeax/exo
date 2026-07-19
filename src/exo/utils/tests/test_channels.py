@@ -171,6 +171,24 @@ def test_mp_channel_flush_timeout_bounds_marker_enqueue() -> None:
     send.join()
 
 
+def test_mp_channel_blocking_receive_translates_closed_queue(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    send, receive = mp_channel[str]()
+
+    def force_would_block() -> str:
+        raise WouldBlock
+
+    monkeypatch.setattr(receive, "receive_nowait", force_would_block)
+    receive.close()
+
+    with pytest.raises(ClosedResourceError):
+        receive.receive()
+
+    send.close()
+    send.join()
+
+
 def test_channel_error_override_replaces_sync_errors_with_subclasses():
     send, recv = channel[int](0, error_override_config=ERROR_OVERRIDE)
 
