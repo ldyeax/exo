@@ -3,6 +3,7 @@ import importlib
 import importlib.machinery
 import json
 import pathlib
+import subprocess
 import sys
 import types
 from dataclasses import dataclass, field
@@ -38,6 +39,7 @@ from exo.worker.sglang_kt.preflight import (
 )
 from exo.worker.sglang_kt.preflight_collector import (
     SGLANG_KT_ARTIFACT_BUILD_ID_FUNCTION_SOURCE,
+    SGLANG_KT_RUNTIME_PROBE_SCRIPT,
     ExternalPythonSglangKtRuntimeProbe,
     LinuxSglangKtHostInventoryProbe,
     LocalSglangKtFilesystemProbe,
@@ -194,8 +196,10 @@ def make_runtime(spec: SglangKtProcessLaunchSpec) -> SglangKtRuntimeObservation:
         ),
         sglang_revision=spec.expected_sglang_revision,
         ktransformers_revision=spec.expected_ktransformers_revision,
-        transformers_distribution_version=spec.required_transformers_version,
-        transformers_module_version=spec.required_transformers_version,
+        transformers_distribution_version=(
+            spec.required_transformers_distribution_version
+        ),
+        transformers_module_version=spec.required_transformers_module_version,
         torch_version=TORCH_VERSION,
         cuda_version=CUDA_VERSION,
         sgl_kernel_build_id=SGL_KERNEL_BUILD_ID,
@@ -219,8 +223,10 @@ def make_runtime_validation_receipt(
         model_config_sha256=CONFIG_SHA256,
         sglang_revision=spec.expected_sglang_revision,
         ktransformers_revision=spec.expected_ktransformers_revision,
-        transformers_distribution_version=spec.required_transformers_version,
-        transformers_module_version=spec.required_transformers_version,
+        transformers_distribution_version=(
+            spec.required_transformers_distribution_version
+        ),
+        transformers_module_version=spec.required_transformers_module_version,
         torch_version=TORCH_VERSION,
         cuda_version=CUDA_VERSION,
         sgl_kernel_build_id=SGL_KERNEL_BUILD_ID,
@@ -537,8 +543,9 @@ def test_external_runtime_probe_parses_only_the_external_python_payload() -> Non
     assert len(command_runner.calls) == 1
     command, timeout_seconds = command_runner.calls[0]
     assert command[:3] == (spec.executable, "-I", "-c")
-    assert 'source_revision("sglang")' in command[3]
-    assert 'source_revision("ktransformers")' in command[3]
+    assert "embedded_source_revisions()" in command[3]
+    assert 'for package_name in ("sglang", "kt_kernel")' in command[3]
+    assert '"_exo_build_provenance.py"' in command[3]
     assert 'distribution_version("transformers-kt")' in command[3]
     assert 'module_version("transformers")' in command[3]
     assert "torch_runtime_versions()" in command[3]
@@ -546,8 +553,8 @@ def test_external_runtime_probe_parses_only_the_external_python_payload() -> Non
     assert '"deep_gemm", "deep_gemm"' in command[3]
     assert '"kt_kernel", "kt_kernel_ext", ("kt_kernel_ext",)' in command[3]
     assert "exo-sglang-kt-artifact-v1" in command[3]
-    assert '"status"' in command[3]
-    assert '"--untracked-files=no"' in command[3]
+    assert '"git"' not in command[3]
+    assert "subprocess" not in command[3]
     assert timeout_seconds == 30.0
 
 
@@ -677,7 +684,7 @@ def test_external_runtime_probe_fails_closed_on_untrusted_results(
     assert observed == SglangKtRuntimeObservation()
 
 
-def test_external_runtime_probe_leaves_no_git_source_revisions_unobserved() -> None:
+def test_external_runtime_probe_leaves_missing_embedded_revisions_unobserved() -> None:
     spec = make_specs()[0]
     no_git_runtime = SglangKtRuntimeObservation(
         executable=spec.executable,
@@ -689,8 +696,10 @@ def test_external_runtime_probe_leaves_no_git_source_revisions_unobserved() -> N
         ),
         sglang_revision=None,
         ktransformers_revision=None,
-        transformers_distribution_version=spec.required_transformers_version,
-        transformers_module_version=spec.required_transformers_version,
+        transformers_distribution_version=(
+            spec.required_transformers_distribution_version
+        ),
+        transformers_module_version=spec.required_transformers_module_version,
     )
     command_runner = RecordingRuntimeCommandRunner(
         SglangKtRuntimeCommandResult(
@@ -707,6 +716,64 @@ def test_external_runtime_probe_leaves_no_git_source_revisions_unobserved() -> N
     assert observed == no_git_runtime
     assert observed.sglang_revision is None
     assert observed.ktransformers_revision is None
+
+
+def _execute_runtime_probe_with_provenance(
+    tmp_path: Path,
+    *,
+    kt_kernel_sglang_revision: str,
+) -> SglangKtRuntimeObservation:
+    ktransformers_revision = "1" * 40
+    sglang_revision = "2" * 40
+    for package_name, package_sglang_revision in (
+        ("sglang", sglang_revision),
+        ("kt_kernel", kt_kernel_sglang_revision),
+    ):
+        package = tmp_path / package_name
+        package.mkdir()
+        (package / "__init__.py").write_text("", encoding="utf-8")
+        (package / "_exo_build_provenance.py").write_text(
+            "SCHEMA_VERSION = 1\n"
+            f'KTRANSFORMERS_REVISION = "{ktransformers_revision}"\n'
+            f'SGLANG_REVISION = "{package_sglang_revision}"\n',
+            encoding="ascii",
+        )
+    wrapper = (
+        "import sys;"
+        f"sys.path.insert(0, {str(tmp_path)!r});"
+        f"exec({SGLANG_KT_RUNTIME_PROBE_SCRIPT!r})"
+    )
+    result = subprocess.run(
+        (sys.executable, "-I", "-c", wrapper),
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return SglangKtRuntimeObservation.model_validate_json(result.stdout)
+
+
+def test_runtime_probe_accepts_matching_embedded_wheel_provenance(
+    tmp_path: Path,
+) -> None:
+    observed = _execute_runtime_probe_with_provenance(
+        tmp_path,
+        kt_kernel_sglang_revision="2" * 40,
+    )
+
+    assert observed.ktransformers_revision == "1" * 40
+    assert observed.sglang_revision == "2" * 40
+
+
+def test_runtime_probe_rejects_disagreeing_embedded_wheel_provenance(
+    tmp_path: Path,
+) -> None:
+    observed = _execute_runtime_probe_with_provenance(
+        tmp_path,
+        kt_kernel_sglang_revision="3" * 40,
+    )
+
+    assert observed.ktransformers_revision is None
+    assert observed.sglang_revision is None
 
 
 def test_default_glm_5_2_fp8_compatibility_verifier_accepts_exact_config(

@@ -16,10 +16,11 @@ from exo.shared.types.worker.sglang_kt import (
 from exo.utils.pydantic_ext import FrozenModel
 from exo.worker.sglang_kt.launch_spec import (
     GLM_4_7_FLASH_BF16_CONFIG_SHA256,
+    GLM_4_7_FLASH_CPU_ROUTED_EXPERTS_TARGET_PROFILE,
     GLM_4_7_FLASH_KV_CACHE_DTYPE,
     GLM_4_7_FLASH_TARGET_PROFILE,
+    GLM_4_7_FLASH_TARGET_PROFILES,
     GLM_5_2_KV_CACHE_DTYPE,
-    REQUIRED_TRANSFORMERS_VERSION,
     SglangKtProcessLaunchSpec,
 )
 
@@ -32,9 +33,11 @@ SglangKtRuntimeCapability = Literal[
     "kt_process_cpu_affinity_v1",
     "kt_fp8_amx_executed_v1",
     "glm47_flash_kt_wrapper_active_v1",
+    "glm47_flash_kt_wrapper_layers_1_46_v1",
     "glm47_flash_bf16_sm86_short_forward_v1",
     "kt_bf16_amx_executed_v1",
     "kt_bf16_cpu_gpu_hybrid_executed_v1",
+    "glm47_flash_bf16_cpu_routed_experts_executed_v1",
 ]
 GLM_5_2_REQUIRED_RUNTIME_CAPABILITIES: frozenset[SglangKtRuntimeCapability] = frozenset(
     (
@@ -49,6 +52,7 @@ GLM_4_7_FLASH_REQUIRED_RUNTIME_CAPABILITIES: frozenset[SglangKtRuntimeCapability
     frozenset(
         (
             "glm47_flash_kt_wrapper_active_v1",
+            "glm47_flash_kt_wrapper_layers_1_46_v1",
             "glm47_flash_bf16_sm86_short_forward_v1",
             "kt_physical_numa_mapping_v1",
             "kt_process_cpu_affinity_v1",
@@ -57,6 +61,20 @@ GLM_4_7_FLASH_REQUIRED_RUNTIME_CAPABILITIES: frozenset[SglangKtRuntimeCapability
         )
     )
 )
+GLM_4_7_FLASH_CPU_ROUTED_EXPERTS_REQUIRED_RUNTIME_CAPABILITIES: frozenset[
+    SglangKtRuntimeCapability
+] = frozenset(
+    (
+        "glm47_flash_kt_wrapper_active_v1",
+        "glm47_flash_kt_wrapper_layers_1_46_v1",
+        "glm47_flash_bf16_sm86_short_forward_v1",
+        "kt_physical_numa_mapping_v1",
+        "kt_process_cpu_affinity_v1",
+        "kt_bf16_amx_executed_v1",
+        "glm47_flash_bf16_cpu_routed_experts_executed_v1",
+    )
+)
+GLM_4_7_FLASH_WRAPPED_EXPERT_LAYERS: tuple[ResourceIndex, ...] = tuple(range(1, 47))
 # Backwards-compatible name for callers that only know the original GLM-5.2 profile.
 REQUIRED_RUNTIME_CAPABILITIES = GLM_5_2_REQUIRED_RUNTIME_CAPABILITIES
 PreflightCheck = Literal[
@@ -152,11 +170,18 @@ class SglangKtRuntimeValidationReceiptObservation(FrozenModel):
     max_total_tokens: PositiveInt
     static_memory_fraction: StaticMemoryFraction
     capabilities: tuple[SglangKtRuntimeCapability, ...]
+    ktransformers_wrapped_expert_layers: tuple[ResourceIndex, ...] = ()
 
     @model_validator(mode="after")
     def validate_capabilities(self) -> "SglangKtRuntimeValidationReceiptObservation":
         if len(set(self.capabilities)) != len(self.capabilities):
             raise ValueError("runtime validation capabilities must be unique")
+        if tuple(sorted(set(self.ktransformers_wrapped_expert_layers))) != (
+            self.ktransformers_wrapped_expert_layers
+        ):
+            raise ValueError(
+                "KTransformers wrapped expert layers must be sorted and unique"
+            )
         if not self.cpu_cores or len(set(self.cpu_cores)) != len(self.cpu_cores):
             raise ValueError("validated runtime CPU cores must be nonempty and unique")
         if not self.memory_nodes or len(set(self.memory_nodes)) != len(
@@ -394,22 +419,25 @@ def _evaluate_runtime(
         )
     if (
         runtime.transformers_distribution_version
-        != process_spec.required_transformers_version
+        != process_spec.required_transformers_distribution_version
     ):
         _record_failure(
             failures,
             process_spec,
             "transformers_distribution_version",
-            expected=(process_spec.required_transformers_version,),
+            expected=(process_spec.required_transformers_distribution_version,),
             observed=_optional_observed(runtime.transformers_distribution_version),
             detail="the installed transformers-kt distribution is not supported",
         )
-    if runtime.transformers_module_version != REQUIRED_TRANSFORMERS_VERSION:
+    if (
+        runtime.transformers_module_version
+        != process_spec.required_transformers_module_version
+    ):
         _record_failure(
             failures,
             process_spec,
             "transformers_module_version",
-            expected=(REQUIRED_TRANSFORMERS_VERSION,),
+            expected=(process_spec.required_transformers_module_version,),
             observed=_optional_observed(runtime.transformers_module_version),
             detail="the imported transformers module version is not supported",
         )
@@ -468,7 +496,7 @@ def _evaluate_snapshot_receipt(
 ) -> None:
     expected_config_sha256 = (
         GLM_4_7_FLASH_BF16_CONFIG_SHA256
-        if process_spec.target_profile == GLM_4_7_FLASH_TARGET_PROFILE
+        if process_spec.target_profile in GLM_4_7_FLASH_TARGET_PROFILES
         else None
     )
     receipt = next(
@@ -540,12 +568,22 @@ def _evaluate_runtime_validation(
     observation: SglangKtHostPreflightObservation,
     failures: list[SglangKtPreflightFailure],
 ) -> None:
-    if process_spec.target_profile == GLM_4_7_FLASH_TARGET_PROFILE:
-        expected_cpu_backend: Literal["AMX", "AMX_BF16"] = "AMX_BF16"
-        expected_kv_cache_dtype: Literal["bfloat16", "fp8_e4m3"] = (
-            GLM_4_7_FLASH_KV_CACHE_DTYPE
+    expected_cpu_backend: Literal["AMX", "AMX_BF16"]
+    expected_kv_cache_dtype: Literal["bfloat16", "fp8_e4m3"]
+    required_capabilities: frozenset[SglangKtRuntimeCapability]
+    expected_wrapped_expert_layers: tuple[ResourceIndex, ...] | None = None
+    if process_spec.target_profile == GLM_4_7_FLASH_CPU_ROUTED_EXPERTS_TARGET_PROFILE:
+        expected_cpu_backend = "AMX_BF16"
+        expected_kv_cache_dtype = GLM_4_7_FLASH_KV_CACHE_DTYPE
+        required_capabilities = (
+            GLM_4_7_FLASH_CPU_ROUTED_EXPERTS_REQUIRED_RUNTIME_CAPABILITIES
         )
+        expected_wrapped_expert_layers = GLM_4_7_FLASH_WRAPPED_EXPERT_LAYERS
+    elif process_spec.target_profile == GLM_4_7_FLASH_TARGET_PROFILE:
+        expected_cpu_backend = "AMX_BF16"
+        expected_kv_cache_dtype = GLM_4_7_FLASH_KV_CACHE_DTYPE
         required_capabilities = GLM_4_7_FLASH_REQUIRED_RUNTIME_CAPABILITIES
+        expected_wrapped_expert_layers = GLM_4_7_FLASH_WRAPPED_EXPERT_LAYERS
     else:
         expected_cpu_backend = "AMX"
         expected_kv_cache_dtype = GLM_5_2_KV_CACHE_DTYPE
@@ -582,9 +620,9 @@ def _evaluate_runtime_validation(
         and validation_receipt.ktransformers_revision
         == process_spec.expected_ktransformers_revision
         and validation_receipt.transformers_distribution_version
-        == process_spec.required_transformers_version
+        == process_spec.required_transformers_distribution_version
         and validation_receipt.transformers_module_version
-        == process_spec.required_transformers_version
+        == process_spec.required_transformers_module_version
         and validation_receipt.torch_version == observation.runtime.torch_version
         and validation_receipt.cuda_version == observation.runtime.cuda_version
         and validation_receipt.sgl_kernel_build_id
@@ -601,6 +639,11 @@ def _evaluate_runtime_validation(
         and validation_receipt.max_total_tokens == process_spec.plan.max_total_tokens
         and validation_receipt.static_memory_fraction
         == process_spec.plan.static_memory_fraction
+        and (
+            expected_wrapped_expert_layers is None
+            or validation_receipt.ktransformers_wrapped_expert_layers
+            == expected_wrapped_expert_layers
+        )
         and required_capabilities.issubset(validation_receipt.capabilities)
     )
     if receipt_matches:
@@ -639,6 +682,11 @@ def _evaluate_runtime_validation(
             validation_receipt.kv_cache_dtype,
             f"max_total_tokens={validation_receipt.max_total_tokens}",
             "static_memory_fraction=" + str(validation_receipt.static_memory_fraction),
+            "ktransformers_wrapped_expert_layers="
+            + ",".join(
+                str(layer)
+                for layer in validation_receipt.ktransformers_wrapped_expert_layers
+            ),
             *validation_receipt.capabilities,
         )
     )
@@ -658,7 +706,8 @@ def _evaluate_runtime_validation(
             "model_config_sha256=<snapshot receipt>",
             process_spec.expected_sglang_revision,
             process_spec.expected_ktransformers_revision,
-            process_spec.required_transformers_version,
+            process_spec.required_transformers_distribution_version,
+            process_spec.required_transformers_module_version,
             "torch_version=<current runtime>",
             "cuda_version=<current runtime>",
             "sgl_kernel_build_id=<current runtime>",
@@ -670,6 +719,12 @@ def _evaluate_runtime_validation(
             expected_kv_cache_dtype,
             f"max_total_tokens={process_spec.plan.max_total_tokens}",
             "static_memory_fraction=" + str(process_spec.plan.static_memory_fraction),
+            "ktransformers_wrapped_expert_layers="
+            + (
+                "<not-profile-bound>"
+                if expected_wrapped_expert_layers is None
+                else ",".join(str(layer) for layer in expected_wrapped_expert_layers)
+            ),
             *tuple(sorted(required_capabilities)),
         ),
         observed=observed,

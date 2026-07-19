@@ -253,7 +253,7 @@ def calculate_sglang_kt_artifact_build_id(
 # This script runs only under the exact external Python named by the launch spec.
 # It deliberately uses only the standard library and reports partial facts when a
 # package is absent. The evaluator turns every absent fact into a failed check.
-_RUNTIME_PROBE_SCRIPT = (
+SGLANG_KT_RUNTIME_PROBE_SCRIPT = (
     r"""
 import hashlib
 import importlib
@@ -263,52 +263,53 @@ import importlib.util
 import json
 import pathlib
 import platform
-import re
-import subprocess
 import sys
 
 
 """
     + SGLANG_KT_ARTIFACT_BUILD_ID_FUNCTION_SOURCE
     + r"""
-def source_revision(module_name):
+def embedded_source_revisions():
     try:
-        module_spec = importlib.util.find_spec(module_name)
-        if module_spec is None or module_spec.origin is None:
-            return None
-        module_directory = pathlib.Path(module_spec.origin).resolve().parent
-        result = subprocess.run(
-            ["git", "-C", str(module_directory), "rev-parse", "HEAD"],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        status = subprocess.run(
-            [
-                "git",
-                "-C",
-                str(module_directory),
-                "status",
-                "--porcelain",
-                "--untracked-files=no",
-            ],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        revision = result.stdout.strip().lower()
-        if (
-            result.returncode == 0
-            and status.returncode == 0
-            and not status.stdout.strip()
-            and re.fullmatch(r"[0-9a-f]{40}", revision)
-        ):
-            return revision
+        observations = []
+        for package_name in ("sglang", "kt_kernel"):
+            package_spec = importlib.util.find_spec(package_name)
+            provenance_name = package_name + "._exo_build_provenance"
+            provenance_spec = importlib.util.find_spec(provenance_name)
+            if (
+                package_spec is None
+                or package_spec.origin is None
+                or provenance_spec is None
+                or provenance_spec.origin is None
+            ):
+                return None, None
+            package_directory = pathlib.Path(package_spec.origin).resolve().parent
+            provenance_path = pathlib.Path(provenance_spec.origin).resolve()
+            if (
+                provenance_path.parent != package_directory
+                or provenance_path.name != "_exo_build_provenance.py"
+            ):
+                return None, None
+            provenance = importlib.import_module(provenance_name)
+            schema_version = getattr(provenance, "SCHEMA_VERSION", None)
+            ktransformers_revision = getattr(
+                provenance, "KTRANSFORMERS_REVISION", None
+            )
+            sglang_revision = getattr(provenance, "SGLANG_REVISION", None)
+            revisions = (ktransformers_revision, sglang_revision)
+            if schema_version != 1 or any(
+                not isinstance(revision, str)
+                or len(revision) != 40
+                or any(character not in "0123456789abcdef" for character in revision)
+                for revision in revisions
+            ):
+                return None, None
+            observations.append(revisions)
+        if len(observations) == 2 and observations[0] == observations[1]:
+            return observations[0]
     except Exception:
         pass
-    return None
+    return None, None
 
 
 def distribution_version(distribution_name):
@@ -342,6 +343,7 @@ def torch_runtime_versions():
 
 
 torch_version, cuda_version = torch_runtime_versions()
+ktransformers_revision, sglang_revision = embedded_source_revisions()
 print(json.dumps({
     "executable": sys.executable,
     "python_implementation": platform.python_implementation(),
@@ -350,8 +352,8 @@ print(json.dumps({
         "minor": sys.version_info.minor,
         "patch": sys.version_info.micro,
     },
-    "sglang_revision": source_revision("sglang"),
-    "ktransformers_revision": source_revision("ktransformers"),
+    "sglang_revision": sglang_revision,
+    "ktransformers_revision": ktransformers_revision,
     "transformers_distribution_version": distribution_version("transformers-kt"),
     "transformers_module_version": module_version("transformers"),
     "torch_version": torch_version,
@@ -468,7 +470,7 @@ class ExternalPythonSglangKtRuntimeProbe:
     ) -> SglangKtRuntimeObservation:
         try:
             result = self._command_runner(
-                (executable, "-I", "-c", _RUNTIME_PROBE_SCRIPT),
+                (executable, "-I", "-c", SGLANG_KT_RUNTIME_PROBE_SCRIPT),
                 _RUNTIME_PROBE_TIMEOUT_SECONDS,
             )
             if result.return_code != 0:

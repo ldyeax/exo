@@ -11,15 +11,19 @@ from exo.shared.types.worker.sglang_kt import (
 from exo.worker.sglang_kt.launch_spec import (
     GLM_4_7_FLASH_BF16_MODEL_ID,
     GLM_4_7_FLASH_BF16_MODEL_REVISION,
+    GLM_4_7_FLASH_CPU_ROUTED_EXPERTS_TARGET_PROFILE,
     GLM_4_7_FLASH_KTRANSFORMERS_REVISION,
     GLM_4_7_FLASH_SGLANG_REVISION,
     GLM_4_7_FLASH_TARGET_PROFILE,
     GLM_5_2_FULL_INDEXER_LAYER_STARTS,
     GLM_5_2_TARGET_PROFILE,
+    REQUIRED_TRANSFORMERS_DISTRIBUTION_VERSION,
+    REQUIRED_TRANSFORMERS_MODULE_VERSION,
     REQUIRED_TRANSFORMERS_VERSION,
     SUPPORTED_KTRANSFORMERS_REVISION,
     SUPPORTED_SGLANG_REVISION,
     SglangKtProcessLaunchSpec,
+    build_glm_4_7_flash_bf16_cpu_routed_experts_process_launch_specs,
     build_glm_4_7_flash_bf16_process_launch_specs,
     build_glm_5_2_fp8_process_launch_specs,
 )
@@ -170,6 +174,15 @@ def make_glm_4_7_flash_bf16_plan(
     )
 
 
+def make_glm_4_7_flash_bf16_cpu_routed_experts_plan() -> SglangKtLaunchPlan:
+    plan = make_glm_4_7_flash_bf16_plan(resident_gpu_experts=0)
+    return plan.model_copy(
+        update={
+            "target_profile": GLM_4_7_FLASH_CPU_ROUTED_EXPERTS_TARGET_PROFILE,
+        }
+    )
+
+
 def argument_value(arguments: tuple[str, ...], option: str) -> str:
     return arguments[arguments.index(option) + 1]
 
@@ -250,6 +263,16 @@ def test_builds_pinned_glm_5_2_ktransformers_arguments() -> None:
     assert spec.expected_sglang_revision == SUPPORTED_SGLANG_REVISION
     assert spec.expected_ktransformers_revision == SUPPORTED_KTRANSFORMERS_REVISION
     assert spec.required_transformers_version == REQUIRED_TRANSFORMERS_VERSION
+    assert (
+        spec.required_transformers_distribution_version
+        == REQUIRED_TRANSFORMERS_DISTRIBUTION_VERSION
+        == "5.6.0.post1"
+    )
+    assert (
+        spec.required_transformers_module_version
+        == REQUIRED_TRANSFORMERS_MODULE_VERSION
+        == "5.6.0"
+    )
     assert "--revision" not in spec.arguments
 
 
@@ -313,6 +336,70 @@ def test_builds_fail_closed_glm_4_7_flash_bf16_hybrid_smoke() -> None:
     assert SglangKtProcessLaunchSpec.model_validate_json(spec.model_dump_json()) == spec
 
 
+def test_builds_fail_closed_glm_4_7_flash_cpu_routed_experts_control() -> None:
+    plan = make_glm_4_7_flash_bf16_cpu_routed_experts_plan()
+
+    (spec,) = build_glm_4_7_flash_bf16_cpu_routed_experts_process_launch_specs(
+        plan, PYTHON_EXECUTABLE
+    )
+
+    assert spec.target_profile == GLM_4_7_FLASH_CPU_ROUTED_EXPERTS_TARGET_PROFILE
+    assert spec.model_id == GLM_4_7_FLASH_BF16_MODEL_ID
+    assert spec.expected_model_revision == GLM_4_7_FLASH_BF16_MODEL_REVISION
+    assert spec.expected_sglang_revision == GLM_4_7_FLASH_SGLANG_REVISION
+    assert spec.expected_ktransformers_revision == GLM_4_7_FLASH_KTRANSFORMERS_REVISION
+    assert len(spec.plan.stages) == 1
+    assert spec.hca_devices == ()
+    assert argument_value(spec.arguments, "--pp-size") == "1"
+    assert argument_value(spec.arguments, "--tp-size") == "1"
+    assert argument_value(spec.arguments, "--nnodes") == "1"
+    assert argument_value(spec.arguments, "--kt-method") == "BF16"
+    assert argument_value(spec.arguments, "--kt-num-gpu-experts") == "0"
+    assert argument_value(spec.arguments, "--attention-backend") == "flashinfer"
+    assert argument_value(spec.arguments, "--kv-cache-dtype") == "bfloat16"
+    assert dict(spec.environment)["CUDA_VISIBLE_DEVICES"] == spec.gpu_uuid
+    assert all(not name.startswith("NCCL_") for name, _value in spec.environment)
+    assert SglangKtProcessLaunchSpec.model_validate_json(spec.model_dump_json()) == spec
+
+
+@pytest.mark.parametrize("resident_gpu_experts", (1, 63))
+def test_glm_4_7_flash_mixed_profile_keeps_resident_expert_boundaries(
+    resident_gpu_experts: int,
+) -> None:
+    (spec,) = build_glm_4_7_flash_bf16_process_launch_specs(
+        make_glm_4_7_flash_bf16_plan(
+            resident_gpu_experts=resident_gpu_experts,
+        ),
+        PYTHON_EXECUTABLE,
+    )
+
+    assert spec.stage.resident_gpu_experts == resident_gpu_experts
+
+
+@pytest.mark.parametrize(
+    ("stage_update", "error_message"),
+    (
+        ({"resident_gpu_experts": 1}, "exactly 0 resident GPU experts"),
+        ({"resident_gpu_experts": 63}, "exactly 0 resident GPU experts"),
+        ({"hca_devices": ("mlx4_0:1",)}, "does not admit HCA"),
+        ({"ktransformers_method": "FP8"}, "method BF16"),
+    ),
+)
+def test_glm_4_7_flash_cpu_routed_experts_control_rejects_other_resources(
+    stage_update: dict[str, object],
+    error_message: str,
+) -> None:
+    plan = make_glm_4_7_flash_bf16_cpu_routed_experts_plan()
+    plan = plan.model_copy(
+        update={"stages": (plan.stages[0].model_copy(update=stage_update),)}
+    )
+
+    with pytest.raises(ValueError, match=error_message):
+        build_glm_4_7_flash_bf16_cpu_routed_experts_process_launch_specs(
+            plan, PYTHON_EXECUTABLE
+        )
+
+
 @pytest.mark.parametrize(
     ("plan_update", "stage_update", "error_message"),
     (
@@ -372,6 +459,14 @@ def test_model_specific_builders_reject_the_other_target_profile() -> None:
         )
     with pytest.raises(ValueError, match="GLM-4.7-Flash builder requires"):
         build_glm_4_7_flash_bf16_process_launch_specs(make_plan(), PYTHON_EXECUTABLE)
+    with pytest.raises(ValueError, match="GLM-4.7-Flash builder requires"):
+        build_glm_4_7_flash_bf16_process_launch_specs(
+            make_glm_4_7_flash_bf16_cpu_routed_experts_plan(), PYTHON_EXECUTABLE
+        )
+    with pytest.raises(ValueError, match="CPU-routed-experts builder requires"):
+        build_glm_4_7_flash_bf16_cpu_routed_experts_process_launch_specs(
+            make_glm_4_7_flash_bf16_plan(), PYTHON_EXECUTABLE
+        )
 
 
 def test_process_launch_spec_roundtrip() -> None:

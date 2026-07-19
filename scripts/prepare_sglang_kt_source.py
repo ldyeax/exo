@@ -14,9 +14,9 @@ from pathlib import Path
 from typing import Self
 
 KTRANSFORMERS_BASE_REVISION = "8e46e5896c3d993a1285052f2618f5a9f01882d4"
-KTRANSFORMERS_RESULT_REVISION = "a4b0c45aa6f5f8d48f28b4f07d7591f0fb8960a8"
+KTRANSFORMERS_RESULT_REVISION = "7e70d7518edd26af6a0638593037d68c9b6bd6bf"
 SGLANG_BASE_REVISION = "5d6bef9f61637aaeaf047bf8209def2af3eaa83f"
-SGLANG_RESULT_REVISION = "449c59f07752189baf724630c6799c28736cee87"
+SGLANG_RESULT_REVISION = "41d4d300a21fd2f486681d56f1017789dfb355fe"
 SGLANG_SUBMODULE_PATH = Path("third_party/sglang")
 PATCH_DIRECTORY = Path(__file__).resolve().parent / "patches" / "sglang_kt"
 
@@ -55,7 +55,7 @@ class SglangKtSourcePlan:
                 path=PATCH_DIRECTORY
                 / "0001-feat-fail-closed-on-GLM-Flash-KT-coverage.patch",
                 sha256=(
-                    "640182e1d7b1bcae590318ab879fa9b6ce2fc81b23a877deef97efc3aeb17d7c"
+                    "eb18c0d55d51b59e6ec5cc28780c4f8a6cc518ac5d9dbbc4b6a6d8f5d9e1d3c5"
                 ),
                 committer_name="jimm",
                 committer_email="jimm@jimm.horse",
@@ -63,7 +63,7 @@ class SglangKtSourcePlan:
             ktransformers_patch=MailPatch(
                 path=PATCH_DIRECTORY / "0002-build-pin-GLM-Flash-KT-registration.patch",
                 sha256=(
-                    "0fb28c518c9844677484b7c97ec5fd50220bc41989e6fc8f5d8f36a030f41c5a"
+                    "bdb3fd297dc21b53c460d925edbbe42d7e629bce2b8e6b7cd03ead4cdb64209a"
                 ),
                 committer_name="jimm",
                 committer_email="jimm@jimm.horse",

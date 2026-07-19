@@ -13,6 +13,8 @@ source of truth. Update this file in the same commit that records each new test.
 - **PASS (diagnostic):** correctness, transport, or lifecycle passed, but the
   receipt has `performance_comparable=false`; timing must not be used as a
   controlled hardware comparison.
+- **PASS (artifact):** immutable source/build/install integrity passed without
+  executing the model or making an inference-performance claim.
 - **STAGE PASS:** exact model acquisition and cross-host manifest equality
   passed; staging makes no inference-performance claim.
 - **EXPECTED FAIL:** a fail-closed check rejected an invalid or incomplete
@@ -30,15 +32,20 @@ source of truth. Update this file in the same commit that records each new test.
   `6da455c8e3eb5e21d09812f10e44a31712545816`.
 - Completed ladder rungs: Llama 3.2 1B, Llama 3.2 3B, Llama 3.1 8B,
   GPT-OSS 20B, and GLM-4.7 Flash.
-- Latest result: GLM-4.7 Flash TP=2 passed exact TP1 output equality, two-rank
-  NCCL initialization, payload on both QDR rails, clean HCA health counters,
-  instance deletion, process cleanup, and resource release.
+- Latest live result: GLM-4.7 Flash TP=2 passed exact TP1 output equality,
+  two-rank NCCL initialization, payload on both QDR rails, clean HCA health
+  counters, instance deletion, process cleanup, and resource release.
+- Latest artifact result: the exact GLM-4.7 Flash SGLang-KTransformers source
+  was built into a provenance-bound native dwagon runtime and installed as an
+  immutable overlay. Static receipt validation reconstructed both IDs and
+  passed; no model execution is claimed by this artifact checkpoint.
 - Historical Ornith AMXINT8 conversion and serving receipts were recovered and
   hashed below. They inform the GLM hybrid-runtime work but are not Exo tests.
-- Next work: build and validate the clean pinned GLM-4.7 Flash BF16 runtime,
-  then run CPU-only and mixed AMX-BF16/RTX-3090 PP1 correctness controls. The
-  Qwen3-Coder ladder rung is deferred until that hybrid path has trustworthy
-  execution receipts.
+- Next work: run the leased CUDA/AMX kernel validator on dwagon, reproduce the
+  native build and validator on fwuff, then add file-backed model admission
+  receipts and an exact model-shard manifest before CPU-only and mixed
+  AMX-BF16/RTX-3090 PP1 correctness controls. The Qwen3-Coder ladder rung is
+  deferred until that hybrid path has trustworthy execution receipts.
 
 ## Automated validation
 
@@ -49,8 +56,11 @@ test total.
 | --- | --- | --- |
 | Corrected SGLang launch, snapshot, and preflight slice | **PASS** | 94 passed |
 | GLM-4.7 Flash target profile, preflight, snapshot verifier, and local process supervisor | **PASS** | 148 passed on 2026-07-19, including 25 supervisor lifecycle tests; inherited NCCL/SGLang isolation and shutdown/error-race receipt regressions included |
-| Reproducible GLM-4.7 SGLang-KTransformers source integration | **PASS** | 9 Exo bootstrap tests plus 12 SGLang registration/coverage tests; exact clean-base and partially initialized result-state replays produced SGLang `449c59f07752189baf724630c6799c28736cee87` and KTransformers `a4b0c45aa6f5f8d48f28b4f07d7591f0fb8960a8` without mutating rejected dirty parent or dependency sources |
-| Changed GLM-4.7 Flash Python files, strict targeted type checks and Ruff | **PASS** | Both Basedpyright configurations reported 0 errors/0 warnings; repository-wide `ruff check` passed; all nine changed Python files passed `ruff format --check` on 2026-07-19 |
+| Reproducible GLM-4.7 SGLang-KTransformers source integration | **PASS** | Exact clean-base and partially initialized result-state replays produced SGLang `41d4d300a21fd2f486681d56f1017789dfb355fe` and KTransformers `7e70d7518edd26af6a0638593037d68c9b6bd6bf` without mutating rejected dirty parent or dependency sources |
+| Pinned dwagon GLM-4.7 native runtime build | **PASS (artifact)** | Build ID `44df90375778d5af6b735a696a730efaa5b3a8de1f5081517892636fe1616a69`; receipt SHA-256 `a29b56a9a703d19b99c0f92adb591452b7e0899eb1ffabbf1e1522a0e8555e64`; validator reconstructed the complete source, bootstrap, toolchain, command, layout, and wheel provenance |
+| Immutable dwagon runtime overlay | **PASS (artifact)** | Install ID `91418a4ab5c6bc0e3896cbf7021ba6eb1c81010ac702dd6924391e5a3a048b42`; receipt SHA-256 `51a6fa03a675f10e1791e3a15dec51de77b34b9ea730b11b6fc0d84872f21eb5`; the old 9.9 GB base runtime remains untouched |
+| Focused GLM-4.7 source, build, overlay, validator, launch, and preflight suite | **PASS** | 211 tests passed on 2026-07-19 |
+| Changed GLM-4.7 Flash Python files, strict targeted type checks and Ruff | **PASS** | Three targeted Basedpyright configurations reported 0 errors; repository-wide `ruff check` passed; all 15 changed Python files passed `ruff format --check` on 2026-07-19 |
 | Repository-wide Basedpyright in the existing `.venv` | **BLOCKED** | The environment cannot resolve installed project dependencies (including `httpx`, AnyIO, and pytest), producing dependency-driven diagnostics across the untouched tree; `uv run` could not complete the pinned MLX wheel acquisition |
 | Repository-wide pytest collection | **BLOCKED** | `tests/conftest.py` imports unavailable `exo_tools`; collection stopped before tests ran |
 | Nix formatting | **BLOCKED** | `nix` is not installed on dwagon; Ruff formatting is clean for every changed Python file |
@@ -163,9 +173,10 @@ above.
   KTransformers `8e46e5896c3d993a1285052f2618f5a9f01882d4` and embedded SGLang
   `5d6bef9f61637aaeaf047bf8209def2af3eaa83f`. No recovered Ornith commit is
   required. Exo's reproducible mail patches produce admitted revisions
-  KTransformers `a4b0c45aa6f5f8d48f28b4f07d7591f0fb8960a8` and SGLang
-  `449c59f07752189baf724630c6799c28736cee87`, with fatal registration and
-  structured 46-layer wrapper/mask coverage.
+  KTransformers `7e70d7518edd26af6a0638593037d68c9b6bd6bf` and SGLang
+  `41d4d300a21fd2f486681d56f1017789dfb355fe`, with fatal registration,
+  structured 46-layer wrapper/mask coverage, and fail-closed exact loading of
+  every resident expert's gate, up, and down projections from the checkpoint.
 - Highest-value generic candidates to mine forward are KTransformers `e5f1771`
   for fused BF16 expert conversion, SGLang `4c267d946` for per-layer frequency
   placement with dynamic updates, `464ffce91` for AMXINT8 full-prefill fallback,
@@ -266,25 +277,63 @@ above.
   main layers. The index's embedded `metadata.total_size` is 31,221,488,576,
   not the real shard byte total, so later receipts must bind the Hugging Face
   manifest and actual shard sizes.
-- This is source-artifact verification only. No SGLang-KTransformers model load,
-  AMX execution, CPU/GPU hybrid forward, output parity, or performance result is
-  claimed yet.
+- The final clean prepared source is
+  `/var/lib/exo/sources/ktransformers-glm47-7e70d75`, at KTransformers
+  `7e70d7518edd26af6a0638593037d68c9b6bd6bf`, embedded SGLang
+  `41d4d300a21fd2f486681d56f1017789dfb355fe`, llama.cpp
+  `a94e6ff8774b7c9f950d9545baf0ce35e8d1ed2f`, and pybind11
+  `bb05e0810b87e74709d9f4c4545f1f57a1b386f5`.
+- The final native dwagon build is
+  `/var/lib/exo/runtimes/glm47-sglang-kt/dwagon/44df90375778d5af6b735a696a730efaa5b3a8de1f5081517892636fe1616a69`.
+  Its build ID is the final path component and its receipt SHA-256 is
+  `a29b56a9a703d19b99c0f92adb591452b7e0899eb1ffabbf1e1522a0e8555e64`.
+  Static validation reconstructed the complete canonical build inputs and ID.
+- The immutable dwagon overlay is
+  `/var/lib/exo/runtimes/glm47-sglang-kt-overlay/dwagon/91418a4ab5c6bc0e3896cbf7021ba6eb1c81010ac702dd6924391e5a3a048b42`.
+  Its install ID is the final path component and its receipt SHA-256 is
+  `51a6fa03a675f10e1791e3a15dec51de77b34b9ea730b11b6fc0d84872f21eb5`.
+  The overlay pins its base runtime and three newly built wheels without
+  modifying the old 9.9 GB environment.
+- The kernel validator can prove only
+  `kt_bf16_amx_executed_v1`: exact runtime provenance, SM86 BF16 CUDA math,
+  AMX BF16 at query lengths 1 and 16, and a two-way
+  CUDA-to-pinned-host-to-AMX-to-pinned-host-to-CUDA dependency chain. It cannot
+  satisfy a GLM model-execution receipt or authorize a model launch.
+- Model admission remains fail-closed until Exo parses receipts from verified
+  files and binds the kernel/build/install receipts, the exact model index and
+  shard manifest, runtime artifact hashes, wrapper coverage for layers 1-46,
+  a real short forward, and the CPU-only or mixed expert-execution capability.
+  Caller-constructed Pydantic receipt objects are not sufficient evidence.
+- No SGLang-KTransformers model load, AMX execution, CPU/GPU hybrid forward,
+  output parity, or performance result is claimed by this artifact checkpoint.
+
+### Profiler safety incident
+
+- A previous out-of-tree VTune SEP/PAX kernel profiler (`sep5`/`pax`) crashed
+  dwagon. Treat the server as stable now, but never load or use those drivers
+  again. Profiling for this work must remain driverless, using `perf` and
+  ordinary application, CUDA, and runtime counters only.
 
 ## Pending tests
 
-1. Build and validate the clean pinned SGLang-KTransformers runtime, add a
-   separate fail-closed 0-expert CPU-only profile, then run that BF16 control
-   and the mixed 1/4 resident-GPU-expert controls under `/ai/coordinate.md`
-   lease arbitration.
-2. Convert the verified BF16 source to AMXINT8 only after BF16 parity and hybrid
+1. Under `/ai/coordinate.md` lease arbitration, run the exact kernel validator
+   on dwagon, reproduce the native build and overlay on fwuff rather than
+   copying dwagon's native wheel, and run the validator there.
+2. Add a file-backed model-receipt parser and exact index/shard manifest binding,
+   then run a real one-layer loader and short-forward check. Keep kernel-level
+   capability evidence separate from model-level launch admission.
+3. Run the fail-closed 0-expert BF16 CPU-routed control and the mixed 1/4
+   resident-GPU-expert controls with complete 46-layer wrapper and routing
+   evidence.
+4. Convert the verified BF16 source to AMXINT8 only after BF16 parity and hybrid
    execution evidence pass; keep packed-GPU mode disabled initially.
-3. Resume exact staging, deterministic TP1, and strict TP=2 for Qwen3-Coder 30B
+5. Resume exact staging, deterministic TP1, and strict TP=2 for Qwen3-Coder 30B
    A3B, followed by Qwen3.5 35B A3B.
-4. After the first larger-model correctness proof, complete at least five
+6. After the first larger-model correctness proof, complete at least five
    distinct dwagon-only optimization runs and five distinct dwagon-plus-fwuff
    InfiniBand optimization runs. Each run needs repeated samples and a recorded
    hypothesis/lesson. Keep a matched-artifact comparison workload; when a
    different exact-revision HF quantization or format wins one track, add a
    quality-gated matched-format control so topology and format effects remain
    separable.
-5. Re-run the preserved QDR receipts after the ConnectX-5 EDR hardware swap.
+7. Re-run the preserved QDR receipts after the ConnectX-5 EDR hardware swap.

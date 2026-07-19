@@ -37,15 +37,27 @@ GLM_4_7_FLASH_ROUTED_EXPERT_COUNT: Final = 64
 GLM_4_7_FLASH_TARGET_PROFILE: Final[SglangKtTargetProfile] = (
     "glm47_flash_bf16_sm86_smoke_v1"
 )
+GLM_4_7_FLASH_CPU_ROUTED_EXPERTS_TARGET_PROFILE: Final[SglangKtTargetProfile] = (
+    "glm47_flash_bf16_sm86_cpu_routed_experts_control_v1"
+)
+GLM_4_7_FLASH_TARGET_PROFILES: Final = frozenset(
+    (
+        GLM_4_7_FLASH_TARGET_PROFILE,
+        GLM_4_7_FLASH_CPU_ROUTED_EXPERTS_TARGET_PROFILE,
+    )
+)
 
 # KTransformers v0.6.3 is the first release with explicit GLM-5.2 support. Its
 # SGLang submodule pins the matching fork revision below.
 SUPPORTED_KTRANSFORMERS_REVISION: Final = "ce7c3ddbe93f7ac1f992375eed54058bbc512646"
 SUPPORTED_SGLANG_REVISION: Final = "8b636f9008dbad58c0a8e481b03e794739e6c146"
-GLM_4_7_FLASH_KTRANSFORMERS_REVISION: Final = "a4b0c45aa6f5f8d48f28b4f07d7591f0fb8960a8"
-GLM_4_7_FLASH_SGLANG_REVISION: Final = "449c59f07752189baf724630c6799c28736cee87"
+GLM_4_7_FLASH_KTRANSFORMERS_REVISION: Final = "7e70d7518edd26af6a0638593037d68c9b6bd6bf"
+GLM_4_7_FLASH_SGLANG_REVISION: Final = "41d4d300a21fd2f486681d56f1017789dfb355fe"
 REQUIRED_TRANSFORMERS_DISTRIBUTION: Final = "transformers-kt"
-REQUIRED_TRANSFORMERS_VERSION: Final = "5.6.0.post1"
+REQUIRED_TRANSFORMERS_DISTRIBUTION_VERSION: Final = "5.6.0.post1"
+REQUIRED_TRANSFORMERS_MODULE_VERSION: Final = "5.6.0"
+# Backwards-compatible name for callers that only tracked the distribution.
+REQUIRED_TRANSFORMERS_VERSION: Final = REQUIRED_TRANSFORMERS_DISTRIBUTION_VERSION
 GLM_5_2_KV_CACHE_DTYPE: Final = "fp8_e4m3"
 GLM_4_7_FLASH_KV_CACHE_DTYPE: Final = "bfloat16"
 
@@ -137,14 +149,22 @@ class SglangKtProcessLaunchSpec(FrozenModel):
         return REQUIRED_TRANSFORMERS_VERSION
 
     @property
+    def required_transformers_distribution_version(self) -> str:
+        return REQUIRED_TRANSFORMERS_DISTRIBUTION_VERSION
+
+    @property
+    def required_transformers_module_version(self) -> str:
+        return REQUIRED_TRANSFORMERS_MODULE_VERSION
+
+    @property
     def attention_backend(self) -> Literal["flashinfer", "nsa"]:
-        if self.target_profile == GLM_4_7_FLASH_TARGET_PROFILE:
+        if self.target_profile in GLM_4_7_FLASH_TARGET_PROFILES:
             return "flashinfer"
         return "nsa"
 
     @property
     def kv_cache_dtype(self) -> Literal["bfloat16", "fp8_e4m3"]:
-        if self.target_profile == GLM_4_7_FLASH_TARGET_PROFILE:
+        if self.target_profile in GLM_4_7_FLASH_TARGET_PROFILES:
             return GLM_4_7_FLASH_KV_CACHE_DTYPE
         return GLM_5_2_KV_CACHE_DTYPE
 
@@ -196,7 +216,7 @@ class SglangKtProcessLaunchSpec(FrozenModel):
             "--max-running-requests",
             str(self.plan.max_concurrent_requests),
         )
-        if self.target_profile == GLM_4_7_FLASH_TARGET_PROFILE:
+        if self.target_profile in GLM_4_7_FLASH_TARGET_PROFILES:
             return (
                 *common_arguments,
                 "--chunked-prefill-size",
@@ -238,7 +258,7 @@ class SglangKtProcessLaunchSpec(FrozenModel):
             ("CUDA_VISIBLE_DEVICES", self.stage.gpu_uuid),
             ("PYTORCH_ALLOC_CONF", "expandable_segments:True"),
         )
-        if self.target_profile == GLM_4_7_FLASH_TARGET_PROFILE:
+        if self.target_profile in GLM_4_7_FLASH_TARGET_PROFILES:
             return (
                 *common_environment,
                 ("SGLANG_KT_HYBRID_TIMING", "1"),
@@ -313,6 +333,20 @@ def build_glm_4_7_flash_bf16_process_launch_specs(
     return build_sglang_kt_process_launch_specs(plan, python_executable)
 
 
+def build_glm_4_7_flash_bf16_cpu_routed_experts_process_launch_specs(
+    plan: SglangKtLaunchPlan,
+    python_executable: str,
+) -> tuple[SglangKtProcessLaunchSpec, ...]:
+    """Build the receipt-gated zero-resident-GPU-expert control process."""
+
+    if plan.target_profile != GLM_4_7_FLASH_CPU_ROUTED_EXPERTS_TARGET_PROFILE:
+        raise ValueError(
+            "GLM-4.7-Flash CPU-routed-experts builder requires target profile "
+            f"{GLM_4_7_FLASH_CPU_ROUTED_EXPERTS_TARGET_PROFILE}"
+        )
+    return build_sglang_kt_process_launch_specs(plan, python_executable)
+
+
 def build_sglang_kt_process_launch_specs(
     plan: SglangKtLaunchPlan,
     python_executable: str,
@@ -334,7 +368,7 @@ def build_sglang_kt_process_launch_specs(
 
 
 def _validate_supported_plan(plan: SglangKtLaunchPlan) -> None:
-    if plan.target_profile == GLM_4_7_FLASH_TARGET_PROFILE:
+    if plan.target_profile in GLM_4_7_FLASH_TARGET_PROFILES:
         _validate_glm_4_7_flash_bf16_plan(plan)
         return
     _validate_glm_5_2_fp8_plan(plan)
@@ -388,6 +422,8 @@ def _validate_glm_5_2_fp8_plan(plan: SglangKtLaunchPlan) -> None:
 
 
 def _validate_glm_4_7_flash_bf16_plan(plan: SglangKtLaunchPlan) -> None:
+    if plan.target_profile not in GLM_4_7_FLASH_TARGET_PROFILES:
+        raise ValueError(f"unsupported SGLang-KT target profile {plan.target_profile}")
     if plan.model_id != GLM_4_7_FLASH_BF16_MODEL_ID:
         raise ValueError(
             "the GLM-4.7-Flash smoke profile only supports zai-org/GLM-4.7-Flash"
@@ -428,7 +464,18 @@ def _validate_glm_4_7_flash_bf16_plan(plan: SglangKtLaunchPlan) -> None:
         )
     if stage.ktransformers_method != "BF16":
         raise ValueError("GLM-4.7-Flash BF16 stage requires KTransformers method BF16")
-    if not 1 <= stage.resident_gpu_experts < GLM_4_7_FLASH_ROUTED_EXPERT_COUNT:
+    if (
+        plan.target_profile == GLM_4_7_FLASH_CPU_ROUTED_EXPERTS_TARGET_PROFILE
+        and stage.resident_gpu_experts != 0
+    ):
+        raise ValueError(
+            "GLM-4.7-Flash CPU-routed-experts control requires exactly 0 resident "
+            "GPU experts"
+        )
+    if (
+        plan.target_profile == GLM_4_7_FLASH_TARGET_PROFILE
+        and not 1 <= stage.resident_gpu_experts < GLM_4_7_FLASH_ROUTED_EXPERT_COUNT
+    ):
         raise ValueError(
             "GLM-4.7-Flash hybrid smoke requires between 1 and 63 resident GPU "
             "experts per MoE layer"

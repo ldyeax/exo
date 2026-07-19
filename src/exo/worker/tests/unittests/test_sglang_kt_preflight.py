@@ -4,12 +4,15 @@ from pydantic import ValidationError
 from exo.shared.models.model_cards import ModelId
 from exo.worker.sglang_kt.launch_spec import (
     GLM_4_7_FLASH_BF16_CONFIG_SHA256,
-    GLM_4_7_FLASH_TARGET_PROFILE,
+    GLM_4_7_FLASH_CPU_ROUTED_EXPERTS_TARGET_PROFILE,
+    GLM_4_7_FLASH_TARGET_PROFILES,
     SglangKtProcessLaunchSpec,
+    build_glm_4_7_flash_bf16_cpu_routed_experts_process_launch_specs,
     build_glm_4_7_flash_bf16_process_launch_specs,
     build_glm_5_2_fp8_process_launch_specs,
 )
 from exo.worker.sglang_kt.preflight import (
+    GLM_4_7_FLASH_WRAPPED_EXPERT_LAYERS,
     SglangKtHostPreflightObservation,
     SglangKtModelSnapshotReceiptObservation,
     SglangKtPreflightFailed,
@@ -21,6 +24,7 @@ from exo.worker.sglang_kt.preflight import (
 )
 from exo.worker.tests.unittests.test_sglang_kt_launch_spec import (
     PYTHON_EXECUTABLE,
+    make_glm_4_7_flash_bf16_cpu_routed_experts_plan,
     make_glm_4_7_flash_bf16_plan,
     make_plan,
 )
@@ -49,8 +53,10 @@ def make_runtime(spec: SglangKtProcessLaunchSpec) -> SglangKtRuntimeObservation:
         ),
         sglang_revision=spec.expected_sglang_revision,
         ktransformers_revision=spec.expected_ktransformers_revision,
-        transformers_distribution_version=spec.required_transformers_version,
-        transformers_module_version=spec.required_transformers_version,
+        transformers_distribution_version=(
+            spec.required_transformers_distribution_version
+        ),
+        transformers_module_version=spec.required_transformers_module_version,
         torch_version=TORCH_VERSION,
         cuda_version=CUDA_VERSION,
         sgl_kernel_build_id=SGL_KERNEL_BUILD_ID,
@@ -62,7 +68,10 @@ def make_runtime(spec: SglangKtProcessLaunchSpec) -> SglangKtRuntimeObservation:
 def make_runtime_validation_receipt(
     spec: SglangKtProcessLaunchSpec,
 ) -> SglangKtRuntimeValidationReceiptObservation:
-    is_flash = spec.target_profile == GLM_4_7_FLASH_TARGET_PROFILE
+    is_flash = spec.target_profile in GLM_4_7_FLASH_TARGET_PROFILES
+    is_cpu_routed_experts_control = (
+        spec.target_profile == GLM_4_7_FLASH_CPU_ROUTED_EXPERTS_TARGET_PROFILE
+    )
     return SglangKtRuntimeValidationReceiptObservation(
         target_profile=spec.target_profile,
         gpu_uuid=spec.gpu_uuid,
@@ -77,8 +86,10 @@ def make_runtime_validation_receipt(
         ),
         sglang_revision=spec.expected_sglang_revision,
         ktransformers_revision=spec.expected_ktransformers_revision,
-        transformers_distribution_version=spec.required_transformers_version,
-        transformers_module_version=spec.required_transformers_version,
+        transformers_distribution_version=(
+            spec.required_transformers_distribution_version
+        ),
+        transformers_module_version=spec.required_transformers_module_version,
         torch_version=TORCH_VERSION,
         cuda_version=CUDA_VERSION,
         sgl_kernel_build_id=SGL_KERNEL_BUILD_ID,
@@ -93,6 +104,17 @@ def make_runtime_validation_receipt(
         capabilities=(
             (
                 "glm47_flash_kt_wrapper_active_v1",
+                "glm47_flash_kt_wrapper_layers_1_46_v1",
+                "glm47_flash_bf16_sm86_short_forward_v1",
+                "kt_physical_numa_mapping_v1",
+                "kt_process_cpu_affinity_v1",
+                "kt_bf16_amx_executed_v1",
+                "glm47_flash_bf16_cpu_routed_experts_executed_v1",
+            )
+            if is_cpu_routed_experts_control
+            else (
+                "glm47_flash_kt_wrapper_active_v1",
+                "glm47_flash_kt_wrapper_layers_1_46_v1",
                 "glm47_flash_bf16_sm86_short_forward_v1",
                 "kt_physical_numa_mapping_v1",
                 "kt_process_cpu_affinity_v1",
@@ -107,6 +129,9 @@ def make_runtime_validation_receipt(
                 "kt_process_cpu_affinity_v1",
                 "kt_fp8_amx_executed_v1",
             )
+        ),
+        ktransformers_wrapped_expert_layers=(
+            GLM_4_7_FLASH_WRAPPED_EXPERT_LAYERS if is_flash else ()
         ),
     )
 
@@ -140,7 +165,7 @@ def make_host_observation(
                 ktransformers_method=first_spec.ktransformers_method,
                 config_sha256=(
                     GLM_4_7_FLASH_BF16_CONFIG_SHA256
-                    if first_spec.target_profile == GLM_4_7_FLASH_TARGET_PROFILE
+                    if first_spec.target_profile in GLM_4_7_FLASH_TARGET_PROFILES
                     else CONFIG_SHA256
                 ),
                 full_indexer_layer_starts=FULL_INDEXER_LAYER_STARTS,
@@ -211,6 +236,135 @@ def test_flash_smoke_requires_exact_executed_hybrid_runtime_receipt() -> None:
     assert isinstance(passed, SglangKtPreflightPassed)
     assert isinstance(missing_receipt, SglangKtPreflightFailed)
     assert checks_for_rank(missing_receipt, 0) == ("runtime_validation_receipt",)
+
+
+@pytest.mark.parametrize(
+    "receipt_update",
+    (
+        {"ktransformers_wrapped_expert_layers": tuple(range(1, 46))},
+        {
+            "capabilities": (
+                "glm47_flash_kt_wrapper_active_v1",
+                "glm47_flash_bf16_sm86_short_forward_v1",
+                "kt_physical_numa_mapping_v1",
+                "kt_process_cpu_affinity_v1",
+                "kt_bf16_amx_executed_v1",
+                "kt_bf16_cpu_gpu_hybrid_executed_v1",
+            )
+        },
+    ),
+)
+def test_flash_hybrid_rejects_incomplete_wrapped_layer_evidence(
+    receipt_update: dict[str, object],
+) -> None:
+    (spec,) = build_glm_4_7_flash_bf16_process_launch_specs(
+        make_glm_4_7_flash_bf16_plan(), PYTHON_EXECUTABLE
+    )
+    observation = make_host_observation((spec,))
+    receipt = observation.runtime_validation_receipts[0].model_copy(
+        update=receipt_update
+    )
+
+    result = evaluate_sglang_kt_preflight(
+        (spec,),
+        (observation.model_copy(update={"runtime_validation_receipts": (receipt,)}),),
+    )
+
+    assert isinstance(result, SglangKtPreflightFailed)
+    assert checks_for_rank(result, 0) == ("runtime_validation_receipt",)
+
+
+def test_flash_cpu_routed_experts_control_requires_exact_execution_receipt() -> None:
+    (spec,) = build_glm_4_7_flash_bf16_cpu_routed_experts_process_launch_specs(
+        make_glm_4_7_flash_bf16_cpu_routed_experts_plan(), PYTHON_EXECUTABLE
+    )
+    observation = make_host_observation((spec,))
+    (receipt,) = observation.runtime_validation_receipts
+
+    result = evaluate_sglang_kt_preflight((spec,), (observation,))
+
+    assert isinstance(result, SglangKtPreflightPassed)
+    assert receipt.target_profile == GLM_4_7_FLASH_CPU_ROUTED_EXPERTS_TARGET_PROFILE
+    assert receipt.gpu_compute_capability == (8, 6)
+    assert receipt.executed_cpu_backend == "AMX_BF16"
+    assert receipt.resident_gpu_experts == 0
+    assert "kt_bf16_cpu_gpu_hybrid_executed_v1" not in receipt.capabilities
+    assert (
+        receipt.ktransformers_wrapped_expert_layers
+        == GLM_4_7_FLASH_WRAPPED_EXPERT_LAYERS
+        == tuple(range(1, 47))
+    )
+
+
+@pytest.mark.parametrize(
+    "receipt_update",
+    (
+        {"executed_cpu_backend": "AMX"},
+        {"resident_gpu_experts": 1},
+        {"gpu_compute_capability": (9, 0)},
+        {"ktransformers_wrapped_expert_layers": tuple(range(1, 46))},
+        {
+            "capabilities": (
+                "glm47_flash_kt_wrapper_active_v1",
+                "glm47_flash_bf16_sm86_short_forward_v1",
+                "kt_physical_numa_mapping_v1",
+                "kt_process_cpu_affinity_v1",
+                "kt_bf16_amx_executed_v1",
+                "glm47_flash_bf16_cpu_routed_experts_executed_v1",
+            )
+        },
+        {
+            "capabilities": (
+                "glm47_flash_kt_wrapper_active_v1",
+                "glm47_flash_kt_wrapper_layers_1_46_v1",
+                "glm47_flash_bf16_sm86_short_forward_v1",
+                "kt_physical_numa_mapping_v1",
+                "kt_process_cpu_affinity_v1",
+                "glm47_flash_bf16_cpu_routed_experts_executed_v1",
+            )
+        },
+        {
+            "capabilities": (
+                "glm47_flash_kt_wrapper_active_v1",
+                "glm47_flash_kt_wrapper_layers_1_46_v1",
+                "glm47_flash_bf16_sm86_short_forward_v1",
+                "kt_physical_numa_mapping_v1",
+                "kt_process_cpu_affinity_v1",
+                "kt_bf16_amx_executed_v1",
+            )
+        },
+    ),
+)
+def test_flash_cpu_routed_experts_control_rejects_incomplete_evidence(
+    receipt_update: dict[str, object],
+) -> None:
+    (spec,) = build_glm_4_7_flash_bf16_cpu_routed_experts_process_launch_specs(
+        make_glm_4_7_flash_bf16_cpu_routed_experts_plan(), PYTHON_EXECUTABLE
+    )
+    observation = make_host_observation((spec,))
+    receipt = observation.runtime_validation_receipts[0].model_copy(
+        update=receipt_update
+    )
+
+    result = evaluate_sglang_kt_preflight(
+        (spec,),
+        (observation.model_copy(update={"runtime_validation_receipts": (receipt,)}),),
+    )
+
+    assert isinstance(result, SglangKtPreflightFailed)
+    assert checks_for_rank(result, 0) == ("runtime_validation_receipt",)
+
+
+def test_flash_cpu_routed_experts_control_still_requires_assigned_cuda_gpu() -> None:
+    (spec,) = build_glm_4_7_flash_bf16_cpu_routed_experts_process_launch_specs(
+        make_glm_4_7_flash_bf16_cpu_routed_experts_plan(), PYTHON_EXECUTABLE
+    )
+    observation = make_host_observation((spec,)).model_copy(update={"gpu_uuids": ()})
+
+    result = evaluate_sglang_kt_preflight((spec,), (observation,))
+
+    assert isinstance(result, SglangKtPreflightFailed)
+    assert checks_for_rank(result, 0) == ("gpu_uuid",)
 
 
 def test_flash_smoke_rejects_unpinned_config_even_when_receipts_agree() -> None:
@@ -316,6 +470,7 @@ def test_version_only_runtime_facts_cannot_release_the_process_group() -> None:
         {"model_config_sha256": "b" * 64},
         {"sglang_revision": "c" * 40},
         {"transformers_distribution_version": "5.6.0.post2"},
+        {"transformers_module_version": "5.6.1"},
         {"ktransformers_method": "BF16"},
         {"resident_gpu_experts": 1},
         {"attention_backend": "flashinfer"},
