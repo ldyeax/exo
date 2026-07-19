@@ -35,17 +35,18 @@ source of truth. Update this file in the same commit that records each new test.
 - Latest live result: GLM-4.7 Flash TP=2 passed exact TP1 output equality,
   two-rank NCCL initialization, payload on both QDR rails, clean HCA health
   counters, instance deletion, process cleanup, and resource release.
+- Latest kernel result: independent dwagon and fwuff native runtimes each
+  passed the leased SM86 CUDA plus AMX-BF16 validator and claimed only
+  `kt_bf16_amx_executed_v1`. Both runs cleaned up without force.
 - Latest artifact result: the exact GLM-4.7 Flash SGLang-KTransformers source
-  was built into a provenance-bound native dwagon runtime and installed as an
-  immutable overlay. Static receipt validation reconstructed both IDs and
-  passed; no model execution is claimed by this artifact checkpoint.
+  was built independently on dwagon and fwuff, installed into immutable
+  overlays, and statically reconstructed from each host's complete receipt.
 - Historical Ornith AMXINT8 conversion and serving receipts were recovered and
   hashed below. They inform the GLM hybrid-runtime work but are not Exo tests.
-- Next work: run the leased CUDA/AMX kernel validator on dwagon, reproduce the
-  native build and validator on fwuff, then add file-backed model admission
-  receipts and an exact model-shard manifest before CPU-only and mixed
-  AMX-BF16/RTX-3090 PP1 correctness controls. The Qwen3-Coder ladder rung is
-  deferred until that hybrid path has trustworthy execution receipts.
+- Next work: add file-backed model admission receipts and an exact model-shard
+  manifest, then run the real loader/short-forward gate before CPU-only and
+  mixed AMX-BF16/RTX-3090 PP1 correctness controls. The Qwen3-Coder ladder rung
+  is deferred until that hybrid path has trustworthy model execution receipts.
 
 ## Automated validation
 
@@ -59,6 +60,9 @@ test total.
 | Reproducible GLM-4.7 SGLang-KTransformers source integration | **PASS** | Exact clean-base and partially initialized result-state replays produced SGLang `41d4d300a21fd2f486681d56f1017789dfb355fe` and KTransformers `7e70d7518edd26af6a0638593037d68c9b6bd6bf` without mutating rejected dirty parent or dependency sources |
 | Pinned dwagon GLM-4.7 native runtime build | **PASS (artifact)** | Build ID `44df90375778d5af6b735a696a730efaa5b3a8de1f5081517892636fe1616a69`; receipt SHA-256 `a29b56a9a703d19b99c0f92adb591452b7e0899eb1ffabbf1e1522a0e8555e64`; validator reconstructed the complete source, bootstrap, toolchain, command, layout, and wheel provenance |
 | Immutable dwagon runtime overlay | **PASS (artifact)** | Install ID `91418a4ab5c6bc0e3896cbf7021ba6eb1c81010ac702dd6924391e5a3a048b42`; receipt SHA-256 `51a6fa03a675f10e1791e3a15dec51de77b34b9ea730b11b6fc0d84872f21eb5`; the old 9.9 GB base runtime remains untouched |
+| Pinned fwuff GLM-4.7 native runtime build | **PASS (artifact)** | Build ID `e21ef087b1c50cf961339e1bd1a2e1a3f60047579f811385614297de6a2abfc9`; receipt SHA-256 `051b78a5238adac99721eb268c95d8ab5e8721d8c1c61114bbda967468433dfb`; native KT wheel/extension SHA-256 `f57c574cc190f8817a51cf0b08c5f2165e2f761c3a1b2999560abcbdcc792d45` / `b2f60ec18aba53223e27cfd925f2c23083a281c109cf53ca06f1ac98bff6e99b` |
+| Immutable fwuff runtime overlay | **PASS (artifact)** | Install ID `82d20634f743ed87ae9cc71f2b7f4936d9451363db1ca46a207218f22de51ef8`; receipt SHA-256 `fe57f9fe10160ebf2f0a0ba3731e69c8ddb4608841f07880bac2ff6bd0640eb4`; its old base runtime remains untouched |
+| Leased two-host CUDA/AMX kernel validation | **PASS** | Dwagon v4 and fwuff v1 independently passed exact provenance, SM86 BF16 CUDA math, AMX-BF16 qlen 1/16, and the bidirectional non-default CUDA-stream bridge; each claimed only `kt_bf16_amx_executed_v1` and cleaned up without force |
 | Focused GLM-4.7 source, build, overlay, validator, launch, and preflight suite | **PASS** | 214 tests passed on 2026-07-19, including an isolated validator-import regression with the model-download stack deliberately unavailable and canonical/raw PyTorch GPU UUID coverage |
 | Changed GLM-4.7 Flash Python files, strict targeted type checks and Ruff | **PASS** | Three targeted Basedpyright configurations reported 0 errors; repository-wide `ruff check` passed; all 16 changed Python files passed `ruff format --check` on 2026-07-19 |
 | Repository-wide Basedpyright in the existing `.venv` | **BLOCKED** | The environment cannot resolve installed project dependencies (including `httpx`, AnyIO, and pytest), producing dependency-driven diagnostics across the untouched tree; `uv run` could not complete the pinned MLX wheel acquisition |
@@ -294,6 +298,17 @@ above.
   `51a6fa03a675f10e1791e3a15dec51de77b34b9ea730b11b6fc0d84872f21eb5`.
   The overlay pins its base runtime and three newly built wheels without
   modifying the old 9.9 GB environment.
+- The independent fwuff native build is
+  `/var/lib/exo/runtimes/glm47-sglang-kt/fwuff/e21ef087b1c50cf961339e1bd1a2e1a3f60047579f811385614297de6a2abfc9`,
+  with build-receipt SHA-256
+  `051b78a5238adac99721eb268c95d8ab5e8721d8c1c61114bbda967468433dfb`.
+  Its host-native KT wheel SHA-256 is
+  `f57c574cc190f8817a51cf0b08c5f2165e2f761c3a1b2999560abcbdcc792d45`;
+  the pure-Python KTransformers and SGLang wheels match dwagon byte-for-byte.
+- Fwuff's immutable overlay is
+  `/var/lib/exo/runtimes/glm47-sglang-kt-overlay/fwuff/82d20634f743ed87ae9cc71f2b7f4936d9451363db1ca46a207218f22de51ef8`,
+  with install-receipt SHA-256
+  `fe57f9fe10160ebf2f0a0ba3731e69c8ddb4608841f07880bac2ff6bd0640eb4`.
 - The kernel validator can prove only
   `kt_bf16_amx_executed_v1`: exact runtime provenance, SM86 BF16 CUDA math,
   AMX BF16 at query lengths 1 and 16, and a two-way
@@ -304,8 +319,9 @@ above.
   shard manifest, runtime artifact hashes, wrapper coverage for layers 1-46,
   a real short forward, and the CPU-only or mixed expert-execution capability.
   Caller-constructed Pydantic receipt objects are not sufficient evidence.
-- No SGLang-KTransformers model load, AMX execution, CPU/GPU hybrid forward,
-  output parity, or performance result is claimed by this artifact checkpoint.
+- The live kernel receipts below establish AMX execution but still do not
+  establish a SGLang-KTransformers model load, CPU/GPU hybrid forward, output
+  parity, or performance result.
 
 ### Kernel validation attempt ledger
 
@@ -314,6 +330,8 @@ above.
 | `glm47-kt-kernel-dwagon-20260719-v1` | **EXPECTED FAIL (diagnostic)** | The clean deployment was absent from the overlay interpreter's import path, so `exo` failed to import before Torch, CUDA, or AMX execution. Cleanup was unforced and the lease was released. Result/manifest SHA-256: `3229885ee0fb809493ae5ab1bef59326ffcc9faf7551539fb15214c9b9dacda4` / `38f7d2c81f350b5f541c8af39f11f78886754d2aaab94c3ac195226b3c597d72`. |
 | `glm47-kt-kernel-dwagon-20260719-v2` | **EXPECTED FAIL (diagnostic)** | Supplying the clean source exposed an accidental import of Exo's `aiofiles`-dependent download stack through `preflight_collector.py`; failure again preceded Torch, CUDA, and AMX. The artifact identity helper is now isolated in a standard-library-only module with a regression test. Cleanup was unforced and the lease was released. Result/manifest SHA-256: `ff242d7164e9805f0e18434e115300ee85ac054516e3c5d798d917c184e463f6` / `321b449f7283a73f5c8fb7f8f97b7b9bbe424431a0123b583a291469941011a5`. |
 | `glm47-kt-kernel-dwagon-20260719-v3` | **EXPECTED FAIL (diagnostic)** | CUDA BF16, AMX BF16 at query lengths 1 and 16, and the bidirectional CUDA-stream bridge all executed within numerical tolerance. Admission failed only because Torch exposed the selected GPU UUID without `nvidia-smi`'s `GPU-` prefix. The validator now retains the raw value and compares a syntax-validated canonical value. Receipt/result/manifest SHA-256: `824ed5604e93380b59a485fdbf76cce9632591faf8edecd269e4e4214fdad995` / `d219e67258d146636253d2533a65c7906c1abe1bbf5da674f55b90b29e08b2ef` / `5a2e56bf95609041237049e1ff878a4254155a36d86179513dc759d36a4f8eae`. Cleanup was unforced and the lease was released. |
+| `glm47-kt-kernel-dwagon-20260719-v4` | **PASS** | Exact dwagon build/runtime provenance, SM86 CUDA BF16, direct AMX-BF16 qlen 1/16, and the non-default CUDA-to-host-to-AMX-to-host-to-CUDA dependency chain passed. Relative L1 errors were `0.0014008`, `0.0033588`, `0.0036068`, and `0.0040199`, all below `0.02`. Receipt/result/manifest SHA-256: `b4f6fd1718bb3145a17c97cf8113bbfcd186416cfde3cd0fcc9eada301b78eef` / `3b2ad0463a575cf659f7793a2ef65c684b50207de39836d5e508b8da1e6ffb61` / `b5173d4efedcd83d8283b0800dc58263f113a97200cb54e89972911c709febc5`. Capability is only `kt_bf16_amx_executed_v1`; cleanup was unforced. |
+| `glm47-kt-kernel-fwuff-20260719-v1` | **PASS** | Fwuff independently reproduced the same four deterministic numerical errors using its own native build and GPU UUID. Local and remote receipt/log hashes matched, no remote validator survived, and cleanup was unforced. Receipt/result/manifest SHA-256: `efe770fc84f7e28614e0d2c9ff3ca3b9e9337d511fbd78d19c5a3bade65bb782` / `093ec960fc39aaace7fc99b3abe2d6daaf02f73aba7277f14c9c06da3a7c9d3d` / `be8a450a83a424a4d39604bf2f658d04bedf707da92d58a8418fa5843fc657d4`. Capability is only `kt_bf16_amx_executed_v1`. |
 
 ### Profiler safety incident
 
@@ -324,24 +342,21 @@ above.
 
 ## Pending tests
 
-1. Under `/ai/coordinate.md` lease arbitration, run the exact kernel validator
-   on dwagon, reproduce the native build and overlay on fwuff rather than
-   copying dwagon's native wheel, and run the validator there.
-2. Add a file-backed model-receipt parser and exact index/shard manifest binding,
+1. Add a file-backed model-receipt parser and exact index/shard manifest binding,
    then run a real one-layer loader and short-forward check. Keep kernel-level
    capability evidence separate from model-level launch admission.
-3. Run the fail-closed 0-expert BF16 CPU-routed control and the mixed 1/4
+2. Run the fail-closed 0-expert BF16 CPU-routed control and the mixed 1/4
    resident-GPU-expert controls with complete 46-layer wrapper and routing
    evidence.
-4. Convert the verified BF16 source to AMXINT8 only after BF16 parity and hybrid
+3. Convert the verified BF16 source to AMXINT8 only after BF16 parity and hybrid
    execution evidence pass; keep packed-GPU mode disabled initially.
-5. Resume exact staging, deterministic TP1, and strict TP=2 for Qwen3-Coder 30B
+4. Resume exact staging, deterministic TP1, and strict TP=2 for Qwen3-Coder 30B
    A3B, followed by Qwen3.5 35B A3B.
-6. After the first larger-model correctness proof, complete at least five
+5. After the first larger-model correctness proof, complete at least five
    distinct dwagon-only optimization runs and five distinct dwagon-plus-fwuff
    InfiniBand optimization runs. Each run needs repeated samples and a recorded
    hypothesis/lesson. Keep a matched-artifact comparison workload; when a
    different exact-revision HF quantization or format wins one track, add a
    quality-gated matched-format control so topology and format effects remain
    separable.
-7. Re-run the preserved QDR receipts after the ConnectX-5 EDR hardware swap.
+6. Re-run the preserved QDR receipts after the ConnectX-5 EDR hardware swap.
