@@ -6,17 +6,18 @@ import hashlib
 import importlib.machinery
 import io
 import json
+import math
 import os
 import shlex
 import signal
 import subprocess
 import sys
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable
+from typing import Callable, cast
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
@@ -30,7 +31,9 @@ from scripts.two_host_mlx_nccl_poc import (
     GpuIdentity,
     HarnessConfig,
     HarnessError,
+    HcaCounterSnapshot,
     HcaPort,
+    HcaPortCounterSnapshot,
     HcaPortObservation,
     HostConfig,
     HostPreflightReport,
@@ -86,6 +89,20 @@ RUNTIME_DISTRIBUTION_VERSIONS = {
     "tokenizers": "0.22.2",
     "transformers": "5.6.2",
 }
+TEST_HCA_HEALTH_COUNTERS = (
+    "VL15_dropped",
+    "excessive_buffer_overrun_errors",
+    "link_downed",
+    "link_error_recovery",
+    "local_link_integrity_errors",
+    "port_rcv_constraint_errors",
+    "port_rcv_errors",
+    "port_rcv_remote_physical_errors",
+    "port_rcv_switch_relay_errors",
+    "port_xmit_constraint_errors",
+    "port_xmit_discards",
+    "symbol_error",
+)
 
 
 def test_model_manifest_digest_has_a_stable_canonical_golden() -> None:
@@ -580,6 +597,8 @@ class FakeEffects:
         self.posted_instances: list[JsonObject] = []
         self.completion_requests: list[JsonObject] = []
         self.writes: dict[str, JsonObject] = {}
+        self.events: list[str] = []
+        self.hca_capture_count_by_host: dict[str, int] = {}
 
     def run_preflight(
         self, host: HostConfig, config: HarnessConfig
@@ -627,6 +646,48 @@ class FakeEffects:
             sha256_manifest=TEST_MODEL_MANIFEST,
             receipt_kind="exo",
             verified=True,
+        )
+
+    def capture_hca_counters(self, host: HostConfig) -> HcaCounterSnapshot:
+        capture_count = self.hca_capture_count_by_host.get(host.name, 0)
+        self.hca_capture_count_by_host[host.name] = capture_count + 1
+        phase = "before" if capture_count == 0 else "after"
+        self.events.append(f"capture:{phase}:{host.name}")
+        is_coordinator = host.role == "coordinator"
+        ports: list[HcaPortCounterSnapshot] = []
+        for index, configured in enumerate(host.hca_ports):
+            counters = {name: 0 for name in TEST_HCA_HEALTH_COUNTERS}
+            counters.update(
+                {
+                    "port_xmit_data": 10_000,
+                    "port_rcv_data": 20_000,
+                    "port_xmit_packets": 1_000,
+                    "port_rcv_packets": 2_000,
+                }
+            )
+            if phase == "after":
+                counters["port_xmit_data"] += 400_000 if is_coordinator else 300_000
+                counters["port_rcv_data"] += 300_000 if is_coordinator else 400_000
+                counters["port_xmit_packets"] += 4_000 if is_coordinator else 3_000
+                counters["port_rcv_packets"] += 3_000 if is_coordinator else 4_000
+            ports.append(
+                HcaPortCounterSnapshot(
+                    rail_id=configured.rail_id or f"rail-{index + 1}",
+                    device=configured.device,
+                    port=configured.port,
+                    state="4: ACTIVE",
+                    physical_state="5: LinkUp",
+                    rate="40 Gb/sec",
+                    counters=counters,
+                )
+            )
+        return HcaCounterSnapshot(
+            schema_version=1,
+            host_name=host.name,
+            counter_source="sysfs_class_infiniband",
+            captured_at_unix_seconds=float(capture_count + 1),
+            captured_at_monotonic_seconds=float(capture_count + 1),
+            ports=tuple(ports),
         )
 
     def start_node(
@@ -740,6 +801,7 @@ class FakeEffects:
                 raise HarnessError("injected completion failure")
             assert body is not None
             self.completion_requests.append(copy.deepcopy(body))
+            self.events.append(f"completion:{len(self.completion_requests)}")
             if self.signal_latch is not None:
                 self.signal_latch.handle(signal.SIGTERM, None)
             content = (
@@ -805,6 +867,64 @@ def _owned_nccl_logs(config: HarnessConfig, owner_token: str) -> dict[str, str]:
     return logs
 
 
+def _dual_rail_config(tmp_path: Path) -> HarnessConfig:
+    raw = make_config(tmp_path).model_dump(mode="json")
+    raw["hosts"][0]["hca_ports"] = [
+        {"device": "mlx4_0", "port": 1, "gid": "fe80::1", "rail_id": "qdr-a"},
+        {"device": "mlx4_0", "port": 2, "gid": "fe80::3", "rail_id": "qdr-b"},
+    ]
+    raw["hosts"][0]["environment"]["NCCL_IB_HCA"] = "=mlx4_0:1,mlx4_0:2"
+    raw["hosts"][1]["hca_ports"] = [
+        {"device": "mlx4_0", "port": 1, "gid": "fe80::2", "rail_id": "qdr-a"},
+        {"device": "mlx4_0", "port": 2, "gid": "fe80::4", "rail_id": "qdr-b"},
+    ]
+    raw["hosts"][1]["environment"]["NCCL_IB_HCA"] = "=mlx4_0:1,mlx4_0:2"
+    return HarnessConfig.model_validate_json(json.dumps(raw))
+
+
+def _fake_counter_snapshots(
+    config: HarnessConfig,
+) -> tuple[dict[str, HcaCounterSnapshot], dict[str, HcaCounterSnapshot]]:
+    effects = FakeEffects(config)
+    before = {host.name: effects.capture_hca_counters(host) for host in config.hosts}
+    after = {host.name: effects.capture_hca_counters(host) for host in config.hosts}
+    return before, after
+
+
+def _replace_snapshot_counter(
+    snapshot: HcaCounterSnapshot,
+    *,
+    rail_id: str,
+    counter_name: str,
+    value: int,
+) -> HcaCounterSnapshot:
+    ports: list[HcaPortCounterSnapshot] = []
+    for port in snapshot.ports:
+        if port.rail_id != rail_id:
+            ports.append(port)
+            continue
+        counters = dict(port.counters)
+        counters[counter_name] = value
+        ports.append(port.model_copy(update={"counters": counters}))
+    return snapshot.model_copy(update={"ports": tuple(ports)})
+
+
+def _replace_snapshot_capture_time(
+    snapshot: HcaCounterSnapshot, value: float
+) -> HcaCounterSnapshot:
+    raw = snapshot.model_dump(mode="python")
+    raw["captured_at_unix_seconds"] = value
+    return HcaCounterSnapshot.model_validate(raw)
+
+
+def _replace_snapshot_monotonic_capture_time(
+    snapshot: HcaCounterSnapshot, value: float
+) -> HcaCounterSnapshot:
+    raw = snapshot.model_dump(mode="python")
+    raw["captured_at_monotonic_seconds"] = value
+    return HcaCounterSnapshot.model_validate(raw)
+
+
 def test_config_is_strict_and_requires_the_reserved_nccl_port(tmp_path: Path) -> None:
     config = make_config(tmp_path)
     raw = config.model_dump(mode="json")
@@ -825,6 +945,67 @@ def test_config_rejects_pre_topology_readiness_schema(tmp_path: Path) -> None:
 
     with pytest.raises(ValidationError, match="literal_error"):
         HarnessConfig.model_validate_json(json.dumps(raw))
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value", "message"),
+    [
+        (
+            "minimum_hca_data_bytes_per_rail",
+            1_048_575,
+            "greater than or equal",
+        ),
+        (
+            "hca_counter_match_relative_tolerance",
+            0.010_001,
+            "less than or equal",
+        ),
+        (
+            "hca_counter_match_absolute_tolerance_bytes",
+            262_145,
+            "one quarter",
+        ),
+    ],
+)
+def test_config_rejects_permissive_hca_counter_policy(
+    tmp_path: Path, field_name: str, value: int | float, message: str
+) -> None:
+    raw = make_config(tmp_path).model_dump(mode="json")
+    raw["benchmark"][field_name] = value
+
+    with pytest.raises(ValidationError, match=message):
+        HarnessConfig.model_validate_json(json.dumps(raw))
+
+
+def test_config_rejects_mismatched_explicit_rail_ids(tmp_path: Path) -> None:
+    raw = _dual_rail_config(tmp_path).model_dump(mode="json")
+    raw["hosts"][1]["hca_ports"][1]["rail_id"] = "wrong-rail"
+
+    with pytest.raises(ValidationError, match="same HCA rail IDs"):
+        HarnessConfig.model_validate_json(json.dumps(raw))
+
+
+def test_schema_three_config_accepts_legacy_positional_rails_and_counter_defaults(
+    tmp_path: Path,
+) -> None:
+    raw = make_config(tmp_path).model_dump(mode="json")
+    for field_name in (
+        "minimum_hca_data_bytes_per_rail",
+        "hca_counter_match_absolute_tolerance_bytes",
+        "hca_counter_match_relative_tolerance",
+    ):
+        del raw["benchmark"][field_name]
+    for host in raw["hosts"]:
+        for port in host["hca_ports"]:
+            del port["rail_id"]
+
+    config = HarnessConfig.model_validate_json(json.dumps(raw))
+
+    assert config.schema_version == 3
+    assert config.benchmark.minimum_hca_data_bytes_per_rail == 1_048_576
+    assert config.benchmark.hca_counter_match_absolute_tolerance_bytes == 65_536
+    assert config.benchmark.hca_counter_match_relative_tolerance == 0.001
+    assert all(port.rail_id is None for host in config.hosts for port in host.hca_ports)
 
 
 @pytest.mark.parametrize(
@@ -1125,6 +1306,22 @@ def test_active_lease_binding_requires_held_lock_and_exact_static_proof(
     assert isinstance(metadata, dict)
     assert metadata["command"] == list(command)
     assert metadata["runtime_requirements"] == config.runtime.model_dump(mode="json")
+    assert metadata["benchmark_contract"] == {
+        "warmup_count": config.benchmark.warmup_count,
+        "sample_count": config.benchmark.sample_count,
+        "max_tokens": config.benchmark.max_tokens,
+        "seed": config.benchmark.seed,
+        "temperature": config.benchmark.temperature,
+        "minimum_hca_data_bytes_per_rail": (
+            config.benchmark.minimum_hca_data_bytes_per_rail
+        ),
+        "hca_counter_match_absolute_tolerance_bytes": (
+            config.benchmark.hca_counter_match_absolute_tolerance_bytes
+        ),
+        "hca_counter_match_relative_tolerance": (
+            config.benchmark.hca_counter_match_relative_tolerance
+        ),
+    }
     oracle = metadata["correctness_oracle"]
     assert isinstance(oracle, dict)
     assert oracle["expected_content_sha256"] == config.benchmark.expected_content_sha256
@@ -1156,6 +1353,38 @@ def test_active_lease_binds_runtime_abi_and_host_pins(
     with lock_path.open("r+") as lock_file:
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         with pytest.raises(HarnessError, match=r"metadata\.runtime_requirements"):
+            poc.validate_active_lease(
+                changed_config,
+                config_path=config_path,
+                lease_path=lease_path,
+                lock_path=lock_path,
+            )
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [
+        ("minimum_hca_data_bytes_per_rail", 2_097_152),
+        ("hca_counter_match_absolute_tolerance_bytes", 131_072),
+        ("hca_counter_match_relative_tolerance", 0.005),
+    ],
+)
+def test_active_lease_binds_hca_counter_policy(
+    tmp_path: Path, field_name: str, value: int | float
+) -> None:
+    config = make_config(tmp_path)
+    config_path, lease_path, lock_path, _command, record = _active_lease_fixture(
+        config, tmp_path
+    )
+    raw = config.model_dump(mode="json")
+    raw["benchmark"][field_name] = value
+    changed_config = HarnessConfig.model_validate_json(json.dumps(raw))
+    config_path.write_text(changed_config.model_dump_json(), encoding="utf-8")
+    lease_path.write_text(json.dumps(record), encoding="utf-8")
+
+    with lock_path.open("r+") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with pytest.raises(HarnessError, match=r"metadata\.benchmark_contract"):
             poc.validate_active_lease(
                 changed_config,
                 config_path=config_path,
@@ -1822,6 +2051,24 @@ def test_cleanup_bound_counts_sequential_signal_and_delete_poll_delays(
     assert poc.minimum_cleanup_grace_seconds(slow_poll_config) > 2000.0
 
 
+def test_cleanup_bound_includes_completion_timeout_and_diagnostic_captures(
+    tmp_path: Path,
+) -> None:
+    raw = make_config(tmp_path).model_dump(mode="json")
+    raw["timeouts"].update(
+        {
+            "api_start_seconds": 200.0,
+            "request_seconds": 100.0,
+            "process_start_seconds": 1.0,
+            "cleanup_seconds": 1.0,
+            "poll_seconds": 1.0,
+        }
+    )
+    config = HarnessConfig.model_validate_json(json.dumps(raw))
+
+    assert poc.minimum_cleanup_grace_seconds(config) == pytest.approx(770.0)
+
+
 @pytest.mark.parametrize(
     ("duration", "heartbeat", "cleanup", "message"),
     [
@@ -2115,6 +2362,10 @@ def test_nccl_log_evidence_requires_one_line_proving_merged_rails(
         {"device": "mlx4_1", "port": 1, "gid": "fe80::3"}
     )
     raw["hosts"][0]["environment"]["NCCL_IB_HCA"] = "=mlx4_0:1,mlx4_1:1"
+    raw["hosts"][1]["hca_ports"].append(
+        {"device": "mlx4_1", "port": 2, "gid": "fe80::4"}
+    )
+    raw["hosts"][1]["environment"]["NCCL_IB_HCA"] = "=mlx4_0:2,mlx4_1:2"
     config = HarnessConfig.model_validate_json(json.dumps(raw))
     owner_token = "owned-log-token"
     logs = _owned_nccl_logs(config, owner_token)
@@ -2126,6 +2377,414 @@ def test_nccl_log_evidence_requires_one_line_proving_merged_rails(
 
     with pytest.raises(HarnessError, match="merged HCA rails"):
         poc.validate_nccl_logs(config, make_placement(config), logs, owner_token)
+
+
+def test_hca_counter_evidence_verifies_two_explicit_rails(tmp_path: Path) -> None:
+    config = _dual_rail_config(tmp_path)
+    before, after = _fake_counter_snapshots(config)
+
+    evidence = poc.validate_hca_counter_evidence(config, before, after)
+
+    assert evidence["hca_payload_counter_deltas_verified"] is True
+    assert evidence["dual_rail_payload_verified"] is True
+    assert evidence["explicit_rail_pairing"] is True
+    assert evidence["workload_attributed_to_nccl"] is False
+    assert "PMA data-octet" in str(evidence["counter_scope"])
+    assert "excluding link overhead" in str(evidence["counter_scope"])
+    assert evidence["health_counter_deltas_clean"] is True
+    assert evidence["cross_endpoint_deltas_matched"] is True
+    rails = cast(list[JsonObject], cast(object, evidence["rails"]))
+    assert [rail["rail_id"] for rail in rails] == ["qdr-a", "qdr-b"]
+    assert all(rail["matched_data_bytes"] == 2_800_000 for rail in rails)
+    deltas = cast(JsonObject, cast(object, evidence["deltas"]))
+    dwagon_deltas = cast(JsonObject, cast(object, deltas["dwagon"]))
+    qdr_a_deltas = cast(JsonObject, cast(object, dwagon_deltas["qdr-a"]))
+    assert qdr_a_deltas["estimated_xmit_data_bytes"] == 1_600_000
+    assert evidence["before"] == {
+        host_name: snapshot.model_dump(mode="json")
+        for host_name, snapshot in before.items()
+    }
+    assert evidence["after"] == {
+        host_name: snapshot.model_dump(mode="json")
+        for host_name, snapshot in after.items()
+    }
+
+
+def test_positional_rail_pairing_cannot_certify_dual_rail_payload(
+    tmp_path: Path,
+) -> None:
+    raw = _dual_rail_config(tmp_path).model_dump(mode="json")
+    for host in raw["hosts"]:
+        for port in host["hca_ports"]:
+            del port["rail_id"]
+    config = HarnessConfig.model_validate_json(json.dumps(raw))
+    before, after = _fake_counter_snapshots(config)
+
+    evidence = poc.validate_hca_counter_evidence(config, before, after)
+
+    assert evidence["hca_payload_counter_deltas_verified"] is True
+    assert evidence["explicit_rail_pairing"] is False
+    assert evidence["dual_rail_payload_verified"] is False
+    assert evidence["failure_reasons"] == []
+    assert "explicit matching rail_id" in str(evidence["dual_rail_failure_reasons"])
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    ["captured_at_unix_seconds", "captured_at_monotonic_seconds"],
+)
+@pytest.mark.parametrize("capture_time", [math.nan, math.inf, -math.inf, -1.0])
+def test_hca_counter_snapshot_rejects_invalid_capture_time(
+    tmp_path: Path, field_name: str, capture_time: float
+) -> None:
+    config = make_config(tmp_path)
+    snapshot = FakeEffects(config).capture_hca_counters(config.hosts[0])
+    raw = snapshot.model_dump(mode="python")
+    raw[field_name] = capture_time
+
+    with pytest.raises(ValidationError):
+        HcaCounterSnapshot.model_validate(raw)
+
+
+def test_hca_counter_snapshot_requires_monotonic_capture_time(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    snapshot = FakeEffects(config).capture_hca_counters(config.hosts[0])
+    raw = snapshot.model_dump(mode="python")
+    del raw["captured_at_monotonic_seconds"]
+
+    with pytest.raises(ValidationError, match="captured_at_monotonic_seconds"):
+        HcaCounterSnapshot.model_validate(raw)
+
+
+def test_hca_counter_evidence_does_not_require_cross_host_clock_order(
+    tmp_path: Path,
+) -> None:
+    config = _dual_rail_config(tmp_path)
+    before, after = _fake_counter_snapshots(config)
+    before = {
+        host_name: _replace_snapshot_capture_time(snapshot, 200.0)
+        for host_name, snapshot in before.items()
+    }
+    after = {
+        host_name: _replace_snapshot_capture_time(snapshot, 100.0)
+        for host_name, snapshot in after.items()
+    }
+
+    evidence = poc.validate_hca_counter_evidence(config, before, after)
+
+    assert evidence["hca_payload_counter_deltas_verified"] is True
+    assert evidence["dual_rail_payload_verified"] is True
+    assert all(
+        before[host_name].captured_at_monotonic_seconds
+        < after[host_name].captured_at_monotonic_seconds
+        for host_name in before
+    )
+
+
+def test_hca_counter_evidence_rejects_same_host_reversed_monotonic_time(
+    tmp_path: Path,
+) -> None:
+    config = _dual_rail_config(tmp_path)
+    before, after = _fake_counter_snapshots(config)
+    before["fwuff"] = _replace_snapshot_monotonic_capture_time(before["fwuff"], 200.0)
+    after["fwuff"] = _replace_snapshot_monotonic_capture_time(after["fwuff"], 100.0)
+
+    with pytest.raises(
+        HarnessError, match="monotonic capture time regressed for fwuff"
+    ):
+        poc.validate_hca_counter_evidence(config, before, after)
+
+
+@pytest.mark.parametrize(
+    ("packet_difference", "expected_verified"),
+    [(256, True), (257, False)],
+)
+def test_hca_packet_counter_tolerance_boundary(
+    tmp_path: Path, packet_difference: int, expected_verified: bool
+) -> None:
+    config = _dual_rail_config(tmp_path)
+    before, after = _fake_counter_snapshots(config)
+    snapshot = after["dwagon"]
+    port = next(port for port in snapshot.ports if port.rail_id == "qdr-a")
+    after["dwagon"] = _replace_snapshot_counter(
+        snapshot,
+        rail_id="qdr-a",
+        counter_name="port_xmit_packets",
+        value=port.counters["port_xmit_packets"] + packet_difference,
+    )
+
+    evidence = poc.validate_hca_counter_evidence(config, before, after)
+
+    assert evidence["hca_payload_counter_deltas_verified"] is expected_verified
+    assert evidence["cross_endpoint_deltas_matched"] is expected_verified
+
+
+def test_hca_counter_evidence_rejects_cross_endpoint_mismatch(tmp_path: Path) -> None:
+    config = _dual_rail_config(tmp_path)
+    before, after = _fake_counter_snapshots(config)
+    snapshot = after["dwagon"]
+    port = next(port for port in snapshot.ports if port.rail_id == "qdr-a")
+    after["dwagon"] = _replace_snapshot_counter(
+        snapshot,
+        rail_id="qdr-a",
+        counter_name="port_xmit_data",
+        value=port.counters["port_xmit_data"] + 100_000,
+    )
+
+    evidence = poc.validate_hca_counter_evidence(config, before, after)
+
+    assert evidence["hca_payload_counter_deltas_verified"] is False
+    assert evidence["dual_rail_payload_verified"] is False
+    assert evidence["cross_endpoint_deltas_matched"] is False
+    failure_reasons = cast(list[str], cast(object, evidence["failure_reasons"]))
+    assert "qdr-a endpoint counter deltas do not match" in failure_reasons
+    dual_failure_reasons = cast(
+        list[str], cast(object, evidence["dual_rail_failure_reasons"])
+    )
+    assert "qdr-a endpoint counter deltas do not match" in dual_failure_reasons
+
+
+def test_hca_counter_evidence_rejects_counter_regression(tmp_path: Path) -> None:
+    config = _dual_rail_config(tmp_path)
+    before, after = _fake_counter_snapshots(config)
+    initial = next(port for port in before["dwagon"].ports if port.rail_id == "qdr-a")
+    after["dwagon"] = _replace_snapshot_counter(
+        after["dwagon"],
+        rail_id="qdr-a",
+        counter_name="port_xmit_data",
+        value=initial.counters["port_xmit_data"] - 1,
+    )
+
+    evidence = poc.validate_hca_counter_evidence(config, before, after)
+
+    assert evidence["hca_payload_counter_deltas_verified"] is False
+    assert evidence["counters_monotonic"] is False
+    failure_reasons = cast(list[str], cast(object, evidence["failure_reasons"]))
+    assert any(
+        "counter port_xmit_data regressed" in reason for reason in failure_reasons
+    )
+
+
+def test_hca_counter_evidence_rejects_health_counter_increment(
+    tmp_path: Path,
+) -> None:
+    config = _dual_rail_config(tmp_path)
+    before, after = _fake_counter_snapshots(config)
+    initial = next(port for port in before["fwuff"].ports if port.rail_id == "qdr-b")
+    after["fwuff"] = _replace_snapshot_counter(
+        after["fwuff"],
+        rail_id="qdr-b",
+        counter_name="port_xmit_discards",
+        value=initial.counters["port_xmit_discards"] + 1,
+    )
+
+    evidence = poc.validate_hca_counter_evidence(config, before, after)
+
+    assert evidence["hca_payload_counter_deltas_verified"] is False
+    assert evidence["health_counter_deltas_clean"] is False
+    failure_reasons = cast(list[str], cast(object, evidence["failure_reasons"]))
+    assert any(
+        "health counter port_xmit_discards increased" in reason
+        for reason in failure_reasons
+    )
+
+
+def test_single_rail_counter_proof_is_not_a_dual_rail_proof(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    before, after = _fake_counter_snapshots(config)
+
+    evidence = poc.validate_hca_counter_evidence(config, before, after)
+
+    assert evidence["hca_payload_counter_deltas_verified"] is True
+    assert evidence["dual_rail_payload_verified"] is False
+
+
+def test_zero_second_rail_is_diagnostic_and_full_harness_cleans_up(
+    tmp_path: Path,
+) -> None:
+    config = _dual_rail_config(tmp_path)
+
+    class ZeroSecondRailEffects(FakeEffects):
+        def capture_hca_counters(self, host: HostConfig) -> HcaCounterSnapshot:
+            snapshot = super().capture_hca_counters(host)
+            if self.hca_capture_count_by_host[host.name] != 2:
+                return snapshot
+            baseline = {
+                "port_xmit_data": 10_000,
+                "port_rcv_data": 20_000,
+                "port_xmit_packets": 1_000,
+                "port_rcv_packets": 2_000,
+            }
+            for counter_name, value in baseline.items():
+                snapshot = _replace_snapshot_counter(
+                    snapshot,
+                    rail_id="qdr-b",
+                    counter_name=counter_name,
+                    value=value,
+                )
+            return snapshot
+
+    effects = ZeroSecondRailEffects(config)
+
+    result = run_harness(config, effects)
+
+    assert result["status"] == "benchmark_failed"
+    assert result["reportable"] is False
+    assert result["cleanup_succeeded"] is True
+    assert result["dual_rail_payload_verified"] is False
+    evidence = result["hca_counter_evidence"]
+    assert isinstance(evidence, dict)
+    assert evidence["before"] is not None
+    assert evidence["after"] is not None
+    assert evidence["all_rails_above_minimum"] is False
+    assert "qdr-b matched 0 data bytes" in str(evidence["failure_reasons"])
+    assert effects.deleted_paths == ["/instance/owned-instance"]
+    assert effects.stopped == list(reversed(effects.started))
+
+
+def test_hca_counter_capture_brackets_completions(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    effects = FakeEffects(config)
+
+    result = run_harness(config, effects)
+
+    assert result["status"] == "completed"
+    assert effects.events == [
+        "capture:before:dwagon",
+        "capture:before:fwuff",
+        "completion:1",
+        "completion:2",
+        "completion:3",
+        "completion:4",
+        "completion:5",
+        "capture:after:dwagon",
+        "capture:after:fwuff",
+    ]
+
+
+def test_explicit_dual_rail_requires_counters_and_nccl_logs_for_top_level_proof(
+    tmp_path: Path,
+) -> None:
+    config = _dual_rail_config(tmp_path)
+    effects = FakeEffects(config)
+
+    result = run_harness(config, effects)
+
+    assert result["status"] == "completed"
+    counter_evidence = result["hca_counter_evidence"]
+    log_evidence = result["nccl_log_evidence"]
+    assert isinstance(counter_evidence, dict)
+    assert isinstance(log_evidence, dict)
+    assert counter_evidence["dual_rail_payload_verified"] is True
+    assert counter_evidence["workload_attributed_to_nccl"] is False
+    assert log_evidence["workload_attributed_to_nccl"] is True
+    assert log_evidence["dual_rail_payload_verified"] is True
+    assert result["dual_rail_payload_verified"] is True
+
+
+def test_nccl_log_failure_withholds_top_level_dual_rail_proof(
+    tmp_path: Path,
+) -> None:
+    config = _dual_rail_config(tmp_path)
+
+    class SocketFallbackLogEffects(FakeEffects):
+        def read_owned_log(self, process: OwnedProcess) -> str:
+            log = super().read_owned_log(process)
+            if process.host_name == "fwuff":
+                return log + "NCCL INFO NET/Socket : injected fallback\n"
+            return log
+
+    effects = SocketFallbackLogEffects(config)
+
+    result = run_harness(config, effects)
+
+    assert result["status"] == "benchmark_failed"
+    assert result["cleanup_succeeded"] is True
+    counter_evidence = result["hca_counter_evidence"]
+    assert isinstance(counter_evidence, dict)
+    assert counter_evidence["dual_rail_payload_verified"] is True
+    assert result["nccl_log_evidence"] is None
+    assert result["dual_rail_payload_verified"] is False
+    assert "forbidden marker" in str(result["error"])
+
+
+def test_oracle_failure_withholds_top_level_dual_rail_proof(
+    tmp_path: Path,
+) -> None:
+    config = _dual_rail_config(tmp_path)
+    effects = FakeEffects(config, vary_samples=True)
+
+    result = run_harness(config, effects)
+
+    assert result["status"] == "benchmark_failed"
+    assert result["cleanup_succeeded"] is True
+    counter_evidence = result["hca_counter_evidence"]
+    log_evidence = result["nccl_log_evidence"]
+    assert isinstance(counter_evidence, dict)
+    assert isinstance(log_evidence, dict)
+    assert counter_evidence["dual_rail_payload_verified"] is True
+    assert log_evidence["dual_rail_payload_verified"] is True
+    assert result["dual_rail_payload_verified"] is False
+    assert "correctness oracle" in str(result["error"])
+
+
+def test_hca_counter_before_capture_failure_is_diagnostic_and_cleans_up(
+    tmp_path: Path,
+) -> None:
+    config = make_config(tmp_path)
+
+    class FailedBeforeCaptureEffects(FakeEffects):
+        def capture_hca_counters(self, host: HostConfig) -> HcaCounterSnapshot:
+            if host.name == "dwagon" and not self.hca_capture_count_by_host:
+                raise HarnessError("injected before-counter failure")
+            return super().capture_hca_counters(host)
+
+    effects = FailedBeforeCaptureEffects(config)
+
+    result = run_harness(config, effects)
+
+    assert result["status"] == "benchmark_failed"
+    assert result["reportable"] is False
+    assert result["cleanup_succeeded"] is True
+    assert effects.completion_requests == []
+    evidence = result["hca_counter_evidence"]
+    assert isinstance(evidence, dict)
+    assert evidence["capture_phase_failed"] == "before"
+    assert evidence["before"] == {}
+    assert evidence["after"] == {}
+    assert evidence["diagnostic_only"] is True
+    assert "injected before-counter failure" in str(result["error"])
+
+
+def test_hca_counter_capture_failure_is_diagnostic_and_cleans_up(
+    tmp_path: Path,
+) -> None:
+    config = make_config(tmp_path)
+
+    class FailedAfterCaptureEffects(FakeEffects):
+        def capture_hca_counters(self, host: HostConfig) -> HcaCounterSnapshot:
+            snapshot = super().capture_hca_counters(host)
+            if host.name == "fwuff" and self.hca_capture_count_by_host[host.name] == 2:
+                raise HarnessError("injected after-counter failure")
+            return snapshot
+
+    effects = FailedAfterCaptureEffects(config)
+
+    result = run_harness(config, effects)
+
+    assert result["status"] == "benchmark_failed"
+    assert result["reportable"] is False
+    assert result["cleanup_succeeded"] is True
+    evidence = result["hca_counter_evidence"]
+    assert isinstance(evidence, dict)
+    assert evidence["capture_phase_failed"] == "after"
+    before_receipts = cast(JsonObject, cast(object, evidence["before"]))
+    after_receipts = cast(JsonObject, cast(object, evidence["after"]))
+    assert set(before_receipts) == {"dwagon", "fwuff"}
+    assert set(after_receipts) == {"dwagon"}
+    assert "injected after-counter failure" in str(evidence["failure_reasons"])
+    assert effects.deleted_paths == ["/instance/owned-instance"]
+    assert effects.stopped == list(reversed(effects.started))
 
 
 def test_runner_failed_aborts_readiness_immediately(tmp_path: Path) -> None:
@@ -2324,7 +2983,8 @@ def test_full_harness_uses_deterministic_requests_and_owned_cleanup(
     assert oracle["expected_content_sha256"] == config.benchmark.expected_content_sha256
     log_evidence = result["nccl_log_evidence"]
     assert isinstance(log_evidence, dict)
-    assert log_evidence["hca_payload_counter_deltas_verified"] is False
+    assert log_evidence["hca_payload_counter_deltas_verified"] is True
+    assert result["dual_rail_payload_verified"] is False
     runtime_metadata = effects.writes["runtime-metadata.json"]
     assert "owner_processes" not in runtime_metadata
     assert len(runtime_metadata["owned_processes"]) == 2
@@ -2648,6 +3308,23 @@ def test_failure_after_submission_still_deletes_only_owned_instance(
     assert result["reportable"] is False
     assert result["cleanup_succeeded"] is True
     assert "injected completion failure" in str(result["error"])
+    evidence = result["hca_counter_evidence"]
+    assert isinstance(evidence, dict)
+    assert set(cast(JsonObject, cast(object, evidence["before"]))) == {
+        "dwagon",
+        "fwuff",
+    }
+    assert set(cast(JsonObject, cast(object, evidence["after"]))) == {
+        "dwagon",
+        "fwuff",
+    }
+    assert evidence["diagnostic_only"] is True
+    assert evidence["diagnostic_counter_deltas_valid"] is True
+    assert evidence["hca_payload_counter_deltas_verified"] is False
+    assert evidence["dual_rail_payload_verified"] is False
+    assert "completion phase did not finish normally" in str(
+        evidence["certification_withheld_reason"]
+    )
     assert effects.deleted_paths == ["/instance/owned-instance"]
     assert effects.stopped == list(reversed(effects.started))
 
@@ -2734,6 +3411,15 @@ class CleanHostProbe:
     def hca_port_observations(
         self, ports: tuple[HcaPort, ...]
     ) -> tuple[HcaPortObservation, ...]:
+        counters = {name: "0" for name in TEST_HCA_HEALTH_COUNTERS}
+        counters.update(
+            {
+                "port_rcv_data": "1",
+                "port_rcv_packets": "2",
+                "port_xmit_data": "3",
+                "port_xmit_packets": "4",
+            }
+        )
         return tuple(
             HcaPortObservation(
                 device=port.device,
@@ -2746,7 +3432,7 @@ class CleanHostProbe:
                 gids=(port.gid,),
                 net_devices=(),
                 ip_addresses=(),
-                counters={"port_rcv_data": "1"},
+                counters=counters,
             )
             for port in ports
         )
@@ -2854,6 +3540,30 @@ def test_builtin_preflight_contract_is_strict_and_self_contained(
     assert report.conflicts == ()
     assert report.checked_tcp_ports == config.reserved_ports
     assert report.checked_udp_ports == config.reserved_ports
+
+
+def test_hca_counter_snapshot_parses_required_sysfs_counters(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    host = config.hosts[0]
+    request = poc.HostHcaCounterRequest(
+        schema_version=1,
+        host_name=host.name,
+        ports=host.hca_ports,
+    )
+
+    snapshot = poc.collect_hca_counter_snapshot(
+        request,
+        cast(poc.HostProbe, cast(object, CleanHostProbe(host))),
+        clock=lambda: 123.0,
+        monotonic_clock=lambda: 456.0,
+    )
+
+    assert snapshot.host_name == host.name
+    assert snapshot.counter_source == "sysfs_class_infiniband"
+    assert snapshot.captured_at_unix_seconds == 123.0
+    assert snapshot.captured_at_monotonic_seconds == 456.0
+    assert snapshot.ports[0].rail_id == "rail-1"
+    assert snapshot.ports[0].counters["port_xmit_data"] == 3
 
 
 @pytest.mark.parametrize("mutation", ["inactive", "wrong_gid", "zero_lid"])
@@ -2984,6 +3694,45 @@ def test_system_effects_preflight_uses_deployed_script_and_remote_argv(
     assert transported[-1] == shlex.join(
         ("python", "-c", "print('argument with spaces')")
     )
+
+
+def test_system_effects_hca_capture_uses_deployed_internal_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = make_config(tmp_path)
+    host = config.hosts[1]
+    effects = SystemEffects(config)
+    expected_snapshot = FakeEffects(config).capture_hca_counters(host)
+    observed: dict[str, object] = {}
+
+    def fake_run_text_command(
+        command_host: HostConfig,
+        command: Sequence[str],
+        *,
+        stdin: str | None,
+        timeout: float,
+    ) -> str:
+        observed.update(
+            host=command_host,
+            command=tuple(command),
+            stdin=stdin,
+            timeout=timeout,
+        )
+        return expected_snapshot.model_dump_json()
+
+    monkeypatch.setattr(effects, "_run_text_command", fake_run_text_command)
+
+    snapshot = effects.capture_hca_counters(host)
+
+    assert snapshot == expected_snapshot
+    assert cast(tuple[str, ...], observed["command"]) == (
+        host.python_executable,
+        f"{host.source_directory}/scripts/two_host_mlx_nccl_poc.py",
+        "host-hca-counters",
+    )
+    request = poc.HostHcaCounterRequest.model_validate_json(str(observed["stdin"]))
+    assert request.host_name == host.name
+    assert request.ports == host.hca_ports
 
 
 def test_system_effects_result_output_stays_on_trusted_directory_descriptor(
@@ -3561,7 +4310,7 @@ def test_tp1_manifest_digest_rejects_matching_but_wrong_host_snapshots(
 def test_stop_failure_does_not_skip_other_owned_process_cleanup(
     tmp_path: Path,
 ) -> None:
-    config = make_config(tmp_path)
+    config = _dual_rail_config(tmp_path)
     effects = FakeEffects(config)
     original_stop = effects.stop_node
     attempted_hosts: list[str] = []
@@ -3583,6 +4332,13 @@ def test_stop_failure_does_not_skip_other_owned_process_cleanup(
     assert result["cleanup_succeeded"] is False
     assert len(result["process_cleanup"]) == 2
     assert "injected stop adapter failure" in str(result["process_cleanup"][0])
+    counter_evidence = result["hca_counter_evidence"]
+    log_evidence = result["nccl_log_evidence"]
+    assert isinstance(counter_evidence, dict)
+    assert isinstance(log_evidence, dict)
+    assert counter_evidence["dual_rail_payload_verified"] is True
+    assert log_evidence["dual_rail_payload_verified"] is True
+    assert result["dual_rail_payload_verified"] is False
 
 
 def test_failed_preflight_never_starts_a_process(tmp_path: Path) -> None:

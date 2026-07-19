@@ -76,6 +76,37 @@ _DEFAULT_LOCK_PATH = Path("/var/lock/fwuffydwagon-benchmark.lock")
 _LEASE_BIND_TIMEOUT_SECONDS = 5.0
 _LEASE_METADATA_MAX_AGE = timedelta(minutes=15)
 _MINIMUM_CLEANUP_GRACE_SECONDS = 300.0
+_HCA_DATA_COUNTER_NAMES = (
+    "port_rcv_data",
+    "port_rcv_packets",
+    "port_xmit_data",
+    "port_xmit_packets",
+)
+_HCA_HEALTH_COUNTER_NAMES = (
+    "VL15_dropped",
+    "excessive_buffer_overrun_errors",
+    "link_downed",
+    "link_error_recovery",
+    "local_link_integrity_errors",
+    "port_rcv_constraint_errors",
+    "port_rcv_errors",
+    "port_rcv_remote_physical_errors",
+    "port_rcv_switch_relay_errors",
+    "port_xmit_constraint_errors",
+    "port_xmit_discards",
+    "symbol_error",
+)
+_HCA_COUNTER_NAMES = (*_HCA_DATA_COUNTER_NAMES, *_HCA_HEALTH_COUNTER_NAMES)
+_HCA_DATA_COUNTER_UNIT_BYTES = 4
+_HCA_PACKET_MATCH_ABSOLUTE_TOLERANCE = 256
+_HCA_COUNTER_SCOPE = (
+    "port-wide PMA data-octet traffic, excluding link overhead, observed within "
+    "the exclusive warmup-and-sample bracket"
+)
+_HCA_WORKLOAD_ATTRIBUTION_RULE = (
+    "counter deltas alone do not attribute traffic to NCCL; workload attribution "
+    "requires successful NCCL log validation"
+)
 _REQUIRED_RUNTIME_DISTRIBUTIONS = (
     "exo",
     "huggingface-hub",
@@ -175,6 +206,7 @@ class HcaPort(StrictModel):
     device: str = Field(min_length=1)
     port: int = Field(ge=1)
     gid: str
+    rail_id: str | None = None
 
     @field_validator("gid")
     @classmethod
@@ -187,6 +219,13 @@ class HcaPort(StrictModel):
         ):
             raise ValueError("gid must be a port-specific IPv6 address")
         return str(parsed)
+
+    @field_validator("rail_id")
+    @classmethod
+    def validate_rail_id(cls, value: str | None) -> str | None:
+        if value is not None and _SAFE_NAME.fullmatch(value) is None:
+            raise ValueError("rail_id must be a safe nonempty identifier")
+        return value
 
 
 class SourceIdentity(StrictModel):
@@ -303,6 +342,9 @@ class BenchmarkConfig(StrictModel):
     max_tokens: int = Field(ge=1)
     seed: int
     temperature: float
+    minimum_hca_data_bytes_per_rail: int = Field(default=1_048_576, ge=1_048_576)
+    hca_counter_match_absolute_tolerance_bytes: int = Field(default=65_536, ge=0)
+    hca_counter_match_relative_tolerance: float = Field(default=0.001, ge=0.0, le=0.01)
 
     @field_validator("temperature")
     @classmethod
@@ -310,6 +352,18 @@ class BenchmarkConfig(StrictModel):
         if value != 0.0:
             raise ValueError("proof benchmark temperature must be 0")
         return value
+
+    @model_validator(mode="after")
+    def validate_hca_counter_policy(self) -> "BenchmarkConfig":
+        if (
+            self.hca_counter_match_absolute_tolerance_bytes * 4
+            > self.minimum_hca_data_bytes_per_rail
+        ):
+            raise ValueError(
+                "HCA absolute counter tolerance must not exceed one quarter of "
+                "the minimum data bytes per rail"
+            )
+        return self
 
 
 class TimeoutConfig(StrictModel):
@@ -445,6 +499,15 @@ class HarnessConfig(StrictModel):
             )
         if len(set(all_ports)) != len(all_ports):
             raise ValueError("service ports must be globally unique for the proof")
+        rail_ids_by_host = {
+            host.name: set(_resolved_hca_rails(host)) for host in self.hosts
+        }
+        if len(rail_ids_by_host[coordinator.name]) != len(coordinator.hca_ports):
+            raise ValueError("coordinator HCA rail IDs must be unique")
+        if len(rail_ids_by_host[worker.name]) != len(worker.hca_ports):
+            raise ValueError("worker HCA rail IDs must be unique")
+        if rail_ids_by_host[coordinator.name] != rail_ids_by_host[worker.name]:
+            raise ValueError("both hosts must configure the same HCA rail IDs")
         for host in self.hosts:
             _validate_launch_contract(host, self)
         return self
@@ -452,6 +515,26 @@ class HarnessConfig(StrictModel):
     @property
     def tensor_world_size(self) -> int:
         return len(self.requested_compute_resource_ids)
+
+
+def _resolved_hca_rails(host: HostConfig) -> dict[str, HcaPort]:
+    return {
+        port.rail_id or f"rail-{index + 1}": port
+        for index, port in enumerate(host.hca_ports)
+    }
+
+
+def _has_explicit_hca_rail_pairing(config: HarnessConfig) -> bool:
+    explicit_ids_by_host: list[set[str]] = []
+    for host in config.hosts:
+        if any(port.rail_id is None for port in host.hca_ports):
+            return False
+        explicit_ids_by_host.append(
+            {cast(str, port.rail_id) for port in host.hca_ports}
+        )
+    return len(explicit_ids_by_host) == 2 and (
+        explicit_ids_by_host[0] == explicit_ids_by_host[1]
+    )
 
 
 def _gpu_owners(config: HarnessConfig) -> dict[str, tuple[HostConfig, GpuIdentity]]:
@@ -509,6 +592,65 @@ class HcaPortObservation(StrictModel):
     counters: dict[str, str] = Field(default_factory=dict)
 
 
+class HcaPortCounterSnapshot(StrictModel):
+    rail_id: str
+    device: str
+    port: int = Field(ge=1)
+    state: str
+    physical_state: str
+    rate: str
+    counters: dict[str, int]
+
+    @field_validator("rail_id")
+    @classmethod
+    def validate_snapshot_rail_id(cls, value: str) -> str:
+        if _SAFE_NAME.fullmatch(value) is None:
+            raise ValueError("snapshot rail_id must be a safe nonempty identifier")
+        return value
+
+    @field_validator("counters")
+    @classmethod
+    def validate_snapshot_counters(cls, value: dict[str, int]) -> dict[str, int]:
+        if set(value) != set(_HCA_COUNTER_NAMES):
+            raise ValueError("snapshot must contain the exact required HCA counters")
+        if any(counter < 0 for counter in value.values()):
+            raise ValueError("HCA counters must be nonnegative")
+        return value
+
+
+class HcaCounterSnapshot(StrictModel):
+    schema_version: Literal[1]
+    host_name: str
+    counter_source: Literal["sysfs_class_infiniband"]
+    captured_at_unix_seconds: float = Field(ge=0.0)
+    captured_at_monotonic_seconds: float = Field(ge=0.0)
+    ports: tuple[HcaPortCounterSnapshot, ...]
+
+    @field_validator("captured_at_unix_seconds")
+    @classmethod
+    def validate_capture_time(cls, value: float) -> float:
+        if not math.isfinite(value):
+            raise ValueError("HCA counter Unix capture time must be finite")
+        return value
+
+    @field_validator("captured_at_monotonic_seconds")
+    @classmethod
+    def validate_monotonic_capture_time(cls, value: float) -> float:
+        if not math.isfinite(value):
+            raise ValueError("HCA counter monotonic capture time must be finite")
+        return value
+
+    @model_validator(mode="after")
+    def validate_snapshot_ports(self) -> "HcaCounterSnapshot":
+        if not self.ports:
+            raise ValueError("HCA counter snapshot must contain at least one port")
+        if len({port.rail_id for port in self.ports}) != len(self.ports):
+            raise ValueError("HCA counter snapshot rail IDs must be unique")
+        if len({(port.device, port.port) for port in self.ports}) != len(self.ports):
+            raise ValueError("HCA counter snapshot ports must be unique")
+        return self
+
+
 class HostPreflightReport(StrictModel):
     schema_version: Literal[1]
     run_id: str
@@ -533,6 +675,12 @@ class HostPreflightRequest(StrictModel):
     run_id: str
     host: HostConfig
     reserved_ports: tuple[int, ...]
+
+
+class HostHcaCounterRequest(StrictModel):
+    schema_version: Literal[1]
+    host_name: str
+    ports: tuple[HcaPort, ...]
 
 
 class HostProbe(Protocol):
@@ -1115,6 +1263,69 @@ def collect_host_preflight(
     )
 
 
+def collect_hca_counter_snapshot(
+    request: HostHcaCounterRequest,
+    probe: HostProbe,
+    clock: Callable[[], float] = time.time,
+    monotonic_clock: Callable[[], float] = time.monotonic,
+) -> HcaCounterSnapshot:
+    observations = probe.hca_port_observations(request.ports)
+    if len(observations) != len(request.ports):
+        raise HarnessError("HCA counter probe returned the wrong number of ports")
+    ports: list[HcaPortCounterSnapshot] = []
+    for index, (configured, observed) in enumerate(
+        zip(request.ports, observations, strict=True)
+    ):
+        if (observed.device, observed.port) != (configured.device, configured.port):
+            raise HarnessError("HCA counter probe returned the wrong port identity")
+        if not _ib_state_is(observed.state, "ACTIVE") or not _ib_state_is(
+            observed.physical_state, "LINKUP"
+        ):
+            raise HarnessError(
+                f"HCA counter port {configured.device}:{configured.port} is not LinkUp"
+            )
+        counters: dict[str, int] = {}
+        for name in _HCA_COUNTER_NAMES:
+            raw_value = observed.counters.get(name)
+            if raw_value is None:
+                raise HarnessError(
+                    f"HCA counter {name} is unavailable on "
+                    f"{configured.device}:{configured.port}"
+                )
+            try:
+                value = int(raw_value)
+            except ValueError as error:
+                raise HarnessError(
+                    f"HCA counter {name} is not an integer on "
+                    f"{configured.device}:{configured.port}"
+                ) from error
+            if value < 0:
+                raise HarnessError(
+                    f"HCA counter {name} is negative on "
+                    f"{configured.device}:{configured.port}"
+                )
+            counters[name] = value
+        ports.append(
+            HcaPortCounterSnapshot(
+                rail_id=configured.rail_id or f"rail-{index + 1}",
+                device=configured.device,
+                port=configured.port,
+                state=observed.state,
+                physical_state=observed.physical_state,
+                rate=observed.rate,
+                counters=counters,
+            )
+        )
+    return HcaCounterSnapshot(
+        schema_version=1,
+        host_name=request.host_name,
+        counter_source="sysfs_class_infiniband",
+        captured_at_unix_seconds=clock(),
+        captured_at_monotonic_seconds=monotonic_clock(),
+        ports=tuple(ports),
+    )
+
+
 @dataclass(frozen=True)
 class OwnedProcess:
     host_name: str
@@ -1460,11 +1671,12 @@ def _lease_static_metadata(config: HarnessConfig, command: Sequence[str]) -> Jso
     hca_bindings: JsonObject = {
         host.name: [
             {
+                "rail_id": port.rail_id or f"rail-{index + 1}",
                 "device": port.device,
                 "port": port.port,
                 "gid": port.gid,
             }
-            for port in host.hca_ports
+            for index, port in enumerate(host.hca_ports)
         ]
         for host in config.hosts
     }
@@ -1515,6 +1727,22 @@ def _lease_static_metadata(config: HarnessConfig, command: Sequence[str]) -> Jso
             "expected_completion_tokens": (config.benchmark.expected_completion_tokens),
             "expected_finish_reason": config.benchmark.expected_finish_reason,
         },
+        "benchmark_contract": {
+            "warmup_count": config.benchmark.warmup_count,
+            "sample_count": config.benchmark.sample_count,
+            "max_tokens": config.benchmark.max_tokens,
+            "seed": config.benchmark.seed,
+            "temperature": config.benchmark.temperature,
+            "minimum_hca_data_bytes_per_rail": (
+                config.benchmark.minimum_hca_data_bytes_per_rail
+            ),
+            "hca_counter_match_absolute_tolerance_bytes": (
+                config.benchmark.hca_counter_match_absolute_tolerance_bytes
+            ),
+            "hca_counter_match_relative_tolerance": (
+                config.benchmark.hca_counter_match_relative_tolerance
+            ),
+        },
         "requested_compute_resource_ids": [
             resource_id for resource_id in config.requested_compute_resource_ids
         ],
@@ -1534,10 +1762,15 @@ def minimum_cleanup_grace_seconds(config: HarnessConfig) -> float:
         + config.timeouts.cleanup_seconds
         + 5.0
     )
+    completion_failure_diagnostic_delay = (
+        config.timeouts.request_seconds
+        + len(config.hosts) * config.timeouts.api_start_seconds
+    )
     maximum_signal_checkpoint_delay = max(
         config.timeouts.api_start_seconds,
         config.timeouts.request_seconds,
         remote_start_checkpoint_delay,
+        completion_failure_diagnostic_delay,
         config.timeouts.poll_seconds,
     )
     delete_and_verify_bound = (
@@ -2220,6 +2453,8 @@ class HarnessEffects(Protocol):
         self, host: HostConfig, model: ModelSnapshot
     ) -> ModelProbeResult: ...
 
+    def capture_hca_counters(self, host: HostConfig) -> HcaCounterSnapshot: ...
+
     def start_node(
         self, host: HostConfig, config: HarnessConfig, owner_token: str
     ) -> OwnedProcess: ...
@@ -2266,6 +2501,16 @@ class SignalAwareEffects:
         result = self._effects.probe_model(host, model)
         self._latch.checkpoint()
         return result
+
+    def capture_hca_counters(self, host: HostConfig) -> HcaCounterSnapshot:
+        self._latch.checkpoint()
+        result = self._effects.capture_hca_counters(host)
+        self._latch.checkpoint()
+        return result
+
+    def capture_hca_counters_diagnostic(self, host: HostConfig) -> HcaCounterSnapshot:
+        """Best-effort read after a managed failure without masking its signal."""
+        return self._effects.capture_hca_counters(host)
 
     def start_node(
         self, host: HostConfig, config: HarnessConfig, owner_token: str
@@ -2753,6 +2998,27 @@ class SystemEffects:
         except ValidationError as error:
             raise HarnessError(
                 f"invalid preflight JSON returned by {host.name}: {error}"
+            ) from error
+
+    def capture_hca_counters(self, host: HostConfig) -> HcaCounterSnapshot:
+        request = HostHcaCounterRequest(
+            schema_version=1,
+            host_name=host.name,
+            ports=host.hca_ports,
+        )
+        script_path = Path(host.source_directory) / "scripts" / Path(__file__).name
+        command = (host.python_executable, str(script_path), "host-hca-counters")
+        output = self._run_text_command(
+            host,
+            command,
+            stdin=request.model_dump_json(),
+            timeout=self._config.timeouts.api_start_seconds,
+        )
+        try:
+            return HcaCounterSnapshot.model_validate_json(output)
+        except ValidationError as error:
+            raise HarnessError(
+                f"invalid HCA counter JSON returned by {host.name}: {error}"
             ) from error
 
     def probe_model(self, host: HostConfig, model: ModelSnapshot) -> ModelProbeResult:
@@ -3837,11 +4103,361 @@ def _sample_aggregate(samples: Sequence[JsonObject]) -> JsonObject:
     }
 
 
+def _snapshot_receipts(
+    snapshots: Mapping[str, HcaCounterSnapshot],
+) -> JsonObject:
+    return {
+        host_name: cast(JsonValue, snapshot.model_dump(mode="json"))
+        for host_name, snapshot in snapshots.items()
+    }
+
+
+def _failed_hca_counter_evidence(
+    *,
+    config: HarnessConfig,
+    phase: Literal["before", "after", "validation"],
+    before: Mapping[str, HcaCounterSnapshot],
+    after: Mapping[str, HcaCounterSnapshot],
+    error: BaseException,
+) -> JsonObject:
+    explicit_rail_pairing = _has_explicit_hca_rail_pairing(config)
+    dual_rail_failures: list[JsonValue] = []
+    if any(len(host.hca_ports) >= 2 for host in config.hosts) and not (
+        explicit_rail_pairing
+    ):
+        dual_rail_failures.append(
+            "dual-rail attribution requires an explicit matching rail_id on every "
+            "configured HCA port"
+        )
+    return {
+        "schema_version": 1,
+        "counter_source": "sysfs_class_infiniband",
+        "evidence_scope": "warmups_and_samples",
+        "counter_scope": _HCA_COUNTER_SCOPE,
+        "workload_attribution_rule": _HCA_WORKLOAD_ATTRIBUTION_RULE,
+        "workload_attributed_to_nccl": False,
+        "explicit_rail_pairing": explicit_rail_pairing,
+        "diagnostic_only": True,
+        "certification_withheld_reason": f"{type(error).__name__}: {error}",
+        "capture_phase_failed": phase,
+        "before": _snapshot_receipts(before),
+        "after": _snapshot_receipts(after),
+        "deltas": {},
+        "rails": [],
+        "health_counter_deltas_clean": False,
+        "cross_endpoint_deltas_matched": False,
+        "all_rails_above_minimum": False,
+        "hca_payload_counter_deltas_verified": False,
+        "dual_rail_payload_verified": False,
+        "dual_rail_failure_reasons": dual_rail_failures,
+        "failure_reasons": [f"{type(error).__name__}: {error}"],
+    }
+
+
+def _withheld_hca_counter_evidence(
+    evidence: JsonObject, completion_error: BaseException
+) -> JsonObject:
+    result = copy.deepcopy(evidence)
+    reason = (
+        "completion phase did not finish normally; counter evidence is diagnostic "
+        f"only ({type(completion_error).__name__}: {completion_error})"
+    )
+    result["diagnostic_only"] = True
+    result["diagnostic_counter_deltas_valid"] = (
+        result.get("hca_payload_counter_deltas_verified") is True
+    )
+    result["certification_withheld_reason"] = reason
+    result["hca_payload_counter_deltas_verified"] = False
+    result["dual_rail_payload_verified"] = False
+    result["workload_attributed_to_nccl"] = False
+    failure_reasons = result.get("failure_reasons")
+    if isinstance(failure_reasons, list):
+        failure_reasons.append(reason)
+    else:
+        result["failure_reasons"] = [reason]
+    dual_failure_reasons = result.get("dual_rail_failure_reasons")
+    if isinstance(dual_failure_reasons, list):
+        dual_failure_reasons.append(reason)
+    else:
+        result["dual_rail_failure_reasons"] = [reason]
+    return result
+
+
+def validate_hca_counter_evidence(
+    config: HarnessConfig,
+    before: Mapping[str, HcaCounterSnapshot],
+    after: Mapping[str, HcaCounterSnapshot],
+) -> JsonObject:
+    """Validate port-wide PMA data deltas across paired direct-link rails."""
+    expected_hosts = {host.name for host in config.hosts}
+    if set(before) != expected_hosts or set(after) != expected_hosts:
+        raise HarnessError("HCA counter snapshots do not cover both configured hosts")
+
+    failures: list[str] = []
+    dual_rail_failures: list[str] = []
+    explicit_rail_pairing = _has_explicit_hca_rail_pairing(config)
+    health_clean = True
+    counters_monotonic = True
+    deltas_by_host: JsonObject = {}
+    for host in config.hosts:
+        before_snapshot = before[host.name]
+        after_snapshot = after[host.name]
+        if (
+            before_snapshot.host_name != host.name
+            or after_snapshot.host_name != host.name
+        ):
+            raise HarnessError(f"HCA counter snapshot host mismatch for {host.name}")
+        if (
+            after_snapshot.captured_at_monotonic_seconds
+            < before_snapshot.captured_at_monotonic_seconds
+        ):
+            raise HarnessError(
+                f"HCA counter snapshot monotonic capture time regressed for {host.name}"
+            )
+        expected_rails = _resolved_hca_rails(host)
+        before_ports = {port.rail_id: port for port in before_snapshot.ports}
+        after_ports = {port.rail_id: port for port in after_snapshot.ports}
+        if set(before_ports) != set(expected_rails) or set(after_ports) != set(
+            expected_rails
+        ):
+            raise HarnessError(f"HCA counter snapshot rail mismatch for {host.name}")
+        host_deltas: JsonObject = {}
+        for rail_id, configured in expected_rails.items():
+            initial = before_ports[rail_id]
+            final = after_ports[rail_id]
+            expected_identity = (configured.device, configured.port)
+            if (initial.device, initial.port) != expected_identity or (
+                final.device,
+                final.port,
+            ) != expected_identity:
+                raise HarnessError(
+                    f"HCA counter snapshot port mismatch for {host.name}/{rail_id}"
+                )
+            rail_deltas: JsonObject = {}
+            for name in _HCA_COUNTER_NAMES:
+                delta = final.counters[name] - initial.counters[name]
+                rail_deltas[name] = delta
+                if delta < 0:
+                    counters_monotonic = False
+                    failures.append(
+                        f"{host.name}/{rail_id} counter {name} regressed by {-delta}"
+                    )
+                elif name in _HCA_HEALTH_COUNTER_NAMES and delta > 0:
+                    health_clean = False
+                    failures.append(
+                        f"{host.name}/{rail_id} health counter {name} increased "
+                        f"by {delta}"
+                    )
+            rail_deltas["estimated_xmit_data_bytes"] = (
+                cast(int, rail_deltas["port_xmit_data"]) * _HCA_DATA_COUNTER_UNIT_BYTES
+            )
+            rail_deltas["estimated_rcv_data_bytes"] = (
+                cast(int, rail_deltas["port_rcv_data"]) * _HCA_DATA_COUNTER_UNIT_BYTES
+            )
+            host_deltas[rail_id] = rail_deltas
+        deltas_by_host[host.name] = host_deltas
+
+    coordinator = next(host for host in config.hosts if host.role == "coordinator")
+    worker = next(host for host in config.hosts if host.role == "worker")
+    rail_ids = tuple(sorted(_resolved_hca_rails(coordinator)))
+    if len(rail_ids) >= 2 and not explicit_rail_pairing:
+        reason = (
+            "dual-rail attribution requires an explicit matching rail_id on every "
+            "configured HCA port"
+        )
+        dual_rail_failures.append(reason)
+    rail_receipts: list[JsonValue] = []
+    cross_endpoint_matched = True
+    all_rails_above_minimum = True
+    for rail_id in rail_ids:
+        coordinator_deltas = _object(
+            _object(deltas_by_host[coordinator.name], "coordinator HCA deltas")[
+                rail_id
+            ],
+            f"coordinator HCA delta {rail_id}",
+        )
+        worker_deltas = _object(
+            _object(deltas_by_host[worker.name], "worker HCA deltas")[rail_id],
+            f"worker HCA delta {rail_id}",
+        )
+        coordinator_xmit_bytes = cast(
+            int, coordinator_deltas["estimated_xmit_data_bytes"]
+        )
+        coordinator_rcv_bytes = cast(
+            int, coordinator_deltas["estimated_rcv_data_bytes"]
+        )
+        worker_xmit_bytes = cast(int, worker_deltas["estimated_xmit_data_bytes"])
+        worker_rcv_bytes = cast(int, worker_deltas["estimated_rcv_data_bytes"])
+        coordinator_xmit_packets = cast(int, coordinator_deltas["port_xmit_packets"])
+        coordinator_rcv_packets = cast(int, coordinator_deltas["port_rcv_packets"])
+        worker_xmit_packets = cast(int, worker_deltas["port_xmit_packets"])
+        worker_rcv_packets = cast(int, worker_deltas["port_rcv_packets"])
+
+        forward_byte_tolerance = max(
+            config.benchmark.hca_counter_match_absolute_tolerance_bytes,
+            math.ceil(
+                max(coordinator_xmit_bytes, worker_rcv_bytes)
+                * config.benchmark.hca_counter_match_relative_tolerance
+            ),
+        )
+        reverse_byte_tolerance = max(
+            config.benchmark.hca_counter_match_absolute_tolerance_bytes,
+            math.ceil(
+                max(worker_xmit_bytes, coordinator_rcv_bytes)
+                * config.benchmark.hca_counter_match_relative_tolerance
+            ),
+        )
+        forward_packet_tolerance = max(
+            _HCA_PACKET_MATCH_ABSOLUTE_TOLERANCE,
+            math.ceil(
+                max(coordinator_xmit_packets, worker_rcv_packets)
+                * config.benchmark.hca_counter_match_relative_tolerance
+            ),
+        )
+        reverse_packet_tolerance = max(
+            _HCA_PACKET_MATCH_ABSOLUTE_TOLERANCE,
+            math.ceil(
+                max(worker_xmit_packets, coordinator_rcv_packets)
+                * config.benchmark.hca_counter_match_relative_tolerance
+            ),
+        )
+        forward_bytes_matched = (
+            coordinator_xmit_bytes >= 0
+            and worker_rcv_bytes >= 0
+            and abs(coordinator_xmit_bytes - worker_rcv_bytes) <= forward_byte_tolerance
+        )
+        reverse_bytes_matched = (
+            worker_xmit_bytes >= 0
+            and coordinator_rcv_bytes >= 0
+            and abs(worker_xmit_bytes - coordinator_rcv_bytes) <= reverse_byte_tolerance
+        )
+        forward_packets_matched = (
+            coordinator_xmit_packets >= 0
+            and worker_rcv_packets >= 0
+            and abs(coordinator_xmit_packets - worker_rcv_packets)
+            <= forward_packet_tolerance
+        )
+        reverse_packets_matched = (
+            worker_xmit_packets >= 0
+            and coordinator_rcv_packets >= 0
+            and abs(worker_xmit_packets - coordinator_rcv_packets)
+            <= reverse_packet_tolerance
+        )
+        rail_endpoints_matched = (
+            forward_bytes_matched
+            and reverse_bytes_matched
+            and forward_packets_matched
+            and reverse_packets_matched
+        )
+        matched_data_bytes = max(
+            0, min(coordinator_xmit_bytes, worker_rcv_bytes)
+        ) + max(0, min(worker_xmit_bytes, coordinator_rcv_bytes))
+        above_minimum = (
+            matched_data_bytes >= config.benchmark.minimum_hca_data_bytes_per_rail
+        )
+        if not rail_endpoints_matched:
+            cross_endpoint_matched = False
+            failures.append(f"{rail_id} endpoint counter deltas do not match")
+        if not above_minimum:
+            all_rails_above_minimum = False
+            failures.append(
+                f"{rail_id} matched {matched_data_bytes} data bytes, below required "
+                f"{config.benchmark.minimum_hca_data_bytes_per_rail}"
+            )
+        rail_receipts.append(
+            {
+                "rail_id": rail_id,
+                "coordinator_endpoint": {
+                    "host_name": coordinator.name,
+                    "device": _resolved_hca_rails(coordinator)[rail_id].device,
+                    "port": _resolved_hca_rails(coordinator)[rail_id].port,
+                },
+                "worker_endpoint": {
+                    "host_name": worker.name,
+                    "device": _resolved_hca_rails(worker)[rail_id].device,
+                    "port": _resolved_hca_rails(worker)[rail_id].port,
+                },
+                "coordinator_to_worker": {
+                    "xmit_data_bytes": coordinator_xmit_bytes,
+                    "peer_rcv_data_bytes": worker_rcv_bytes,
+                    "byte_tolerance": forward_byte_tolerance,
+                    "bytes_matched": forward_bytes_matched,
+                    "xmit_packets": coordinator_xmit_packets,
+                    "peer_rcv_packets": worker_rcv_packets,
+                    "packet_tolerance": forward_packet_tolerance,
+                    "packets_matched": forward_packets_matched,
+                },
+                "worker_to_coordinator": {
+                    "xmit_data_bytes": worker_xmit_bytes,
+                    "peer_rcv_data_bytes": coordinator_rcv_bytes,
+                    "byte_tolerance": reverse_byte_tolerance,
+                    "bytes_matched": reverse_bytes_matched,
+                    "xmit_packets": worker_xmit_packets,
+                    "peer_rcv_packets": coordinator_rcv_packets,
+                    "packet_tolerance": reverse_packet_tolerance,
+                    "packets_matched": reverse_packets_matched,
+                },
+                "matched_data_bytes": matched_data_bytes,
+                "above_minimum": above_minimum,
+                "endpoints_matched": rail_endpoints_matched,
+            }
+        )
+
+    verified = (
+        counters_monotonic
+        and health_clean
+        and cross_endpoint_matched
+        and all_rails_above_minimum
+    )
+    if len(rail_ids) >= 2:
+        dual_rail_failures.extend(
+            reason for reason in failures if reason not in dual_rail_failures
+        )
+    dual_rail_verified = verified and len(rail_ids) >= 2 and explicit_rail_pairing
+    return {
+        "schema_version": 1,
+        "counter_source": "sysfs_class_infiniband",
+        "evidence_scope": "warmups_and_samples",
+        "counter_scope": _HCA_COUNTER_SCOPE,
+        "workload_attribution_rule": _HCA_WORKLOAD_ATTRIBUTION_RULE,
+        "workload_attributed_to_nccl": False,
+        "explicit_rail_pairing": explicit_rail_pairing,
+        "diagnostic_only": False,
+        "certification_withheld_reason": None,
+        "data_counter_unit_bytes": _HCA_DATA_COUNTER_UNIT_BYTES,
+        "minimum_data_bytes_per_rail": (
+            config.benchmark.minimum_hca_data_bytes_per_rail
+        ),
+        "matching_rule": (
+            "absolute delta difference <= max(absolute tolerance, "
+            "ceil(larger delta * relative tolerance))"
+        ),
+        "absolute_tolerance_bytes": (
+            config.benchmark.hca_counter_match_absolute_tolerance_bytes
+        ),
+        "relative_tolerance": (config.benchmark.hca_counter_match_relative_tolerance),
+        "absolute_packet_tolerance": _HCA_PACKET_MATCH_ABSOLUTE_TOLERANCE,
+        "before": _snapshot_receipts(before),
+        "after": _snapshot_receipts(after),
+        "deltas": deltas_by_host,
+        "rails": rail_receipts,
+        "counters_monotonic": counters_monotonic,
+        "health_counter_deltas_clean": health_clean,
+        "cross_endpoint_deltas_matched": cross_endpoint_matched,
+        "all_rails_above_minimum": all_rails_above_minimum,
+        "hca_payload_counter_deltas_verified": verified,
+        "dual_rail_payload_verified": dual_rail_verified,
+        "dual_rail_failure_reasons": [reason for reason in dual_rail_failures],
+        "failure_reasons": [reason for reason in failures],
+    }
+
+
 def validate_nccl_logs(
     config: HarnessConfig,
     placement: JsonObject,
     logs_by_host: Mapping[str, str],
     owner_token: str,
+    hca_counter_evidence: JsonObject | None = None,
 ) -> JsonObject:
     """Require stable NCCL transport/rank evidence before a run is reportable."""
     if set(logs_by_host) != {host.name for host in config.hosts}:
@@ -4005,10 +4621,27 @@ def validate_nccl_logs(
             ),
         }
         host_evidence[host.name] = evidence
+    hca_counters_verified = (
+        hca_counter_evidence is not None
+        and hca_counter_evidence.get("hca_payload_counter_deltas_verified") is True
+    )
+    explicit_rail_pairing = (
+        hca_counter_evidence is not None
+        and hca_counter_evidence.get("explicit_rail_pairing") is True
+    )
+    dual_rail_payload_verified = (
+        hca_counters_verified
+        and explicit_rail_pairing
+        and hca_counter_evidence is not None
+        and hca_counter_evidence.get("dual_rail_payload_verified") is True
+    )
     return {
         "evidence_scope": "functional_transport_and_rank_initialization",
         "performance_comparable": False,
-        "hca_payload_counter_deltas_verified": False,
+        "hca_payload_counter_deltas_verified": hca_counters_verified,
+        "explicit_rail_pairing": explicit_rail_pairing,
+        "workload_attributed_to_nccl": hca_counters_verified,
+        "dual_rail_payload_verified": dual_rail_payload_verified,
         "world_size": world_size,
         "observed_ranks": [rank for rank in sorted(observed_ranks)],
         "initialized_ranks": [rank for rank in sorted(initialized_ranks)],
@@ -4062,6 +4695,9 @@ def run_harness(
     samples: list[JsonObject] = []
     aggregate: JsonObject | None = None
     nccl_log_evidence: JsonObject | None = None
+    hca_counter_before: dict[str, HcaCounterSnapshot] = {}
+    hca_counter_after: dict[str, HcaCounterSnapshot] = {}
+    hca_counter_evidence: JsonObject | None = None
     runtime_node_ids: dict[str, str] = {}
     cluster_readiness: JsonObject | None = None
     started_at = time.time()
@@ -4141,8 +4777,87 @@ def run_harness(
             owned_instance_id,
             owned_runner_ids,
         )
-        warmups, samples = run_completions(effects, config, processes)
+        try:
+            for host in config.hosts:
+                hca_counter_before[host.name] = effects.capture_hca_counters(host)
+        except BaseException as error:
+            hca_counter_evidence = _failed_hca_counter_evidence(
+                config=config,
+                phase="before",
+                before=hca_counter_before,
+                after=hca_counter_after,
+                error=error,
+            )
+            raise
+        try:
+            warmups, samples = run_completions(effects, config, processes)
+        except BaseException as completion_error:
+            diagnostic_capture_error: BaseException | None = None
+            for host in config.hosts:
+                try:
+                    hca_counter_after[host.name] = (
+                        effects.capture_hca_counters_diagnostic(host)
+                    )
+                except BaseException as error:
+                    diagnostic_capture_error = error
+                    break
+            if diagnostic_capture_error is not None:
+                diagnostic_evidence = _failed_hca_counter_evidence(
+                    config=config,
+                    phase="after",
+                    before=hca_counter_before,
+                    after=hca_counter_after,
+                    error=diagnostic_capture_error,
+                )
+            else:
+                try:
+                    diagnostic_evidence = validate_hca_counter_evidence(
+                        config, hca_counter_before, hca_counter_after
+                    )
+                except BaseException as error:
+                    diagnostic_evidence = _failed_hca_counter_evidence(
+                        config=config,
+                        phase="validation",
+                        before=hca_counter_before,
+                        after=hca_counter_after,
+                        error=error,
+                    )
+            hca_counter_evidence = _withheld_hca_counter_evidence(
+                diagnostic_evidence, completion_error
+            )
+            raise
         completions_complete = True
+        try:
+            for host in config.hosts:
+                hca_counter_after[host.name] = effects.capture_hca_counters(host)
+        except BaseException as error:
+            hca_counter_evidence = _failed_hca_counter_evidence(
+                config=config,
+                phase="after",
+                before=hca_counter_before,
+                after=hca_counter_after,
+                error=error,
+            )
+            raise
+        try:
+            hca_counter_evidence = validate_hca_counter_evidence(
+                config, hca_counter_before, hca_counter_after
+            )
+        except BaseException as error:
+            hca_counter_evidence = _failed_hca_counter_evidence(
+                config=config,
+                phase="validation",
+                before=hca_counter_before,
+                after=hca_counter_after,
+                error=error,
+            )
+            raise
+        if not hca_counter_evidence["hca_payload_counter_deltas_verified"]:
+            reasons = cast(list[JsonValue], hca_counter_evidence["failure_reasons"])
+            raise HarnessError(
+                "required HCA payload counter proof failed: "
+                + "; ".join(str(reason) for reason in reasons)
+            )
         validate_completion_oracle(config, warmups, samples)
         aggregate = _sample_aggregate(samples)
         benchmark_complete = True
@@ -4210,7 +4925,11 @@ def run_harness(
                     for process in processes
                 }
                 nccl_log_evidence = validate_nccl_logs(
-                    config, placement, logs_by_host, owner_token
+                    config,
+                    placement,
+                    logs_by_host,
+                    owner_token,
+                    hca_counter_evidence,
                 )
             except BaseException as error:
                 benchmark_complete = False
@@ -4226,6 +4945,13 @@ def run_harness(
         and len(process_cleanups) == len(processes) + failed_start_cleanup_count
     )
     cleanup_complete = instance_cleanup_complete and process_cleanup_complete
+    dual_rail_payload_verified = (
+        benchmark_complete
+        and caught_error is None
+        and cleanup_complete
+        and nccl_log_evidence is not None
+        and nccl_log_evidence.get("dual_rail_payload_verified") is True
+    )
     if not preflight_complete:
         status = "preflight_failed"
     elif not cleanup_complete:
@@ -4245,7 +4971,7 @@ def run_harness(
             "reportable": status == "completed",
             "result_scope": "functional_proof_of_concept",
             "performance_comparable": False,
-            "dual_rail_payload_verified": False,
+            "dual_rail_payload_verified": dual_rail_payload_verified,
             "requires_exact_physical_gpu_inventory": True,
             "completed_normally": benchmark_complete and caught_error is None,
             "cleanup_succeeded": cleanup_complete,
@@ -4278,6 +5004,7 @@ def run_harness(
             "preflight": preflights,
             "model_probes": model_probes,
             "cluster_readiness": cluster_readiness,
+            "hca_counter_evidence": hca_counter_evidence,
             "commands": {host.name: list(host.launch_argv) for host in config.hosts},
             "environment": {
                 host.name: {
@@ -4308,7 +5035,13 @@ def run_harness(
                     "cpu_set": list(host.cpu_set),
                     "numa_nodes": list(host.numa_nodes),
                     "hca_ports": [
-                        port.model_dump(mode="json") for port in host.hca_ports
+                        {
+                            "rail_id": port.rail_id or f"rail-{index + 1}",
+                            "device": port.device,
+                            "port": port.port,
+                            "gid": port.gid,
+                        }
+                        for index, port in enumerate(host.hca_ports)
                     ],
                 }
                 for host in config.hosts
@@ -4912,10 +5645,26 @@ def host_preflight_main() -> int:
     return 0
 
 
+def host_hca_counters_main() -> int:
+    try:
+        request = HostHcaCounterRequest.model_validate_json(sys.stdin.read())
+        snapshot = collect_hca_counter_snapshot(request, LinuxHostProbe())
+    except (ValidationError, HarnessError, OSError, ValueError) as error:
+        print(
+            f"host HCA counter capture failed: {type(error).__name__}: {error}",
+            file=sys.stderr,
+        )
+        return 2
+    print(snapshot.model_dump_json())
+    return 0
+
+
 def main(arguments: Sequence[str] | None = None) -> int:
     normalized_arguments = list(sys.argv[1:] if arguments is None else arguments)
     if normalized_arguments == ["host-preflight"]:
         return host_preflight_main()
+    if normalized_arguments == ["host-hca-counters"]:
+        return host_hca_counters_main()
     if normalized_arguments and normalized_arguments[0] == "prepare-lease":
         return prepare_lease_main(normalized_arguments[1:])
     args = parse_args(normalized_arguments)
