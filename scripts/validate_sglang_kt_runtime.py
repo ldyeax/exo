@@ -34,12 +34,12 @@ from typing import Any, Literal, Protocol, cast
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from exo.worker.sglang_kt.artifact_identity import (
+    calculate_sglang_kt_artifact_build_id,
+)
 from exo.worker.sglang_kt.launch_spec import (
     GLM_4_7_FLASH_KTRANSFORMERS_REVISION,
     GLM_4_7_FLASH_SGLANG_REVISION,
-)
-from exo.worker.sglang_kt.preflight_collector import (
-    calculate_sglang_kt_artifact_build_id,
 )
 from scripts.build_sglang_kt_runtime import (
     BOOTSTRAP_WHEEL_PINS,

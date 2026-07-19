@@ -4,6 +4,8 @@ import hashlib
 import json
 import os
 import shutil
+import subprocess
+import sys
 import zipfile
 from dataclasses import asdict, replace
 from datetime import UTC, datetime
@@ -16,6 +18,34 @@ import scripts.validate_sglang_kt_runtime as validator
 
 GPU_UUID = "GPU-11111111-2222-3333-4444-555555555555"
 TIMESTAMP = datetime(2026, 7, 19, 12, 0, tzinfo=UTC)
+
+
+def test_validator_import_does_not_require_model_download_stack() -> None:
+    repository = Path(__file__).resolve().parents[2]
+    program = f"""
+import importlib.abc
+import sys
+
+sys.path.insert(0, {str(repository)!r})
+
+class BlockAiofiles(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path, target=None):
+        if fullname == "aiofiles" or fullname.startswith("aiofiles."):
+            raise ModuleNotFoundError("aiofiles is intentionally unavailable")
+        return None
+
+sys.meta_path.insert(0, BlockAiofiles())
+import scripts.validate_sglang_kt_runtime
+"""
+
+    result = subprocess.run(
+        (sys.executable, "-I", "-c", program),
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 def make_config() -> validator.ValidationConfig:

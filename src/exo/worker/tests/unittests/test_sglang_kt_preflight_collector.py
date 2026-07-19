@@ -20,6 +20,10 @@ from exo.shared.types.worker.sglang_kt import (
     GitRevision,
     NetworkPort,
 )
+from exo.worker.sglang_kt.artifact_identity import (
+    SGLANG_KT_ARTIFACT_BUILD_ID_FUNCTION_SOURCE,
+    calculate_sglang_kt_artifact_build_id,
+)
 from exo.worker.sglang_kt.launch_spec import (
     GLM_4_7_FLASH_BF16_CONFIG_SHA256,
     GLM_4_7_FLASH_BF16_MODEL_ID,
@@ -38,7 +42,6 @@ from exo.worker.sglang_kt.preflight import (
     evaluate_sglang_kt_preflight,
 )
 from exo.worker.sglang_kt.preflight_collector import (
-    SGLANG_KT_ARTIFACT_BUILD_ID_FUNCTION_SOURCE,
     SGLANG_KT_RUNTIME_PROBE_SCRIPT,
     ExternalPythonSglangKtRuntimeProbe,
     LinuxSglangKtHostInventoryProbe,
@@ -47,7 +50,6 @@ from exo.worker.sglang_kt.preflight_collector import (
     SglangKtModelSnapshotCompatibility,
     SglangKtRuntimeCommandResult,
     SocketSglangKtPortProbe,
-    calculate_sglang_kt_artifact_build_id,
     collect_sglang_kt_local_host_preflight_observation,
 )
 from exo.worker.tests.unittests.test_sglang_kt_launch_spec import (
