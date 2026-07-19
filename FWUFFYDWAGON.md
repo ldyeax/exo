@@ -25,7 +25,7 @@ Bring Exo to a working, efficient Linux/NVIDIA deployment that can serve GLM-5.2
 
 ### Interconnect
 
-- One MCX354A ConnectX-3 VPI QDR card is installed in each server. Both physical links train `LinkUp` at 4X QDR, 40 Gb/s raw per port. They are normally `INIT` without a persistent subnet manager; benchmark-owned OpenSM instances make both direct-connect subnets `ACTIVE` for a run.
+- One MCX354A ConnectX-3 VPI QDR card is installed in each server. Both physical links train `LinkUp` at 4X QDR, 40 Gb/s raw per port. After the 2026-07-19 reboot/slot change they were `INIT` until fwuff's enabled `opensm.service` was restored by loading the in-tree `ib_umad` module and starting its existing `PORTS=ALL` configuration. Two service-owned OpenSM instances now keep both direct-connect subnets `ACTIVE`; benchmark manifests must record this persistent infrastructure and must not stop or reconfigure it.
 - Planned upgrade: a matched pair of Mellanox `MCX555A-ECAT` ConnectX-5 VPI single-port EDR/100GbE cards and an EDR-rated QSFP28 100G direct cable. Preserve all current QDR results as the pre-upgrade baseline.
 - Use the kernel `mlx4_core`/`mlx4_ib` drivers, `rdma-core`, `perftest`, Mellanox Firmware Tools, and one OpenSM instance per disconnected direct-connect rail. Current MLNX_OFED releases no longer support ConnectX-3.
 - Keep 10 GbE as the management/control plane. QDR ports do not aggregate automatically; select and benchmark both rails explicitly.
@@ -336,7 +336,7 @@ If three logical resources cannot be launched reliably, design a separate fail-c
 1. Keep both healthy NVIDIA drivers and the verified MLX CUDA 13/NCCL 2.28.9 user-space stack; exact driver versions may differ if both satisfy the CUDA ABI.
 2. A/B test moving dwagon's NUMA-1 RTX 3090 from x8 to a local x16 slot while preserving NVLink.
 3. Keep dwagon's HCA near the NUMA-1 inter-host pipeline stage and fwuff's HCA in its verified x8 NUMA-0 slot.
-4. Both QDR rails and benchmark-owned OpenSM instances are operational. Decide separately whether OpenSM should persist across reboot; reproducible benchmark wrappers must continue to own and clean up the exact managers they launch.
+4. Both QDR rails are operational. Fwuff currently runs two service-owned OpenSM instances, one per direct-connect rail. Reproducible benchmark wrappers must verify and record those stable managers without stopping them, or explicitly replace that policy with lease-owned managers and clean up only the exact processes they launch.
 5. The completed x8/x8 retest improved aggregate throughput from 29.80 to 32.56 Gb/s, only about 9.3%, and did not approach the 1.7x target. Two independent pinned client/server pairs reproduced the same ceiling with zero health-counter deltas, so process-level native dual-port handling is not the sole explanation. Treat shared ConnectX-3/PCIe/host-path behavior as the measured ceiling for the same-direction v4 workload, not as a documented normal MCX354A limit, and preserve v4 for the ConnectX-5 comparison.
 6. Install the selected `MCX555A-ECAT` pair in PCIe 3.0 x16-or-better slots with NUMA/root-complex placement chosen for the inter-host GPU boundary. Re-run the identical perftest, NCCL, and model benchmark manifests over the EDR QSFP28 link.
 7. Free at least 650 GB on dwagon and retain at least 300 GB free on fwuff before full GLM-5.2 staging. Use NFS only for initial loading, not the inference hot path.

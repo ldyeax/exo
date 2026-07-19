@@ -598,12 +598,45 @@ canonical process-spec/config SHA-256 values are
   errors and Ruff lint/format checks pass. This checkpoint ran no model, GPU,
   AMX, InfiniBand, benchmark, or profiler workload.
 
+### Leased GLM-4.7 synthetic MoE tuner checkpoint
+
+- Commit `29e80bf9` adds a schema-v3, lease-contained RTX 3090 tuner for the
+  exact pinned SGLang fused-MoE gate/up and down kernel ABI used by the four
+  resident-expert KTransformers path. It enforces the complete canonical quick
+  or balanced search space, deterministic route strata, fallback-bracketed CUDA
+  timing, numerical rejection, immutable runtime authorization, and
+  identity-safe descendant cleanup.
+- The output is deliberately a candidate-only synthetic bundle. It records that
+  the GLM checkpoint was not consumed, that synthetic kernel weights are
+  generated, and that production AMX/GPU concurrency is not reproduced. No
+  bundle can be adopted until a future tuned serving profile binds its exact
+  configuration hashes and wins a matched end-to-end warm-serving comparison.
+- The focused tuner suite passes `91 passed`; Ruff lint and format checks pass,
+  the independent blocking review found no remaining correctness or containment
+  issue, and ordinary push updated `ldyeax/exo` without force. No CUDA kernel,
+  model, AMX, InfiniBand traffic, benchmark, or profiler ran at this checkpoint.
+
 ### Profiler safety incident
 
 - A previous out-of-tree VTune SEP/PAX kernel profiler (`sep5`/`pax`) crashed
   dwagon. Treat the server as stable now, but never load or use those drivers
   again. Profiling for this work must remain driverless, using `perf` and
   ordinary application, CUDA, and runtime counters only.
+
+### Post-crash InfiniBand control-plane restoration
+
+- On 2026-07-19, both ConnectX-3 cards initially reported both physical links
+  `LinkUp` at 40 Gb/s but subnet state `INIT`. No benchmark lease existed and no
+  OpenSM process was active. Fwuff's enabled `opensm.service` had been skipped
+  at boot because `/sys/class/infiniband_mad/abi_version` did not yet exist
+  after the card-slot change.
+- The in-tree `ib_umad` module was loaded on fwuff and its already-enabled
+  `opensm.service` was started with the existing `PORTS=ALL` configuration. It
+  launched exactly two `/usr/sbin/opensm` instances, one for each fwuff port
+  GUID. Both ports on both hosts then reported `ACTIVE`, physical `LinkUp`, and
+  40 Gb/s; dwagon LIDs are 1/1 with SM LIDs 2/4, and fwuff LIDs are 2/4 with SM
+  LIDs 2/4. This was infrastructure restoration only: no payload traffic, GPU,
+  model, performance measurement, or profiler ran.
 
 ## Pending tests
 
