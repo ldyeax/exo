@@ -429,6 +429,12 @@ above.
   InfiniBand, benchmark, or profiler workload ran for this checkpoint.
 - No live model-execution receipt exists yet. The admission-grade producer and
   its real layer-one probe/full short forward remain the launch blocker.
+- The historical kernel validator resolved the overlay interpreter symlink and
+  recorded the base CPython path. That is valid kernel/build evidence, but it
+  cannot equal a launch spec that must invoke `overlay/venv/bin/python` to load
+  the pinned packages. Future receipts now preserve the invoked absolute
+  executable path; the focused kernel-validator suite passes `30 passed`.
+  Fresh per-host kernel receipts are required before the model proof.
 
 ### Profiler safety incident
 

@@ -48,6 +48,15 @@ import scripts.validate_sglang_kt_runtime
     assert result.returncode == 0, result.stderr
 
 
+def test_invoked_python_executable_preserves_overlay_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    overlay_python = "/runtime/overlay/venv/bin/python"
+    monkeypatch.setattr(validator.sys, "executable", overlay_python)
+
+    assert validator._invoked_python_executable() == overlay_python
+
+
 def make_config() -> validator.ValidationConfig:
     return validator.ValidationConfig(
         gpu_uuid=GPU_UUID,

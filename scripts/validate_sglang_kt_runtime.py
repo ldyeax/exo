@@ -1206,6 +1206,13 @@ def _allowed_memory_nodes() -> tuple[int, ...]:
     return _parse_index_list(value)
 
 
+def _invoked_python_executable() -> str:
+    executable = Path(sys.executable)
+    if not executable.is_absolute():
+        raise RuntimeValidationError("Python executable path is not absolute")
+    return str(executable)
+
+
 def observe_host() -> HostEvidence:
     node_paths = tuple(
         sorted(
@@ -1224,7 +1231,9 @@ def observe_host() -> HostEvidence:
     )
     process = ProcessEvidence(
         hostname=socket.gethostname().split(".", maxsplit=1)[0].lower(),
-        executable=str(Path(sys.executable).resolve()),
+        # Preserve the invoked venv path. Resolving its interpreter symlink would
+        # discard the overlay identity needed by the launch specification.
+        executable=_invoked_python_executable(),
         python_implementation=platform.python_implementation(),
         python_version=(
             sys.version_info.major,
