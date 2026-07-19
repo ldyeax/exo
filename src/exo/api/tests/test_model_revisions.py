@@ -14,6 +14,7 @@ from exo.shared.types.memory import Memory
 from exo.shared.types.state import State
 from exo.shared.types.worker.downloads import DownloadCompleted
 from exo.shared.types.worker.shards import PipelineShardMetadata
+from exo.utils.channels import channel
 
 MODEL_ID = ModelId("test-org/test-model")
 REVISION = "0123456789abcdef0123456789abcdef01234567"
@@ -167,7 +168,8 @@ async def test_missing_instance_notifies_when_only_wrong_revision_is_downloaded(
 async def test_add_custom_model_fetches_and_broadcasts_exact_revision() -> None:
     api = object.__new__(API)
     api._system_id = SystemId()  # pyright: ignore[reportPrivateUsage]
-    api.command_sender = AsyncMock()
+    command_sender, command_receiver = channel[ForwarderCommand]()
+    api.command_sender = command_sender
     card = _card()
 
     with (
@@ -184,8 +186,9 @@ async def test_add_custom_model_fetches_and_broadcasts_exact_revision() -> None:
 
     fetch.assert_awaited_once_with(MODEL_ID, REVISION)
     add_to_memory.assert_called_once_with(card)
-    api.command_sender.send.assert_awaited_once()
-    forwarded = api.command_sender.send.await_args.args[0]
+    forwarded_commands = command_receiver.collect()
+    assert len(forwarded_commands) == 1
+    forwarded = forwarded_commands[0]
     assert isinstance(forwarded, ForwarderCommand)
     assert isinstance(forwarded.command, AddCustomModelCard)
     assert forwarded.command.model_card == card
