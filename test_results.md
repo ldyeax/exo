@@ -29,7 +29,7 @@ source of truth. Update this file in the same commit that records each new test.
 - Latest published proof-harness source: clean commit
   `65a04353b5b3e396053865afb47983ff636dc21c`.
 - Latest completed live-validation source: clean commit
-  `d9ff2920481c3aeefa797ef70b3dd5b5be947c6f`.
+  `187d6e67b471c57c7b42991712b7d4ecd8650b19`.
 - Completed ladder rungs: Llama 3.2 1B, Llama 3.2 3B, Llama 3.1 8B,
   GPT-OSS 20B, and GLM-4.7 Flash.
 - Latest reportable model result: GLM-4.7 Flash TP=2 passed exact TP1 output equality,
@@ -43,14 +43,12 @@ source of truth. Update this file in the same commit that records each new test.
   packaged contract covering every launch-relevant file, all 48 indexed
   shards, and their Hugging Face revision metadata. A leased full rehash
   verified that 62.4 GB contract on the shared read-only snapshot.
-- Latest hybrid attempt: CPU-control v7 loaded all 48 GLM-4.7 Flash BF16 shards
-  and its model child passed. The immutable receipt proves AMX-BF16 execution,
-  exact wrappers on routed layers 1-46, a repeated layer-one CPU expert oracle,
-  and finite extend/decode logits with stable routing masks. Native runtime
-  diagnostics also wrote to stdout, so the outer harness rejected the 194-line
-  stream before receipt binding instead of accepting its final JSON line.
-  Cleanup and containment passed; the outer result remains nonreportable and
-  non-comparable despite the valid child receipt.
+- Latest hybrid result: CPU-control v8 is the first reportable GLM-4.7 Flash
+  SGLang-KTransformers model admission. It binds the immutable 62.4 GB BF16
+  checkpoint, AMX-BF16 kernel receipt, process spec, validator, wrappers on
+  routed layers 1-46, deterministic CPU expert oracle, and real extend/decode
+  logits. Native diagnostics remained in stderr and stdout contained exactly one
+  JSON control response. This is a correctness proof, not a performance result.
 - Historical Ornith AMXINT8 conversion and serving receipts were recovered and
   hashed below. They inform the GLM hybrid-runtime work but are not Exo tests.
 - Commit `65a04353` routes the disposable backend child's OS-level stdout to the
@@ -59,10 +57,9 @@ source of truth. Update this file in the same commit that records each new test.
   rejecting prefixed, suffixed, or multiple JSON records instead of parsing the
   last line. The broad focused slice passes 749 tests; repository-wide
   Basedpyright and Ruff pass, and changed Python files are formatted.
-- Next work: run a fresh immutable CPU-control v8 proof with the existing
-  corrected native runtime. No native runtime rebuild is required. Run the mixed
-  AMX-BF16/RTX-3090 PP1 correctness gate only after CPU-control produces an
-  admitted receipt.
+- Next work: run fresh immutable mixed AMX-BF16/RTX-3090 correctness gates with
+  one and then four resident GPU experts. Keep each receipt separate and do not
+  treat short-forward validation timings as serving-performance measurements.
 
 ## Automated validation
 
@@ -88,6 +85,7 @@ test total.
 | Portable-Python sealed-evidence regression slice | **PASS** | 325 harness/lease/backend/live/receipt/reference/trace/model tests passed on 2026-07-19; repository-wide Ruff and touched formatting passed. A trivial disposable child also passed under the exact immutable CPython 3.12.13 overlay with libc memfd creation, all four required seals, and canonical evidence SHA-256 `af4daf371da4cad51875b9db9f1ed82c20c4a6f61dbba07518acb31451d2cf48`. |
 | GLM v6 trace-evidence correction | **PASS** | Commit `53e18bdd` captures non-null `next_token_logits` for `MODEL_FORWARD`, captures non-null wrapper `hidden_states`, preserves exact nested backend errors, and admits the exact current v6 kernel receipt while auditing v4 as superseded. The broad focused slice passed 744 tests; repository-wide Basedpyright reported 0 errors/warnings, repository-wide Ruff passed, and all six changed Python files passed `ruff format --check`. |
 | GLM runtime diagnostic/protocol isolation | **PASS** | Commit `65a04353` redirects the disposable backend child's inherited file descriptor 1 to the parent validator's stderr while sealed memfd remains the evidence transport. Regressions prove native `os.write(1, ...)` and fd2 diagnostics cannot pollute stdout, a clean single JSON response is accepted, and prefix/suffix/two-record contamination remains rejected. The focused validator/live/harness slice passed 128 tests and the broad focused slice passed 749 tests; repository-wide Basedpyright reported 0 errors/warnings/notes, repository-wide Ruff passed, the three changed Python files passed `ruff format --check`, and `git diff --check` passed. |
+| GLM-4.7 BF16 CPU-control model admission | **PASS** | V8 completed normally with a bound model receipt, `model_checkpoint_verified=true`, `reportable=true`, and clean unforced cleanup. It derives all seven required wrapper, short-forward, NUMA/affinity, AMX, and CPU-routed-expert capabilities. `performance_comparable=false`: this validates the launch contract and real model execution, not serving throughput. |
 | GLM-4.7 packaged-contract wheel inclusion | **PASS (artifact)** | `uv build --wheel` produced `exo-0.3.70-py3-none-any.whl`; its package contains the exact 16,218-byte `exo/worker/sglang_kt/manifests/glm47_flash_bf16_7dd20894.json` resource |
 | Changed GLM-4.7 Flash Python files, strict targeted type checks and Ruff | **PASS** | Three targeted Basedpyright configurations reported 0 errors; repository-wide `ruff check` passed; all 16 changed Python files passed `ruff format --check` on 2026-07-19 |
 | Repository-wide Basedpyright | **PASS** | `uv run --no-sync basedpyright` reported 0 errors, 0 warnings, and 0 notes after synchronizing the locked workspace environment |
@@ -408,13 +406,14 @@ above.
 | `glm47-kt-cpu-control-dwagon-20260719-v6` | **EXPECTED FAIL (diagnostic)** | Immutable source `0af52113` used the corrected SGLang `42504e598...` build and overlay. Its immutable deployment is `/var/lib/exo/deployments/glm47-kt-cpu-control-dwagon-20260719-v6`. Generation passed in 0.370105447 s and fresh CUDA/AMX validation passed in 8.024723519 s. The 131.365563637 s model stage loaded all 48 BF16 shards, emitted exact wrapper coverage for layers 1-46, and did not reproduce the former `is_hash` failure. Weight loading took 18.08 s; model weights occupied 4.52 GB, the 4,096-token BF16 KV cache occupied 0.21 GB, and 18.46 GB remained available. The public wrapper retained only `live GLM-4.7 backend failed`. Code-path inspection therefore provides the current, explicitly unverified diagnosis: SGLang's model-forward result contains non-null `next_token_logits` and `hidden_states=None`, while the trace collector tests field presence before nullness and tries to snapshot `hidden_states`, leading internally to `builtins.NoneType is missing dtype`. No verified extend/decode trace, model receipt, performance result, or InfiniBand traffic was produced; status was `validation_failed`, return code 1, and the result is nonreportable/non-comparable. Result/manifest/runtime-metadata/kernel-receipt/process-spec-file SHA-256: `50008be5e03d3b92c30db19a610eb44b9b4d7d5b33f2e8701b4cdd6f9635d465` / `41dd13ccd7e170455b2b66b83012935254ad559ce3a88e96ee007670add98486` / `bebca51f18b18a9f01403f724f50828fe43eb4203f5dc659c140b82e246a63c0` / `5cfffa1e450f0dbcded077f7496e5b9d3094bed1f73aeab370f2ebb2775867c6` / `c282b9e51c8540141648ea62787640d84d2f3a201bfef17889b8a6ba337b3838`; canonical process-spec SHA-256 `bdeed9d41a5a573b8406980bbfe10a53e22671ac8a007684c87d40d64c8fa94a`. Config SHA-256 was `2dddf4ea4efa364bb83a5028d6302c0708646ae366847f3fb5846b01ee5def5e`; orchestrator/validator SHA-256 values were `53d23cc5458fe6a6f92e9f3751cebbf6bcf3f8a78d7f2e439e435d5db0eba2db` / `c8424ab5b9c39258b468e34e200d92f7524cbe9f829dfff2f07167dd57b1bd94`. Cleanup was unforced and complete; the lease, lock, unit, owned processes, ports, GPU, and scratch were clean. `profiler=none`; the unsafe profiler was not invoked. |
 | `glm47-kt-cpu-control-dwagon-20260719-v7` | **EXPECTED FAIL (diagnostic)** | Clean source `d9ff2920` used the corrected native build/overlay and immutable deployment `/var/lib/exo/deployments/glm47-kt-cpu-control-dwagon-20260719-v7`. Generation and fresh CUDA/AMX validation passed in 0.380145077 s and 8.474109744 s. The 188.229354069 s model child returned 0 and published a valid 29,006-byte receipt: all 48 BF16 shards loaded; layers 1-46 used `NativeMoEWrapper` / `AMXBF16_MOE` / `kt_ep` with zero resident GPU experts and stable mask `50680b69...`; every wrapper ran once for extend and decode. The layer-one experts 0-3 ran entirely on CPU twice with deterministic output and relative L1 error `0.0035165481 < 0.02`. The eight-token extend produced finite FP32 `[1,154880]` logits, argmax 3764, KV 0-to-8, and logits SHA-256 `a4e959ff...`; decode produced argmax 10, KV 8-to-9, and logits SHA-256 `008e5ae3...`. Weight loading took 19.38 s; model weights occupied 4.52 GB, the 4,096-token BF16 KV cache occupied 0.21 GB, and 18.46 GB remained available. However, native Gloo/BF16/CPUInfer/AMX diagnostics occupied the first 193 lines of the 194-line stdout stream before the valid final JSON response. The strict outer harness rejected the whole stream before its six-field receipt-binding step, so outer status is `validation_failed`, `model_checkpoint_verified=false`, and the run is nonreportable/non-comparable. An offline current-source receipt load and pure admission-binding audit passed, but the full launch-time 62.4 GB rehash was not repeated during that audit and does not convert the outer result. Model/kernel/canonical-process-spec/raw-process-spec/model-contract SHA-256: `2800220a897b77d720ad4da01fd83629418265d671285cd726f6a82c36c08b90` / `a2031382a7754b5515b23413b07d9890854957fc84c412b7d09b69ecb25b83a5` / `c4889b5f1e0d29c50e76e057451a50fc15e46bb4ca11076c6803852fe60d03fb` / `7d5e85d7906206ee9f47a9e94d48cdb2594f21c8c50a37594122664ce1212a39` / `4e7333f341ddc5855aa4253d454e3210d84427fae0159eb956104ff00c437479`. Result/manifest/runtime-metadata/config SHA-256: `4cbcb1eaace84749336a295fc03d7bf3a03ba6c28e5eefc39212d45467c51121` / `360f74c8f902307dc218bc1c1099fca51f60d5741b0fc27c21829bd59fe41b4b` / `892f3792033e3fbc4c39cc933bd42494cf7687d0fc9544011536b02c4c361a0b` / `7f211abd648412a8184b598eefcf5b6a4ae7eadf845f3f888fd2c27d002d86f2`; orchestrator/validator SHA-256 `87165caefa568653eb1c9d855d66c174daa70391911a1325479d7b207c89150d` / `6aabd10392e84f20ec1ff2305241cfcd04a934c1ab56b4592f73159be6dac1dc`. Model stdout/stderr and kernel stdout/stderr SHA-256: `fd737984a14055bc0a46d07b56012fb2a9edd1f3f1590a8292d45f3d0eacb1d7` / `11913d305fd9a5b4acf197249bd0a587140d4274bca90d9880ce642c24d92f41` / `c68d0886ef2912165e765f017533c982f6aaad6bcece4d404af28d3cfee6636e` / `e0ac13c829ddff8b29a7df65ad0d8302f3b2db4cf682fd9b0874e992df05617b`. No InfiniBand traffic was expected under `metadata_only`. Cleanup was unforced and complete; `profiler=none` and the unsafe profiler was not invoked. |
 
+| `glm47-kt-cpu-control-dwagon-20260719-v8` | **PASS** | Clean source `187d6e67` and immutable deployment `/var/lib/exo/deployments/glm47-kt-cpu-control-dwagon-20260719-v8` completed the outer admission transaction. Generation, fresh CUDA/AMX validation, and model validation returned 0 in 0.371195338 s, 7.988936580 s, and 175.630093307 s. The outer result is `completed`, `model_checkpoint_verified=true`, and `reportable=true`; the independently reloaded 29,006-byte receipt derives `glm47_flash_kt_wrapper_active_v1`, exact layers 1-46, SM86 short-forward, physical NUMA, CPU affinity, executed AMX-BF16, and CPU-routed-expert execution capabilities. Every routed layer used `NativeMoEWrapper` / `AMXBF16_MOE` / `kt_ep` with zero resident GPU experts and stable mask `50680b69...`. Layer-one experts 0-3 ran entirely on CPU twice with deterministic output and relative L1 error `0.0035165481 < 0.02`. The eight-token extend produced finite FP32 `[1,154880]` logits, argmax 3764, KV 0-to-8, and logits SHA-256 `a4e959ff...`; decode produced argmax 10, KV 8-to-9, and logits SHA-256 `008e5ae3...`. Weight loading took 18.24 s; weights used 4.52 GB, the 4,096-token BF16 KV cache used 0.21 GB, and 18.46 GB remained. The protocol fix is proven in the real path: stdout is one 340-byte JSON line and all 408 native diagnostic lines are in stderr. Model/kernel/canonical-process-spec/raw-process-spec/model-contract SHA-256: `e927dcae4adf1dc8183293bb58f043fc25f56279b798c4420c3616ec296d6bc2` / `3f12008626f80ad0460d044d1ae9ac4cee5f6600bc74e82da9dc029b6546db24` / `550b4a05778264ad7e9fad78ceab39e701c6cb9d8d8a53f3b00a0cef436c53f0` / `f776542edf76edf7b65a6f596a8ee6413b234671b66fe00976d70cd7cc332ef1` / `4e7333f341ddc5855aa4253d454e3210d84427fae0159eb956104ff00c437479`. Result/manifest/runtime-metadata/config SHA-256: `3bd68b25b23f740cfb05a5389a80eac7c74b28d7510e370d70516cee116d4ab2` / `342f81506902bf3b1ac20b48fe7f11b9bee04d836db4fb7e1d03073d1cd5425f` / `a148204c3990fcb73135ff5797b1c0e61c81ae6bb51051881c7e06aa037474ec` / `799946a2757d943b35ac5548a17d69ba739066a67682fff525e3e0f02a78bc08`; orchestrator/validator SHA-256 `967a00bdfd400a607b517066bb35f22a19c96909c74fa54434a8bf0e140fb130` / `d121f7af964cf22af2c3f986b12689b25fddb7d994979df8dfc3faa97d69c24c`. Model stdout/stderr SHA-256: `f7590902af7f599a73f2d261254d3a6074ceff1de8127126edf89ef01f4ad707` / `e2f743d6dd0ade781e02323b64c5e0ac5b85ef880f0afeb4adfc929b0ac19c3e`. No InfiniBand traffic was expected under `metadata_only`; `performance_comparable=false`, so stage timings are diagnostic only. Cleanup was unforced and complete: lease and lock free, unit inactive/collected, owned PIDs gone, ports clear, GPUs idle, and scratch absent. `profiler=none`; unsafe drivers were not invoked. |
+
 The prepared but never executed `glm47-kt-cpu-control-dwagon-20260719-v2`
 deployment predates cgroup containment and its 15-minute metadata window has
 expired. It is retained as an unused artifact only. V3 through v7 are completed
-diagnostic artifacts and must not be reused. Commit `65a04353` isolates native
-runtime diagnostics from the strict stdout control protocol. Publish a fresh
-immutable deployment and prepare v8 against the already pinned corrected runtime;
-no native runtime rebuild is needed for this diagnosis. V4's
+diagnostic artifacts and must not be reused. V8 is the admitted CPU-control
+baseline and must also remain immutable. Prepare fresh one- and four-resident-
+GPU-expert mixed proofs against the same pinned runtime. V4's
 canonical process-spec/config SHA-256 values are
 `f5c954368c0e66bdb5ba494cb4dcf3176da1bc054369f0516051d71924530de5` and
 `212791580cee9e8a028d5b0b8237ddfc474385bbc3455537b45d13b59ad9428d`.
@@ -583,23 +582,18 @@ canonical process-spec/config SHA-256 values are
 
 ## Pending tests
 
-1. Publish a fresh immutable deployment from `65a04353` and run CPU-control v8
-   against the existing corrected native runtime. The disposable backend child
-   now sends inherited native diagnostics to stderr while sealed memfd remains
-   the evidence channel and stdout remains a single strict JSON response. Keep
-   kernel capability evidence separate from model admission.
-2. Run the fail-closed 0-expert BF16 CPU-routed control and the mixed 1/4
-   resident-GPU-expert controls with complete 46-layer wrapper and routing
-   evidence.
-3. Convert the verified BF16 source to AMXINT8 only after BF16 parity and hybrid
+1. Run fresh mixed one- and four-resident-GPU-expert BF16 controls with complete
+   46-layer wrapper, CPU/GPU routing, merge, and numerical evidence. The admitted
+   zero-resident CPU-control baseline is v8.
+2. Convert the verified BF16 source to AMXINT8 only after BF16 parity and hybrid
    execution evidence pass; keep packed-GPU mode disabled initially.
-4. Resume exact staging, deterministic TP1, and strict TP=2 for Qwen3-Coder 30B
+3. Resume exact staging, deterministic TP1, and strict TP=2 for Qwen3-Coder 30B
    A3B, followed by Qwen3.5 35B A3B.
-5. After the first larger-model correctness proof, complete at least five
+4. After the first larger-model correctness proof, complete at least five
    distinct dwagon-only optimization runs and five distinct dwagon-plus-fwuff
    InfiniBand optimization runs. Each run needs repeated samples and a recorded
    hypothesis/lesson. Keep a matched-artifact comparison workload; when a
    different exact-revision HF quantization or format wins one track, add a
    quality-gated matched-format control so topology and format effects remain
    separable.
-6. Re-run the preserved QDR receipts after the ConnectX-5 EDR hardware swap.
+5. Re-run the preserved QDR receipts after the ConnectX-5 EDR hardware swap.
