@@ -64,14 +64,14 @@ test total.
 | --- | --- | --- |
 | Corrected SGLang launch, snapshot, and preflight slice | **PASS** | 94 passed |
 | GLM-4.7 Flash target profile, preflight, snapshot verifier, and local process supervisor | **PASS** | 148 passed on 2026-07-19, including 25 supervisor lifecycle tests; inherited NCCL/SGLang isolation and shutdown/error-race receipt regressions included |
-| Reproducible GLM-4.7 SGLang-KTransformers source integration | **PASS** | Exact clean-base and partially initialized result-state replays produced SGLang `41d4d300a21fd2f486681d56f1017789dfb355fe` and KTransformers `7e70d7518edd26af6a0638593037d68c9b6bd6bf` without mutating rejected dirty parent or dependency sources |
-| Pinned dwagon GLM-4.7 native runtime build | **PASS (artifact)** | Build ID `44df90375778d5af6b735a696a730efaa5b3a8de1f5081517892636fe1616a69`; receipt SHA-256 `a29b56a9a703d19b99c0f92adb591452b7e0899eb1ffabbf1e1522a0e8555e64`; validator reconstructed the complete source, bootstrap, toolchain, command, layout, and wheel provenance |
-| Immutable dwagon runtime overlay | **PASS (artifact)** | Install ID `91418a4ab5c6bc0e3896cbf7021ba6eb1c81010ac702dd6924391e5a3a048b42`; receipt SHA-256 `51a6fa03a675f10e1791e3a15dec51de77b34b9ea730b11b6fc0d84872f21eb5`; the old 9.9 GB base runtime remains untouched |
-| Pinned fwuff GLM-4.7 native runtime build | **PASS (artifact)** | Build ID `e21ef087b1c50cf961339e1bd1a2e1a3f60047579f811385614297de6a2abfc9`; receipt SHA-256 `051b78a5238adac99721eb268c95d8ab5e8721d8c1c61114bbda967468433dfb`; native KT wheel/extension SHA-256 `f57c574cc190f8817a51cf0b08c5f2165e2f761c3a1b2999560abcbdcc792d45` / `b2f60ec18aba53223e27cfd925f2c23083a281c109cf53ca06f1ac98bff6e99b` |
-| Immutable fwuff runtime overlay | **PASS (artifact)** | Install ID `82d20634f743ed87ae9cc71f2b7f4936d9451363db1ca46a207218f22de51ef8`; receipt SHA-256 `fe57f9fe10160ebf2f0a0ba3731e69c8ddb4608841f07880bac2ff6bd0640eb4`; its old base runtime remains untouched |
-| Leased two-host CUDA/AMX kernel validation | **PASS** | Dwagon v4 and fwuff v1 independently passed exact provenance, SM86 BF16 CUDA math, AMX-BF16 qlen 1/16, and the bidirectional non-default CUDA-stream bridge; each claimed only `kt_bf16_amx_executed_v1` and cleaned up without force |
+| Reproducible GLM-4.7 SGLang-KTransformers source integration | **PASS** | Exact clean-base replay produced SGLang `42504e59810130460fc24fdd17ef534cb8278a4b` and KTransformers `6e0a4480936effa7bf0ece429f78a00b29932bec`. The GLM Lite constructor now initializes inherited non-hash/shared-expert state and rejects hash-mode configs; old-source regression tests fail at the missing state while the new source passes. |
+| Pinned dwagon GLM-4.7 native runtime build | **PASS (artifact)** | Build ID `ea9de367cfebe35dc6afe51c1bda5e7daf35d6f51114f404dfebd63d055eec20`; receipt SHA-256 `1f304ea5667445cdd66e9c6938e78682b7119a6c3c3b946cf42ce816a0639542`; all three exact CUDA/AMX runtime wheels were built from the admitted revisions |
+| Immutable dwagon runtime overlay | **PASS (artifact)** | Install ID `b275ec08c01fdce2cd6adb64f10b35f0a5bda12af20899a1fac1de42aa29ecd3`; receipt SHA-256 `7a2b6fd01efb7f889f01ae2a47c66c2625c4162a93373ea116d3964fd405a5f5`; deterministic preflight reconstructed the ID and the old 9.9 GB base runtime remains untouched |
+| Prior fwuff GLM-4.7 runtime and overlay | **SUPERSEDED (artifact)** | Build `e21ef087b1c50cf961339e1bd1a2e1a3f60047579f811385614297de6a2abfc9` and overlay `82d20634f743ed87ae9cc71f2b7f4936d9451363db1ca46a207218f22de51ef8` remain immutable evidence for SGLang `41d4d300...`, but no longer satisfy the current source pin. Rebuild fwuff from `42504e598...` before a two-host GLM run. |
+| Leased two-host CUDA/AMX kernel validation | **PASS (historical)** | Dwagon v4 and fwuff v1 independently passed exact provenance, SM86 BF16 CUDA math, AMX-BF16 qlen 1/16, and the bidirectional non-default CUDA-stream bridge for the superseded source; each claimed only `kt_bf16_amx_executed_v1` and cleaned up without force |
 | Official GLM-4.7 Flash BF16 model contract | **PASS (artifact)** | The packaged contract binds 54 launch-relevant files, 48 indexed shards totaling 62,444,175,504 bytes, exact Hugging Face metadata, tokenizer/template inputs, and absence of executable remote-code files; leased live verification returned 0 and cleaned up unforced |
 | Focused GLM-4.7 source, build, overlay, model-contract, validator, launch, and preflight suite | **PASS** | 277 tests passed on 2026-07-19, including exact packaged-contract pinning, the repaired required-profile launch-plan fixture, isolated validator import, and canonical/raw PyTorch GPU UUID coverage |
+| GLM Lite inherited-state fix and current source admission | **PASS** | Clean replay passed 20 focused SGLang constructor/forward, coverage, registry, and loader tests; Exo source/build/install/process-spec contracts passed 134 tests; affected model-contract/preflight tests passed 149. These suites overlap. |
 | Dedicated leased GLM-4.7 live-validation harness | **PASS (software)** | 37 focused tests cover immutable preparation, exact runtime/GPU/HCA binding, kernel/model result semantics, descriptor-anchored scratch cleanup, delegated cgroup-v2 placement, pre-exec attachment, identity replacement, and fail-closed process/cgroup cleanup; strict targeted Basedpyright and Ruff pass |
 | Lease plus GLM containment contract slice | **PASS (software)** | 103 tests validate the optional static containment contract, exact systemd invocation/UID/owner-token leaf binding, one-way runtime binding, immutable evidence, final result reconciliation, and backward compatibility for leases without containment |
 | Broad GLM producer/consumer and lease regression slice | **PASS** | 672 tests passed on 2026-07-19 after cgroup containment and lease-evidence binding were added |
@@ -79,8 +79,8 @@ test total.
 | Portable-Python sealed-evidence regression slice | **PASS** | 325 harness/lease/backend/live/receipt/reference/trace/model tests passed on 2026-07-19; repository-wide Ruff and touched formatting passed. A trivial disposable child also passed under the exact immutable CPython 3.12.13 overlay with libc memfd creation, all four required seals, and canonical evidence SHA-256 `af4daf371da4cad51875b9db9f1ed82c20c4a6f61dbba07518acb31451d2cf48`. |
 | GLM-4.7 packaged-contract wheel inclusion | **PASS (artifact)** | `uv build --wheel` produced `exo-0.3.70-py3-none-any.whl`; its package contains the exact 16,218-byte `exo/worker/sglang_kt/manifests/glm47_flash_bf16_7dd20894.json` resource |
 | Changed GLM-4.7 Flash Python files, strict targeted type checks and Ruff | **PASS** | Three targeted Basedpyright configurations reported 0 errors; repository-wide `ruff check` passed; all 16 changed Python files passed `ruff format --check` on 2026-07-19 |
-| Repository-wide Basedpyright in the existing `.venv` | **BLOCKED** | The environment cannot resolve installed project dependencies (including `httpx`, AnyIO, and pytest), producing dependency-driven diagnostics across the untouched tree; `uv run` could not complete the pinned MLX wheel acquisition |
-| Repository-wide pytest collection | **BLOCKED** | `tests/conftest.py` imports unavailable `exo_tools`; collection stopped before tests ran |
+| Repository-wide Basedpyright | **PASS** | `uv run --no-sync basedpyright` reported 0 errors, 0 warnings, and 0 notes after synchronizing the locked workspace environment |
+| Repository-wide pytest collection | **BLOCKED** | `uv run --all-packages pytest` selected 1,776 tests but stopped at 10 pre-existing collection errors: nine duplicate `tests.*` package imports under `src/exo/download/tests` and one image/MFlux import without the optional Torch runtime |
 | Nix formatting | **BLOCKED** | `nix` is not installed on dwagon; Ruff formatting is clean for every changed Python file |
 | Scheduler, supervisor, compute-resource lifecycle, and SGLang slice | **PASS** | 138 passed |
 | TP2 harness and reciprocal-topology readiness | **PASS** | 260 passed at `e38ba19d` |
@@ -99,8 +99,8 @@ test total.
 | Dashboard production build | **PASS** | `npm run build` passed |
 | Dashboard static check | **KNOWN BASELINE** | Improved from 19 to 15 errors; 15 errors and 6 warnings remain, all pre-existing |
 | Broad non-image Python baseline | **KNOWN BASELINE** | 459 passed, 5 skipped, plus the unchanged stale Rust-binding failure |
-| Fresh full-repository pytest collection | **BLOCKED** | Root collection lacks external `exo_tools`; adding `tools/src` exposes 23 pre-existing collection/import failures |
-| Required `uv run basedpyright` and `nix fmt` | **BLOCKED** | `uv` and Nix are not installed on dwagon; direct full Basedpyright has environment-wide dependency/stub failures |
+| Fresh full-repository pytest collection | **BLOCKED** | Installing all workspace packages removes the old `exo_tools` blocker, but collection still stops at the 10 unrelated package-name/optional-Torch errors above |
+| Required type and format gates | **PARTIAL** | Required Basedpyright and Ruff gates pass. Nix is not installed on dwagon; all five changed Python files pass `ruff format --check`. |
 
 ### Host cgroup-v2 containment probes
 
@@ -206,10 +206,12 @@ above.
   KTransformers `8e46e5896c3d993a1285052f2618f5a9f01882d4` and embedded SGLang
   `5d6bef9f61637aaeaf047bf8209def2af3eaa83f`. No recovered Ornith commit is
   required. Exo's reproducible mail patches produce admitted revisions
-  KTransformers `7e70d7518edd26af6a0638593037d68c9b6bd6bf` and SGLang
-  `41d4d300a21fd2f486681d56f1017789dfb355fe`, with fatal registration,
+  KTransformers `6e0a4480936effa7bf0ece429f78a00b29932bec` and SGLang
+  `42504e59810130460fc24fdd17ef534cb8278a4b`, with fatal registration,
   structured 46-layer wrapper/mask coverage, and fail-closed exact loading of
   every resident expert's gate, up, and down projections from the checkpoint.
+  The current patch also initializes the inherited non-hash and shared-expert
+  state that the first real GLM extend exposed as missing.
 - Highest-value generic candidates to mine forward are KTransformers `e5f1771`
   for fused BF16 expert conversion, SGLang `4c267d946` for per-layer frequency
   placement with dynamic updates, `464ffce91` for AMXINT8 full-prefill fallback,
@@ -327,30 +329,33 @@ above.
   `2f7666e286ad89ec3ec556a56e5250ea42fba9b9ce175f89334b42dda0e7f419`.
   This is artifact identity evidence only; it does not prove a model load,
   forward pass, wrapper coverage, expert routing, or launch admission.
-- The final clean prepared source is
-  `/var/lib/exo/sources/ktransformers-glm47-7e70d75`, at KTransformers
-  `7e70d7518edd26af6a0638593037d68c9b6bd6bf`, embedded SGLang
-  `41d4d300a21fd2f486681d56f1017789dfb355fe`, llama.cpp
+- The current clean prepared source is
+  `/var/lib/exo/sources/ktransformers-glm47-6e0a448`, at KTransformers
+  `6e0a4480936effa7bf0ece429f78a00b29932bec`, embedded SGLang
+  `42504e59810130460fc24fdd17ef534cb8278a4b`, llama.cpp
   `a94e6ff8774b7c9f950d9545baf0ce35e8d1ed2f`, and pybind11
   `bb05e0810b87e74709d9f4c4545f1f57a1b386f5`.
-- The final native dwagon build is
-  `/var/lib/exo/runtimes/glm47-sglang-kt/dwagon/44df90375778d5af6b735a696a730efaa5b3a8de1f5081517892636fe1616a69`.
+- The current native dwagon build is
+  `/var/lib/exo/runtimes/glm47-sglang-kt/dwagon/ea9de367cfebe35dc6afe51c1bda5e7daf35d6f51114f404dfebd63d055eec20`.
   Its build ID is the final path component and its receipt SHA-256 is
-  `a29b56a9a703d19b99c0f92adb591452b7e0899eb1ffabbf1e1522a0e8555e64`.
-  Static validation reconstructed the complete canonical build inputs and ID.
+  `1f304ea5667445cdd66e9c6938e78682b7119a6c3c3b946cf42ce816a0639542`.
+  The completed receipt binds the complete canonical build inputs and wheels.
 - The immutable dwagon overlay is
-  `/var/lib/exo/runtimes/glm47-sglang-kt-overlay/dwagon/91418a4ab5c6bc0e3896cbf7021ba6eb1c81010ac702dd6924391e5a3a048b42`.
+  `/var/lib/exo/runtimes/glm47-sglang-kt-overlay/dwagon/b275ec08c01fdce2cd6adb64f10b35f0a5bda12af20899a1fac1de42aa29ecd3`.
   Its install ID is the final path component and its receipt SHA-256 is
-  `51a6fa03a675f10e1791e3a15dec51de77b34b9ea730b11b6fc0d84872f21eb5`.
+  `7a2b6fd01efb7f889f01ae2a47c66c2625c4162a93373ea116d3964fd405a5f5`.
   The overlay pins its base runtime and three newly built wheels without
   modifying the old 9.9 GB environment.
-- The independent fwuff native build is
+- The independent fwuff native build below pins the superseded SGLang revision
+  and remains historical evidence only. Rebuild fwuff from the current source
+  before a two-host GLM validation. Its path is
   `/var/lib/exo/runtimes/glm47-sglang-kt/fwuff/e21ef087b1c50cf961339e1bd1a2e1a3f60047579f811385614297de6a2abfc9`,
   with build-receipt SHA-256
   `051b78a5238adac99721eb268c95d8ab5e8721d8c1c61114bbda967468433dfb`.
   Its host-native KT wheel SHA-256 is
   `f57c574cc190f8817a51cf0b08c5f2165e2f761c3a1b2999560abcbdcc792d45`;
-  the pure-Python KTransformers and SGLang wheels match dwagon byte-for-byte.
+  the pure-Python KTransformers and SGLang wheels matched the superseded dwagon
+  build byte-for-byte.
 - Fwuff's immutable overlay is
   `/var/lib/exo/runtimes/glm47-sglang-kt-overlay/fwuff/82d20634f743ed87ae9cc71f2b7f4936d9451363db1ca46a207218f22de51ef8`,
   with install-receipt SHA-256
