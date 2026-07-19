@@ -518,6 +518,23 @@ def model_data(config: oracle.OracleConfig) -> dict[str, object]:
     return cast(dict[str, object], cast(object, config.model_dump(mode="python")))
 
 
+def make_pinned_model_config(
+    tmp_path: Path,
+    model_id: str,
+    revision: str,
+    expected_weight_bytes: int,
+) -> oracle.OracleConfig:
+    raw = model_data(make_config(tmp_path))
+    model = cast(dict[str, object], raw["model"])
+    model["model_id"] = model_id
+    model["revision"] = revision
+    model["expected_weight_bytes"] = expected_weight_bytes
+    model["local_path"] = f"/models/{model_id.replace('/', '--')}--{revision}"
+    environment = cast(dict[str, object], raw["environment"])
+    environment["EXO_CHAT_TEMPLATE_DATE"] = oracle.ORACLE_CHAT_TEMPLATE_DATE
+    return oracle.OracleConfig.model_validate(raw)
+
+
 def make_lease_context(
     config: oracle.OracleConfig, now: datetime
 ) -> tuple[tuple[str, ...], Path, Path, Path, dict[str, object]]:
@@ -1231,6 +1248,11 @@ def test_strict_config_rejects_source_ports_gpu_and_request_tampering(
     ("model_id", "revision", "expected_weight_bytes"),
     [
         (
+            oracle.GLM47_FLASH_4BIT_MODEL_ID,
+            oracle.GLM47_FLASH_4BIT_MODEL_REVISION,
+            oracle.GLM47_FLASH_4BIT_MODEL_WEIGHT_BYTES,
+        ),
+        (
             oracle.GPT_OSS_20B_MODEL_ID,
             oracle.GPT_OSS_20B_MODEL_REVISION,
             oracle.GPT_OSS_20B_MODEL_WEIGHT_BYTES,
@@ -1272,6 +1294,11 @@ def test_strict_config_accepts_pinned_oracle_model(
     ("model_id", "revision", "expected_weight_bytes"),
     [
         (
+            oracle.GLM47_FLASH_4BIT_MODEL_ID,
+            oracle.GLM47_FLASH_4BIT_MODEL_REVISION,
+            oracle.GLM47_FLASH_4BIT_MODEL_WEIGHT_BYTES,
+        ),
+        (
             oracle.GPT_OSS_20B_MODEL_ID,
             oracle.GPT_OSS_20B_MODEL_REVISION,
             oracle.GPT_OSS_20B_MODEL_WEIGHT_BYTES,
@@ -1303,6 +1330,92 @@ def test_strict_dated_template_config_requires_pinned_chat_template_date(
 
     with pytest.raises(ValidationError, match="EXO_CHAT_TEMPLATE_DATE"):
         oracle.OracleConfig.model_validate(raw)
+
+
+def test_glm_oracle_request_disables_thinking_without_changing_default(
+    tmp_path: Path,
+) -> None:
+    default_config = make_config(tmp_path)
+    default_request = oracle.deterministic_request(default_config)
+    assert default_request == {
+        "model": oracle.MODEL_ID,
+        "messages": [{"role": "user", "content": oracle.ORACLE_PROMPT}],
+        "max_tokens": oracle.ORACLE_MAX_TOKENS,
+        "temperature": 0.0,
+        "seed": oracle.ORACLE_SEED,
+        "stream": False,
+        "use_prefix_cache": False,
+        "logprobs": False,
+    }
+
+    glm_config = make_pinned_model_config(
+        tmp_path,
+        oracle.GLM47_FLASH_4BIT_MODEL_ID,
+        oracle.GLM47_FLASH_4BIT_MODEL_REVISION,
+        oracle.GLM47_FLASH_4BIT_MODEL_WEIGHT_BYTES,
+    )
+
+    assert oracle.deterministic_request(glm_config) == {
+        **default_request,
+        "model": oracle.GLM47_FLASH_4BIT_MODEL_ID,
+        "enable_thinking": False,
+    }
+
+
+@pytest.mark.parametrize(
+    ("model_id", "revision", "expected_weight_bytes"),
+    [
+        (
+            oracle.GPT_OSS_20B_MODEL_ID,
+            oracle.GPT_OSS_20B_MODEL_REVISION,
+            oracle.GPT_OSS_20B_MODEL_WEIGHT_BYTES,
+        ),
+        (
+            oracle.LLAMA31_8B_MODEL_ID,
+            oracle.LLAMA31_8B_MODEL_REVISION,
+            oracle.LLAMA31_8B_MODEL_WEIGHT_BYTES,
+        ),
+        (
+            oracle.LLAMA32_3B_MODEL_ID,
+            oracle.LLAMA32_3B_MODEL_REVISION,
+            oracle.LLAMA32_3B_MODEL_WEIGHT_BYTES,
+        ),
+    ],
+)
+def test_non_glm_dated_models_keep_the_existing_request_body(
+    tmp_path: Path,
+    model_id: str,
+    revision: str,
+    expected_weight_bytes: int,
+) -> None:
+    config = make_pinned_model_config(
+        tmp_path, model_id, revision, expected_weight_bytes
+    )
+
+    assert oracle.deterministic_request(config) == {
+        "model": model_id,
+        "messages": [{"role": "user", "content": oracle.ORACLE_PROMPT}],
+        "max_tokens": oracle.ORACLE_MAX_TOKENS,
+        "temperature": 0.0,
+        "seed": oracle.ORACLE_SEED,
+        "stream": False,
+        "use_prefix_cache": False,
+        "logprobs": False,
+    }
+
+
+def test_gpt_oss_published_request_contract_digest_is_stable(tmp_path: Path) -> None:
+    config = make_pinned_model_config(
+        tmp_path,
+        oracle.GPT_OSS_20B_MODEL_ID,
+        oracle.GPT_OSS_20B_MODEL_REVISION,
+        oracle.GPT_OSS_20B_MODEL_WEIGHT_BYTES,
+    )
+
+    assert (
+        oracle.deterministic_request_contract_sha256(config)
+        == "1359d4d3e31a1b4630dbe3c7c5e3c4a2b0d9797b31df79a5f6b1edeaa9d8bcc7"
+    )
 
 
 @pytest.mark.parametrize(

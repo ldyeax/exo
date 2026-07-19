@@ -64,6 +64,19 @@ JsonValue: TypeAlias = JsonScalar | list["JsonValue"] | dict[str, "JsonValue"]
 JsonObject: TypeAlias = dict[str, JsonValue]
 QueryParameters: TypeAlias = Mapping[str, str | Sequence[str]]
 
+GLM47_FLASH_4BIT_MODEL_ID = "mlx-community/GLM-4.7-Flash-4bit"
+GPT_OSS_20B_MODEL_ID = "mlx-community/gpt-oss-20b-MXFP4-Q8"
+LLAMA31_8B_MODEL_ID = "mlx-community/Llama-3.1-8B-Instruct-4bit"
+LLAMA32_3B_MODEL_ID = "mlx-community/Llama-3.2-3B-Instruct-4bit"
+PROOF_CHAT_TEMPLATE_DATE = "18 Jul 2026"
+PINNED_CHAT_TEMPLATE_DATE_MODEL_IDS = frozenset(
+    {
+        GLM47_FLASH_4BIT_MODEL_ID,
+        GPT_OSS_20B_MODEL_ID,
+        LLAMA31_8B_MODEL_ID,
+        LLAMA32_3B_MODEL_ID,
+    }
+)
 _HEX_REVISION = re.compile(r"[0-9a-f]{40}")
 _SAFE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
 _NVIDIA_RESOURCE_PREFIX = "nvidia-gpu:"
@@ -1479,6 +1492,8 @@ def _validate_launch_contract(host: HostConfig, config: HarnessConfig) -> None:
         "EXO_MLX_VISION_LOADING": "disabled",
         "PYTHONHASHSEED": str(config.benchmark.seed),
     }
+    if config.model.model_id in PINNED_CHAT_TEMPLATE_DATE_MODEL_IDS:
+        required_environment["EXO_CHAT_TEMPLATE_DATE"] = PROOF_CHAT_TEMPLATE_DATE
     for name, expected in required_environment.items():
         if host.environment.get(name) != expected:
             raise ValueError(f"{host.name} must set {name}={expected}")
@@ -3804,7 +3819,7 @@ def wait_for_owned_runners_ready(
 
 
 def deterministic_request(config: HarnessConfig) -> JsonObject:
-    return {
+    request: JsonObject = {
         "model": config.model.model_id,
         "messages": [{"role": "user", "content": config.benchmark.prompt}],
         "max_tokens": config.benchmark.max_tokens,
@@ -3814,6 +3829,9 @@ def deterministic_request(config: HarnessConfig) -> JsonObject:
         "use_prefix_cache": False,
         "logprobs": False,
     }
+    if config.model.model_id == GLM47_FLASH_4BIT_MODEL_ID:
+        request["enable_thinking"] = False
+    return request
 
 
 def _completion_result(

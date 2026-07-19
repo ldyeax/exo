@@ -24,6 +24,7 @@ import pytest
 from pydantic import ValidationError
 
 import scripts.benchmark_lease as benchmark_lease
+import scripts.tp1_oracle_capture as tp1_oracle
 import scripts.two_host_mlx_nccl_poc as poc
 from scripts.two_host_mlx_nccl_poc import (
     ApiConfig,
@@ -337,6 +338,19 @@ def make_tp2_config(
     return HarnessConfig.model_validate_json(json.dumps(raw))
 
 
+def make_dated_model_config(tmp_path: Path, model_id: str) -> HarnessConfig:
+    raw = make_tp2_config(tmp_path).model_dump(mode="json")
+    revision, expected_weight_bytes = tp1_oracle.MODEL_SNAPSHOT_CONTRACTS[model_id]
+    raw["model"]["model_id"] = model_id
+    raw["model"]["revision"] = revision
+    raw["model"]["expected_weight_bytes"] = expected_weight_bytes
+    model_directory = f"{model_id.replace('/', '--')}--{revision}"
+    for host in raw["hosts"]:
+        host["model_path"] = str(Path(host["model_path"]).parent / model_directory)
+        host["environment"]["EXO_CHAT_TEMPLATE_DATE"] = poc.PROOF_CHAT_TEMPLATE_DATE
+    return HarnessConfig.model_validate_json(json.dumps(raw))
+
+
 @dataclass(frozen=True)
 class LeasePreparationFixture:
     config: HarnessConfig
@@ -482,7 +496,10 @@ def make_placement(
     for rank, runner_id in enumerate(runner_ids):
         runner_to_shard[runner_id] = {
             "TensorShardMetadata": {
-                "modelCard": {"modelId": MODEL_ID, "revision": REVISION},
+                "modelCard": {
+                    "modelId": config.model.model_id,
+                    "revision": config.model.revision,
+                },
                 "deviceRank": rank,
                 "worldSize": config.tensor_world_size,
                 "startLayer": 0,
@@ -494,7 +511,7 @@ def make_placement(
         "MlxNcclInstance": {
             "instanceId": "owned-instance",
             "shardAssignments": {
-                "modelId": MODEL_ID,
+                "modelId": config.model.model_id,
                 "runnerToShard": runner_to_shard,
                 "nodeToRunner": node_to_runner,
                 "computeResourceToRunner": resource_to_runner,
@@ -771,7 +788,7 @@ class FakeEffects:
             }
         if method == "GET" and path == "/instance/placement":
             assert params == {
-                "model_id": MODEL_ID,
+                "model_id": self.config.model.model_id,
                 "sharding": "Tensor",
                 "instance_meta": "MlxNccl",
                 "min_nodes": "2",
@@ -812,7 +829,7 @@ class FakeEffects:
             return {
                 "id": f"completion-{len(self.completion_requests)}",
                 "object": "chat.completion",
-                "model": MODEL_ID,
+                "model": self.config.model.model_id,
                 "choices": [
                     {
                         "index": 0,
@@ -937,6 +954,80 @@ def test_config_is_strict_and_requires_the_reserved_nccl_port(tmp_path: Path) ->
     raw["reserved_ports"].remove(config.nccl_coordinator_port)
     with pytest.raises(ValidationError, match="must be reserved"):
         HarnessConfig.model_validate_json(json.dumps(raw))
+
+
+def test_tp1_and_tp2_pinned_chat_template_date_contracts_match() -> None:
+    assert poc.PROOF_CHAT_TEMPLATE_DATE == tp1_oracle.ORACLE_CHAT_TEMPLATE_DATE
+    assert (
+        poc.PINNED_CHAT_TEMPLATE_DATE_MODEL_IDS
+        == tp1_oracle.PINNED_CHAT_TEMPLATE_DATE_MODEL_IDS
+    )
+
+
+@pytest.mark.parametrize("model_id", sorted(poc.PINNED_CHAT_TEMPLATE_DATE_MODEL_IDS))
+@pytest.mark.parametrize("host_index", [0, 1])
+@pytest.mark.parametrize("mutation", ["missing", "mismatched"])
+def test_dated_model_config_requires_matching_pinned_chat_template_date(
+    tmp_path: Path, model_id: str, host_index: int, mutation: str
+) -> None:
+    raw = make_dated_model_config(tmp_path, model_id).model_dump(mode="json")
+    environment = raw["hosts"][host_index]["environment"]
+    if mutation == "missing":
+        environment.pop("EXO_CHAT_TEMPLATE_DATE")
+    else:
+        environment["EXO_CHAT_TEMPLATE_DATE"] = "19 Jul 2026"
+
+    with pytest.raises(ValidationError, match="EXO_CHAT_TEMPLATE_DATE"):
+        HarnessConfig.model_validate_json(json.dumps(raw))
+
+
+def test_glm_request_disables_thinking_without_changing_default(
+    tmp_path: Path,
+) -> None:
+    default_request = poc.deterministic_request(make_tp2_config(tmp_path))
+    assert default_request == {
+        "model": MODEL_ID,
+        "messages": [
+            {"role": "user", "content": "Reply with exactly: NCCL proof complete."}
+        ],
+        "max_tokens": 32,
+        "temperature": 0.0,
+        "seed": 42,
+        "stream": False,
+        "use_prefix_cache": False,
+        "logprobs": False,
+    }
+
+    assert poc.deterministic_request(
+        make_dated_model_config(tmp_path, poc.GLM47_FLASH_4BIT_MODEL_ID)
+    ) == {
+        **default_request,
+        "model": poc.GLM47_FLASH_4BIT_MODEL_ID,
+        "enable_thinking": False,
+    }
+
+
+@pytest.mark.parametrize(
+    "model_id",
+    [poc.GPT_OSS_20B_MODEL_ID, poc.LLAMA31_8B_MODEL_ID, poc.LLAMA32_3B_MODEL_ID],
+)
+def test_non_glm_dated_models_keep_the_existing_tp2_request_body(
+    tmp_path: Path, model_id: str
+) -> None:
+    request = poc.deterministic_request(make_dated_model_config(tmp_path, model_id))
+
+    assert request == {
+        "model": model_id,
+        "messages": [
+            {"role": "user", "content": "Reply with exactly: NCCL proof complete."}
+        ],
+        "max_tokens": 32,
+        "temperature": 0.0,
+        "seed": 42,
+        "stream": False,
+        "use_prefix_cache": False,
+        "logprobs": False,
+    }
 
 
 def test_config_rejects_pre_topology_readiness_schema(tmp_path: Path) -> None:
@@ -2989,6 +3080,22 @@ def test_full_harness_uses_deterministic_requests_and_owned_cleanup(
     assert "owner_processes" not in runtime_metadata
     assert len(runtime_metadata["owned_processes"]) == 2
     assert effects.writes["benchmark-result.json"] == result
+
+
+def test_full_glm_harness_sends_non_thinking_request_for_every_completion(
+    tmp_path: Path,
+) -> None:
+    config = make_dated_model_config(tmp_path, poc.GLM47_FLASH_4BIT_MODEL_ID)
+    effects = FakeEffects(config)
+
+    result = run_harness(config, effects)
+
+    assert result["status"] == "completed"
+    assert result["reportable"] is True
+    assert len(effects.completion_requests) == 5
+    expected_request = poc.deterministic_request(config)
+    assert expected_request["enable_thinking"] is False
+    assert all(request == expected_request for request in effects.completion_requests)
 
 
 def test_full_tp2_harness_records_selected_and_physical_gpu_bindings(

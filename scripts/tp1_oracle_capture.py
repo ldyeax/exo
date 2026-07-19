@@ -61,8 +61,15 @@ LLAMA32_3B_MODEL_WEIGHT_BYTES = 1_807_423_488
 GPT_OSS_20B_MODEL_ID = "mlx-community/gpt-oss-20b-MXFP4-Q8"
 GPT_OSS_20B_MODEL_REVISION = "773a7da77e569019bb0fd17a554b263738d669a3"
 GPT_OSS_20B_MODEL_WEIGHT_BYTES = 12_076_119_168
+GLM47_FLASH_4BIT_MODEL_ID = "mlx-community/GLM-4.7-Flash-4bit"
+GLM47_FLASH_4BIT_MODEL_REVISION = "1454cffb1a21737e162f508e5bc70be9def89276"
+GLM47_FLASH_4BIT_MODEL_WEIGHT_BYTES = 16_852_202_496
 MODEL_SNAPSHOT_CONTRACTS = {
     MODEL_ID: (MODEL_REVISION, MODEL_WEIGHT_BYTES),
+    GLM47_FLASH_4BIT_MODEL_ID: (
+        GLM47_FLASH_4BIT_MODEL_REVISION,
+        GLM47_FLASH_4BIT_MODEL_WEIGHT_BYTES,
+    ),
     GPT_OSS_20B_MODEL_ID: (
         GPT_OSS_20B_MODEL_REVISION,
         GPT_OSS_20B_MODEL_WEIGHT_BYTES,
@@ -80,6 +87,14 @@ ORACLE_PROMPT = "Reply with exactly: NCCL proof complete."
 ORACLE_MAX_TOKENS = 32
 ORACLE_SEED = 42
 ORACLE_CHAT_TEMPLATE_DATE = "18 Jul 2026"
+PINNED_CHAT_TEMPLATE_DATE_MODEL_IDS = frozenset(
+    {
+        GLM47_FLASH_4BIT_MODEL_ID,
+        GPT_OSS_20B_MODEL_ID,
+        LLAMA31_8B_MODEL_ID,
+        LLAMA32_3B_MODEL_ID,
+    }
+)
 DWAGON_HCA_PORT_IDENTITIES = (
     ("mlx4_0", 1, "fe80::10:e000:166:3a19"),
     ("mlx4_0", 2, "fe80::10:e000:166:3a1a"),
@@ -374,11 +389,7 @@ class OracleConfig(StrictModel):
             "EXO_MLX_VISION_LOADING": "disabled",
             "PYTHONHASHSEED": str(self.request.seed),
         }
-        if self.model.model_id in {
-            GPT_OSS_20B_MODEL_ID,
-            LLAMA31_8B_MODEL_ID,
-            LLAMA32_3B_MODEL_ID,
-        }:
+        if self.model.model_id in PINNED_CHAT_TEMPLATE_DATE_MODEL_IDS:
             required["EXO_CHAT_TEMPLATE_DATE"] = ORACLE_CHAT_TEMPLATE_DATE
         for name, expected in required.items():
             if self.environment.get(name) != expected:
@@ -1216,7 +1227,7 @@ def validate_tp1_placement(
 
 
 def deterministic_request(config: OracleConfig) -> JsonObject:
-    return {
+    request: JsonObject = {
         "model": config.model.model_id,
         "messages": [{"role": "user", "content": config.request.prompt}],
         "max_tokens": config.request.max_tokens,
@@ -1226,6 +1237,9 @@ def deterministic_request(config: OracleConfig) -> JsonObject:
         "use_prefix_cache": config.request.use_prefix_cache,
         "logprobs": config.request.logprobs,
     }
+    if config.model.model_id == GLM47_FLASH_4BIT_MODEL_ID:
+        request["enable_thinking"] = False
+    return request
 
 
 @dataclass(frozen=True)
