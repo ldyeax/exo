@@ -459,6 +459,7 @@ def validate_sglang_kt_rank_admission_binding(
         and model_runtime_receipt.executed_cpu_backend == "AMX_BF16"
         and model_runtime_receipt.model_id == process_spec.model_id
         and model_runtime_receipt.model_revision == process_spec.expected_model_revision
+        and model_runtime_receipt.model_path == snapshot_receipts[0].model_path
         and model_runtime_receipt.model_config_sha256
         == snapshot_receipts[0].config_sha256
         and model_runtime_receipt.model_contract_path
@@ -469,6 +470,11 @@ def validate_sglang_kt_rank_admission_binding(
         == snapshot_receipts[0].contract_sha256
         and model_runtime_receipt.model_index_sha256
         == snapshot_receipts[0].index_sha256
+        and model_runtime_receipt.model_weight_map_entries
+        == snapshot_receipts[0].weight_map_entries
+        and model_runtime_receipt.model_shard_count == snapshot_receipts[0].shard_count
+        and model_runtime_receipt.model_physical_weight_bytes
+        == snapshot_receipts[0].physical_weight_bytes
         and model_runtime_receipt.sglang_revision
         == process_spec.expected_sglang_revision
         and model_runtime_receipt.ktransformers_revision
@@ -1073,6 +1079,7 @@ def _evaluate_runtime_validation(
                 == validation_receipt.receipt_sha256
                 and validation_receipt.process_spec_sha256
                 == calculate_sglang_kt_process_launch_spec_sha256(process_spec)
+                and validation_receipt.model_path == snapshot_receipt.model_path
                 and validation_receipt.model_contract_path
                 == snapshot_receipt.contract_path
                 and validation_receipt.model_contract_receipt_sha256
@@ -1081,6 +1088,11 @@ def _evaluate_runtime_validation(
                 == snapshot_receipt.contract_sha256
                 and validation_receipt.model_index_sha256
                 == snapshot_receipt.index_sha256
+                and validation_receipt.model_weight_map_entries
+                == snapshot_receipt.weight_map_entries
+                and validation_receipt.model_shard_count == snapshot_receipt.shard_count
+                and validation_receipt.model_physical_weight_bytes
+                == snapshot_receipt.physical_weight_bytes
                 and kernel_validation_receipt is not None
                 and validation_receipt.kernel_runtime_validation_receipt_path
                 == kernel_validation_receipt.receipt_path

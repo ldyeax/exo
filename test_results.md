@@ -44,10 +44,10 @@ source of truth. Update this file in the same commit that records each new test.
   verified that 62.4 GB contract on the shared read-only snapshot.
 - Historical Ornith AMXINT8 conversion and serving receipts were recovered and
   hashed below. They inform the GLM hybrid-runtime work but are not Exo tests.
-- Next work: bind file-backed build/install/kernel/model receipts into model
-  admission, then run the real loader/short-forward gate before CPU-only and
-  mixed AMX-BF16/RTX-3090 PP1 correctness controls. The Qwen3-Coder ladder rung
-  is deferred until that hybrid path has trustworthy model execution receipts.
+- Next work: deploy the completed admission-grade model-receipt producer, make
+  a fresh overlay-interpreter kernel receipt, then run the real CPU-control and
+  mixed AMX-BF16/RTX-3090 PP1 correctness gates. The Qwen3-Coder ladder rung is
+  deferred until that hybrid path has trustworthy live model evidence.
 
 ## Automated validation
 
@@ -436,6 +436,50 @@ above.
   executable path; the focused kernel-validator suite passes `30 passed`.
   Fresh per-host kernel receipts are required before the model proof.
 
+### Admission-grade GLM-4.7 producer checkpoint
+
+- The model-receipt producer now runs the pinned PP1/TP1 SGLang-KTransformers
+  loader only in a disposable child bound by exact CPU cores, memory nodes, GPU
+  UUID, overlay interpreter, and sanitized launch environment. Host and GPU
+  headroom are checked before the heavy runtime executes, and evidence is
+  released only after distributed cleanup and a clean child exit.
+- The live backend requires the KTEP wrapper, `NativeMoEWrapper`, and
+  `AMXBF16_MOE` on every routed layer 1-46. It runs a deterministic layer-1
+  probe twice, compares CPU-only or CPU/GPU merged BF16 output against a
+  memory-bounded checkpoint oracle, and traces one eight-token extend plus one
+  decode through the pinned SGLang batch/forward path. Captured trace tensors
+  are detached and cloned at successful return so reused runtime buffers cannot
+  falsify repeat evidence.
+- Parent and child independently bind the canonical process spec, exact model
+  contract, every byte of all 48 model shards, raw kernel receipt, current
+  executable/affinity/NUMA/GPU identity, and an exact read-only 22-file
+  validator import closure. The selected NUMA nodes must use `MPOL_BIND` and
+  retain the complete 62,444,175,504-byte checkpoint plus 64 GiB. Parent and
+  child both reverify the immutable snapshot; the parent repeats those checks
+  after child exit before create-new canonical publication.
+- Direct Torch work runs under `inference_mode`. The otherwise random SGLang
+  auxiliary/NCCL port is pinned to the process spec's reserved service port and
+  checked again after `PortArgs` construction. The child evidence channel uses
+  a sealed memfd, the retained child session leader anchors owned process-group
+  cleanup, profiler/loader controls are stripped, and bytecode writes are
+  disabled so root execution cannot mutate the admitted source closure.
+- A separate inert CLI creates the exact CPU-control (zero resident experts) or
+  hybrid (one through four residents) process spec. It strictly reparses and
+  re-canonicalizes the payload, reports both raw-file and canonical-spec
+  digests, and refuses output replacement, symlink traversal, or a replaced
+  output parent.
+- The combined producer, backend, trace, oracle, receipt, generator, admission,
+  preflight, collector, supervisor, kernel-receipt, and schema suite passes
+  `569 passed`. Strict source, receipt, generator, and validator-test
+  Basedpyright configurations report zero errors, and Ruff is clean. This is a
+  software checkpoint against a complete fake pinned-runtime surface: no model
+  load, GPU, AMX, InfiniBand, benchmark, or profiler workload ran.
+- Live execution against the installed pinned runtime remains the decisive
+  proof. The historical dwagon kernel receipt names the base CPython rather
+  than the overlay interpreter, so a fresh kernel receipt is required before
+  the CPU-control model run. Multi-host admission still requires the separate
+  event-sourced verify/commit/abort barrier.
+
 ### Profiler safety incident
 
 - A previous out-of-tree VTune SEP/PAX kernel profiler (`sep5`/`pax`) crashed
@@ -445,10 +489,11 @@ above.
 
 ## Pending tests
 
-1. Implement the pinned model-level receipt producer, then run a real diagnostic
-   layer-1 expert probe and an admission-grade full short forward. Bind and
-   reload its output through the completed file-backed pre-launch gate. Keep
-   kernel-level capability evidence separate from model-level launch admission.
+1. Deploy the pinned model-level receipt producer, create a fresh kernel receipt
+   through the exact overlay interpreter, then run the real layer-1 probe and
+   admission-grade full short forward. Bind and reload its output through the
+   completed file-backed pre-launch gate. Keep kernel capability evidence
+   separate from model-level launch admission.
 2. Run the fail-closed 0-expert BF16 CPU-routed control and the mixed 1/4
    resident-GPU-expert controls with complete 46-layer wrapper and routing
    evidence.

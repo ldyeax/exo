@@ -93,9 +93,16 @@ def _write_bound_model_receipt(
 
     assert snapshot_receipt.contract_path is not None
     assert snapshot_receipt.contract_receipt_sha256 is not None
+    assert snapshot_receipt.weight_map_entries is not None
+    assert snapshot_receipt.shard_count is not None
+    assert snapshot_receipt.physical_weight_bytes is not None
     model_contract = _object_field(parents, "model_contract")
     model_contract["path"] = snapshot_receipt.contract_path
+    model_contract["model_path"] = snapshot_receipt.model_path
     model_contract["receipt_sha256"] = snapshot_receipt.contract_receipt_sha256
+    model_contract["weight_map_entries"] = snapshot_receipt.weight_map_entries
+    model_contract["shard_count"] = snapshot_receipt.shard_count
+    model_contract["physical_weight_bytes"] = snapshot_receipt.physical_weight_bytes
 
     kernel_parent = _object_field(parents, "kernel_runtime_validation")
     kernel_parent["receipt_path"] = kernel_receipt.receipt_path

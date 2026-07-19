@@ -201,6 +201,9 @@ def make_model_runtime_validation_receipt(
     assert snapshot_receipt.contract_receipt_sha256 is not None
     assert snapshot_receipt.contract_sha256 is not None
     assert snapshot_receipt.index_sha256 is not None
+    assert snapshot_receipt.weight_map_entries is not None
+    assert snapshot_receipt.shard_count is not None
+    assert snapshot_receipt.physical_weight_bytes is not None
     is_cpu_control = (
         spec.target_profile == GLM_4_7_FLASH_CPU_ROUTED_EXPERTS_TARGET_PROFILE
     )
@@ -213,10 +216,14 @@ def make_model_runtime_validation_receipt(
         validator_sha256="b" * 64,
         process_spec_sha256=calculate_sglang_kt_process_launch_spec_sha256(spec),
         model_contract_path=snapshot_receipt.contract_path,
+        model_path=snapshot_receipt.model_path,
         model_contract_receipt_sha256=(snapshot_receipt.contract_receipt_sha256),
         model_contract_sha256=snapshot_receipt.contract_sha256,
         model_config_sha256=snapshot_receipt.config_sha256,
         model_index_sha256=snapshot_receipt.index_sha256,
+        model_weight_map_entries=snapshot_receipt.weight_map_entries,
+        model_shard_count=snapshot_receipt.shard_count,
+        model_physical_weight_bytes=snapshot_receipt.physical_weight_bytes,
         kernel_runtime_validation_receipt_path=kernel_receipt.receipt_path,
         kernel_runtime_validation_receipt_sha256=kernel_receipt.receipt_sha256,
         target_profile=spec.target_profile,

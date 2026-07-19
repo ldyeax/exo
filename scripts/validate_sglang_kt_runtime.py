@@ -32,7 +32,10 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Literal, Protocol, cast
 
 if __package__ in {None, ""}:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    sys.dont_write_bytecode = True
+    _repository_root = Path(__file__).resolve().parents[1]
+    sys.path.insert(0, str(_repository_root))
+    sys.path.insert(0, str(_repository_root / "src"))
 
 from exo.worker.sglang_kt.artifact_identity import (
     calculate_sglang_kt_artifact_build_id,

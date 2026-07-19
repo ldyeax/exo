@@ -41,12 +41,16 @@ from exo.worker.sglang_kt.launch_spec import (
 )
 from exo.worker.sglang_kt.receipt_io import (
     SglangKtReceiptFileError,
+    canonical_sglang_kt_json,
     parse_sglang_kt_strict_json,
     read_sglang_kt_bound_file,
 )
 
 MODEL_RUNTIME_VALIDATION_RECEIPT_SCHEMA_VERSION = 1
 MODEL_RUNTIME_VALIDATION_RECEIPT_MAXIMUM_BYTES = 4 * 1024 * 1024
+MODEL_RUNTIME_VALIDATOR_SOURCE_BUNDLE_CANONICALIZATION = (
+    "exo-sglang-kt-model-runtime-validator-source-bundle-v1"
+)
 GLM_4_7_FLASH_BF16_INDEX_SHA256 = (
     "91e6e95ca21700f50904a680c8c4212f5aa16dc7c10a013f01c906957c889791"
 )
@@ -60,11 +64,40 @@ _EXPECTED_CPU_BACKEND_WRAPPER = "NativeMoEWrapper"
 _EXPECTED_CPU_KERNEL_CLASS = "AMXBF16_MOE"
 _EXPECTED_QUANT_METHOD_WRAPPER = "kt_ep"
 _EXPECTED_LAYER_ONE_PROBE_SEED = 20_260_719
+_EXPECTED_LAYER_ONE_INPUT_DTYPE = "torch.bfloat16"
+_EXPECTED_LAYER_ONE_ROUTE_WEIGHTS = (0.4, 0.3, 0.2, 0.1)
 _EXPECTED_LAYER_ONE_RELATIVE_L1_TOLERANCE = 0.02
 _EXPECTED_EXTEND_TOKEN_IDS = (1, 2, 3, 4, 5, 6, 7, 8)
 _EXPECTED_EXTEND_POSITIONS = tuple(range(8))
 _EXPECTED_LOGITS_SHAPE = (1, 154_880)
 _EXPECTED_HIDDEN_SHAPE = (1, 2_048)
+_EXPECTED_MODEL_WEIGHT_MAP_ENTRIES = 9_703
+_EXPECTED_MODEL_SHARD_COUNT = 48
+_EXPECTED_MODEL_PHYSICAL_WEIGHT_BYTES = 62_444_175_504
+MODEL_RUNTIME_VALIDATOR_SOURCE_RELATIVE_PATHS = (
+    "scripts/sglang_kt_glm47_backend.py",
+    "scripts/sglang_kt_glm47_live.py",
+    "scripts/sglang_kt_glm47_receipt.py",
+    "scripts/sglang_kt_glm47_reference.py",
+    "scripts/sglang_kt_glm47_trace.py",
+    "scripts/validate_sglang_kt_glm47_model.py",
+    "src/exo/__init__.py",
+    "src/exo/shared/__init__.py",
+    "src/exo/shared/types/__init__.py",
+    "src/exo/shared/types/common.py",
+    "src/exo/shared/types/worker/__init__.py",
+    "src/exo/shared/types/worker/sglang_kt.py",
+    "src/exo/utils/__init__.py",
+    "src/exo/utils/phantom.py",
+    "src/exo/utils/pydantic_ext.py",
+    "src/exo/worker/__init__.py",
+    "src/exo/worker/sglang_kt/__init__.py",
+    "src/exo/worker/sglang_kt/launch_spec.py",
+    "src/exo/worker/sglang_kt/model_contract.py",
+    "src/exo/worker/sglang_kt/model_runtime_validation_receipt.py",
+    "src/exo/worker/sglang_kt/receipt_io.py",
+    "src/exo/worker/sglang_kt/runtime_validation_receipt.py",
+)
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 
 NonemptyText = Annotated[str, StringConstraints(min_length=1)]
@@ -119,6 +152,27 @@ def calculate_glm_4_7_flash_expert_mask_sha256(
     return hashlib.sha256(mask).hexdigest()
 
 
+def build_glm_4_7_flash_layer_one_reference_tensor_keys(
+    selected_expert_ids: tuple[int, ...],
+) -> tuple[str, ...]:
+    """Build the exact 12 BF16 checkpoint keys used by the layer-one oracle."""
+
+    if (
+        len(selected_expert_ids) != len(_EXPECTED_LAYER_ONE_ROUTE_WEIGHTS)
+        or len(set(selected_expert_ids)) != len(selected_expert_ids)
+        or any(
+            expert_id < 0 or expert_id >= GLM_4_7_FLASH_ROUTED_EXPERT_COUNT
+            for expert_id in selected_expert_ids
+        )
+    ):
+        raise ValueError("reference tensor keys require four distinct routed experts")
+    return tuple(
+        f"model.layers.1.mlp.experts.{expert_id}.{projection}_proj.weight"
+        for expert_id in selected_expert_ids
+        for projection in ("gate", "up", "down")
+    )
+
+
 class SglangKtModelRuntimeValidationReceiptError(ValueError):
     """Raised when a GLM-4.7 model validation receipt is not admissible."""
 
@@ -142,6 +196,44 @@ def _validate_absolute_normalized_path(value: str) -> str:
     return value
 
 
+def calculate_sglang_kt_model_runtime_validator_bundle_sha256(
+    sources: tuple[tuple[str, str], ...],
+) -> str:
+    """Hash an exact, ordered bundle of validator source files."""
+
+    if not sources or tuple(path for path, _ in sources) != tuple(
+        sorted({path for path, _ in sources})
+    ):
+        raise ValueError("validator source paths must be nonempty, sorted, and unique")
+    if len(sources) != len(MODEL_RUNTIME_VALIDATOR_SOURCE_RELATIVE_PATHS):
+        raise ValueError(
+            "validator source bundle does not contain the exact source set"
+        )
+    source_roots: list[str] = []
+    for path, sha256 in sources:
+        _validate_absolute_normalized_path(path)
+        if _SHA256_PATTERN.fullmatch(sha256) is None:
+            raise ValueError("validator source SHA-256 is invalid")
+    for (path, _), relative_path in zip(
+        sources,
+        MODEL_RUNTIME_VALIDATOR_SOURCE_RELATIVE_PATHS,
+        strict=True,
+    ):
+        suffix = f"/{relative_path}"
+        if not path.endswith(suffix):
+            raise ValueError(
+                "validator source bundle does not contain the exact source set"
+            )
+        source_roots.append(path[: -len(suffix)])
+    if not source_roots[0] or len(set(source_roots)) != 1:
+        raise ValueError("validator sources must belong to one repository root")
+    payload = {
+        "canonicalization": MODEL_RUNTIME_VALIDATOR_SOURCE_BUNDLE_CANONICALIZATION,
+        "sources": [{"path": path, "sha256": sha256} for path, sha256 in sources],
+    }
+    return hashlib.sha256(canonical_sglang_kt_json(payload)).hexdigest()
+
+
 def _validate_sorted_unique(values: tuple[int, ...], description: str) -> None:
     if not values or values != tuple(sorted(set(values))):
         raise ValueError(f"{description} must be nonempty, sorted, and unique")
@@ -150,12 +242,16 @@ def _validate_sorted_unique(values: tuple[int, ...], description: str) -> None:
 @final
 class _ModelContractBinding(_StrictModel):
     path: AbsoluteRuntimePath
+    model_path: AbsoluteRuntimePath
     receipt_sha256: Sha256Digest
     contract_sha256: Sha256Digest
     config_sha256: Sha256Digest
     index_sha256: Sha256Digest
+    weight_map_entries: PositiveInt
+    shard_count: PositiveInt
+    physical_weight_bytes: PositiveInt
 
-    @field_validator("path")
+    @field_validator("path", "model_path")
     @classmethod
     def validate_path(cls, value: str) -> str:
         return _validate_absolute_normalized_path(value)
@@ -177,6 +273,17 @@ class _ParentBindings(_StrictModel):
     process_spec_sha256: Sha256Digest
     model_contract: _ModelContractBinding
     kernel_runtime_validation: _KernelRuntimeValidationBinding
+
+
+@final
+class _ValidatorSourceEvidence(_StrictModel):
+    path: AbsoluteRuntimePath
+    sha256: Sha256Digest
+
+    @field_validator("path")
+    @classmethod
+    def validate_path(cls, value: str) -> str:
+        return _validate_absolute_normalized_path(value)
 
 
 @final
@@ -321,25 +428,70 @@ class _NumericalEvidence(_StrictModel):
 
 
 @final
+class _LayerOneOutputEvidence(_StrictModel):
+    actual_output_sha256: Sha256Digest
+    repeat_actual_output_sha256: Sha256Digest
+    reference_output_sha256: Sha256Digest
+    numerical: _NumericalEvidence
+
+    @model_validator(mode="after")
+    def validate_repeat_output(self) -> "_LayerOneOutputEvidence":
+        if self.repeat_actual_output_sha256 != self.actual_output_sha256:
+            raise ValueError("layer-one repeated backend output is not deterministic")
+        return self
+
+
+@final
+class _LayerOneHybridMergeEvidence(_StrictModel):
+    combined_output_sha256: Sha256Digest
+    cpu_output_sha256: Sha256Digest
+    gpu_output_sha256: Sha256Digest
+    merged_backend_output_sha256: Sha256Digest
+    repeat_merged_backend_output_sha256: Sha256Digest
+    reference_merged_backend_output_sha256: Sha256Digest
+    numerical: _NumericalEvidence
+
+    @model_validator(mode="after")
+    def validate_repeat_merge(self) -> "_LayerOneHybridMergeEvidence":
+        if (
+            self.repeat_merged_backend_output_sha256
+            != self.merged_backend_output_sha256
+            or self.merged_backend_output_sha256 != self.combined_output_sha256
+        ):
+            raise ValueError(
+                "layer-one backend merge is not deterministic or does not match "
+                "the combined output"
+            )
+        return self
+
+
+@final
 class _LayerOneExpertProbe(_StrictModel):
     layer_index: ResourceIndex
     random_seed: int
     probe_invocation_count: PositiveInt
+    input_shape: tuple[PositiveInt, ...]
+    input_dtype: Literal["torch.bfloat16"]
     input_sha256: Sha256Digest
     selected_expert_ids: tuple[ExpertId, ...]
     repeat_selected_expert_ids: tuple[ExpertId, ...]
+    routing_weights: tuple[float, float, float, float]
+    reference_tensor_keys: tuple[NonemptyText, ...]
     cpu_expert_ids: tuple[ExpertId, ...]
     gpu_expert_ids: tuple[ExpertId, ...]
     cpu_backend_wrapper_class: Literal["NativeMoEWrapper"]
     cpu_kernel_class: Literal["AMXBF16_MOE"]
-    cpu_submit_count: ResourceIndex
-    cpu_sync_count: ResourceIndex
+    sglang_cpu_submit_count: ResourceIndex
+    sglang_cpu_sync_count: ResourceIndex
+    native_cpu_submit_count: ResourceIndex
+    native_cpu_sync_count: ResourceIndex
     gpu_forward_count: ResourceIndex
     output_merge_count: ResourceIndex
-    output_sha256: Sha256Digest
-    repeat_output_sha256: Sha256Digest
     global_expert_mask_sha256: Sha256Digest
-    numerical: _NumericalEvidence
+    combined_output: _LayerOneOutputEvidence
+    cpu_output: _LayerOneOutputEvidence
+    gpu_output: _LayerOneOutputEvidence | None
+    hybrid_merge: _LayerOneHybridMergeEvidence | None
 
     @model_validator(mode="after")
     def validate_deterministic_probe(self) -> "_LayerOneExpertProbe":
@@ -347,12 +499,20 @@ class _LayerOneExpertProbe(_StrictModel):
             self.layer_index != 1
             or self.random_seed != _EXPECTED_LAYER_ONE_PROBE_SEED
             or self.probe_invocation_count != 2
+            or self.input_shape != _EXPECTED_HIDDEN_SHAPE
+            or self.input_dtype != _EXPECTED_LAYER_ONE_INPUT_DTYPE
             or len(self.selected_expert_ids) != 4
             or len(set(self.selected_expert_ids)) != 4
             or self.repeat_selected_expert_ids != self.selected_expert_ids
-            or self.repeat_output_sha256 != self.output_sha256
-            or self.cpu_submit_count != 2
-            or self.cpu_sync_count != 2
+            or self.routing_weights != _EXPECTED_LAYER_ONE_ROUTE_WEIGHTS
+            or self.reference_tensor_keys
+            != build_glm_4_7_flash_layer_one_reference_tensor_keys(
+                self.selected_expert_ids
+            )
+            or self.sglang_cpu_submit_count != 2
+            or self.sglang_cpu_sync_count != 2
+            or self.native_cpu_submit_count != 2
+            or self.native_cpu_sync_count != 2
             or self.output_merge_count != 2
         ):
             raise ValueError("layer-one deterministic expert probe is incomplete")
@@ -433,6 +593,7 @@ class _PassedModelRuntimeValidationReceiptV1(_StrictModel):
     generated_at_utc: NonemptyText
     profiler: Literal["none"]
     validator_sha256: Sha256Digest
+    validator_sources: tuple[_ValidatorSourceEvidence, ...]
     failures: tuple[NonemptyText, ...]
     parents: _ParentBindings
     runtime: _RuntimeLaunchSummary
@@ -457,11 +618,21 @@ class _PassedModelRuntimeValidationReceiptV1(_StrictModel):
     ) -> "_PassedModelRuntimeValidationReceiptV1":
         if self.failures:
             raise ValueError("passed model receipt contains failures")
+        validator_sources = tuple(
+            (source.path, source.sha256) for source in self.validator_sources
+        )
+        if self.validator_sha256 != (
+            calculate_sglang_kt_model_runtime_validator_bundle_sha256(validator_sources)
+        ):
+            raise ValueError("model receipt validator source bundle is inconsistent")
         contract = self.parents.model_contract
         if (
             contract.contract_sha256 != GLM_4_7_FLASH_BF16_MODEL_CONTRACT_SHA256
             or contract.config_sha256 != GLM_4_7_FLASH_BF16_CONFIG_SHA256
             or contract.index_sha256 != GLM_4_7_FLASH_BF16_INDEX_SHA256
+            or contract.weight_map_entries != _EXPECTED_MODEL_WEIGHT_MAP_ENTRIES
+            or contract.shard_count != _EXPECTED_MODEL_SHARD_COUNT
+            or contract.physical_weight_bytes != _EXPECTED_MODEL_PHYSICAL_WEIGHT_BYTES
             or contract.config_sha256 != self.runtime.model_config_sha256
         ):
             raise ValueError("model receipt contract parent is not pinned")
@@ -513,10 +684,30 @@ class _PassedModelRuntimeValidationReceiptV1(_StrictModel):
             == GLM_4_7_FLASH_CPU_ROUTED_EXPERTS_TARGET_PROFILE
         )
         if is_cpu_control:
-            if probe.gpu_expert_ids or probe.gpu_forward_count != 0:
+            if (
+                probe.gpu_expert_ids
+                or probe.gpu_forward_count != 0
+                or probe.gpu_output is not None
+                or probe.hybrid_merge is not None
+                or probe.combined_output != probe.cpu_output
+            ):
                 raise ValueError("CPU control receipt executed a GPU expert route")
-        elif not probe.gpu_expert_ids or probe.gpu_forward_count != 2:
-            raise ValueError("mixed receipt did not execute both CPU and GPU routes")
+        else:
+            gpu_output = probe.gpu_output
+            merge = probe.hybrid_merge
+            if (
+                not probe.gpu_expert_ids
+                or probe.gpu_forward_count != 2
+                or gpu_output is None
+                or merge is None
+                or merge.combined_output_sha256
+                != probe.combined_output.actual_output_sha256
+                or merge.cpu_output_sha256 != probe.cpu_output.actual_output_sha256
+                or merge.gpu_output_sha256 != gpu_output.actual_output_sha256
+            ):
+                raise ValueError(
+                    "mixed receipt did not execute both CPU and GPU routes"
+                )
 
         mask_hashes = (
             self.short_forward.extend.global_expert_mask_sha256_before,
@@ -541,10 +732,14 @@ class SglangKtModelRuntimeValidationReceiptObservation(_StrictModel):
     validator_sha256: Sha256Digest
     process_spec_sha256: Sha256Digest
     model_contract_path: AbsoluteRuntimePath
+    model_path: AbsoluteRuntimePath
     model_contract_receipt_sha256: Sha256Digest
     model_contract_sha256: Sha256Digest
     model_config_sha256: Sha256Digest
     model_index_sha256: Sha256Digest
+    model_weight_map_entries: PositiveInt
+    model_shard_count: PositiveInt
+    model_physical_weight_bytes: PositiveInt
     kernel_runtime_validation_receipt_path: AbsoluteRuntimePath
     kernel_runtime_validation_receipt_sha256: Sha256Digest
     target_profile: SglangKtTargetProfile
@@ -599,6 +794,32 @@ def _derive_capabilities(
     return (*_COMMON_CAPABILITIES, route_capability)
 
 
+def _validate_model_runtime_validation_receipt_contents(
+    contents: bytes,
+) -> _PassedModelRuntimeValidationReceiptV1:
+    parse_sglang_kt_strict_json(contents)
+    return _PassedModelRuntimeValidationReceiptV1.model_validate_json(contents)
+
+
+def canonicalize_sglang_kt_model_runtime_validation_receipt(
+    payload: object,
+) -> bytes:
+    """Validate one v1 model runtime receipt and return canonical JSON bytes."""
+
+    try:
+        contents = canonical_sglang_kt_json(payload)
+        if len(contents) > MODEL_RUNTIME_VALIDATION_RECEIPT_MAXIMUM_BYTES:
+            raise SglangKtReceiptFileError(
+                "model runtime receipt exceeds the maximum receipt size"
+            )
+        _validate_model_runtime_validation_receipt_contents(contents)
+    except (RecursionError, SglangKtReceiptFileError, ValidationError) as error:
+        raise SglangKtModelRuntimeValidationReceiptError(
+            "invalid SGLang-KTransformers model runtime receipt payload"
+        ) from error
+    return contents
+
+
 def load_sglang_kt_model_runtime_validation_receipt(
     path: Path,
     *,
@@ -632,8 +853,7 @@ def load_sglang_kt_model_runtime_validation_receipt(
             raise SglangKtModelRuntimeValidationReceiptError(
                 "model receipt does not match the expected SHA-256"
             )
-        parse_sglang_kt_strict_json(bound_file.contents)
-        receipt = _PassedModelRuntimeValidationReceiptV1.model_validate_json(
+        receipt = _validate_model_runtime_validation_receipt_contents(
             bound_file.contents
         )
     except SglangKtModelRuntimeValidationReceiptError:
@@ -676,10 +896,14 @@ def load_sglang_kt_model_runtime_validation_receipt(
         validator_sha256=receipt.validator_sha256,
         process_spec_sha256=parents.process_spec_sha256,
         model_contract_path=contract.path,
+        model_path=contract.model_path,
         model_contract_receipt_sha256=contract.receipt_sha256,
         model_contract_sha256=contract.contract_sha256,
         model_config_sha256=runtime.model_config_sha256,
         model_index_sha256=contract.index_sha256,
+        model_weight_map_entries=contract.weight_map_entries,
+        model_shard_count=contract.shard_count,
+        model_physical_weight_bytes=contract.physical_weight_bytes,
         kernel_runtime_validation_receipt_path=kernel.receipt_path,
         kernel_runtime_validation_receipt_sha256=kernel.receipt_sha256,
         target_profile=runtime.target_profile,
