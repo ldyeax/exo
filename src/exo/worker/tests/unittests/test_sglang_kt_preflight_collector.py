@@ -19,6 +19,7 @@ from exo.shared.types.compute_resources import NvidiaGpuComputeResource
 from exo.shared.types.worker.sglang_kt import (
     AbsoluteRuntimePath,
     GitRevision,
+    KTransformersMethod,
     NetworkPort,
 )
 from exo.worker.sglang_kt.artifact_identity import (
@@ -430,7 +431,7 @@ class SuccessfulFilesystemProbe:
 class StaticModelContractProbe:
     observation: SglangKtVerifiedModelSnapshot | None
     calls: list[
-        tuple[AbsoluteRuntimePath, ModelId, GitRevision, Literal["FP8", "BF16"]]
+        tuple[AbsoluteRuntimePath, ModelId, GitRevision, KTransformersMethod]
     ] = field(default_factory=list)
 
     def verify_snapshot(
@@ -438,7 +439,7 @@ class StaticModelContractProbe:
         path: AbsoluteRuntimePath,
         model_id: ModelId,
         revision: GitRevision,
-        ktransformers_method: Literal["FP8", "BF16"],
+        ktransformers_method: KTransformersMethod,
     ) -> SglangKtVerifiedModelSnapshot | None:
         self.calls.append((path, model_id, revision, ktransformers_method))
         return self.observation

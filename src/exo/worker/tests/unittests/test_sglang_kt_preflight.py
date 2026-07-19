@@ -534,7 +534,7 @@ def test_passed_preflight_rejects_missing_or_changed_admission_bindings() -> Non
         SglangKtPreflightPassed.model_validate(missing_binding_payload)
 
     changed_binding_payload = result.model_dump()
-    changed_binding = dict(changed_binding_payload["admission_bindings"][0])
+    changed_binding = result.admission_bindings[0].model_dump()
     changed_binding["process_spec_sha256"] = "0" * 64
     changed_binding_payload["admission_bindings"] = (changed_binding,)
     with pytest.raises(ValidationError, match="process spec digest"):

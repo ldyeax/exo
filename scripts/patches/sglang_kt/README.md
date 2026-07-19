@@ -8,12 +8,13 @@ base and result commit and applies patches in this order:
 
 1. `0001-feat-fail-closed-on-GLM-Flash-KT-coverage.patch` converts SGLang
    `5d6bef9f61637aaeaf047bf8209def2af3eaa83f` to
-   `41d4d300a21fd2f486681d56f1017789dfb355fe`. The result also fixes the
+   `42504e59810130460fc24fdd17ef534cb8278a4b`. The result also fixes the
    BF16 benchmark loader so resident gate/up/down projections cannot silently
-   remain random or be copied into the wrong fused-weight slots.
+   remain random or be copied into the wrong fused-weight slots, and initializes
+   the non-hash GLM sparse-MoE state required by inherited forward methods.
 2. `0002-build-pin-GLM-Flash-KT-registration.patch` converts KTransformers
    `8e46e5896c3d993a1285052f2618f5a9f01882d4` to
-   `7e70d7518edd26af6a0638593037d68c9b6bd6bf` by recording that SGLang
+   `6e0a4480936effa7bf0ece429f78a00b29932bec` by recording that SGLang
    gitlink.
 
 The KTransformers patch deliberately leaves `.gitmodules` unchanged. A plain

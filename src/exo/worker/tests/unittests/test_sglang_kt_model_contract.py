@@ -2,6 +2,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -324,7 +325,7 @@ def test_contract_loader_rejects_extra_fields_and_wrong_pin(tmp_path: Path) -> N
     write_snapshot(snapshot)
     contract_path = tmp_path / "contract.json"
     contract_sha256, _receipt_sha256 = write_contract(snapshot, contract_path)
-    document = json.loads(contract_path.read_text())
+    document = cast(dict[str, object], json.loads(contract_path.read_text()))
     document["untrusted"] = True
     contract_path.write_text(json.dumps(document))
 
@@ -351,7 +352,7 @@ def test_verifier_reloads_contract_and_rechecks_pin(tmp_path: Path) -> None:
         contract_path,
         expected_contract_sha256=contract_sha256,
     )
-    document = json.loads(contract_path.read_text())
+    document = cast(dict[str, object], json.loads(contract_path.read_text()))
     document["model_id"] = "untrusted/substitution"
     contract_path.write_text(json.dumps(document))
 
@@ -371,7 +372,7 @@ def test_contract_rejects_empty_nondeterministic_model_id(tmp_path: Path) -> Non
     write_snapshot(snapshot)
     contract_path = tmp_path / "contract.json"
     _contract_sha256, _receipt_sha256 = write_contract(snapshot, contract_path)
-    document = json.loads(contract_path.read_text())
+    document = cast(dict[str, object], json.loads(contract_path.read_text()))
     document["model_id"] = ""
     contract_path.write_text(json.dumps(document))
 
