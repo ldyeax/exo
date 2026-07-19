@@ -971,12 +971,22 @@ class _TraceOutputCollector:
 
         kind: Literal["tensor", "hidden_states", "next_token_logits"] = "tensor"
         candidate = output
-        if hasattr(output, "hidden_states"):
-            kind = "hidden_states"
-            candidate = _attribute(output, "hidden_states")
-        elif hasattr(output, "next_token_logits"):
+        if probe.operation == MODEL_FORWARD:
             kind = "next_token_logits"
             candidate = _attribute(output, "next_token_logits")
+            if candidate is None:
+                raise Glm47BackendError("model forward returned null next-token logits")
+        elif probe.operation in (
+            QUANT_METHOD_APPLY,
+            LAYER_ONE_KTEP_OUTER_APPLY,
+            GPU_METHOD_APPLY,
+        ):
+            kind = "hidden_states"
+            candidate = _attribute(output, "hidden_states")
+            if candidate is None:
+                raise Glm47BackendError(
+                    f"{probe.operation} returned null hidden states"
+                )
 
         captured_candidate = candidate
         if phase == "layer_probe" and probe.operation in (

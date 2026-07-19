@@ -41,6 +41,7 @@ from exo.worker.sglang_kt.receipt_io import (
 from exo.worker.sglang_kt.runtime_validation_receipt import (
     SglangKtKernelRuntimeValidationReceiptObservation,
 )
+from scripts import sglang_kt_glm47_backend as backend
 from scripts import validate_sglang_kt_glm47_model as validator
 from scripts.sglang_kt_glm47_live import validator_bundle_paths
 
@@ -1025,3 +1026,64 @@ def test_main_reports_published_live_receipt(
     assert output["status"] == "passed"
     assert output["profiler"] == "none"
     assert output["receipt_sha256"] == "a" * 64
+
+
+def test_run_bound_backend_preserves_backend_failure_detail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend_detail = "builtins.NoneType is missing dtype"
+    runtime = SimpleNamespace(torch=object())
+    process_spec = SimpleNamespace(plan=SimpleNamespace(static_memory_fraction=0.8))
+    preflight = cast(
+        validator.Glm47ModelSoftwarePreflight,
+        SimpleNamespace(
+            process=SimpleNamespace(process_spec=process_spec),
+            route=object(),
+        ),
+    )
+
+    def reject_backend(*_arguments: object, **_keywords: object) -> object:
+        raise backend.Glm47BackendError(backend_detail)
+
+    monkeypatch.setattr(backend, "load_glm47_runtime_bindings", lambda: runtime)
+    monkeypatch.setattr(backend, "run_glm47_backend", reject_backend)
+    monkeypatch.setattr(
+        validator,
+        "_require_gpu_memory_headroom",
+        lambda *_arguments, **_keywords: None,
+    )
+
+    with pytest.raises(
+        validator.Glm47ModelValidationError,
+        match=f"live GLM-4.7 backend failed: {backend_detail}",
+    ):
+        validator._run_bound_backend(preflight)
+
+
+def test_main_reports_exact_backend_failure_without_traceback(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    arguments, *_rest = write_inputs(tmp_path)
+    backend_detail = "builtins.NoneType is missing dtype"
+
+    def reject_live_validation(_arguments: object) -> dict[str, object]:
+        raise validator.Glm47ModelValidationError(
+            f"live GLM-4.7 backend failed: {backend_detail}"
+        )
+
+    monkeypatch.setattr(
+        validator,
+        "run_parent_live_validation",
+        reject_live_validation,
+    )
+
+    assert validator.main(arguments) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == (
+        "GLM-4.7 model validation failed: live GLM-4.7 backend failed: "
+        f"{backend_detail}\n"
+    )
+    assert "Traceback" not in captured.err

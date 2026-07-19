@@ -25,6 +25,7 @@ from scripts.sglang_kt_glm47_reference import (
 )
 from scripts.sglang_kt_glm47_trace import (
     GPU_METHOD_APPLY,
+    MODEL_FORWARD,
     SGLANG_CPU_SYNC,
     TraceProbe,
 )
@@ -349,9 +350,16 @@ class FakeGpuMethod:
         self.gpu_value = gpu_value
         self.torch = torch
 
-    def apply(self, *_args: object, **_kwargs: object) -> FakeTensor:
+    def apply(self, *_args: object, **_kwargs: object) -> FakeHiddenStates:
         self.torch.require_grad_disabled("gpu_apply")
-        return FakeTensor(self.gpu_value, (1, 2_048), GLM47_BF16_DTYPE, device="cuda:0")
+        return FakeHiddenStates(
+            FakeTensor(
+                self.gpu_value,
+                (1, 2_048),
+                GLM47_BF16_DTYPE,
+                device="cuda:0",
+            )
+        )
 
 
 class KTEPWrapperMethod:
@@ -393,7 +401,9 @@ class KTEPWrapperMethod:
             self.gpu_method.apply(dispatch_output) if self.num_gpu_experts > 0 else None
         )
         cpu_output = self._sync_cpu_forward(handle)
-        value = cpu_output.value + (0.0 if gpu_output is None else gpu_output.value)
+        value = cpu_output.value + (
+            0.0 if gpu_output is None else gpu_output.hidden_states.value
+        )
         return FakeHiddenStates(
             FakeTensor(value, (1, 2_048), GLM47_BF16_DTYPE, device="cuda:0")
         )
@@ -453,6 +463,17 @@ def _mask_sha256(rows: tuple[tuple[bool, ...], ...]) -> str:
     ).hexdigest()
 
 
+class FakeLogitsProcessorOutput:
+    def __init__(self) -> None:
+        self.next_token_logits = FakeTensor(
+            0.25,
+            (1, 154_880),
+            GLM47_FLOAT32_DTYPE,
+            device="cuda:0",
+        )
+        self.hidden_states: FakeTensor | None = None
+
+
 class FakeCausalModel:
     def __init__(
         self,
@@ -505,7 +526,7 @@ class FakeCausalModel:
         }
         self.torch = torch
 
-    def forward(self, _forward_batch: object) -> FakeHiddenStates:
+    def forward(self, _forward_batch: object) -> FakeLogitsProcessorOutput:
         self.torch.require_grad_disabled("causal_model_forward")
         hidden = FakeTensor(0.5, (1, 2_048), GLM47_BF16_DTYPE, device="cuda:0")
         for layer in self.model.layers[1:]:
@@ -515,22 +536,12 @@ class FakeCausalModel:
                 FakeDispatchOutput(hidden_states=hidden),
             )
             hidden = result.hidden_states
-        return FakeHiddenStates(hidden)
-
-
-class FakeLogitsOutput:
-    def __init__(self) -> None:
-        self.next_token_logits = FakeTensor(
-            0.25,
-            (1, 154_880),
-            GLM47_FLOAT32_DTYPE,
-            device="cuda:0",
-        )
+        return FakeLogitsProcessorOutput()
 
 
 class FakeRunnerOutput:
-    def __init__(self) -> None:
-        self.logits_output = FakeLogitsOutput()
+    def __init__(self, logits_output: FakeLogitsProcessorOutput) -> None:
+        self.logits_output = logits_output
 
 
 class FakeModelRunner:
@@ -559,10 +570,11 @@ class FakeModelRunner:
 
     def forward(self, forward_batch: object) -> FakeRunnerOutput:
         self.torch.require_grad_disabled("model_runner_forward")
-        self.model.forward(forward_batch)
-        return FakeRunnerOutput()
+        return FakeRunnerOutput(self.model.forward(forward_batch))
 
-    def sample(self, logits_output: FakeLogitsOutput, _batch: object) -> FakeTensor:
+    def sample(
+        self, logits_output: FakeLogitsProcessorOutput, _batch: object
+    ) -> FakeTensor:
         return logits_output.next_token_logits.argmax(dim=-1)
 
 
@@ -1122,10 +1134,13 @@ def test_trace_collector_clones_reused_layer_probe_buffers(
     runtime = FakeEnvironment(2).runtime()
     collector = backend._TraceOutputCollector(runtime)
     reused = FakeTensor(1.0, (1, 2_048), GLM47_BF16_DTYPE, device="cuda:0")
+    output: object = (
+        FakeHiddenStates(reused) if operation == GPU_METHOD_APPLY else reused
+    )
 
-    collector(TraceProbe(operation, 1), "layer_probe", reused)
+    collector(TraceProbe(operation, 1), "layer_probe", output)
     reused.value = 9.0
-    collector(TraceProbe(operation, 1), "layer_probe", reused)
+    collector(TraceProbe(operation, 1), "layer_probe", output)
 
     captured = cast(list[FakeTensor], getattr(collector, output_attribute))
     assert reused.clone_count == 2
@@ -1133,6 +1148,22 @@ def test_trace_collector_clones_reused_layer_probe_buffers(
     assert captured[1] is not reused
     assert captured[0] is not captured[1]
     assert (captured[0].value, captured[1].value) == (1.0, 9.0)
+
+
+def test_trace_collector_captures_model_logits_when_hidden_states_are_none() -> None:
+    runtime = FakeEnvironment(0).runtime()
+    collector = backend._TraceOutputCollector(runtime)
+
+    captured = collector(
+        TraceProbe(MODEL_FORWARD),
+        "extend",
+        FakeLogitsProcessorOutput(),
+    )
+
+    assert captured.kind == "next_token_logits"
+    assert captured.tensor is not None
+    assert captured.tensor.dtype == GLM47_FLOAT32_DTYPE
+    assert captured.tensor.shape == (1, 154_880)
 
 
 @pytest.mark.parametrize(

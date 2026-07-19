@@ -75,7 +75,7 @@ def make_process_spec():
 def make_kernel_observation():
     fixture = (
         Path(__file__).parents[2]
-        / "src/exo/worker/tests/fixtures/sglang_kt/glm47_kernel_runtime_v1_dwagon_v4.json"
+        / "src/exo/worker/tests/fixtures/sglang_kt/glm47_kernel_runtime_v1_dwagon_v6.json"
     )
     observed = load_sglang_kt_kernel_runtime_validation_receipt(fixture)
     return observed.model_copy(

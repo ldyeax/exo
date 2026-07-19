@@ -19,26 +19,43 @@ _MACHINE_DWAGON_V4_RECEIPT = Path(
     "/var/lib/exo/benchmarks/glm47-kt-kernel-dwagon-20260719-v4/"
     "runtime-validation-receipt.json"
 )
-_GOLDEN_DWAGON_V4_RECEIPT = (
+_MACHINE_DWAGON_V6_RECEIPT = Path(
+    "/var/lib/exo/benchmarks/glm47-kt-cpu-control-dwagon-20260719-v6/"
+    "kernel-runtime-validation-receipt.json"
+)
+_HISTORICAL_DWAGON_V4_RECEIPT = (
     Path(__file__).parents[1]
     / "fixtures"
     / "sglang_kt"
     / "glm47_kernel_runtime_v1_dwagon_v4.json"
 )
-_REAL_DWAGON_V4_RECEIPT_SHA256 = (
+_CURRENT_DWAGON_V6_RECEIPT = (
+    Path(__file__).parents[1]
+    / "fixtures"
+    / "sglang_kt"
+    / "glm47_kernel_runtime_v1_dwagon_v6.json"
+)
+_HISTORICAL_DWAGON_V4_RECEIPT_SHA256 = (
     "b4f6fd1718bb3145a17c97cf8113bbfcd186416cfde3cd0fcc9eada301b78eef"
+)
+_CURRENT_DWAGON_V6_RECEIPT_SHA256 = (
+    "5cfffa1e450f0dbcded077f7496e5b9d3094bed1f73aeab370f2ebb2775867c6"
+)
+_HISTORICAL_DWAGON_V4_SGLANG_REVISION = "41d4d300a21fd2f486681d56f1017789dfb355fe"
+_HISTORICAL_DWAGON_V4_KTRANSFORMERS_REVISION = (
+    "7e70d7518edd26af6a0638593037d68c9b6bd6bf"
 )
 
 type JsonObject = dict[str, object]
 type JsonPathPart = str | int
 
 
-def _golden_receipt_json() -> str:
-    return _GOLDEN_DWAGON_V4_RECEIPT.read_text()
+def _current_receipt_json() -> str:
+    return _CURRENT_DWAGON_V6_RECEIPT.read_text()
 
 
-def _golden_receipt_document() -> JsonObject:
-    return cast(JsonObject, json.loads(_golden_receipt_json()))
+def _current_receipt_document() -> JsonObject:
+    return cast(JsonObject, json.loads(_current_receipt_json()))
 
 
 def _write_receipt(tmp_path: Path, contents: str) -> Path:
@@ -90,15 +107,15 @@ def _replace_json_path(
         _json_array(current)[last_part] = replacement
 
 
-def test_loads_real_dwagon_v4_golden_and_derives_only_kernel_capability() -> None:
+def test_loads_current_dwagon_v6_golden_and_derives_only_kernel_capability() -> None:
     observation = load_sglang_kt_kernel_runtime_validation_receipt(
-        _GOLDEN_DWAGON_V4_RECEIPT,
-        expected_receipt_sha256=_REAL_DWAGON_V4_RECEIPT_SHA256,
+        _CURRENT_DWAGON_V6_RECEIPT,
+        expected_receipt_sha256=_CURRENT_DWAGON_V6_RECEIPT_SHA256,
     )
 
-    assert observation.receipt_path == str(_GOLDEN_DWAGON_V4_RECEIPT)
-    assert observation.receipt_sha256 == _REAL_DWAGON_V4_RECEIPT_SHA256
-    assert observation.receipt_size_bytes == _GOLDEN_DWAGON_V4_RECEIPT.stat().st_size
+    assert observation.receipt_path == str(_CURRENT_DWAGON_V6_RECEIPT)
+    assert observation.receipt_sha256 == _CURRENT_DWAGON_V6_RECEIPT_SHA256
+    assert observation.receipt_size_bytes == _CURRENT_DWAGON_V6_RECEIPT.stat().st_size
     assert observation.schema_version == 1
     assert observation.capabilities == ("kt_bf16_amx_executed_v1",)
     assert observation.gpu_uuid == "GPU-a442b72e-6727-6322-ba5d-5a9512b79886"
@@ -113,17 +130,71 @@ def test_loads_real_dwagon_v4_golden_and_derives_only_kernel_capability() -> Non
     assert observation.cuda_version == "12.8"
 
 
+def test_dwagon_v4_golden_preserves_historical_hash_and_provenance() -> None:
+    contents = _HISTORICAL_DWAGON_V4_RECEIPT.read_bytes()
+    document = cast(JsonObject, json.loads(contents))
+    provenance = _json_object(document["provenance"])
+    runtime_identity = _json_object(document["runtime_identity"])
+
+    assert hashlib.sha256(contents).hexdigest() == (
+        _HISTORICAL_DWAGON_V4_RECEIPT_SHA256
+    )
+    assert provenance["sglang_revision"] == _HISTORICAL_DWAGON_V4_SGLANG_REVISION
+    assert provenance["ktransformers_revision"] == (
+        _HISTORICAL_DWAGON_V4_KTRANSFORMERS_REVISION
+    )
+    for embedded in (
+        *_json_array(provenance["embedded_provenance"]),
+        *_json_array(runtime_identity["embedded_provenance"]),
+    ):
+        evidence = _json_object(embedded)
+        assert evidence["sglang_revision"] == (_HISTORICAL_DWAGON_V4_SGLANG_REVISION)
+        assert evidence["ktransformers_revision"] == (
+            _HISTORICAL_DWAGON_V4_KTRANSFORMERS_REVISION
+        )
+
+
+def test_rejects_historical_dwagon_v4_golden_as_superseded() -> None:
+    with pytest.raises(
+        SglangKtKernelRuntimeValidationReceiptError,
+        match="invalid SGLang-KTransformers kernel runtime receipt",
+    ) as raised:
+        load_sglang_kt_kernel_runtime_validation_receipt(
+            _HISTORICAL_DWAGON_V4_RECEIPT,
+            expected_receipt_sha256=_HISTORICAL_DWAGON_V4_RECEIPT_SHA256,
+        )
+
+    assert raised.value.__cause__ is not None
+    assert "kernel receipt source revisions are not pinned" in str(
+        raised.value.__cause__
+    )
+
+
 @pytest.mark.skipif(
     not _MACHINE_DWAGON_V4_RECEIPT.is_file(),
     reason="the machine-local dwagon v4 validation receipt is unavailable",
 )
-def test_checked_in_golden_matches_machine_dwagon_v4_receipt() -> None:
+def test_historical_golden_matches_machine_dwagon_v4_receipt_byte_for_byte() -> None:
     machine_contents = _MACHINE_DWAGON_V4_RECEIPT.read_bytes()
-    golden_contents = _GOLDEN_DWAGON_V4_RECEIPT.read_bytes()
+    golden_contents = _HISTORICAL_DWAGON_V4_RECEIPT.read_bytes()
 
     assert machine_contents == golden_contents
     assert hashlib.sha256(machine_contents).hexdigest() == (
-        _REAL_DWAGON_V4_RECEIPT_SHA256
+        _HISTORICAL_DWAGON_V4_RECEIPT_SHA256
+    )
+
+
+@pytest.mark.skipif(
+    not _MACHINE_DWAGON_V6_RECEIPT.is_file(),
+    reason="the machine-local dwagon v6 validation receipt is unavailable",
+)
+def test_current_golden_matches_machine_dwagon_v6_receipt_byte_for_byte() -> None:
+    machine_contents = _MACHINE_DWAGON_V6_RECEIPT.read_bytes()
+    golden_contents = _CURRENT_DWAGON_V6_RECEIPT.read_bytes()
+
+    assert machine_contents == golden_contents
+    assert hashlib.sha256(machine_contents).hexdigest() == (
+        _CURRENT_DWAGON_V6_RECEIPT_SHA256
     )
 
 
@@ -152,7 +223,7 @@ def test_rejects_nonpassing_or_widened_receipt_claims(
     path: tuple[JsonPathPart, ...],
     replacement: object,
 ) -> None:
-    document = _golden_receipt_document()
+    document = _current_receipt_document()
     _replace_json_path(document, path, replacement)
     receipt_path = _write_document(tmp_path, document)
 
@@ -186,7 +257,7 @@ def test_rejects_changed_runtime_or_resource_identity(
     path: tuple[JsonPathPart, ...],
     replacement: object,
 ) -> None:
-    document = _golden_receipt_document()
+    document = _current_receipt_document()
     _replace_json_path(document, path, replacement)
     receipt_path = _write_document(tmp_path, document)
 
@@ -202,7 +273,7 @@ def test_rejects_changed_runtime_or_resource_identity(
         (("amx", 0, "extension_sha256"), "e" * 64),
         (("amx", 0, "numerical", "relative_l1_error"), -1.0),
         (("amx", 1, "numerical", "relative_l1_error"), 0.5),
-        (("cuda_stream", "default_cuda_stream_id"), 713_304_304),
+        (("cuda_stream", "default_cuda_stream_id"), 1_014_859_664),
         (("cuda_stream", "cuda_output_consumer_count"), 0),
         (("cuda_stream", "cpu_input_observed_checksum"), 0.0),
         (("cuda_stream", "cuda_output_consumed_l1"), 20.0),
@@ -213,7 +284,7 @@ def test_rejects_incomplete_amx_or_cuda_stream_execution(
     path: tuple[JsonPathPart, ...],
     replacement: object,
 ) -> None:
-    document = _golden_receipt_document()
+    document = _current_receipt_document()
     _replace_json_path(document, path, replacement)
     receipt_path = _write_document(tmp_path, document)
 
@@ -222,14 +293,14 @@ def test_rejects_incomplete_amx_or_cuda_stream_execution(
 
 
 def test_rejects_unexpected_keys_and_camel_case_schema(tmp_path: Path) -> None:
-    extra_key_document = _golden_receipt_document()
+    extra_key_document = _current_receipt_document()
     extra_key_document["unexpected"] = True
     extra_key_path = _write_document(tmp_path, extra_key_document)
 
     with pytest.raises(SglangKtKernelRuntimeValidationReceiptError):
         load_sglang_kt_kernel_runtime_validation_receipt(extra_key_path)
 
-    camel_case_document = _golden_receipt_document()
+    camel_case_document = _current_receipt_document()
     camel_case_document["schemaVersion"] = camel_case_document.pop("schema_version")
     camel_case_path = _write_document(tmp_path, camel_case_document)
 
@@ -238,7 +309,7 @@ def test_rejects_unexpected_keys_and_camel_case_schema(tmp_path: Path) -> None:
 
 
 def test_rejects_duplicate_keys_and_nonfinite_numbers(tmp_path: Path) -> None:
-    receipt_text = _golden_receipt_json().rstrip()
+    receipt_text = _current_receipt_json().rstrip()
     duplicate_key_path = _write_receipt(
         tmp_path,
         receipt_text[:-1] + ', "status": "failed"}\n',
@@ -247,7 +318,7 @@ def test_rejects_duplicate_keys_and_nonfinite_numbers(tmp_path: Path) -> None:
     with pytest.raises(SglangKtKernelRuntimeValidationReceiptError):
         load_sglang_kt_kernel_runtime_validation_receipt(duplicate_key_path)
 
-    document = _golden_receipt_document()
+    document = _current_receipt_document()
     _replace_json_path(
         document,
         ("cuda", "numerical", "relative_l1_error"),
@@ -261,7 +332,7 @@ def test_rejects_duplicate_keys_and_nonfinite_numbers(tmp_path: Path) -> None:
 
 
 def test_rejects_wrong_expected_hash_and_unsafe_file(tmp_path: Path) -> None:
-    receipt_path = _write_receipt(tmp_path, _golden_receipt_json())
+    receipt_path = _write_receipt(tmp_path, _current_receipt_json())
 
     with pytest.raises(
         SglangKtKernelRuntimeValidationReceiptError,

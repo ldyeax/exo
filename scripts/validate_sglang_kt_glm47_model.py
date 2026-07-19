@@ -880,7 +880,9 @@ def _run_bound_backend(
             runtime_loader=lambda: runtime,
         )
     except Glm47BackendError as error:
-        raise Glm47ModelValidationError("live GLM-4.7 backend failed") from error
+        raise Glm47ModelValidationError(
+            f"live GLM-4.7 backend failed: {error}"
+        ) from error
 
 
 def perform_internal_live_validation(
