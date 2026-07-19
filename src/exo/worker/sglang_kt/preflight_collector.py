@@ -31,13 +31,19 @@ from exo.worker.sglang_kt.launch_spec import (
     GLM_4_7_FLASH_BF16_MODEL_REVISION,
     GLM_5_2_FP8_MODEL_ID,
     SglangKtProcessLaunchSpec,
+    calculate_sglang_kt_process_launch_spec_sha256,
 )
 from exo.worker.sglang_kt.model_contract import (
     SglangKtVerifiedModelSnapshot,
     verify_sglang_kt_model_snapshot,
 )
+from exo.worker.sglang_kt.model_runtime_validation_receipt import (
+    load_sglang_kt_model_runtime_validation_receipt,
+)
 from exo.worker.sglang_kt.preflight import (
+    SglangKtBoundModelRuntimeValidationReceipt,
     SglangKtHostPreflightObservation,
+    SglangKtModelRuntimeValidationBinding,
     SglangKtModelSnapshotReceiptObservation,
     SglangKtRuntimeObservation,
     SglangKtRuntimeValidationReceiptObservation,
@@ -251,6 +257,17 @@ class SglangKtKernelRuntimeValidationProbe(Protocol):
     ) -> SglangKtKernelRuntimeValidationReceiptObservation | None: ...
 
 
+class SglangKtModelRuntimeValidationProbe(Protocol):
+    def observe_model_runtime_validation(
+        self,
+        process_spec: SglangKtProcessLaunchSpec,
+        model_snapshot_receipt: SglangKtModelSnapshotReceiptObservation,
+        kernel_runtime_validation_receipt: (
+            SglangKtKernelRuntimeValidationReceiptObservation
+        ),
+    ) -> SglangKtBoundModelRuntimeValidationReceipt | None: ...
+
+
 @final
 class SglangKtKernelRuntimeValidationBinding(FrozenModel):
     gpu_uuid: GpuUuid
@@ -286,6 +303,62 @@ class LocalSglangKtKernelRuntimeValidationProbe:
         return load_sglang_kt_kernel_runtime_validation_receipt(
             Path(binding.receipt_path),
             expected_receipt_sha256=binding.receipt_sha256,
+        )
+
+
+@final
+class LocalSglangKtModelRuntimeValidationProbe:
+    """Load only receipts explicitly bound to an exact process specification."""
+
+    def __init__(
+        self, bindings: Sequence[SglangKtModelRuntimeValidationBinding]
+    ) -> None:
+        self._bindings = tuple(bindings)
+        process_spec_sha256_values = tuple(
+            binding.process_spec_sha256 for binding in self._bindings
+        )
+        if len(set(process_spec_sha256_values)) != len(process_spec_sha256_values):
+            raise ValueError(
+                "model runtime validation bindings require unique process specs"
+            )
+
+    def observe_model_runtime_validation(
+        self,
+        process_spec: SglangKtProcessLaunchSpec,
+        model_snapshot_receipt: SglangKtModelSnapshotReceiptObservation,
+        kernel_runtime_validation_receipt: (
+            SglangKtKernelRuntimeValidationReceiptObservation
+        ),
+    ) -> SglangKtBoundModelRuntimeValidationReceipt | None:
+        process_spec_sha256 = calculate_sglang_kt_process_launch_spec_sha256(
+            process_spec
+        )
+        binding = next(
+            (
+                candidate
+                for candidate in self._bindings
+                if candidate.process_spec_sha256 == process_spec_sha256
+            ),
+            None,
+        )
+        if binding is None:
+            return None
+        contract_receipt_sha256 = model_snapshot_receipt.contract_receipt_sha256
+        if contract_receipt_sha256 is None:
+            return None
+        receipt = load_sglang_kt_model_runtime_validation_receipt(
+            Path(binding.receipt_path),
+            expected_validator_sha256=binding.validator_sha256,
+            expected_process_spec_sha256=process_spec_sha256,
+            expected_model_contract_receipt_sha256=contract_receipt_sha256,
+            expected_kernel_receipt_sha256=(
+                kernel_runtime_validation_receipt.receipt_sha256
+            ),
+            expected_receipt_sha256=binding.receipt_sha256,
+        )
+        return SglangKtBoundModelRuntimeValidationReceipt(
+            binding=binding,
+            receipt=receipt,
         )
 
 
@@ -849,6 +922,7 @@ def collect_sglang_kt_local_host_preflight_observation(
     port_probe: SglangKtPortProbe,
     runtime_validation_probe: SglangKtRuntimeValidationProbe | None = None,
     kernel_runtime_validation_probe: SglangKtKernelRuntimeValidationProbe | None = None,
+    model_runtime_validation_probe: SglangKtModelRuntimeValidationProbe | None = None,
 ) -> SglangKtHostPreflightObservation:
     """Collect one host observation from explicitly supplied local effects."""
 
@@ -886,10 +960,14 @@ def collect_sglang_kt_local_host_preflight_observation(
     kernel_runtime_validation_receipts: list[
         SglangKtKernelRuntimeValidationReceiptObservation
     ] = []
+    bound_model_runtime_validation_receipts: list[
+        SglangKtBoundModelRuntimeValidationReceipt
+    ] = []
     if runtime_validation_probe is not None:
         for process_spec in process_specs:
             if (
-                process_spec.gpu_uuid not in planned_gpu_uuids
+                process_spec.model_id == GLM_4_7_FLASH_BF16_MODEL_ID
+                or process_spec.gpu_uuid not in planned_gpu_uuids
                 or process_spec.gpu_uuid not in observed_gpu_uuids
             ):
                 continue
@@ -918,10 +996,42 @@ def collect_sglang_kt_local_host_preflight_observation(
                 and kernel_receipt.gpu_uuid == process_spec.gpu_uuid
             ):
                 kernel_runtime_validation_receipts.append(kernel_receipt)
+    if model_runtime_validation_probe is not None:
+        snapshots_by_path = {
+            receipt.model_path: receipt for receipt in model_snapshot_receipts
+        }
+        kernels_by_gpu = {
+            receipt.gpu_uuid: receipt for receipt in kernel_runtime_validation_receipts
+        }
+        for process_spec in process_specs:
+            snapshot_receipt = snapshots_by_path.get(process_spec.model_path)
+            kernel_receipt = kernels_by_gpu.get(process_spec.gpu_uuid)
+            if snapshot_receipt is None or kernel_receipt is None:
+                continue
+            try:
+                bound_model_receipt = (
+                    model_runtime_validation_probe.observe_model_runtime_validation(
+                        process_spec,
+                        snapshot_receipt,
+                        kernel_receipt,
+                    )
+                )
+            except Exception:
+                continue
+            if (
+                bound_model_receipt is not None
+                and bound_model_receipt.receipt.gpu_uuid == process_spec.gpu_uuid
+                and bound_model_receipt.binding.process_spec_sha256
+                == calculate_sglang_kt_process_launch_spec_sha256(process_spec)
+            ):
+                bound_model_runtime_validation_receipts.append(bound_model_receipt)
     return SglangKtHostPreflightObservation(
         node_id=node_id,
         runtime=runtime,
         runtime_validation_receipts=tuple(runtime_validation_receipts),
+        bound_model_runtime_validation_receipts=tuple(
+            bound_model_runtime_validation_receipts
+        ),
         kernel_runtime_validation_receipts=tuple(kernel_runtime_validation_receipts),
         readable_directories=readable_directories,
         model_snapshot_receipts=model_snapshot_receipts,

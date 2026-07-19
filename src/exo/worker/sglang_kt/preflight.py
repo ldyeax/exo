@@ -24,6 +24,9 @@ from exo.worker.sglang_kt.launch_spec import (
     SglangKtProcessLaunchSpec,
     calculate_sglang_kt_process_launch_spec_sha256,
 )
+from exo.worker.sglang_kt.model_runtime_validation_receipt import (
+    SglangKtModelRuntimeValidationReceiptObservation,
+)
 from exo.worker.sglang_kt.runtime_validation_receipt import (
     SglangKtKernelRuntimeValidationReceiptObservation,
 )
@@ -198,6 +201,37 @@ class SglangKtRuntimeValidationReceiptObservation(FrozenModel):
 
 
 @final
+class SglangKtModelRuntimeValidationBinding(FrozenModel):
+    """Operator-supplied expectations independent of receipt contents."""
+
+    process_spec_sha256: Sha256Digest
+    validator_sha256: Sha256Digest
+    receipt_path: AbsoluteRuntimePath
+    receipt_sha256: Sha256Digest
+
+
+@final
+class SglangKtBoundModelRuntimeValidationReceipt(FrozenModel):
+    binding: SglangKtModelRuntimeValidationBinding
+    receipt: SglangKtModelRuntimeValidationReceiptObservation
+
+    @model_validator(mode="after")
+    def validate_expected_identity(
+        self,
+    ) -> "SglangKtBoundModelRuntimeValidationReceipt":
+        if (
+            self.receipt.process_spec_sha256 != self.binding.process_spec_sha256
+            or self.receipt.validator_sha256 != self.binding.validator_sha256
+            or self.receipt.receipt_path != self.binding.receipt_path
+            or self.receipt.receipt_sha256 != self.binding.receipt_sha256
+        ):
+            raise ValueError(
+                "model runtime receipt does not match its independent binding"
+            )
+        return self
+
+
+@final
 class SglangKtModelSnapshotReceiptObservation(FrozenModel):
     """Observed Exo revision receipt and snapshot completeness for one path."""
 
@@ -254,6 +288,9 @@ class SglangKtHostPreflightObservation(FrozenModel):
     runtime_validation_receipts: tuple[
         SglangKtRuntimeValidationReceiptObservation, ...
     ] = ()
+    bound_model_runtime_validation_receipts: tuple[
+        SglangKtBoundModelRuntimeValidationReceipt, ...
+    ] = ()
     kernel_runtime_validation_receipts: tuple[
         SglangKtKernelRuntimeValidationReceiptObservation, ...
     ] = ()
@@ -295,6 +332,28 @@ class SglangKtHostPreflightObservation(FrozenModel):
         )
         if len(set(validation_gpu_uuids)) != len(validation_gpu_uuids):
             raise ValueError("runtime validation receipt GPU UUIDs must be unique")
+        model_validation_gpu_uuids = tuple(
+            bound.receipt.gpu_uuid
+            for bound in self.bound_model_runtime_validation_receipts
+        )
+        if len(set(model_validation_gpu_uuids)) != len(model_validation_gpu_uuids):
+            raise ValueError(
+                "model runtime validation receipt GPU UUIDs must be unique"
+            )
+        model_validation_process_specs = tuple(
+            bound.binding.process_spec_sha256
+            for bound in self.bound_model_runtime_validation_receipts
+        )
+        if len(set(model_validation_process_specs)) != len(
+            model_validation_process_specs
+        ):
+            raise ValueError(
+                "model runtime validation bindings require unique process specs"
+            )
+        if set(validation_gpu_uuids) & set(model_validation_gpu_uuids):
+            raise ValueError(
+                "legacy and file-bound model runtime receipts cannot share a GPU"
+            )
         kernel_validation_gpu_uuids = tuple(
             receipt.gpu_uuid for receipt in self.kernel_runtime_validation_receipts
         )
@@ -312,8 +371,8 @@ class SglangKtRankAdmissionBinding(FrozenModel):
     pipeline_rank: ResourceIndex
     process_spec_sha256: Sha256Digest
     model_snapshot_receipts: tuple[SglangKtModelSnapshotReceiptObservation, ...] = ()
-    model_runtime_validation_receipt: (
-        SglangKtRuntimeValidationReceiptObservation | None
+    bound_model_runtime_validation_receipt: (
+        SglangKtBoundModelRuntimeValidationReceipt | None
     ) = None
     kernel_runtime_validation_receipt: (
         SglangKtKernelRuntimeValidationReceiptObservation | None
@@ -341,7 +400,7 @@ def validate_sglang_kt_rank_admission_binding(
     if process_spec.target_profile not in GLM_4_7_FLASH_TARGET_PROFILES:
         if (
             binding.model_snapshot_receipts
-            or binding.model_runtime_validation_receipt is not None
+            or binding.bound_model_runtime_validation_receipt is not None
             or binding.kernel_runtime_validation_receipt is not None
         ):
             raise ValueError("target profile does not admit GLM-4.7 evidence")
@@ -371,7 +430,12 @@ def validate_sglang_kt_rank_admission_binding(
     ):
         raise ValueError("admission binding model contract evidence is inconsistent")
 
-    model_runtime_receipt = binding.model_runtime_validation_receipt
+    bound_model_runtime_receipt = binding.bound_model_runtime_validation_receipt
+    model_runtime_receipt = (
+        None
+        if bound_model_runtime_receipt is None
+        else bound_model_runtime_receipt.receipt
+    )
     kernel_receipt = binding.kernel_runtime_validation_receipt
     expected_runtime_capabilities = (
         GLM_4_7_FLASH_CPU_ROUTED_EXPERTS_REQUIRED_RUNTIME_CAPABILITIES
@@ -382,7 +446,12 @@ def validate_sglang_kt_rank_admission_binding(
     expected_wrapped_layers = GLM_4_7_FLASH_WRAPPED_EXPERT_LAYERS
     if not (
         model_runtime_receipt is not None
+        and bound_model_runtime_receipt is not None
+        and bound_model_runtime_receipt.binding.process_spec_sha256
+        == calculate_sglang_kt_process_launch_spec_sha256(process_spec)
         and model_runtime_receipt.target_profile == process_spec.target_profile
+        and model_runtime_receipt.process_spec_sha256
+        == calculate_sglang_kt_process_launch_spec_sha256(process_spec)
         and model_runtime_receipt.gpu_uuid == process_spec.gpu_uuid
         and model_runtime_receipt.gpu_compute_capability == (8, 6)
         and model_runtime_receipt.cpu_cores == process_spec.cpu_cores
@@ -392,6 +461,14 @@ def validate_sglang_kt_rank_admission_binding(
         and model_runtime_receipt.model_revision == process_spec.expected_model_revision
         and model_runtime_receipt.model_config_sha256
         == snapshot_receipts[0].config_sha256
+        and model_runtime_receipt.model_contract_path
+        == snapshot_receipts[0].contract_path
+        and model_runtime_receipt.model_contract_receipt_sha256
+        == snapshot_receipts[0].contract_receipt_sha256
+        and model_runtime_receipt.model_contract_sha256
+        == snapshot_receipts[0].contract_sha256
+        and model_runtime_receipt.model_index_sha256
+        == snapshot_receipts[0].index_sha256
         and model_runtime_receipt.sglang_revision
         == process_spec.expected_sglang_revision
         and model_runtime_receipt.ktransformers_revision
@@ -401,6 +478,10 @@ def validate_sglang_kt_rank_admission_binding(
         and model_runtime_receipt.transformers_module_version
         == process_spec.required_transformers_module_version
         and kernel_receipt is not None
+        and model_runtime_receipt.kernel_runtime_validation_receipt_path
+        == kernel_receipt.receipt_path
+        and model_runtime_receipt.kernel_runtime_validation_receipt_sha256
+        == kernel_receipt.receipt_sha256
         and model_runtime_receipt.torch_version == kernel_receipt.torch_version
         and model_runtime_receipt.cuda_version == kernel_receipt.cuda_version
         and model_runtime_receipt.sgl_kernel_build_id
@@ -508,8 +589,8 @@ def _build_rank_admission_binding(
     observation: SglangKtHostPreflightObservation,
 ) -> SglangKtRankAdmissionBinding:
     model_snapshot_receipts: tuple[SglangKtModelSnapshotReceiptObservation, ...] = ()
-    model_runtime_validation_receipt: (
-        SglangKtRuntimeValidationReceiptObservation | None
+    bound_model_runtime_validation_receipt: (
+        SglangKtBoundModelRuntimeValidationReceipt | None
     ) = None
     kernel_runtime_validation_receipt: (
         SglangKtKernelRuntimeValidationReceiptObservation | None
@@ -543,11 +624,12 @@ def _build_rank_admission_binding(
             ),
             None,
         )
-        model_runtime_validation_receipt = next(
+        bound_model_runtime_validation_receipt = next(
             (
-                receipt
-                for receipt in observation.runtime_validation_receipts
-                if receipt.gpu_uuid == process_spec.gpu_uuid
+                bound
+                for bound in observation.bound_model_runtime_validation_receipts
+                if bound.binding.process_spec_sha256
+                == calculate_sglang_kt_process_launch_spec_sha256(process_spec)
             ),
             None,
         )
@@ -558,7 +640,7 @@ def _build_rank_admission_binding(
             process_spec
         ),
         model_snapshot_receipts=model_snapshot_receipts,
-        model_runtime_validation_receipt=model_runtime_validation_receipt,
+        bound_model_runtime_validation_receipt=(bound_model_runtime_validation_receipt),
         kernel_runtime_validation_receipt=kernel_runtime_validation_receipt,
     )
     try:
@@ -897,13 +979,31 @@ def _evaluate_runtime_validation(
         expected_kv_cache_dtype = GLM_5_2_KV_CACHE_DTYPE
         required_capabilities = GLM_5_2_REQUIRED_RUNTIME_CAPABILITIES
 
-    validation_receipt = next(
+    bound_model_runtime_receipt = next(
         (
-            receipt
-            for receipt in observation.runtime_validation_receipts
-            if receipt.gpu_uuid == process_spec.gpu_uuid
+            bound
+            for bound in observation.bound_model_runtime_validation_receipts
+            if bound.binding.process_spec_sha256
+            == calculate_sglang_kt_process_launch_spec_sha256(process_spec)
         ),
         None,
+    )
+    validation_receipt = (
+        None
+        if process_spec.target_profile in GLM_4_7_FLASH_TARGET_PROFILES
+        and bound_model_runtime_receipt is None
+        else (
+            bound_model_runtime_receipt.receipt
+            if bound_model_runtime_receipt is not None
+            else next(
+                (
+                    receipt
+                    for receipt in observation.runtime_validation_receipts
+                    if receipt.gpu_uuid == process_spec.gpu_uuid
+                ),
+                None,
+            )
+        )
     )
     snapshot_receipt = next(
         (
@@ -957,6 +1057,37 @@ def _evaluate_runtime_validation(
         validation_receipt is not None
         and snapshot_receipt is not None
         and kernel_validation_matches
+        and (
+            process_spec.target_profile not in GLM_4_7_FLASH_TARGET_PROFILES
+            or (
+                isinstance(
+                    validation_receipt,
+                    SglangKtModelRuntimeValidationReceiptObservation,
+                )
+                and bound_model_runtime_receipt is not None
+                and bound_model_runtime_receipt.binding.validator_sha256
+                == validation_receipt.validator_sha256
+                and bound_model_runtime_receipt.binding.receipt_path
+                == validation_receipt.receipt_path
+                and bound_model_runtime_receipt.binding.receipt_sha256
+                == validation_receipt.receipt_sha256
+                and validation_receipt.process_spec_sha256
+                == calculate_sglang_kt_process_launch_spec_sha256(process_spec)
+                and validation_receipt.model_contract_path
+                == snapshot_receipt.contract_path
+                and validation_receipt.model_contract_receipt_sha256
+                == snapshot_receipt.contract_receipt_sha256
+                and validation_receipt.model_contract_sha256
+                == snapshot_receipt.contract_sha256
+                and validation_receipt.model_index_sha256
+                == snapshot_receipt.index_sha256
+                and kernel_validation_receipt is not None
+                and validation_receipt.kernel_runtime_validation_receipt_path
+                == kernel_validation_receipt.receipt_path
+                and validation_receipt.kernel_runtime_validation_receipt_sha256
+                == kernel_validation_receipt.receipt_sha256
+            )
+        )
         and validation_receipt.target_profile == process_spec.target_profile
         and validation_receipt.gpu_compute_capability == (8, 6)
         and validation_receipt.cpu_cores == process_spec.cpu_cores

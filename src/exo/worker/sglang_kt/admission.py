@@ -8,7 +8,12 @@ from exo.worker.sglang_kt.model_contract import (
     SglangKtModelContractError,
     verify_sglang_kt_model_snapshot,
 )
+from exo.worker.sglang_kt.model_runtime_validation_receipt import (
+    SglangKtModelRuntimeValidationReceiptError,
+    load_sglang_kt_model_runtime_validation_receipt,
+)
 from exo.worker.sglang_kt.preflight import (
+    SglangKtBoundModelRuntimeValidationReceipt,
     SglangKtModelSnapshotReceiptObservation,
     SglangKtRankAdmissionBinding,
     validate_sglang_kt_rank_admission_binding,
@@ -92,6 +97,34 @@ def _verify_kernel_runtime_receipt(
         )
 
 
+def _verify_model_runtime_receipt(
+    bound_receipt: SglangKtBoundModelRuntimeValidationReceipt,
+) -> None:
+    binding = bound_receipt.binding
+    receipt = bound_receipt.receipt
+    try:
+        reloaded = load_sglang_kt_model_runtime_validation_receipt(
+            Path(binding.receipt_path),
+            expected_validator_sha256=binding.validator_sha256,
+            expected_process_spec_sha256=binding.process_spec_sha256,
+            expected_model_contract_receipt_sha256=(
+                receipt.model_contract_receipt_sha256
+            ),
+            expected_kernel_receipt_sha256=(
+                receipt.kernel_runtime_validation_receipt_sha256
+            ),
+            expected_receipt_sha256=binding.receipt_sha256,
+        )
+    except SglangKtModelRuntimeValidationReceiptError as error:
+        raise SglangKtAdmissionEvidenceError(
+            "model runtime validation receipt changed after preflight"
+        ) from error
+    if reloaded != receipt:
+        raise SglangKtAdmissionEvidenceError(
+            "model runtime validation evidence changed after preflight"
+        )
+
+
 def verify_sglang_kt_local_admission_bindings_sync(
     process_specs: tuple[SglangKtProcessLaunchSpec, ...],
     admission_bindings: tuple[SglangKtRankAdmissionBinding, ...],
@@ -121,6 +154,9 @@ def verify_sglang_kt_local_admission_bindings_sync(
     kernel_receipts_by_gpu: dict[
         GpuUuid, SglangKtKernelRuntimeValidationReceiptObservation
     ] = {}
+    model_runtime_receipts_by_path: dict[
+        AbsoluteRuntimePath, SglangKtBoundModelRuntimeValidationReceipt
+    ] = {}
     for pipeline_rank in sorted(specs_by_rank):
         process_spec = specs_by_rank[pipeline_rank]
         binding = bindings_by_rank[pipeline_rank]
@@ -145,11 +181,23 @@ def verify_sglang_kt_local_admission_bindings_sync(
                 raise SglangKtAdmissionEvidenceError(
                     "local ranks disagree about kernel runtime evidence"
                 )
+        bound_model_runtime_receipt = binding.bound_model_runtime_validation_receipt
+        if bound_model_runtime_receipt is not None:
+            previous_model_runtime = model_runtime_receipts_by_path.setdefault(
+                bound_model_runtime_receipt.binding.receipt_path,
+                bound_model_runtime_receipt,
+            )
+            if previous_model_runtime != bound_model_runtime_receipt:
+                raise SglangKtAdmissionEvidenceError(
+                    "local ranks disagree about model runtime evidence"
+                )
 
     for receipt in snapshots_by_path.values():
         _verify_model_snapshot_receipt(receipt)
     for receipt in kernel_receipts_by_gpu.values():
         _verify_kernel_runtime_receipt(receipt)
+    for receipt in model_runtime_receipts_by_path.values():
+        _verify_model_runtime_receipt(receipt)
 
 
 async def verify_sglang_kt_local_admission_bindings(

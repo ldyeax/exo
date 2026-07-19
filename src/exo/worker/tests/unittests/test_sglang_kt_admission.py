@@ -18,7 +18,12 @@ from exo.worker.sglang_kt.launch_spec import (
     calculate_sglang_kt_process_launch_spec_sha256,
 )
 from exo.worker.sglang_kt.model_contract import SglangKtVerifiedModelSnapshot
+from exo.worker.sglang_kt.model_runtime_validation_receipt import (
+    SglangKtModelRuntimeValidationReceiptObservation,
+)
 from exo.worker.sglang_kt.preflight import (
+    SglangKtBoundModelRuntimeValidationReceipt,
+    SglangKtModelRuntimeValidationBinding,
     SglangKtModelSnapshotReceiptObservation,
     SglangKtRankAdmissionBinding,
 )
@@ -32,7 +37,7 @@ from exo.worker.tests.unittests.test_sglang_kt_launch_spec import (
 from exo.worker.tests.unittests.test_sglang_kt_preflight import (
     CUDA_VERSION,
     TORCH_VERSION,
-    make_runtime_validation_receipt,
+    make_model_runtime_validation_receipt,
 )
 
 INDEX_SHA256 = "91e6e95ca21700f50904a680c8c4212f5aa16dc7c10a013f01c906957c889791"
@@ -148,22 +153,54 @@ def make_binding(
     snapshot_receipt: SglangKtModelSnapshotReceiptObservation,
     kernel_receipt: SglangKtKernelRuntimeValidationReceiptObservation,
 ) -> SglangKtRankAdmissionBinding:
+    model_runtime_receipt = make_model_runtime_validation_receipt(
+        spec,
+        snapshot_receipt,
+        kernel_receipt,
+    )
     return SglangKtRankAdmissionBinding(
         pipeline_rank=spec.pipeline_rank,
         process_spec_sha256=calculate_sglang_kt_process_launch_spec_sha256(spec),
         model_snapshot_receipts=(snapshot_receipt,),
-        model_runtime_validation_receipt=make_runtime_validation_receipt(spec),
+        bound_model_runtime_validation_receipt=(
+            SglangKtBoundModelRuntimeValidationReceipt(
+                binding=SglangKtModelRuntimeValidationBinding(
+                    process_spec_sha256=(
+                        calculate_sglang_kt_process_launch_spec_sha256(spec)
+                    ),
+                    validator_sha256=model_runtime_receipt.validator_sha256,
+                    receipt_path=model_runtime_receipt.receipt_path,
+                    receipt_sha256=model_runtime_receipt.receipt_sha256,
+                ),
+                receipt=model_runtime_receipt,
+            )
+        ),
         kernel_runtime_validation_receipt=kernel_receipt,
     )
+
+
+def binding_model_runtime_receipt(
+    binding: SglangKtRankAdmissionBinding,
+) -> SglangKtModelRuntimeValidationReceiptObservation:
+    bound = binding.bound_model_runtime_validation_receipt
+    assert bound is not None
+    return bound.receipt
 
 
 def install_unchanged_evidence_loaders(
     monkeypatch: pytest.MonkeyPatch,
     snapshot_receipt: SglangKtModelSnapshotReceiptObservation,
     kernel_receipt: SglangKtKernelRuntimeValidationReceiptObservation,
-) -> tuple[list[Path], list[Path]]:
+    model_runtime_receipts: tuple[
+        SglangKtModelRuntimeValidationReceiptObservation, ...
+    ],
+) -> tuple[list[Path], list[Path], list[Path]]:
     model_paths: list[Path] = []
     kernel_paths: list[Path] = []
+    model_runtime_paths: list[Path] = []
+    model_runtime_receipts_by_path = {
+        Path(receipt.receipt_path): receipt for receipt in model_runtime_receipts
+    }
 
     def verify_model_snapshot(
         snapshot_path: Path,
@@ -191,6 +228,30 @@ def install_unchanged_evidence_loaders(
         kernel_paths.append(path)
         return kernel_receipt
 
+    def load_model_runtime_receipt(
+        path: Path,
+        *,
+        expected_validator_sha256: str,
+        expected_process_spec_sha256: str,
+        expected_model_contract_receipt_sha256: str,
+        expected_kernel_receipt_sha256: str,
+        expected_receipt_sha256: str | None = None,
+    ) -> SglangKtModelRuntimeValidationReceiptObservation:
+        model_runtime_receipt = model_runtime_receipts_by_path[path]
+        assert expected_validator_sha256 == model_runtime_receipt.validator_sha256
+        assert expected_process_spec_sha256 == model_runtime_receipt.process_spec_sha256
+        assert (
+            expected_model_contract_receipt_sha256
+            == model_runtime_receipt.model_contract_receipt_sha256
+        )
+        assert (
+            expected_kernel_receipt_sha256
+            == model_runtime_receipt.kernel_runtime_validation_receipt_sha256
+        )
+        assert expected_receipt_sha256 == model_runtime_receipt.receipt_sha256
+        model_runtime_paths.append(path)
+        return model_runtime_receipt
+
     monkeypatch.setattr(
         admission,
         "verify_sglang_kt_model_snapshot",
@@ -201,7 +262,12 @@ def install_unchanged_evidence_loaders(
         "load_sglang_kt_kernel_runtime_validation_receipt",
         load_kernel_receipt,
     )
-    return model_paths, kernel_paths
+    monkeypatch.setattr(
+        admission,
+        "load_sglang_kt_model_runtime_validation_receipt",
+        load_model_runtime_receipt,
+    )
+    return model_paths, kernel_paths, model_runtime_paths
 
 
 def test_revalidates_unchanged_file_bound_evidence_without_external_execution(
@@ -211,16 +277,19 @@ def test_revalidates_unchanged_file_bound_evidence_without_external_execution(
     snapshot_receipt = make_snapshot_receipt(spec)
     kernel_receipt = make_kernel_receipt(spec)
     binding = make_binding(spec, snapshot_receipt, kernel_receipt)
-    model_paths, kernel_paths = install_unchanged_evidence_loaders(
+    model_runtime_receipt = binding_model_runtime_receipt(binding)
+    model_paths, kernel_paths, model_runtime_paths = install_unchanged_evidence_loaders(
         monkeypatch,
         snapshot_receipt,
         kernel_receipt,
+        (model_runtime_receipt,),
     )
 
     verify_sglang_kt_local_admission_bindings_sync((spec,), (binding,))
 
     assert model_paths == [Path(snapshot_receipt.model_path)]
     assert kernel_paths == [Path(kernel_receipt.receipt_path)]
+    assert model_runtime_paths == [Path(model_runtime_receipt.receipt_path)]
 
 
 def test_rejects_process_spec_digest_mutation_before_loading_evidence(
@@ -230,10 +299,12 @@ def test_rejects_process_spec_digest_mutation_before_loading_evidence(
     snapshot_receipt = make_snapshot_receipt(spec)
     kernel_receipt = make_kernel_receipt(spec)
     binding = make_binding(spec, snapshot_receipt, kernel_receipt)
-    model_paths, kernel_paths = install_unchanged_evidence_loaders(
+    model_runtime_receipt = binding_model_runtime_receipt(binding)
+    model_paths, kernel_paths, model_runtime_paths = install_unchanged_evidence_loaders(
         monkeypatch,
         snapshot_receipt,
         kernel_receipt,
+        (model_runtime_receipt,),
     )
     changed_spec = spec.model_copy(update={"executable": "/different/python"})
 
@@ -245,6 +316,7 @@ def test_rejects_process_spec_digest_mutation_before_loading_evidence(
 
     assert model_paths == []
     assert kernel_paths == []
+    assert model_runtime_paths == []
 
 
 def test_rejects_local_process_and_binding_rank_mismatch(
@@ -256,10 +328,12 @@ def test_rejects_local_process_and_binding_rank_mismatch(
     binding = make_binding(spec, snapshot_receipt, kernel_receipt).model_copy(
         update={"pipeline_rank": 1}
     )
-    model_paths, kernel_paths = install_unchanged_evidence_loaders(
+    model_runtime_receipt = binding_model_runtime_receipt(binding)
+    model_paths, kernel_paths, model_runtime_paths = install_unchanged_evidence_loaders(
         monkeypatch,
         snapshot_receipt,
         kernel_receipt,
+        (model_runtime_receipt,),
     )
 
     with pytest.raises(SglangKtAdmissionEvidenceError, match="one binding per"):
@@ -267,6 +341,7 @@ def test_rejects_local_process_and_binding_rank_mismatch(
 
     assert model_paths == []
     assert kernel_paths == []
+    assert model_runtime_paths == []
 
 
 def test_rejects_model_snapshot_evidence_mutation(
@@ -276,10 +351,12 @@ def test_rejects_model_snapshot_evidence_mutation(
     snapshot_receipt = make_snapshot_receipt(spec)
     kernel_receipt = make_kernel_receipt(spec)
     binding = make_binding(spec, snapshot_receipt, kernel_receipt)
+    model_runtime_receipt = binding_model_runtime_receipt(binding)
     install_unchanged_evidence_loaders(
         monkeypatch,
         snapshot_receipt,
         kernel_receipt,
+        (model_runtime_receipt,),
     )
 
     def return_changed_snapshot(
@@ -310,10 +387,12 @@ def test_rejects_kernel_receipt_reload_mutation(
     snapshot_receipt = make_snapshot_receipt(spec)
     kernel_receipt = make_kernel_receipt(spec)
     binding = make_binding(spec, snapshot_receipt, kernel_receipt)
+    model_runtime_receipt = binding_model_runtime_receipt(binding)
     install_unchanged_evidence_loaders(
         monkeypatch,
         snapshot_receipt,
         kernel_receipt,
+        (model_runtime_receipt,),
     )
 
     def return_changed_kernel_receipt(
@@ -339,7 +418,55 @@ def test_rejects_kernel_receipt_reload_mutation(
         verify_sglang_kt_local_admission_bindings_sync((spec,), (binding,))
 
 
-def test_deduplicates_identical_evidence_shared_by_local_ranks(
+def test_rejects_model_runtime_receipt_reload_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = make_spec()
+    snapshot_receipt = make_snapshot_receipt(spec)
+    kernel_receipt = make_kernel_receipt(spec)
+    binding = make_binding(spec, snapshot_receipt, kernel_receipt)
+    model_runtime_receipt = binding_model_runtime_receipt(binding)
+    install_unchanged_evidence_loaders(
+        monkeypatch,
+        snapshot_receipt,
+        kernel_receipt,
+        (model_runtime_receipt,),
+    )
+
+    def return_changed_model_runtime_receipt(
+        _path: Path,
+        *,
+        expected_validator_sha256: str,
+        expected_process_spec_sha256: str,
+        expected_model_contract_receipt_sha256: str,
+        expected_kernel_receipt_sha256: str,
+        expected_receipt_sha256: str | None = None,
+    ) -> SglangKtModelRuntimeValidationReceiptObservation:
+        del (
+            expected_process_spec_sha256,
+            expected_validator_sha256,
+            expected_model_contract_receipt_sha256,
+            expected_kernel_receipt_sha256,
+            expected_receipt_sha256,
+        )
+        return model_runtime_receipt.model_copy(
+            update={"receipt_size_bytes": model_runtime_receipt.receipt_size_bytes + 1}
+        )
+
+    monkeypatch.setattr(
+        admission,
+        "load_sglang_kt_model_runtime_validation_receipt",
+        return_changed_model_runtime_receipt,
+    )
+
+    with pytest.raises(
+        SglangKtAdmissionEvidenceError,
+        match="model runtime validation evidence changed",
+    ):
+        verify_sglang_kt_local_admission_bindings_sync((spec,), (binding,))
+
+
+def test_deduplicates_shared_parent_evidence_and_reloads_each_rank_receipt(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     base_spec = make_spec()
@@ -356,10 +483,17 @@ def test_deduplicates_identical_evidence_shared_by_local_ranks(
         make_binding(spec_zero, snapshot_receipt, kernel_receipt),
         make_binding(spec_one, snapshot_receipt, kernel_receipt),
     )
-    model_paths, kernel_paths = install_unchanged_evidence_loaders(
+    model_runtime_receipts = tuple(
+        receipt
+        for binding in bindings
+        for receipt in (binding_model_runtime_receipt(binding),)
+    )
+    assert len(model_runtime_receipts) == 2
+    model_paths, kernel_paths, model_runtime_paths = install_unchanged_evidence_loaders(
         monkeypatch,
         snapshot_receipt,
         kernel_receipt,
+        model_runtime_receipts,
     )
 
     verify_sglang_kt_local_admission_bindings_sync(
@@ -369,6 +503,9 @@ def test_deduplicates_identical_evidence_shared_by_local_ranks(
 
     assert model_paths == [Path(snapshot_receipt.model_path)]
     assert kernel_paths == [Path(kernel_receipt.receipt_path)]
+    assert model_runtime_paths == [
+        Path(receipt.receipt_path) for receipt in model_runtime_receipts
+    ]
 
 
 def test_binding_rejects_duplicate_snapshot_paths() -> None:

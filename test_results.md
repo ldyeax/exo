@@ -405,6 +405,31 @@ above.
   capability evidence, not same-boot evidence: it lacks a boot ID, so a future
   per-boot claim requires a v2 receipt or a fresh validator run.
 
+### File-backed model-execution receipt checkpoint
+
+- Exo now has a strict schema-v1 GLM-4.7 model-execution receipt consumer. It
+  accepts only the pinned official BF16 model, Torch `2.9.1+cu128`, CUDA `12.8`,
+  SM86, exact source/build identities, wrapper coverage for layers 1-46, a
+  canonical 47-by-64 expert mask, deterministic layer-one CPU/GPU routing and
+  numerical evidence, and one eight-token extend plus one decode invocation.
+  Capabilities are derived from validated evidence rather than accepted from the
+  receipt.
+- Collection retains an operator-supplied binding for the exact process-spec
+  digest, validator digest, receipt path, and raw-file digest. Preflight relates
+  that bound file to the independently verified model contract and kernel
+  receipt. Admission reloads the same file using those independent expectations,
+  so a caller-constructed Pydantic summary cannot authorize launch.
+- The GLM-4.7 collector skips the overlapping legacy runtime-receipt path. A
+  software integration test writes canonical JSON and exercises the real loader
+  through local collection, preflight, and admission reload with only the model
+  snapshot and kernel-receipt effects substituted.
+- The focused launch-spec, model-receipt, integration, preflight, collector,
+  admission, supervisor, and kernel-receipt suites pass: `279 passed`. Ruff and
+  strict changed-module basedpyright are clean. No model load, GPU, AMX,
+  InfiniBand, benchmark, or profiler workload ran for this checkpoint.
+- No live model-execution receipt exists yet. The admission-grade producer and
+  its real layer-one probe/full short forward remain the launch blocker.
+
 ### Profiler safety incident
 
 - A previous out-of-tree VTune SEP/PAX kernel profiler (`sep5`/`pax`) crashed
@@ -414,11 +439,10 @@ above.
 
 ## Pending tests
 
-1. Finish the concrete file-backed model-level validation receipt and loader,
-   then run a real diagnostic layer-1 expert probe and an admission-grade full
-   short forward. Bind and reload that receipt through the completed pre-launch
-   gate. Keep kernel-level capability evidence separate from model-level launch
-   admission.
+1. Implement the pinned model-level receipt producer, then run a real diagnostic
+   layer-1 expert probe and an admission-grade full short forward. Bind and
+   reload its output through the completed file-backed pre-launch gate. Keep
+   kernel-level capability evidence separate from model-level launch admission.
 2. Run the fail-closed 0-expert BF16 CPU-routed control and the mixed 1/4
    resident-GPU-expert controls with complete 46-layer wrapper and routing
    evidence.

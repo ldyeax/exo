@@ -13,9 +13,14 @@ from exo.worker.sglang_kt.launch_spec import (
     build_glm_5_2_fp8_process_launch_specs,
     calculate_sglang_kt_process_launch_spec_sha256,
 )
+from exo.worker.sglang_kt.model_runtime_validation_receipt import (
+    SglangKtModelRuntimeValidationReceiptObservation,
+)
 from exo.worker.sglang_kt.preflight import (
     GLM_4_7_FLASH_WRAPPED_EXPERT_LAYERS,
+    SglangKtBoundModelRuntimeValidationReceipt,
     SglangKtHostPreflightObservation,
+    SglangKtModelRuntimeValidationBinding,
     SglangKtModelSnapshotReceiptObservation,
     SglangKtPreflightFailed,
     SglangKtPreflightPassed,
@@ -187,6 +192,79 @@ def make_kernel_runtime_validation_receipt(
     )
 
 
+def make_model_runtime_validation_receipt(
+    spec: SglangKtProcessLaunchSpec,
+    snapshot_receipt: SglangKtModelSnapshotReceiptObservation,
+    kernel_receipt: SglangKtKernelRuntimeValidationReceiptObservation,
+) -> SglangKtModelRuntimeValidationReceiptObservation:
+    assert snapshot_receipt.contract_path is not None
+    assert snapshot_receipt.contract_receipt_sha256 is not None
+    assert snapshot_receipt.contract_sha256 is not None
+    assert snapshot_receipt.index_sha256 is not None
+    is_cpu_control = (
+        spec.target_profile == GLM_4_7_FLASH_CPU_ROUTED_EXPERTS_TARGET_PROFILE
+    )
+    return SglangKtModelRuntimeValidationReceiptObservation(
+        receipt_path=f"/receipts/model-rank-{spec.pipeline_rank}.json",
+        receipt_size_bytes=1,
+        receipt_sha256=f"{spec.pipeline_rank + 10:x}" * 64,
+        schema_version=1,
+        generated_at_utc="2026-07-19T00:00:00+00:00",
+        validator_sha256="b" * 64,
+        process_spec_sha256=calculate_sglang_kt_process_launch_spec_sha256(spec),
+        model_contract_path=snapshot_receipt.contract_path,
+        model_contract_receipt_sha256=(snapshot_receipt.contract_receipt_sha256),
+        model_contract_sha256=snapshot_receipt.contract_sha256,
+        model_config_sha256=snapshot_receipt.config_sha256,
+        model_index_sha256=snapshot_receipt.index_sha256,
+        kernel_runtime_validation_receipt_path=kernel_receipt.receipt_path,
+        kernel_runtime_validation_receipt_sha256=kernel_receipt.receipt_sha256,
+        target_profile=spec.target_profile,
+        gpu_uuid=spec.gpu_uuid,
+        gpu_compute_capability=(8, 6),
+        cpu_cores=spec.cpu_cores,
+        memory_nodes=spec.memory_nodes,
+        executed_cpu_backend="AMX_BF16",
+        model_id=spec.model_id,
+        model_revision=spec.expected_model_revision,
+        sglang_revision=spec.expected_sglang_revision,
+        ktransformers_revision=spec.expected_ktransformers_revision,
+        transformers_distribution_version=(
+            spec.required_transformers_distribution_version
+        ),
+        transformers_module_version=spec.required_transformers_module_version,
+        torch_version=TORCH_VERSION,
+        cuda_version=CUDA_VERSION,
+        sgl_kernel_build_id=SGL_KERNEL_BUILD_ID,
+        deep_gemm_build_id=DEEP_GEMM_BUILD_ID,
+        kt_kernel_build_id=KT_KERNEL_BUILD_ID,
+        ktransformers_method="BF16",
+        resident_gpu_experts=spec.stage.resident_gpu_experts,
+        attention_backend="flashinfer",
+        kv_cache_dtype="bfloat16",
+        max_total_tokens=spec.plan.max_total_tokens,
+        static_memory_fraction=spec.plan.static_memory_fraction,
+        capabilities=(
+            "glm47_flash_kt_wrapper_active_v1",
+            "glm47_flash_kt_wrapper_layers_1_46_v1",
+            "glm47_flash_bf16_sm86_short_forward_v1",
+            "kt_physical_numa_mapping_v1",
+            "kt_process_cpu_affinity_v1",
+            "kt_bf16_amx_executed_v1",
+            (
+                "glm47_flash_bf16_cpu_routed_experts_executed_v1"
+                if is_cpu_control
+                else "kt_bf16_cpu_gpu_hybrid_executed_v1"
+            ),
+        ),
+        ktransformers_wrapped_expert_layers=(GLM_4_7_FLASH_WRAPPED_EXPERT_LAYERS),
+        global_expert_mask_sha256="c" * 64,
+        layer_one_selected_expert_ids=(4, 5, 6, 7) if is_cpu_control else (0, 1, 4, 5),
+        extend_logits_sha256="d" * 64,
+        decode_logits_sha256="e" * 64,
+    )
+
+
 def make_host_observation(
     host_specs: tuple[SglangKtProcessLaunchSpec, ...],
 ) -> SglangKtHostPreflightObservation:
@@ -200,75 +278,71 @@ def make_host_observation(
         (spec for spec in host_specs if spec.pipeline_rank == 0),
         None,
     )
+    is_flash = first_spec.target_profile in GLM_4_7_FLASH_TARGET_PROFILES
+    snapshot_receipts = tuple(
+        SglangKtModelSnapshotReceiptObservation(
+            model_path=snapshot_path,
+            model_id=first_spec.model_id,
+            revision=first_spec.expected_model_revision,
+            weight_format="safetensors",
+            ktransformers_method=first_spec.ktransformers_method,
+            config_sha256=(
+                GLM_4_7_FLASH_BF16_CONFIG_SHA256 if is_flash else CONFIG_SHA256
+            ),
+            full_indexer_layer_starts=((0,) if is_flash else FULL_INDEXER_LAYER_STARTS),
+            receipt_verified=True,
+            snapshot_complete=True,
+            contract_path="/contracts/glm47-flash-bf16.json" if is_flash else None,
+            contract_receipt_sha256=(
+                GLM_4_7_FLASH_BF16_MODEL_CONTRACT_SHA256 if is_flash else None
+            ),
+            contract_sha256=(
+                GLM_4_7_FLASH_BF16_MODEL_CONTRACT_SHA256 if is_flash else None
+            ),
+            index_sha256=GLM_4_7_FLASH_INDEX_SHA256 if is_flash else None,
+            weight_map_entries=9_703 if is_flash else None,
+            shard_count=48 if is_flash else None,
+            physical_weight_bytes=62_444_175_504 if is_flash else None,
+        )
+        for snapshot_path in snapshot_paths
+    )
+    kernel_receipts = tuple(
+        make_kernel_runtime_validation_receipt(spec) for spec in host_specs if is_flash
+    )
+    snapshots_by_path = {receipt.model_path: receipt for receipt in snapshot_receipts}
+    kernels_by_gpu = {receipt.gpu_uuid: receipt for receipt in kernel_receipts}
+    bound_model_runtime_receipts = tuple(
+        SglangKtBoundModelRuntimeValidationReceipt(
+            binding=SglangKtModelRuntimeValidationBinding(
+                process_spec_sha256=(
+                    calculate_sglang_kt_process_launch_spec_sha256(spec)
+                ),
+                validator_sha256=model_receipt.validator_sha256,
+                receipt_path=model_receipt.receipt_path,
+                receipt_sha256=model_receipt.receipt_sha256,
+            ),
+            receipt=model_receipt,
+        )
+        for spec in host_specs
+        if is_flash
+        for model_receipt in (
+            make_model_runtime_validation_receipt(
+                spec,
+                snapshots_by_path[spec.model_path],
+                kernels_by_gpu[spec.gpu_uuid],
+            ),
+        )
+    )
     return SglangKtHostPreflightObservation(
         node_id=first_spec.node_id,
         runtime=make_runtime(first_spec),
         runtime_validation_receipts=tuple(
-            make_runtime_validation_receipt(spec) for spec in host_specs
+            make_runtime_validation_receipt(spec) for spec in host_specs if not is_flash
         ),
-        kernel_runtime_validation_receipts=tuple(
-            make_kernel_runtime_validation_receipt(spec)
-            for spec in host_specs
-            if spec.target_profile in GLM_4_7_FLASH_TARGET_PROFILES
-        ),
+        bound_model_runtime_validation_receipts=bound_model_runtime_receipts,
+        kernel_runtime_validation_receipts=kernel_receipts,
         readable_directories=tuple(dict.fromkeys((*model_paths, *weight_paths))),
-        model_snapshot_receipts=tuple(
-            SglangKtModelSnapshotReceiptObservation(
-                model_path=snapshot_path,
-                model_id=first_spec.model_id,
-                revision=first_spec.expected_model_revision,
-                weight_format="safetensors",
-                ktransformers_method=first_spec.ktransformers_method,
-                config_sha256=(
-                    GLM_4_7_FLASH_BF16_CONFIG_SHA256
-                    if first_spec.target_profile in GLM_4_7_FLASH_TARGET_PROFILES
-                    else CONFIG_SHA256
-                ),
-                full_indexer_layer_starts=(
-                    (0,)
-                    if first_spec.target_profile in GLM_4_7_FLASH_TARGET_PROFILES
-                    else FULL_INDEXER_LAYER_STARTS
-                ),
-                receipt_verified=True,
-                snapshot_complete=True,
-                contract_path=(
-                    "/contracts/glm47-flash-bf16.json"
-                    if first_spec.target_profile in GLM_4_7_FLASH_TARGET_PROFILES
-                    else None
-                ),
-                contract_receipt_sha256=(
-                    GLM_4_7_FLASH_BF16_MODEL_CONTRACT_SHA256
-                    if first_spec.target_profile in GLM_4_7_FLASH_TARGET_PROFILES
-                    else None
-                ),
-                contract_sha256=(
-                    GLM_4_7_FLASH_BF16_MODEL_CONTRACT_SHA256
-                    if first_spec.target_profile in GLM_4_7_FLASH_TARGET_PROFILES
-                    else None
-                ),
-                index_sha256=(
-                    GLM_4_7_FLASH_INDEX_SHA256
-                    if first_spec.target_profile in GLM_4_7_FLASH_TARGET_PROFILES
-                    else None
-                ),
-                weight_map_entries=(
-                    9_703
-                    if first_spec.target_profile in GLM_4_7_FLASH_TARGET_PROFILES
-                    else None
-                ),
-                shard_count=(
-                    48
-                    if first_spec.target_profile in GLM_4_7_FLASH_TARGET_PROFILES
-                    else None
-                ),
-                physical_weight_bytes=(
-                    62_444_175_504
-                    if first_spec.target_profile in GLM_4_7_FLASH_TARGET_PROFILES
-                    else None
-                ),
-            )
-            for snapshot_path in snapshot_paths
-        ),
+        model_snapshot_receipts=snapshot_receipts,
         gpu_uuids=tuple(spec.gpu_uuid for spec in host_specs),
         cpu_cores=tuple(core for spec in host_specs for core in spec.cpu_cores),
         memory_nodes=tuple(
@@ -303,6 +377,35 @@ def checks_for_rank(result: SglangKtPreflightFailed, rank: int) -> tuple[str, ..
     )
 
 
+def model_runtime_receipts(
+    observation: SglangKtHostPreflightObservation,
+) -> tuple[SglangKtModelRuntimeValidationReceiptObservation, ...]:
+    return tuple(
+        bound.receipt for bound in observation.bound_model_runtime_validation_receipts
+    )
+
+
+def replace_model_runtime_receipts(
+    observation: SglangKtHostPreflightObservation,
+    receipts: tuple[SglangKtModelRuntimeValidationReceiptObservation, ...],
+) -> SglangKtHostPreflightObservation:
+    existing = observation.bound_model_runtime_validation_receipts
+    if len(existing) != len(receipts):
+        if not receipts:
+            return observation.model_copy(
+                update={"bound_model_runtime_validation_receipts": ()}
+            )
+        raise AssertionError("test replacement must preserve receipt cardinality")
+    return observation.model_copy(
+        update={
+            "bound_model_runtime_validation_receipts": tuple(
+                bound.model_copy(update={"receipt": receipt})
+                for bound, receipt in zip(existing, receipts, strict=True)
+            )
+        }
+    )
+
+
 def test_valid_observations_release_the_complete_process_group() -> None:
     specs = make_specs()
     observations = make_observations(specs)
@@ -331,7 +434,7 @@ def test_flash_smoke_requires_exact_executed_hybrid_runtime_receipt() -> None:
     passed = evaluate_sglang_kt_preflight((spec,), (observation,))
     missing_receipt = evaluate_sglang_kt_preflight(
         (spec,),
-        (observation.model_copy(update={"runtime_validation_receipts": ()}),),
+        (replace_model_runtime_receipts(observation, ()),),
     )
 
     assert isinstance(passed, SglangKtPreflightPassed)
@@ -340,8 +443,8 @@ def test_flash_smoke_requires_exact_executed_hybrid_runtime_receipt() -> None:
         observation.model_snapshot_receipts[0],
     )
     assert (
-        admission_binding.model_runtime_validation_receipt
-        == observation.runtime_validation_receipts[0]
+        admission_binding.bound_model_runtime_validation_receipt
+        == observation.bound_model_runtime_validation_receipts[0]
     )
     assert (
         admission_binding.kernel_runtime_validation_receipt
@@ -349,6 +452,62 @@ def test_flash_smoke_requires_exact_executed_hybrid_runtime_receipt() -> None:
     )
     assert isinstance(missing_receipt, SglangKtPreflightFailed)
     assert checks_for_rank(missing_receipt, 0) == ("runtime_validation_receipt",)
+
+
+@pytest.mark.parametrize(
+    "binding_update",
+    (
+        {"process_spec_sha256": "0" * 64},
+        {"validator_sha256": "1" * 64},
+        {"receipt_path": "/different/model-runtime.json"},
+        {"receipt_sha256": "2" * 64},
+    ),
+)
+def test_bound_model_runtime_receipt_rejects_self_attested_identity(
+    binding_update: dict[str, object],
+) -> None:
+    (spec,) = build_glm_4_7_flash_bf16_process_launch_specs(
+        make_glm_4_7_flash_bf16_plan(), PYTHON_EXECUTABLE
+    )
+    bound_receipt = make_host_observation(
+        (spec,)
+    ).bound_model_runtime_validation_receipts[0]
+
+    with pytest.raises(ValidationError, match="independent binding"):
+        SglangKtBoundModelRuntimeValidationReceipt(
+            binding=bound_receipt.binding.model_copy(update=binding_update),
+            receipt=bound_receipt.receipt,
+        )
+
+
+@pytest.mark.parametrize(
+    "receipt_update",
+    (
+        {"process_spec_sha256": "0" * 64},
+        {"model_contract_path": "/different/contract.json"},
+        {"model_contract_receipt_sha256": "1" * 64},
+        {"model_contract_sha256": "2" * 64},
+        {"model_index_sha256": "3" * 64},
+        {"kernel_runtime_validation_receipt_path": "/different/kernel.json"},
+        {"kernel_runtime_validation_receipt_sha256": "f" * 64},
+    ),
+)
+def test_flash_smoke_requires_exact_model_receipt_parent_bindings(
+    receipt_update: dict[str, object],
+) -> None:
+    (spec,) = build_glm_4_7_flash_bf16_process_launch_specs(
+        make_glm_4_7_flash_bf16_plan(), PYTHON_EXECUTABLE
+    )
+    observation = make_host_observation((spec,))
+    receipt = model_runtime_receipts(observation)[0].model_copy(update=receipt_update)
+
+    result = evaluate_sglang_kt_preflight(
+        (spec,),
+        (replace_model_runtime_receipts(observation, (receipt,)),),
+    )
+
+    assert isinstance(result, SglangKtPreflightFailed)
+    assert checks_for_rank(result, 0) == ("runtime_validation_receipt",)
 
 
 def test_passed_preflight_rejects_missing_or_changed_admission_bindings() -> None:
@@ -375,12 +534,18 @@ def test_passed_preflight_rejects_missing_or_changed_admission_bindings() -> Non
         SglangKtPreflightPassed.model_validate(changed_binding_payload)
 
     (binding,) = result.admission_bindings
-    model_runtime_receipt = binding.model_runtime_validation_receipt
-    assert model_runtime_receipt is not None
+    bound_model_runtime_receipt = binding.bound_model_runtime_validation_receipt
+    assert bound_model_runtime_receipt is not None
     forged_runtime_binding = binding.model_copy(
         update={
-            "model_runtime_validation_receipt": model_runtime_receipt.model_copy(
-                update={"torch_version": "forged"}
+            "bound_model_runtime_validation_receipt": (
+                bound_model_runtime_receipt.model_copy(
+                    update={
+                        "receipt": bound_model_runtime_receipt.receipt.model_copy(
+                            update={"torch_version": "forged"}
+                        )
+                    }
+                )
             )
         }
     )
@@ -437,7 +602,7 @@ def test_runtime_validation_rejects_a_capability_superset() -> None:
         make_glm_4_7_flash_bf16_plan(), PYTHON_EXECUTABLE
     )
     observation = make_host_observation((spec,))
-    (receipt,) = observation.runtime_validation_receipts
+    (receipt,) = model_runtime_receipts(observation)
     receipt_with_unrelated_capability = receipt.model_copy(
         update={
             "capabilities": (
@@ -450,10 +615,9 @@ def test_runtime_validation_rejects_a_capability_superset() -> None:
     result = evaluate_sglang_kt_preflight(
         (spec,),
         (
-            observation.model_copy(
-                update={
-                    "runtime_validation_receipts": (receipt_with_unrelated_capability,)
-                }
+            replace_model_runtime_receipts(
+                observation,
+                (receipt_with_unrelated_capability,),
             ),
         ),
     )
@@ -493,6 +657,7 @@ def test_flash_smoke_requires_the_exact_model_contract_evidence() -> None:
     assert checks_for_rank(result, 0) == (
         "model_revision_receipt",
         "ktransformers_weight_revision_receipt",
+        "runtime_validation_receipt",
     )
 
 
@@ -535,13 +700,11 @@ def test_flash_hybrid_rejects_incomplete_wrapped_layer_evidence(
         make_glm_4_7_flash_bf16_plan(), PYTHON_EXECUTABLE
     )
     observation = make_host_observation((spec,))
-    receipt = observation.runtime_validation_receipts[0].model_copy(
-        update=receipt_update
-    )
+    receipt = model_runtime_receipts(observation)[0].model_copy(update=receipt_update)
 
     result = evaluate_sglang_kt_preflight(
         (spec,),
-        (observation.model_copy(update={"runtime_validation_receipts": (receipt,)}),),
+        (replace_model_runtime_receipts(observation, (receipt,)),),
     )
 
     assert isinstance(result, SglangKtPreflightFailed)
@@ -553,7 +716,7 @@ def test_flash_cpu_routed_experts_control_requires_exact_execution_receipt() -> 
         make_glm_4_7_flash_bf16_cpu_routed_experts_plan(), PYTHON_EXECUTABLE
     )
     observation = make_host_observation((spec,))
-    (receipt,) = observation.runtime_validation_receipts
+    (receipt,) = model_runtime_receipts(observation)
 
     result = evaluate_sglang_kt_preflight((spec,), (observation,))
 
@@ -616,13 +779,11 @@ def test_flash_cpu_routed_experts_control_rejects_incomplete_evidence(
         make_glm_4_7_flash_bf16_cpu_routed_experts_plan(), PYTHON_EXECUTABLE
     )
     observation = make_host_observation((spec,))
-    receipt = observation.runtime_validation_receipts[0].model_copy(
-        update=receipt_update
-    )
+    receipt = model_runtime_receipts(observation)[0].model_copy(update=receipt_update)
 
     result = evaluate_sglang_kt_preflight(
         (spec,),
-        (observation.model_copy(update={"runtime_validation_receipts": (receipt,)}),),
+        (replace_model_runtime_receipts(observation, (receipt,)),),
     )
 
     assert isinstance(result, SglangKtPreflightFailed)
@@ -651,18 +812,18 @@ def test_flash_smoke_rejects_unpinned_config_even_when_receipts_agree() -> None:
         receipt.model_copy(update={"config_sha256": unpinned_config_sha256})
         for receipt in observation.model_snapshot_receipts
     )
-    runtime_receipt = observation.runtime_validation_receipts[0].model_copy(
+    runtime_receipt = model_runtime_receipts(observation)[0].model_copy(
         update={"model_config_sha256": unpinned_config_sha256}
     )
 
     result = evaluate_sglang_kt_preflight(
         (spec,),
         (
-            observation.model_copy(
-                update={
-                    "model_snapshot_receipts": snapshot_receipts,
-                    "runtime_validation_receipts": (runtime_receipt,),
-                }
+            replace_model_runtime_receipts(
+                observation.model_copy(
+                    update={"model_snapshot_receipts": snapshot_receipts}
+                ),
+                (runtime_receipt,),
             ),
         ),
     )
@@ -705,13 +866,11 @@ def test_flash_smoke_rejects_stale_or_incomplete_execution_evidence(
         make_glm_4_7_flash_bf16_plan(), PYTHON_EXECUTABLE
     )
     observation = make_host_observation((spec,))
-    receipt = observation.runtime_validation_receipts[0].model_copy(
-        update=receipt_update
-    )
+    receipt = model_runtime_receipts(observation)[0].model_copy(update=receipt_update)
 
     result = evaluate_sglang_kt_preflight(
         (spec,),
-        (observation.model_copy(update={"runtime_validation_receipts": (receipt,)}),),
+        (replace_model_runtime_receipts(observation, (receipt,)),),
     )
 
     assert isinstance(result, SglangKtPreflightFailed)
