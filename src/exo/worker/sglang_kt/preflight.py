@@ -22,6 +22,7 @@ from exo.worker.sglang_kt.launch_spec import (
     GLM_4_7_FLASH_TARGET_PROFILES,
     GLM_5_2_KV_CACHE_DTYPE,
     SglangKtProcessLaunchSpec,
+    calculate_sglang_kt_process_launch_spec_sha256,
 )
 from exo.worker.sglang_kt.runtime_validation_receipt import (
     SglangKtKernelRuntimeValidationReceiptObservation,
@@ -305,6 +306,149 @@ class SglangKtHostPreflightObservation(FrozenModel):
 
 
 @final
+class SglangKtRankAdmissionBinding(FrozenModel):
+    """Immutable evidence that must still match immediately before launch."""
+
+    pipeline_rank: ResourceIndex
+    process_spec_sha256: Sha256Digest
+    model_snapshot_receipts: tuple[SglangKtModelSnapshotReceiptObservation, ...] = ()
+    model_runtime_validation_receipt: (
+        SglangKtRuntimeValidationReceiptObservation | None
+    ) = None
+    kernel_runtime_validation_receipt: (
+        SglangKtKernelRuntimeValidationReceiptObservation | None
+    ) = None
+
+    @model_validator(mode="after")
+    def validate_unique_snapshot_paths(self) -> "SglangKtRankAdmissionBinding":
+        paths = tuple(receipt.model_path for receipt in self.model_snapshot_receipts)
+        if len(set(paths)) != len(paths):
+            raise ValueError("admission model snapshot paths must be unique")
+        return self
+
+
+def validate_sglang_kt_rank_admission_binding(
+    process_spec: SglangKtProcessLaunchSpec,
+    binding: SglangKtRankAdmissionBinding,
+) -> None:
+    if (
+        binding.pipeline_rank != process_spec.pipeline_rank
+        or binding.process_spec_sha256
+        != calculate_sglang_kt_process_launch_spec_sha256(process_spec)
+    ):
+        raise ValueError("admission binding does not match the process spec digest")
+
+    if process_spec.target_profile not in GLM_4_7_FLASH_TARGET_PROFILES:
+        if (
+            binding.model_snapshot_receipts
+            or binding.model_runtime_validation_receipt is not None
+            or binding.kernel_runtime_validation_receipt is not None
+        ):
+            raise ValueError("target profile does not admit GLM-4.7 evidence")
+        return
+
+    expected_snapshot_paths = {
+        process_spec.model_path,
+        process_spec.ktransformers_weight_path,
+    }
+    snapshot_receipts = binding.model_snapshot_receipts
+    if {receipt.model_path for receipt in snapshot_receipts} != expected_snapshot_paths:
+        raise ValueError("admission binding does not cover every model snapshot")
+    expected_contract_sha256 = process_spec.expected_model_contract_sha256
+    if expected_contract_sha256 is None or any(
+        receipt.model_id != process_spec.model_id
+        or receipt.revision != process_spec.expected_model_revision
+        or receipt.ktransformers_method != process_spec.ktransformers_method
+        or receipt.contract_receipt_sha256 != expected_contract_sha256
+        or receipt.contract_sha256 != expected_contract_sha256
+        or receipt.index_sha256 is None
+        or receipt.weight_map_entries is None
+        or receipt.shard_count is None
+        or receipt.physical_weight_bytes is None
+        or not receipt.receipt_verified
+        or not receipt.snapshot_complete
+        for receipt in snapshot_receipts
+    ):
+        raise ValueError("admission binding model contract evidence is inconsistent")
+
+    model_runtime_receipt = binding.model_runtime_validation_receipt
+    kernel_receipt = binding.kernel_runtime_validation_receipt
+    expected_runtime_capabilities = (
+        GLM_4_7_FLASH_CPU_ROUTED_EXPERTS_REQUIRED_RUNTIME_CAPABILITIES
+        if process_spec.target_profile
+        == GLM_4_7_FLASH_CPU_ROUTED_EXPERTS_TARGET_PROFILE
+        else GLM_4_7_FLASH_REQUIRED_RUNTIME_CAPABILITIES
+    )
+    expected_wrapped_layers = GLM_4_7_FLASH_WRAPPED_EXPERT_LAYERS
+    if not (
+        model_runtime_receipt is not None
+        and model_runtime_receipt.target_profile == process_spec.target_profile
+        and model_runtime_receipt.gpu_uuid == process_spec.gpu_uuid
+        and model_runtime_receipt.gpu_compute_capability == (8, 6)
+        and model_runtime_receipt.cpu_cores == process_spec.cpu_cores
+        and model_runtime_receipt.memory_nodes == process_spec.memory_nodes
+        and model_runtime_receipt.executed_cpu_backend == "AMX_BF16"
+        and model_runtime_receipt.model_id == process_spec.model_id
+        and model_runtime_receipt.model_revision == process_spec.expected_model_revision
+        and model_runtime_receipt.model_config_sha256
+        == snapshot_receipts[0].config_sha256
+        and model_runtime_receipt.sglang_revision
+        == process_spec.expected_sglang_revision
+        and model_runtime_receipt.ktransformers_revision
+        == process_spec.expected_ktransformers_revision
+        and model_runtime_receipt.transformers_distribution_version
+        == process_spec.required_transformers_distribution_version
+        and model_runtime_receipt.transformers_module_version
+        == process_spec.required_transformers_module_version
+        and kernel_receipt is not None
+        and model_runtime_receipt.torch_version == kernel_receipt.torch_version
+        and model_runtime_receipt.cuda_version == kernel_receipt.cuda_version
+        and model_runtime_receipt.sgl_kernel_build_id
+        == kernel_receipt.sgl_kernel_build_id
+        and model_runtime_receipt.deep_gemm_build_id
+        == kernel_receipt.deep_gemm_build_id
+        and model_runtime_receipt.kt_kernel_build_id
+        == kernel_receipt.kt_kernel_build_id
+        and model_runtime_receipt.ktransformers_method
+        == process_spec.ktransformers_method
+        and model_runtime_receipt.resident_gpu_experts
+        == process_spec.stage.resident_gpu_experts
+        and model_runtime_receipt.attention_backend == process_spec.attention_backend
+        and model_runtime_receipt.kv_cache_dtype == GLM_4_7_FLASH_KV_CACHE_DTYPE
+        and model_runtime_receipt.max_total_tokens == process_spec.plan.max_total_tokens
+        and model_runtime_receipt.static_memory_fraction
+        == process_spec.plan.static_memory_fraction
+        and model_runtime_receipt.ktransformers_wrapped_expert_layers
+        == expected_wrapped_layers
+        and frozenset(model_runtime_receipt.capabilities)
+        == expected_runtime_capabilities
+    ):
+        raise ValueError("admission binding model runtime evidence is inconsistent")
+
+    if not (
+        kernel_receipt.gpu_uuid == process_spec.gpu_uuid
+        and kernel_receipt.gpu_compute_capability == (8, 6)
+        and kernel_receipt.hostname == str(process_spec.node_id)
+        and kernel_receipt.executable == process_spec.executable
+        and kernel_receipt.cpu_cores == process_spec.cpu_cores
+        and kernel_receipt.memory_nodes == process_spec.memory_nodes
+        and len(kernel_receipt.threads_per_subpool)
+        == process_spec.stage.threadpool_count
+        and sum(kernel_receipt.threads_per_subpool)
+        == process_spec.stage.cpu_infer_threads
+        and kernel_receipt.sglang_revision == process_spec.expected_sglang_revision
+        and kernel_receipt.ktransformers_revision
+        == process_spec.expected_ktransformers_revision
+        and kernel_receipt.transformers_distribution_version
+        == process_spec.required_transformers_distribution_version
+        and kernel_receipt.transformers_module_version
+        == process_spec.required_transformers_module_version
+        and kernel_receipt.capabilities == ("kt_bf16_amx_executed_v1",)
+    ):
+        raise ValueError("admission binding kernel evidence is inconsistent")
+
+
+@final
 class SglangKtPreflightFailure(FrozenModel):
     pipeline_rank: ResourceIndex
     node_id: NodeId
@@ -317,11 +461,31 @@ class SglangKtPreflightFailure(FrozenModel):
 @final
 class SglangKtPreflightPassed(FrozenModel):
     process_specs: tuple[SglangKtProcessLaunchSpec, ...]
+    admission_bindings: tuple[SglangKtRankAdmissionBinding, ...]
 
     @model_validator(mode="after")
     def validate_nonempty_group(self) -> "SglangKtPreflightPassed":
         if not self.process_specs:
             raise ValueError("a passed preflight must contain process specs")
+        process_ranks = tuple(spec.pipeline_rank for spec in self.process_specs)
+        binding_ranks = tuple(
+            binding.pipeline_rank for binding in self.admission_bindings
+        )
+        if len(set(process_ranks)) != len(process_ranks):
+            raise ValueError("passed preflight process ranks must be unique")
+        if tuple(sorted(binding_ranks)) != tuple(sorted(process_ranks)) or len(
+            set(binding_ranks)
+        ) != len(binding_ranks):
+            raise ValueError(
+                "passed preflight requires one admission binding per process rank"
+            )
+        bindings_by_rank = {
+            binding.pipeline_rank: binding for binding in self.admission_bindings
+        }
+        for process_spec in self.process_specs:
+            validate_sglang_kt_rank_admission_binding(
+                process_spec, bindings_by_rank[process_spec.pipeline_rank]
+            )
         return self
 
 
@@ -337,6 +501,73 @@ class SglangKtPreflightFailed(FrozenModel):
 
 
 SglangKtPreflightResult = SglangKtPreflightPassed | SglangKtPreflightFailed
+
+
+def _build_rank_admission_binding(
+    process_spec: SglangKtProcessLaunchSpec,
+    observation: SglangKtHostPreflightObservation,
+) -> SglangKtRankAdmissionBinding:
+    model_snapshot_receipts: tuple[SglangKtModelSnapshotReceiptObservation, ...] = ()
+    model_runtime_validation_receipt: (
+        SglangKtRuntimeValidationReceiptObservation | None
+    ) = None
+    kernel_runtime_validation_receipt: (
+        SglangKtKernelRuntimeValidationReceiptObservation | None
+    ) = None
+    if process_spec.target_profile in GLM_4_7_FLASH_TARGET_PROFILES:
+        receipts_by_path = {
+            receipt.model_path: receipt
+            for receipt in observation.model_snapshot_receipts
+        }
+        planned_paths = tuple(
+            dict.fromkeys(
+                (
+                    process_spec.model_path,
+                    process_spec.ktransformers_weight_path,
+                )
+            )
+        )
+        try:
+            model_snapshot_receipts = tuple(
+                receipts_by_path[path] for path in planned_paths
+            )
+        except KeyError as error:
+            raise RuntimeError(
+                "successful GLM-4.7 preflight lost model snapshot evidence"
+            ) from error
+        kernel_runtime_validation_receipt = next(
+            (
+                receipt
+                for receipt in observation.kernel_runtime_validation_receipts
+                if receipt.gpu_uuid == process_spec.gpu_uuid
+            ),
+            None,
+        )
+        model_runtime_validation_receipt = next(
+            (
+                receipt
+                for receipt in observation.runtime_validation_receipts
+                if receipt.gpu_uuid == process_spec.gpu_uuid
+            ),
+            None,
+        )
+
+    binding = SglangKtRankAdmissionBinding(
+        pipeline_rank=process_spec.pipeline_rank,
+        process_spec_sha256=calculate_sglang_kt_process_launch_spec_sha256(
+            process_spec
+        ),
+        model_snapshot_receipts=model_snapshot_receipts,
+        model_runtime_validation_receipt=model_runtime_validation_receipt,
+        kernel_runtime_validation_receipt=kernel_runtime_validation_receipt,
+    )
+    try:
+        validate_sglang_kt_rank_admission_binding(process_spec, binding)
+    except ValueError as error:
+        raise RuntimeError(
+            "successful preflight produced inconsistent admission evidence"
+        ) from error
+    return binding
 
 
 def evaluate_sglang_kt_preflight(
@@ -393,7 +624,19 @@ def evaluate_sglang_kt_preflight(
 
     if failures:
         return SglangKtPreflightFailed(failures=tuple(failures))
-    return SglangKtPreflightPassed(process_specs=process_specs)
+    admission_bindings = tuple(
+        _build_rank_admission_binding(
+            process_spec,
+            observations_by_node[process_spec.node_id][0],
+        )
+        for process_spec in sorted(
+            process_specs, key=lambda candidate: candidate.pipeline_rank
+        )
+    )
+    return SglangKtPreflightPassed(
+        process_specs=process_specs,
+        admission_bindings=admission_bindings,
+    )
 
 
 def _evaluate_runtime(

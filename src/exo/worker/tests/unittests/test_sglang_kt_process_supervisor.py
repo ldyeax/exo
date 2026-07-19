@@ -10,14 +10,19 @@ from exo.shared.types.common import NodeId
 from exo.worker.sglang_kt.launch_spec import (
     SglangKtProcessLaunchSpec,
     build_glm_4_7_flash_bf16_process_launch_specs,
+    calculate_sglang_kt_process_launch_spec_sha256,
 )
-from exo.worker.sglang_kt.preflight import SglangKtPreflightPassed
+from exo.worker.sglang_kt.preflight import (
+    SglangKtPreflightPassed,
+    SglangKtRankAdmissionBinding,
+)
 from exo.worker.sglang_kt.process_supervisor import (
     AnyioSglangKtManagedProcess,
     LocalSglangKtProcessGroupSupervisor,
     ProcessOutputStream,
     ProcessOwnershipHandoff,
     ProcessStarter,
+    SglangKtDistributedAdmissionBarrierRequiredError,
     SglangKtManagedProcess,
     build_cpu_bound_sglang_kt_command,
     build_sglang_kt_process_environment,
@@ -146,8 +151,25 @@ class CloseFailsOnceFakeManagedProcess(FakeManagedProcess):
             raise RuntimeError("close failed once")
 
 
+def make_process_spec_only_preflight(
+    specs: tuple[SglangKtProcessLaunchSpec, ...],
+) -> SglangKtPreflightPassed:
+    return SglangKtPreflightPassed(
+        process_specs=specs,
+        admission_bindings=tuple(
+            SglangKtRankAdmissionBinding(
+                pipeline_rank=spec.pipeline_rank,
+                process_spec_sha256=calculate_sglang_kt_process_launch_spec_sha256(
+                    spec
+                ),
+            )
+            for spec in specs
+        ),
+    )
+
+
 def make_preflight() -> SglangKtPreflightPassed:
-    return SglangKtPreflightPassed(process_specs=make_specs())
+    return make_process_spec_only_preflight(make_specs()[:2])
 
 
 async def ready_immediately(_spec: SglangKtProcessLaunchSpec) -> None:
@@ -249,6 +271,13 @@ def test_refuses_node_without_local_specs_and_invalid_timeouts() -> None:
             readiness_probe=ready_immediately,
             readiness_timeout_seconds=0,
         )
+    with pytest.raises(ValueError, match="admission timeout"):
+        LocalSglangKtProcessGroupSupervisor(
+            preflight=preflight,
+            node_id=NodeId("dwagon"),
+            readiness_probe=ready_immediately,
+            admission_timeout_seconds=0,
+        )
     with pytest.raises(ValueError, match="output drain timeout"):
         LocalSglangKtProcessGroupSupervisor(
             preflight=preflight,
@@ -307,6 +336,135 @@ async def test_starts_both_local_ranks_and_stops_idempotently() -> None:
 
     with pytest.raises(RuntimeError, match="cannot be restarted"):
         await supervisor.run()
+
+
+async def test_admission_failure_prevents_every_process_start() -> None:
+    launch_attempts: list[int] = []
+    verified_ranks: list[tuple[int, ...]] = []
+
+    async def reject_admission(
+        specs: tuple[SglangKtProcessLaunchSpec, ...],
+        bindings: tuple[SglangKtRankAdmissionBinding, ...],
+    ) -> None:
+        verified_ranks.append(tuple(spec.pipeline_rank for spec in specs))
+        assert tuple(binding.pipeline_rank for binding in bindings) == (0, 1)
+        raise RuntimeError("admission evidence changed")
+
+    async def launch(spec: SglangKtProcessLaunchSpec) -> SglangKtManagedProcess:
+        launch_attempts.append(spec.pipeline_rank)
+        return FakeManagedProcess(1100 + spec.pipeline_rank)
+
+    supervisor = LocalSglangKtProcessGroupSupervisor(
+        preflight=make_preflight(),
+        node_id=NodeId("dwagon"),
+        readiness_probe=ready_immediately,
+        process_starter=make_process_starter(launch),
+        admission_verifier=reject_admission,
+        output_sink=discard_output,
+    )
+
+    with pytest.raises(RuntimeError, match="admission evidence changed"):
+        await supervisor.run()
+
+    assert verified_ranks == [(0, 1)]
+    assert launch_attempts == []
+    assert supervisor.is_stopped
+    assert supervisor.stop_receipt.processes == ()
+
+
+async def test_distributed_launch_requires_a_post_verification_barrier() -> None:
+    launch_attempts: list[int] = []
+
+    async def launch(spec: SglangKtProcessLaunchSpec) -> SglangKtManagedProcess:
+        launch_attempts.append(spec.pipeline_rank)
+        return FakeManagedProcess(1200 + spec.pipeline_rank)
+
+    supervisor = LocalSglangKtProcessGroupSupervisor(
+        preflight=make_process_spec_only_preflight(make_specs()),
+        node_id=NodeId("dwagon"),
+        readiness_probe=ready_immediately,
+        process_starter=make_process_starter(launch),
+        output_sink=discard_output,
+    )
+
+    with pytest.raises(
+        SglangKtDistributedAdmissionBarrierRequiredError,
+        match="requires an admission barrier",
+    ):
+        await supervisor.run()
+
+    assert launch_attempts == []
+    assert supervisor.is_stopped
+    assert supervisor.stop_receipt.processes == ()
+
+
+async def test_stop_cancels_admission_before_any_process_start() -> None:
+    admission_started = anyio.Event()
+    admission_cancelled = anyio.Event()
+    launch_attempts: list[int] = []
+
+    async def block_admission(
+        _specs: tuple[SglangKtProcessLaunchSpec, ...],
+        _bindings: tuple[SglangKtRankAdmissionBinding, ...],
+    ) -> None:
+        admission_started.set()
+        try:
+            await anyio.sleep_forever()
+        finally:
+            admission_cancelled.set()
+
+    async def launch(spec: SglangKtProcessLaunchSpec) -> SglangKtManagedProcess:
+        launch_attempts.append(spec.pipeline_rank)
+        return FakeManagedProcess(1300 + spec.pipeline_rank)
+
+    supervisor = LocalSglangKtProcessGroupSupervisor(
+        preflight=make_preflight(),
+        node_id=NodeId("dwagon"),
+        readiness_probe=ready_immediately,
+        process_starter=make_process_starter(launch),
+        admission_verifier=block_admission,
+        output_sink=discard_output,
+    )
+
+    async with anyio.create_task_group() as task_group:
+        task_group.start_soon(supervisor.run)
+        await admission_started.wait()
+        with anyio.fail_after(0.5):
+            await supervisor.stop()
+
+    assert admission_cancelled.is_set()
+    assert launch_attempts == []
+    assert supervisor.is_stopped
+
+
+async def test_admission_timeout_prevents_every_process_start() -> None:
+    launch_attempts: list[int] = []
+
+    async def block_admission(
+        _specs: tuple[SglangKtProcessLaunchSpec, ...],
+        _bindings: tuple[SglangKtRankAdmissionBinding, ...],
+    ) -> None:
+        await anyio.sleep_forever()
+
+    async def launch(spec: SglangKtProcessLaunchSpec) -> SglangKtManagedProcess:
+        launch_attempts.append(spec.pipeline_rank)
+        return FakeManagedProcess(1400 + spec.pipeline_rank)
+
+    supervisor = LocalSglangKtProcessGroupSupervisor(
+        preflight=make_preflight(),
+        node_id=NodeId("dwagon"),
+        readiness_probe=ready_immediately,
+        process_starter=make_process_starter(launch),
+        admission_verifier=block_admission,
+        admission_timeout_seconds=0.01,
+        output_sink=discard_output,
+    )
+
+    with pytest.raises(TimeoutError):
+        await supervisor.run()
+
+    assert launch_attempts == []
+    assert supervisor.is_stopped
 
 
 async def test_partial_launch_failure_stops_owned_process() -> None:
@@ -566,7 +724,7 @@ async def test_default_starter_uses_open_process_cancellation_cleanup_before_han
 
     monkeypatch.setattr(anyio, "open_process", delayed_open_process)
     supervisor = LocalSglangKtProcessGroupSupervisor(
-        preflight=SglangKtPreflightPassed(process_specs=(make_specs()[0],)),
+        preflight=make_process_spec_only_preflight((make_specs()[0],)),
         node_id=NodeId("dwagon"),
         readiness_probe=ready_immediately,
         output_sink=discard_output,
@@ -739,7 +897,7 @@ async def test_failed_term_is_preserved_when_process_exits_naturally() -> None:
         return process
 
     supervisor = LocalSglangKtProcessGroupSupervisor(
-        preflight=SglangKtPreflightPassed(process_specs=(make_specs()[0],)),
+        preflight=make_process_spec_only_preflight((make_specs()[0],)),
         node_id=NodeId("dwagon"),
         readiness_probe=ready_immediately,
         process_starter=make_process_starter(launch),
@@ -770,7 +928,7 @@ async def test_exit_race_does_not_claim_term_delivery() -> None:
         return process
 
     supervisor = LocalSglangKtProcessGroupSupervisor(
-        preflight=SglangKtPreflightPassed(process_specs=(make_specs()[0],)),
+        preflight=make_process_spec_only_preflight((make_specs()[0],)),
         node_id=NodeId("dwagon"),
         readiness_probe=ready_immediately,
         process_starter=make_process_starter(launch),
@@ -844,7 +1002,7 @@ async def test_closes_process_handle_only_after_output_drains_finish() -> None:
         nonlocal drained_chunks
         drained_chunks += 1
 
-    one_process_preflight = SglangKtPreflightPassed(process_specs=(make_specs()[0],))
+    one_process_preflight = make_process_spec_only_preflight((make_specs()[0],))
     supervisor = LocalSglangKtProcessGroupSupervisor(
         preflight=one_process_preflight,
         node_id=NodeId("dwagon"),
@@ -882,7 +1040,7 @@ async def test_output_sink_failure_during_shutdown_is_propagated() -> None:
         raise RuntimeError("late output sink failed")
 
     supervisor = LocalSglangKtProcessGroupSupervisor(
-        preflight=SglangKtPreflightPassed(process_specs=(make_specs()[0],)),
+        preflight=make_process_spec_only_preflight((make_specs()[0],)),
         node_id=NodeId("dwagon"),
         readiness_probe=ready_immediately,
         process_starter=make_process_starter(launch),
@@ -921,7 +1079,7 @@ async def test_output_drain_timeout_is_reported_as_truncation() -> None:
         await anyio.sleep_forever()
 
     supervisor = LocalSglangKtProcessGroupSupervisor(
-        preflight=SglangKtPreflightPassed(process_specs=(make_specs()[0],)),
+        preflight=make_process_spec_only_preflight((make_specs()[0],)),
         node_id=NodeId("dwagon"),
         readiness_probe=ready_immediately,
         process_starter=make_process_starter(launch),
@@ -950,7 +1108,7 @@ async def test_cleanup_retry_preserves_kill_history_after_close_failure() -> Non
         return process
 
     supervisor = LocalSglangKtProcessGroupSupervisor(
-        preflight=SglangKtPreflightPassed(process_specs=(make_specs()[0],)),
+        preflight=make_process_spec_only_preflight((make_specs()[0],)),
         node_id=NodeId("dwagon"),
         readiness_probe=ready_immediately,
         process_starter=make_process_starter(launch),

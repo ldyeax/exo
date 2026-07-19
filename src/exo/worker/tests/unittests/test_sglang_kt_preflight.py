@@ -11,6 +11,7 @@ from exo.worker.sglang_kt.launch_spec import (
     build_glm_4_7_flash_bf16_cpu_routed_experts_process_launch_specs,
     build_glm_4_7_flash_bf16_process_launch_specs,
     build_glm_5_2_fp8_process_launch_specs,
+    calculate_sglang_kt_process_launch_spec_sha256,
 )
 from exo.worker.sglang_kt.preflight import (
     GLM_4_7_FLASH_WRAPPED_EXPERT_LAYERS,
@@ -310,6 +311,12 @@ def test_valid_observations_release_the_complete_process_group() -> None:
 
     assert isinstance(result, SglangKtPreflightPassed)
     assert result.process_specs == specs
+    assert tuple(
+        binding.pipeline_rank for binding in result.admission_bindings
+    ) == tuple(spec.pipeline_rank for spec in specs)
+    assert tuple(
+        binding.process_spec_sha256 for binding in result.admission_bindings
+    ) == tuple(calculate_sglang_kt_process_launch_spec_sha256(spec) for spec in specs)
     assert (
         SglangKtPreflightPassed.model_validate_json(result.model_dump_json()) == result
     )
@@ -328,8 +335,60 @@ def test_flash_smoke_requires_exact_executed_hybrid_runtime_receipt() -> None:
     )
 
     assert isinstance(passed, SglangKtPreflightPassed)
+    (admission_binding,) = passed.admission_bindings
+    assert admission_binding.model_snapshot_receipts == (
+        observation.model_snapshot_receipts[0],
+    )
+    assert (
+        admission_binding.model_runtime_validation_receipt
+        == observation.runtime_validation_receipts[0]
+    )
+    assert (
+        admission_binding.kernel_runtime_validation_receipt
+        == observation.kernel_runtime_validation_receipts[0]
+    )
     assert isinstance(missing_receipt, SglangKtPreflightFailed)
     assert checks_for_rank(missing_receipt, 0) == ("runtime_validation_receipt",)
+
+
+def test_passed_preflight_rejects_missing_or_changed_admission_bindings() -> None:
+    (spec,) = build_glm_4_7_flash_bf16_process_launch_specs(
+        make_glm_4_7_flash_bf16_plan(), PYTHON_EXECUTABLE
+    )
+    result = evaluate_sglang_kt_preflight(
+        (spec,),
+        (make_host_observation((spec,)),),
+    )
+    assert isinstance(result, SglangKtPreflightPassed)
+    payload = result.model_dump()
+
+    missing_binding_payload = dict(payload)
+    missing_binding_payload["admission_bindings"] = ()
+    with pytest.raises(ValidationError, match="one admission binding"):
+        SglangKtPreflightPassed.model_validate(missing_binding_payload)
+
+    changed_binding_payload = result.model_dump()
+    changed_binding = dict(changed_binding_payload["admission_bindings"][0])
+    changed_binding["process_spec_sha256"] = "0" * 64
+    changed_binding_payload["admission_bindings"] = (changed_binding,)
+    with pytest.raises(ValidationError, match="process spec digest"):
+        SglangKtPreflightPassed.model_validate(changed_binding_payload)
+
+    (binding,) = result.admission_bindings
+    model_runtime_receipt = binding.model_runtime_validation_receipt
+    assert model_runtime_receipt is not None
+    forged_runtime_binding = binding.model_copy(
+        update={
+            "model_runtime_validation_receipt": model_runtime_receipt.model_copy(
+                update={"torch_version": "forged"}
+            )
+        }
+    )
+    with pytest.raises(ValidationError, match="model runtime evidence"):
+        SglangKtPreflightPassed(
+            process_specs=(spec,),
+            admission_bindings=(forged_runtime_binding,),
+        )
 
 
 def test_flash_smoke_requires_independent_file_bound_kernel_evidence() -> None:

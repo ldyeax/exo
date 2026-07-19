@@ -14,8 +14,12 @@ from pydantic import model_validator
 from exo.shared.types.common import NodeId
 from exo.shared.types.worker.sglang_kt import ResourceIndex
 from exo.utils.pydantic_ext import FrozenModel
+from exo.worker.sglang_kt.admission import verify_sglang_kt_local_admission_bindings
 from exo.worker.sglang_kt.launch_spec import SglangKtProcessLaunchSpec
-from exo.worker.sglang_kt.preflight import SglangKtPreflightPassed
+from exo.worker.sglang_kt.preflight import (
+    SglangKtPreflightPassed,
+    SglangKtRankAdmissionBinding,
+)
 
 ProcessOutputStream = Literal["stdout", "stderr"]
 ProcessStopSignal = Literal["none", "term", "kill"]
@@ -48,6 +52,17 @@ ProcessStarter = Callable[
 ReadinessProbe = Callable[[SglangKtProcessLaunchSpec], Awaitable[None]]
 ProcessOutputSink = Callable[
     [SglangKtProcessLaunchSpec, ProcessOutputStream, bytes], Awaitable[None]
+]
+AdmissionVerifier = Callable[
+    [
+        tuple[SglangKtProcessLaunchSpec, ...],
+        tuple[SglangKtRankAdmissionBinding, ...],
+    ],
+    Awaitable[None],
+]
+AdmissionCommitBarrier = Callable[
+    [NodeId, tuple[SglangKtProcessLaunchSpec, ...]],
+    Awaitable[None],
 ]
 
 
@@ -208,6 +223,10 @@ class SglangKtProcessStarterContractError(RuntimeError):
     pass
 
 
+class SglangKtDistributedAdmissionBarrierRequiredError(RuntimeError):
+    pass
+
+
 class SglangKtOutputDrainTruncatedError(RuntimeError):
     def __init__(self, output_drains: tuple[_OutputDrain, ...]) -> None:
         streams = ", ".join(
@@ -229,11 +248,16 @@ class LocalSglangKtProcessGroupSupervisor:
         readiness_probe: ReadinessProbe,
         process_starter: ProcessStarter = launch_sglang_kt_process,
         output_sink: ProcessOutputSink = log_sglang_kt_process_output,
+        admission_verifier: AdmissionVerifier = verify_sglang_kt_local_admission_bindings,
+        admission_commit_barrier: AdmissionCommitBarrier | None = None,
+        admission_timeout_seconds: float = 900.0,
         readiness_timeout_seconds: float = 300.0,
         terminate_timeout_seconds: float = 15.0,
         kill_timeout_seconds: float = 5.0,
         output_drain_timeout_seconds: float = 5.0,
     ) -> None:
+        if admission_timeout_seconds <= 0:
+            raise ValueError("admission timeout must be positive")
         if readiness_timeout_seconds <= 0:
             raise ValueError("readiness timeout must be positive")
         if terminate_timeout_seconds <= 0:
@@ -258,12 +282,29 @@ class LocalSglangKtProcessGroupSupervisor:
         local_ranks = tuple(process_spec.pipeline_rank for process_spec in local_specs)
         if len(set(local_ranks)) != len(local_ranks):
             raise ValueError("local SGLang-KT process ranks must be unique")
+        bindings_by_rank = {
+            binding.pipeline_rank: binding for binding in preflight.admission_bindings
+        }
+        try:
+            local_bindings = tuple(
+                bindings_by_rank[process_spec.pipeline_rank]
+                for process_spec in local_specs
+            )
+        except KeyError as error:
+            raise ValueError(
+                "passed preflight lacks a local process admission binding"
+            ) from error
 
         self.node_id = node_id
+        self.cluster_process_specs = preflight.process_specs
         self.process_specs = local_specs
+        self.admission_bindings = local_bindings
         self._readiness_probe = readiness_probe
         self._process_starter = process_starter
         self._output_sink = output_sink
+        self._admission_verifier = admission_verifier
+        self._admission_commit_barrier = admission_commit_barrier
+        self._admission_timeout_seconds = admission_timeout_seconds
         self._readiness_timeout_seconds = readiness_timeout_seconds
         self._terminate_timeout_seconds = terminate_timeout_seconds
         self._kill_timeout_seconds = kill_timeout_seconds
@@ -271,6 +312,7 @@ class LocalSglangKtProcessGroupSupervisor:
 
         self._owned_processes: list[_OwnedProcess] = []
         self._process_start_attempts: list[_ProcessStartAttempt] = []
+        self._admission_cancel_scope: anyio.CancelScope | None = None
         self._run_called = False
         self._stopping = False
         self._ever_ready = anyio.Event()
@@ -386,6 +428,37 @@ class LocalSglangKtProcessGroupSupervisor:
         self,
         task_group: TaskGroup,
     ) -> bool:
+        if self._stop_requested.is_set():
+            return False
+        with anyio.CancelScope() as admission_cancel_scope:
+            self._admission_cancel_scope = admission_cancel_scope
+            try:
+                with anyio.fail_after(self._admission_timeout_seconds):
+                    await self._admission_verifier(
+                        self.process_specs,
+                        self.admission_bindings,
+                    )
+                    cluster_node_ids = {
+                        process_spec.node_id
+                        for process_spec in self.cluster_process_specs
+                    }
+                    if self._admission_commit_barrier is None:
+                        if len(cluster_node_ids) > 1:
+                            raise SglangKtDistributedAdmissionBarrierRequiredError(
+                                "multi-node SGLang-KT launch requires an admission "
+                                "barrier"
+                            )
+                    else:
+                        await self._admission_commit_barrier(
+                            self.node_id,
+                            self.cluster_process_specs,
+                        )
+            finally:
+                self._admission_cancel_scope = None
+        await checkpoint_if_cancelled()
+        if self._stop_requested.is_set():
+            return False
+
         startup_deadline = anyio.current_time() + self._readiness_timeout_seconds
         for process_spec in self.process_specs:
             if self._stop_requested.is_set():
@@ -583,6 +656,8 @@ class LocalSglangKtProcessGroupSupervisor:
             raise RuntimeError("SGLang-KT process group has not been started")
         self._stopping = True
         self._stop_requested.set()
+        if self._admission_cancel_scope is not None:
+            self._admission_cancel_scope.cancel()
         await self.wait_stopped()
 
     async def wait_stopped(self) -> None:

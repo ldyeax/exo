@@ -374,6 +374,37 @@ above.
 - The focused launch-spec, preflight, collector, and receipt-loader suites pass:
   `190 passed`. No profiler or hardware workload ran for this checkpoint.
 
+### Pre-launch admission revalidation checkpoint
+
+- A successful preflight now retains one immutable admission binding per rank:
+  the canonical process-spec digest, exact model snapshot/contract observation,
+  retained model-runtime summary, and exact kernel receipt observation. Missing,
+  duplicate, cross-rank, or spec-mismatched bindings are rejected.
+- Before starting any rank, the local supervisor now recomputes every launch-spec
+  digest, fully verifies each distinct model snapshot against its exact contract,
+  and reloads each distinct kernel receipt from its path with the pinned raw-file
+  SHA-256. Shared snapshot and GPU evidence is revalidated only once per host.
+- A preflight spanning multiple nodes now fails closed unless the supervisor is
+  given a cluster admission barrier. That barrier runs after local verification
+  and before any local process starter. Exo event/command integration for the
+  verify/commit barrier remains to be implemented; until then, a distributed
+  SGLang-KT launch is deliberately refused rather than only locally gated.
+- Artifact verification runs in a cancellable worker process with a separate
+  900-second admission timeout, before the readiness timeout begins. Cancellation
+  terminates that verifier process instead of leaving an unowned scan. A normal
+  supervisor stop cancels the active verification/barrier scope promptly.
+  Synthetic tests prove that an admission error or timeout results in zero
+  process-start attempts and a clean empty stop receipt.
+- The focused admission, launch-spec, preflight, collector, supervisor, and
+  kernel-receipt suites pass: `227 passed`. All model/kernel loaders were mocked
+  in the new admission tests, so this checkpoint did not repeat the 62 GB live
+  model scan or run a GPU, AMX, InfiniBand, benchmark, or profiler workload.
+- The model-level runtime summary is retained but is not yet file-backed or
+  reloadable. It therefore remains the next fail-closed blocker before a real
+  GLM-4.7 launch. Kernel receipt schema v1 is treated as durable build/hardware
+  capability evidence, not same-boot evidence: it lacks a boot ID, so a future
+  per-boot claim requires a v2 receipt or a fresh validator run.
+
 ### Profiler safety incident
 
 - A previous out-of-tree VTune SEP/PAX kernel profiler (`sep5`/`pax`) crashed
@@ -383,10 +414,11 @@ above.
 
 ## Pending tests
 
-1. Finish the file-backed model-level validation receipt and launch-time
-   revalidation chain around the completed exact snapshot and kernel receipt
-   bindings, then run a real one-layer loader and short-forward check. Keep
-   kernel-level capability evidence separate from model-level launch admission.
+1. Finish the concrete file-backed model-level validation receipt and loader,
+   then run a real diagnostic layer-1 expert probe and an admission-grade full
+   short forward. Bind and reload that receipt through the completed pre-launch
+   gate. Keep kernel-level capability evidence separate from model-level launch
+   admission.
 2. Run the fail-closed 0-expert BF16 CPU-routed control and the mixed 1/4
    resident-GPU-expert controls with complete 46-layer wrapper and routing
    evidence.
