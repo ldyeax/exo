@@ -446,6 +446,11 @@ def perform_execution_preflight(
     )
     require_immutable_validator_source_deployment(repository_root, software.validator)
     process_spec = software.process.process_spec
+    load_bound_kernel_runtime_receipt(
+        process_spec,
+        software.kernel_runtime_receipt.path,
+        expected_receipt_sha256=software.kernel_runtime_receipt.sha256,
+    )
     snapshot_path = Path(process_spec.model_path)
     require_immutable_model_snapshot(snapshot_path)
     try:

@@ -303,6 +303,7 @@ def test_execution_preflight_verifies_the_exact_model_snapshot(
     )
     immutable_model_paths: list[Path] = []
     verification_calls: list[tuple[Path, Path, dict[str, object]]] = []
+    preflight_order: list[str] = []
 
     def accept_source_deployment(
         repository_root: Path,
@@ -320,13 +321,30 @@ def test_execution_preflight_verifies_the_exact_model_snapshot(
         required_uid: int = 0,
     ) -> None:
         assert required_uid == 0
+        preflight_order.append("model_snapshot")
         immutable_model_paths.append(snapshot_path)
+
+    def accept_kernel_receipt(
+        observed_process_spec: SglangKtProcessLaunchSpec,
+        path: Path,
+        *,
+        expected_receipt_sha256: str,
+    ) -> SglangKtKernelRuntimeValidationReceiptObservation:
+        assert observed_process_spec == process_spec
+        assert path == software.kernel_runtime_receipt.path
+        assert expected_receipt_sha256 == software.kernel_runtime_receipt.sha256
+        preflight_order.append("kernel_receipt")
+        return cast(
+            SglangKtKernelRuntimeValidationReceiptObservation,
+            cast(object, SimpleNamespace()),
+        )
 
     def return_verified_snapshot(
         snapshot_path: Path,
         contract_path: Path,
         **expected: object,
     ) -> SglangKtVerifiedModelSnapshot:
+        preflight_order.append("model_verification")
         verification_calls.append((snapshot_path, contract_path, expected))
         return snapshot
 
@@ -342,6 +360,11 @@ def test_execution_preflight_verifies_the_exact_model_snapshot(
     )
     monkeypatch.setattr(
         validator,
+        "load_bound_kernel_runtime_receipt",
+        accept_kernel_receipt,
+    )
+    monkeypatch.setattr(
+        validator,
         "verify_sglang_kt_model_snapshot",
         return_verified_snapshot,
     )
@@ -352,6 +375,11 @@ def test_execution_preflight_verifies_the_exact_model_snapshot(
     )
 
     assert execution.model_snapshot == snapshot
+    assert preflight_order == [
+        "kernel_receipt",
+        "model_snapshot",
+        "model_verification",
+    ]
     assert immutable_model_paths == [Path(process_spec.model_path)]
     assert verification_calls == [
         (
@@ -365,6 +393,57 @@ def test_execution_preflight_verifies_the_exact_model_snapshot(
             },
         )
     ]
+
+
+def test_execution_preflight_rejects_kernel_before_model_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    arguments, *_rest, validator_repository_root = write_inputs(tmp_path)
+    parsed = validator.parse_arguments(arguments)
+    model_snapshot_inspected = False
+
+    def accept_source_deployment(*_arguments: object, **_keywords: object) -> None:
+        return None
+
+    def reject_kernel_receipt(*_arguments: object, **_keywords: object) -> None:
+        raise validator.Glm47LiveValidationError("rejected kernel receipt")
+
+    def inspect_model_snapshot(*_arguments: object, **_keywords: object) -> None:
+        nonlocal model_snapshot_inspected
+        model_snapshot_inspected = True
+
+    monkeypatch.setattr(
+        validator,
+        "require_immutable_validator_source_deployment",
+        accept_source_deployment,
+    )
+    monkeypatch.setattr(
+        validator,
+        "load_bound_kernel_runtime_receipt",
+        reject_kernel_receipt,
+    )
+    monkeypatch.setattr(
+        validator,
+        "require_immutable_model_snapshot",
+        inspect_model_snapshot,
+    )
+    monkeypatch.setattr(
+        validator,
+        "verify_sglang_kt_model_snapshot",
+        inspect_model_snapshot,
+    )
+
+    with pytest.raises(
+        validator.Glm47LiveValidationError,
+        match="rejected kernel receipt",
+    ):
+        validator.perform_execution_preflight(
+            parsed,
+            validator_repository_root=validator_repository_root,
+        )
+
+    assert model_snapshot_inspected is False
 
 
 @pytest.mark.parametrize("resident_gpu_experts", (5, 62, 63))

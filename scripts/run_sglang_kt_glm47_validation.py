@@ -1172,6 +1172,7 @@ def _systemd_benchmark_argv(
         "--service-type=exec",
         f"--unit={unit_name}",
         f"--slice={SYSTEMD_SLICE}",
+        f"--working-directory={config.source.deployment_root}",
         "--expand-environment=no",
         "--property=Delegate=yes",
         f"--property=DelegateSubgroup={SYSTEMD_DELEGATE_SUBGROUP}",

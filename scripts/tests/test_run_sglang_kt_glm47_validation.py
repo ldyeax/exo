@@ -1266,6 +1266,8 @@ def test_prepare_lease_builds_exact_no_bytecode_deployments(
         "--service-type=exec",
     )
     assert f"--unit={prepared.systemd_unit_name}" in prepared.benchmark_lease_argv
+    working_directory_argument = f"--working-directory={deployment_root}"
+    assert working_directory_argument in prepared.benchmark_lease_argv
     assert "--property=Delegate=yes" in prepared.benchmark_lease_argv
     assert "--property=DelegateSubgroup=supervisor" in prepared.benchmark_lease_argv
     containment = cast(dict[str, object], prepared.metadata["containment_contract"])
@@ -1279,6 +1281,9 @@ def test_prepare_lease_builds_exact_no_bytecode_deployments(
         "cleanup_method": "cgroup.kill-v1",
     }
     command_separator = prepared.benchmark_lease_argv.index("--")
+    assert prepared.benchmark_lease_argv.index(working_directory_argument) < (
+        command_separator
+    )
     assert prepared.benchmark_lease_argv[
         command_separator + 1 : command_separator + 3
     ] == (
