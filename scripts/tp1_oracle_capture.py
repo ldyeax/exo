@@ -58,8 +58,15 @@ LLAMA31_8B_MODEL_WEIGHT_BYTES = 4_517_404_672
 LLAMA32_3B_MODEL_ID = "mlx-community/Llama-3.2-3B-Instruct-4bit"
 LLAMA32_3B_MODEL_REVISION = "7f0dc925e0d0afb0322d96f9255cfddf2ba5636e"
 LLAMA32_3B_MODEL_WEIGHT_BYTES = 1_807_423_488
+GPT_OSS_20B_MODEL_ID = "mlx-community/gpt-oss-20b-MXFP4-Q8"
+GPT_OSS_20B_MODEL_REVISION = "773a7da77e569019bb0fd17a554b263738d669a3"
+GPT_OSS_20B_MODEL_WEIGHT_BYTES = 12_076_119_168
 MODEL_SNAPSHOT_CONTRACTS = {
     MODEL_ID: (MODEL_REVISION, MODEL_WEIGHT_BYTES),
+    GPT_OSS_20B_MODEL_ID: (
+        GPT_OSS_20B_MODEL_REVISION,
+        GPT_OSS_20B_MODEL_WEIGHT_BYTES,
+    ),
     LLAMA31_8B_MODEL_ID: (
         LLAMA31_8B_MODEL_REVISION,
         LLAMA31_8B_MODEL_WEIGHT_BYTES,
@@ -367,7 +374,11 @@ class OracleConfig(StrictModel):
             "EXO_MLX_VISION_LOADING": "disabled",
             "PYTHONHASHSEED": str(self.request.seed),
         }
-        if self.model.model_id in {LLAMA31_8B_MODEL_ID, LLAMA32_3B_MODEL_ID}:
+        if self.model.model_id in {
+            GPT_OSS_20B_MODEL_ID,
+            LLAMA31_8B_MODEL_ID,
+            LLAMA32_3B_MODEL_ID,
+        }:
             required["EXO_CHAT_TEMPLATE_DATE"] = ORACLE_CHAT_TEMPLATE_DATE
         for name, expected in required.items():
             if self.environment.get(name) != expected:

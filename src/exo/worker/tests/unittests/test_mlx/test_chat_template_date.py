@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import cast
 
 import pytest
@@ -55,6 +55,8 @@ def test_chat_template_date_override_is_forwarded(
 
     assert tokenizer.call_kwargs is not None
     assert tokenizer.call_kwargs["date_string"] == "18 Jul 2026"
+    strftime_now = cast(Callable[[str], str], tokenizer.call_kwargs["strftime_now"])
+    assert strftime_now("%Y-%m-%d") == "18 Jul 2026"
 
 
 def test_chat_template_date_override_is_optional(
@@ -68,6 +70,7 @@ def test_chat_template_date_override_is_optional(
 
     assert tokenizer.call_kwargs is not None
     assert "date_string" not in tokenizer.call_kwargs
+    assert "strftime_now" not in tokenizer.call_kwargs
 
 
 @pytest.mark.parametrize("value", ["", "line one\nline two", "x" * 129])

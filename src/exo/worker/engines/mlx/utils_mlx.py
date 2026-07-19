@@ -640,6 +640,11 @@ def render_chat_template(
     extra_kwargs: dict[str, Any] = {}
     if date_string := chat_template_date_override():
         extra_kwargs["date_string"] = date_string
+
+        def pinned_strftime_now(_format: str) -> str:
+            return date_string
+
+        extra_kwargs["strftime_now"] = pinned_strftime_now
     if task_params.enable_thinking is not None:
         # Qwen3 and GLM use "enable_thinking"; DeepSeek uses "thinking".
         # Jinja ignores unknown variables, so passing both is safe.

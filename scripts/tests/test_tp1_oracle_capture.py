@@ -1231,6 +1231,11 @@ def test_strict_config_rejects_source_ports_gpu_and_request_tampering(
     ("model_id", "revision", "expected_weight_bytes"),
     [
         (
+            oracle.GPT_OSS_20B_MODEL_ID,
+            oracle.GPT_OSS_20B_MODEL_REVISION,
+            oracle.GPT_OSS_20B_MODEL_WEIGHT_BYTES,
+        ),
+        (
             oracle.LLAMA31_8B_MODEL_ID,
             oracle.LLAMA31_8B_MODEL_REVISION,
             oracle.LLAMA31_8B_MODEL_WEIGHT_BYTES,
@@ -1242,7 +1247,7 @@ def test_strict_config_rejects_source_ports_gpu_and_request_tampering(
         ),
     ],
 )
-def test_strict_config_accepts_pinned_llama_oracle_model(
+def test_strict_config_accepts_pinned_oracle_model(
     tmp_path: Path,
     model_id: str,
     revision: str,
@@ -1267,6 +1272,11 @@ def test_strict_config_accepts_pinned_llama_oracle_model(
     ("model_id", "revision", "expected_weight_bytes"),
     [
         (
+            oracle.GPT_OSS_20B_MODEL_ID,
+            oracle.GPT_OSS_20B_MODEL_REVISION,
+            oracle.GPT_OSS_20B_MODEL_WEIGHT_BYTES,
+        ),
+        (
             oracle.LLAMA31_8B_MODEL_ID,
             oracle.LLAMA31_8B_MODEL_REVISION,
             oracle.LLAMA31_8B_MODEL_WEIGHT_BYTES,
@@ -1278,7 +1288,7 @@ def test_strict_config_accepts_pinned_llama_oracle_model(
         ),
     ],
 )
-def test_strict_llama_config_requires_pinned_chat_template_date(
+def test_strict_dated_template_config_requires_pinned_chat_template_date(
     tmp_path: Path,
     model_id: str,
     revision: str,
