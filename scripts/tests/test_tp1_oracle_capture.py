@@ -1227,41 +1227,69 @@ def test_strict_config_rejects_source_ports_gpu_and_request_tampering(
             oracle.OracleConfig.model_validate(unpinned)
 
 
-def test_strict_config_accepts_pinned_llama32_3b_oracle_model(
+@pytest.mark.parametrize(
+    ("model_id", "revision", "expected_weight_bytes"),
+    [
+        (
+            oracle.LLAMA31_8B_MODEL_ID,
+            oracle.LLAMA31_8B_MODEL_REVISION,
+            oracle.LLAMA31_8B_MODEL_WEIGHT_BYTES,
+        ),
+        (
+            oracle.LLAMA32_3B_MODEL_ID,
+            oracle.LLAMA32_3B_MODEL_REVISION,
+            oracle.LLAMA32_3B_MODEL_WEIGHT_BYTES,
+        ),
+    ],
+)
+def test_strict_config_accepts_pinned_llama_oracle_model(
     tmp_path: Path,
+    model_id: str,
+    revision: str,
+    expected_weight_bytes: int,
 ) -> None:
     raw = model_data(make_config(tmp_path))
     model = cast(dict[str, object], raw["model"])
-    model["model_id"] = oracle.LLAMA32_3B_MODEL_ID
-    model["revision"] = oracle.LLAMA32_3B_MODEL_REVISION
-    model["expected_weight_bytes"] = oracle.LLAMA32_3B_MODEL_WEIGHT_BYTES
-    model["local_path"] = (
-        "/models/"
-        f"{oracle.LLAMA32_3B_MODEL_ID.replace('/', '--')}--"
-        f"{oracle.LLAMA32_3B_MODEL_REVISION}"
-    )
+    model["model_id"] = model_id
+    model["revision"] = revision
+    model["expected_weight_bytes"] = expected_weight_bytes
+    model["local_path"] = f"/models/{model_id.replace('/', '--')}--{revision}"
     environment = cast(dict[str, object], raw["environment"])
     environment["EXO_CHAT_TEMPLATE_DATE"] = oracle.ORACLE_CHAT_TEMPLATE_DATE
 
     validated = oracle.OracleConfig.model_validate(raw)
 
-    assert validated.model.model_id == oracle.LLAMA32_3B_MODEL_ID
-    assert validated.model.revision == oracle.LLAMA32_3B_MODEL_REVISION
+    assert validated.model.model_id == model_id
+    assert validated.model.revision == revision
 
 
-def test_strict_llama32_3b_config_requires_pinned_chat_template_date(
+@pytest.mark.parametrize(
+    ("model_id", "revision", "expected_weight_bytes"),
+    [
+        (
+            oracle.LLAMA31_8B_MODEL_ID,
+            oracle.LLAMA31_8B_MODEL_REVISION,
+            oracle.LLAMA31_8B_MODEL_WEIGHT_BYTES,
+        ),
+        (
+            oracle.LLAMA32_3B_MODEL_ID,
+            oracle.LLAMA32_3B_MODEL_REVISION,
+            oracle.LLAMA32_3B_MODEL_WEIGHT_BYTES,
+        ),
+    ],
+)
+def test_strict_llama_config_requires_pinned_chat_template_date(
     tmp_path: Path,
+    model_id: str,
+    revision: str,
+    expected_weight_bytes: int,
 ) -> None:
     raw = model_data(make_config(tmp_path))
     model = cast(dict[str, object], raw["model"])
-    model["model_id"] = oracle.LLAMA32_3B_MODEL_ID
-    model["revision"] = oracle.LLAMA32_3B_MODEL_REVISION
-    model["expected_weight_bytes"] = oracle.LLAMA32_3B_MODEL_WEIGHT_BYTES
-    model["local_path"] = (
-        "/models/"
-        f"{oracle.LLAMA32_3B_MODEL_ID.replace('/', '--')}--"
-        f"{oracle.LLAMA32_3B_MODEL_REVISION}"
-    )
+    model["model_id"] = model_id
+    model["revision"] = revision
+    model["expected_weight_bytes"] = expected_weight_bytes
+    model["local_path"] = f"/models/{model_id.replace('/', '--')}--{revision}"
 
     with pytest.raises(ValidationError, match="EXO_CHAT_TEMPLATE_DATE"):
         oracle.OracleConfig.model_validate(raw)

@@ -52,11 +52,18 @@ JsonObject: TypeAlias = dict[str, JsonValue]
 MODEL_ID = "mlx-community/SmolLM2-135M-Instruct-8bit"
 MODEL_REVISION = "0f0d9b8218915bc34d401e1a340b8c049d300d5e"
 MODEL_WEIGHT_BYTES = 142_955_136
+LLAMA31_8B_MODEL_ID = "mlx-community/Llama-3.1-8B-Instruct-4bit"
+LLAMA31_8B_MODEL_REVISION = "90215b22ec18e72f623dde2ea7af4097025160e2"
+LLAMA31_8B_MODEL_WEIGHT_BYTES = 4_517_404_672
 LLAMA32_3B_MODEL_ID = "mlx-community/Llama-3.2-3B-Instruct-4bit"
 LLAMA32_3B_MODEL_REVISION = "7f0dc925e0d0afb0322d96f9255cfddf2ba5636e"
 LLAMA32_3B_MODEL_WEIGHT_BYTES = 1_807_423_488
 MODEL_SNAPSHOT_CONTRACTS = {
     MODEL_ID: (MODEL_REVISION, MODEL_WEIGHT_BYTES),
+    LLAMA31_8B_MODEL_ID: (
+        LLAMA31_8B_MODEL_REVISION,
+        LLAMA31_8B_MODEL_WEIGHT_BYTES,
+    ),
     LLAMA32_3B_MODEL_ID: (
         LLAMA32_3B_MODEL_REVISION,
         LLAMA32_3B_MODEL_WEIGHT_BYTES,
@@ -360,7 +367,7 @@ class OracleConfig(StrictModel):
             "EXO_MLX_VISION_LOADING": "disabled",
             "PYTHONHASHSEED": str(self.request.seed),
         }
-        if self.model.model_id == LLAMA32_3B_MODEL_ID:
+        if self.model.model_id in {LLAMA31_8B_MODEL_ID, LLAMA32_3B_MODEL_ID}:
             required["EXO_CHAT_TEMPLATE_DATE"] = ORACLE_CHAT_TEMPLATE_DATE
         for name, expected in required.items():
             if self.environment.get(name) != expected:
