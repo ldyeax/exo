@@ -23,6 +23,9 @@ from exo.worker.sglang_kt.launch_spec import (
     GLM_5_2_KV_CACHE_DTYPE,
     SglangKtProcessLaunchSpec,
 )
+from exo.worker.sglang_kt.runtime_validation_receipt import (
+    SglangKtKernelRuntimeValidationReceiptObservation,
+)
 
 ObservedText = Annotated[str, StringConstraints(min_length=1)]
 Sha256Digest = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
@@ -206,6 +209,13 @@ class SglangKtModelSnapshotReceiptObservation(FrozenModel):
     full_indexer_layer_starts: tuple[ResourceIndex, ...]
     receipt_verified: bool
     snapshot_complete: bool
+    contract_path: AbsoluteRuntimePath | None = None
+    contract_receipt_sha256: Sha256Digest | None = None
+    contract_sha256: Sha256Digest | None = None
+    index_sha256: Sha256Digest | None = None
+    weight_map_entries: PositiveInt | None = None
+    shard_count: PositiveInt | None = None
+    physical_weight_bytes: PositiveInt | None = None
 
     @model_validator(mode="after")
     def validate_indexer_boundaries(self) -> "SglangKtModelSnapshotReceiptObservation":
@@ -214,6 +224,19 @@ class SglangKtModelSnapshotReceiptObservation(FrozenModel):
             raise ValueError(
                 "full_indexer_layer_starts must be sorted, unique, and begin at zero"
             )
+        contract_evidence = (
+            self.contract_path,
+            self.contract_receipt_sha256,
+            self.contract_sha256,
+            self.index_sha256,
+            self.weight_map_entries,
+            self.shard_count,
+            self.physical_weight_bytes,
+        )
+        if any(value is not None for value in contract_evidence) and any(
+            value is None for value in contract_evidence
+        ):
+            raise ValueError("model contract evidence must be complete or absent")
         return self
 
 
@@ -229,6 +252,9 @@ class SglangKtHostPreflightObservation(FrozenModel):
     runtime: SglangKtRuntimeObservation
     runtime_validation_receipts: tuple[
         SglangKtRuntimeValidationReceiptObservation, ...
+    ] = ()
+    kernel_runtime_validation_receipts: tuple[
+        SglangKtKernelRuntimeValidationReceiptObservation, ...
     ] = ()
     readable_directories: tuple[AbsoluteRuntimePath, ...] = ()
     model_snapshot_receipts: tuple[SglangKtModelSnapshotReceiptObservation, ...] = ()
@@ -268,6 +294,13 @@ class SglangKtHostPreflightObservation(FrozenModel):
         )
         if len(set(validation_gpu_uuids)) != len(validation_gpu_uuids):
             raise ValueError("runtime validation receipt GPU UUIDs must be unique")
+        kernel_validation_gpu_uuids = tuple(
+            receipt.gpu_uuid for receipt in self.kernel_runtime_validation_receipts
+        )
+        if len(set(kernel_validation_gpu_uuids)) != len(kernel_validation_gpu_uuids):
+            raise ValueError(
+                "kernel runtime validation receipt GPU UUIDs must be unique"
+            )
         return self
 
 
@@ -499,6 +532,7 @@ def _evaluate_snapshot_receipt(
         if process_spec.target_profile in GLM_4_7_FLASH_TARGET_PROFILES
         else None
     )
+    expected_contract_sha256 = process_spec.expected_model_contract_sha256
     receipt = next(
         (
             candidate
@@ -517,6 +551,17 @@ def _evaluate_snapshot_receipt(
             expected_config_sha256 is None
             or receipt.config_sha256 == expected_config_sha256
         )
+        and (
+            expected_contract_sha256 is None
+            or (
+                receipt.contract_receipt_sha256 == expected_contract_sha256
+                and receipt.contract_sha256 == expected_contract_sha256
+                and receipt.index_sha256 is not None
+                and receipt.weight_map_entries is not None
+                and receipt.shard_count is not None
+                and receipt.physical_weight_bytes is not None
+            )
+        )
         and all(
             stage.start_layer in receipt.full_indexer_layer_starts
             for stage in process_spec.plan.stages
@@ -534,6 +579,18 @@ def _evaluate_snapshot_receipt(
                 receipt.weight_format,
                 receipt.ktransformers_method,
                 receipt.config_sha256,
+                *(
+                    (
+                        f"contract_receipt_sha256={receipt.contract_receipt_sha256}",
+                        f"contract_sha256={receipt.contract_sha256}",
+                        f"index_sha256={receipt.index_sha256}",
+                        f"weight_map_entries={receipt.weight_map_entries}",
+                        f"shard_count={receipt.shard_count}",
+                        f"physical_weight_bytes={receipt.physical_weight_bytes}",
+                    )
+                    if expected_contract_sha256 is not None
+                    else ()
+                ),
                 "full_indexer_layer_starts="
                 + ",".join(str(start) for start in receipt.full_indexer_layer_starts),
                 f"receipt_verified={receipt.receipt_verified}",
@@ -553,6 +610,14 @@ def _evaluate_snapshot_receipt(
                     "config_sha256=<verified>"
                     if expected_config_sha256 is None
                     else expected_config_sha256
+                ),
+                *(
+                    (
+                        f"model_contract_sha256={expected_contract_sha256}",
+                        "model_contract_index_and_shards=<verified>",
+                    )
+                    if expected_contract_sha256 is not None
+                    else ()
                 ),
                 "pipeline starts on verified full indexers",
                 "receipt_verified=True",
@@ -605,9 +670,50 @@ def _evaluate_runtime_validation(
         ),
         None,
     )
+    kernel_validation_receipt = next(
+        (
+            receipt
+            for receipt in observation.kernel_runtime_validation_receipts
+            if receipt.gpu_uuid == process_spec.gpu_uuid
+        ),
+        None,
+    )
+    kernel_validation_required = (
+        process_spec.target_profile in GLM_4_7_FLASH_TARGET_PROFILES
+    )
+    kernel_validation_matches = not kernel_validation_required or (
+        kernel_validation_receipt is not None
+        and kernel_validation_receipt.capabilities == ("kt_bf16_amx_executed_v1",)
+        and kernel_validation_receipt.gpu_compute_capability == (8, 6)
+        and kernel_validation_receipt.cpu_cores == process_spec.cpu_cores
+        and kernel_validation_receipt.memory_nodes == process_spec.memory_nodes
+        and kernel_validation_receipt.executable == process_spec.executable
+        and len(kernel_validation_receipt.threads_per_subpool)
+        == process_spec.stage.threadpool_count
+        and sum(kernel_validation_receipt.threads_per_subpool)
+        == process_spec.stage.cpu_infer_threads
+        and kernel_validation_receipt.hostname == str(process_spec.node_id)
+        and kernel_validation_receipt.sglang_revision
+        == process_spec.expected_sglang_revision
+        and kernel_validation_receipt.ktransformers_revision
+        == process_spec.expected_ktransformers_revision
+        and kernel_validation_receipt.transformers_distribution_version
+        == process_spec.required_transformers_distribution_version
+        and kernel_validation_receipt.transformers_module_version
+        == process_spec.required_transformers_module_version
+        and kernel_validation_receipt.torch_version == observation.runtime.torch_version
+        and kernel_validation_receipt.cuda_version == observation.runtime.cuda_version
+        and kernel_validation_receipt.sgl_kernel_build_id
+        == observation.runtime.sgl_kernel_build_id
+        and kernel_validation_receipt.deep_gemm_build_id
+        == observation.runtime.deep_gemm_build_id
+        and kernel_validation_receipt.kt_kernel_build_id
+        == observation.runtime.kt_kernel_build_id
+    )
     receipt_matches = (
         validation_receipt is not None
         and snapshot_receipt is not None
+        and kernel_validation_matches
         and validation_receipt.target_profile == process_spec.target_profile
         and validation_receipt.gpu_compute_capability == (8, 6)
         and validation_receipt.cpu_cores == process_spec.cpu_cores
@@ -644,7 +750,7 @@ def _evaluate_runtime_validation(
             or validation_receipt.ktransformers_wrapped_expert_layers
             == expected_wrapped_expert_layers
         )
-        and required_capabilities.issubset(validation_receipt.capabilities)
+        and frozenset(validation_receipt.capabilities) == required_capabilities
     )
     if receipt_matches:
         return
@@ -719,6 +825,11 @@ def _evaluate_runtime_validation(
             expected_kv_cache_dtype,
             f"max_total_tokens={process_spec.plan.max_total_tokens}",
             "static_memory_fraction=" + str(process_spec.plan.static_memory_fraction),
+            *(
+                ("kernel_runtime_validation=<exact file-bound receipt>",)
+                if kernel_validation_required
+                else ()
+            ),
             "ktransformers_wrapped_expert_layers="
             + (
                 "<not-profile-bound>"

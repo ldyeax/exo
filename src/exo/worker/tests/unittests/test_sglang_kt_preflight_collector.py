@@ -26,12 +26,14 @@ from exo.worker.sglang_kt.artifact_identity import (
 )
 from exo.worker.sglang_kt.launch_spec import (
     GLM_4_7_FLASH_BF16_CONFIG_SHA256,
+    GLM_4_7_FLASH_BF16_MODEL_CONTRACT_SHA256,
     GLM_4_7_FLASH_BF16_MODEL_ID,
     GLM_4_7_FLASH_BF16_MODEL_REVISION,
     SglangKtProcessLaunchSpec,
     build_glm_4_7_flash_bf16_process_launch_specs,
     build_glm_5_2_fp8_process_launch_specs,
 )
+from exo.worker.sglang_kt.model_contract import SglangKtVerifiedModelSnapshot
 from exo.worker.sglang_kt.preflight import (
     SglangKtHostPreflightObservation,
     SglangKtModelSnapshotReceiptObservation,
@@ -46,11 +48,18 @@ from exo.worker.sglang_kt.preflight_collector import (
     ExternalPythonSglangKtRuntimeProbe,
     LinuxSglangKtHostInventoryProbe,
     LocalSglangKtFilesystemProbe,
+    LocalSglangKtKernelRuntimeValidationProbe,
+    LocalSglangKtModelContractProbe,
+    SglangKtKernelRuntimeValidationBinding,
     SglangKtLocalHostInventory,
+    SglangKtModelContractBinding,
     SglangKtModelSnapshotCompatibility,
     SglangKtRuntimeCommandResult,
     SocketSglangKtPortProbe,
     collect_sglang_kt_local_host_preflight_observation,
+)
+from exo.worker.sglang_kt.runtime_validation_receipt import (
+    SglangKtKernelRuntimeValidationReceiptObservation,
 )
 from exo.worker.tests.unittests.test_sglang_kt_launch_spec import (
     PYTHON_EXECUTABLE,
@@ -62,9 +71,9 @@ CONFIG_SHA256 = "a" * 64
 FULL_INDEXER_LAYER_STARTS = (0, 1, 2, *range(6, 78, 4))
 TORCH_VERSION = "2.10.0+cu130"
 CUDA_VERSION = "13.0"
-SGL_KERNEL_BUILD_ID = "sgl-kernel-test-build"
-DEEP_GEMM_BUILD_ID = "deep-gemm-test-build"
-KT_KERNEL_BUILD_ID = "kt-kernel-test-build"
+SGL_KERNEL_BUILD_ID = "1" * 64
+DEEP_GEMM_BUILD_ID = "2" * 64
+KT_KERNEL_BUILD_ID = "3" * 64
 
 
 def make_specs() -> tuple[SglangKtProcessLaunchSpec, ...]:
@@ -250,6 +259,49 @@ def make_runtime_validation_receipt(
     )
 
 
+def make_kernel_runtime_validation_receipt(
+    spec: SglangKtProcessLaunchSpec,
+) -> SglangKtKernelRuntimeValidationReceiptObservation:
+    return SglangKtKernelRuntimeValidationReceiptObservation(
+        receipt_path="/receipts/kernel.json",
+        receipt_size_bytes=1,
+        receipt_sha256="4" * 64,
+        schema_version=1,
+        generated_at_utc="2026-07-19T00:00:00+00:00",
+        capabilities=("kt_bf16_amx_executed_v1",),
+        gpu_uuid=spec.gpu_uuid,
+        gpu_compute_capability=(8, 6),
+        gpu_pci_bus_id="0000:01:00.0",
+        gpu_name="NVIDIA GeForce RTX 3090",
+        gpu_total_memory_bytes=24 * 1024**3,
+        driver_version="test-driver",
+        hostname=str(spec.node_id),
+        executable=spec.executable,
+        cpu_cores=spec.cpu_cores,
+        allowed_memory_nodes=spec.memory_nodes,
+        memory_nodes=spec.memory_nodes,
+        threads_per_subpool=(spec.stage.cpu_infer_threads,),
+        build_receipt_path="/receipts/build.json",
+        build_receipt_sha256="5" * 64,
+        runtime_build_id="6" * 64,
+        builder_sha256="7" * 64,
+        kt_extension_sha256="8" * 64,
+        host_profile=str(spec.node_id),
+        package_version="0.6.3.post1",
+        sglang_revision=spec.expected_sglang_revision,
+        ktransformers_revision=spec.expected_ktransformers_revision,
+        torch_version=TORCH_VERSION,
+        cuda_version=CUDA_VERSION,
+        transformers_distribution_version=(
+            spec.required_transformers_distribution_version
+        ),
+        transformers_module_version=spec.required_transformers_module_version,
+        sgl_kernel_build_id=SGL_KERNEL_BUILD_ID,
+        deep_gemm_build_id=DEEP_GEMM_BUILD_ID,
+        kt_kernel_build_id=KT_KERNEL_BUILD_ID,
+    )
+
+
 def make_gpu_resource(
     spec: SglangKtProcessLaunchSpec,
 ) -> NvidiaGpuComputeResource:
@@ -273,6 +325,34 @@ class StaticRuntimeProbe:
     ) -> SglangKtRuntimeObservation:
         self.calls.append(executable)
         return self.observation
+
+
+@dataclass
+class StaticRuntimeValidationProbe:
+    observer: Callable[
+        [SglangKtProcessLaunchSpec],
+        SglangKtRuntimeValidationReceiptObservation | None,
+    ]
+    calls: list[SglangKtProcessLaunchSpec] = field(default_factory=list)
+
+    def observe_runtime_validation(
+        self, process_spec: SglangKtProcessLaunchSpec
+    ) -> SglangKtRuntimeValidationReceiptObservation | None:
+        self.calls.append(process_spec)
+        return self.observer(process_spec)
+
+
+@dataclass
+class StaticKernelRuntimeValidationProbe:
+    observer: Callable[
+        [SglangKtProcessLaunchSpec],
+        SglangKtKernelRuntimeValidationReceiptObservation | None,
+    ]
+
+    def observe_kernel_runtime_validation(
+        self, process_spec: SglangKtProcessLaunchSpec
+    ) -> SglangKtKernelRuntimeValidationReceiptObservation | None:
+        return self.observer(process_spec)
 
 
 @dataclass
@@ -304,6 +384,24 @@ class SuccessfulFilesystemProbe:
             receipt_verified=True,
             snapshot_complete=True,
         )
+
+
+@dataclass
+class StaticModelContractProbe:
+    observation: SglangKtVerifiedModelSnapshot | None
+    calls: list[
+        tuple[AbsoluteRuntimePath, ModelId, GitRevision, Literal["FP8", "BF16"]]
+    ] = field(default_factory=list)
+
+    def verify_snapshot(
+        self,
+        path: AbsoluteRuntimePath,
+        model_id: ModelId,
+        revision: GitRevision,
+        ktransformers_method: Literal["FP8", "BF16"],
+    ) -> SglangKtVerifiedModelSnapshot | None:
+        self.calls.append((path, model_id, revision, ktransformers_method))
+        return self.observation
 
 
 @dataclass
@@ -391,8 +489,8 @@ def collect_successful_observation(
         filesystem_probe=filesystem_probe,
         inventory_probe=inventory_probe,
         port_probe=port_probe,
-        runtime_validation_receipts=tuple(
-            make_runtime_validation_receipt(spec) for spec in specs
+        runtime_validation_probe=StaticRuntimeValidationProbe(
+            make_runtime_validation_receipt
         ),
     )
     return observation, filesystem_probe, inventory_probe, port_probe
@@ -476,10 +574,67 @@ def test_collector_discards_validation_receipt_for_an_unobserved_gpu() -> None:
         filesystem_probe=SuccessfulFilesystemProbe(),
         inventory_probe=StaticInventoryProbe(make_inventory((spec,))),
         port_probe=SuccessfulPortProbe(),
-        runtime_validation_receipts=(make_runtime_validation_receipt(other_spec),),
+        runtime_validation_probe=StaticRuntimeValidationProbe(
+            lambda _process_spec: make_runtime_validation_receipt(other_spec)
+        ),
     )
 
     assert observation.runtime_validation_receipts == ()
+
+
+def test_collector_accepts_kernel_evidence_only_through_its_probe() -> None:
+    (spec,) = build_glm_4_7_flash_bf16_process_launch_specs(
+        make_glm_4_7_flash_bf16_plan(), PYTHON_EXECUTABLE
+    )
+    kernel_receipt = make_kernel_runtime_validation_receipt(spec)
+
+    observation = collect_sglang_kt_local_host_preflight_observation(
+        (spec,),
+        gpu_resources=(make_gpu_resource(spec),),
+        runtime_probe=StaticRuntimeProbe(make_runtime(spec)),
+        filesystem_probe=SuccessfulFilesystemProbe(),
+        inventory_probe=StaticInventoryProbe(make_inventory((spec,))),
+        port_probe=SuccessfulPortProbe(),
+        kernel_runtime_validation_probe=StaticKernelRuntimeValidationProbe(
+            lambda _process_spec: kernel_receipt
+        ),
+    )
+
+    assert observation.kernel_runtime_validation_receipts == (kernel_receipt,)
+
+
+def test_collector_discards_kernel_evidence_for_a_different_gpu() -> None:
+    (spec,) = build_glm_4_7_flash_bf16_process_launch_specs(
+        make_glm_4_7_flash_bf16_plan(), PYTHON_EXECUTABLE
+    )
+    wrong_receipt = make_kernel_runtime_validation_receipt(spec).model_copy(
+        update={"gpu_uuid": "GPU-00000000-0000-0000-0000-000000000099"}
+    )
+
+    observation = collect_sglang_kt_local_host_preflight_observation(
+        (spec,),
+        gpu_resources=(make_gpu_resource(spec),),
+        runtime_probe=StaticRuntimeProbe(make_runtime(spec)),
+        filesystem_probe=SuccessfulFilesystemProbe(),
+        inventory_probe=StaticInventoryProbe(make_inventory((spec,))),
+        port_probe=SuccessfulPortProbe(),
+        kernel_runtime_validation_probe=StaticKernelRuntimeValidationProbe(
+            lambda _process_spec: wrong_receipt
+        ),
+    )
+
+    assert observation.kernel_runtime_validation_receipts == ()
+
+
+def test_local_kernel_probe_requires_unique_explicit_gpu_bindings() -> None:
+    binding = SglangKtKernelRuntimeValidationBinding(
+        gpu_uuid="GPU-00000000-0000-0000-0000-000000000001",
+        receipt_path="/receipts/kernel.json",
+        receipt_sha256="4" * 64,
+    )
+
+    with pytest.raises(ValueError, match="unique GPUs"):
+        LocalSglangKtKernelRuntimeValidationProbe((binding, binding))
 
 
 def test_shared_model_and_ktransformers_path_is_probed_once() -> None:
@@ -812,6 +967,72 @@ def test_default_glm_4_7_flash_verifier_accepts_only_exact_official_bf16_config(
     assert receipt.full_indexer_layer_starts == (0,)
     assert receipt.receipt_verified
     assert receipt.snapshot_complete
+    assert receipt.contract_sha256 is None
+
+
+def test_filesystem_probe_carries_complete_exact_model_contract_evidence(
+    tmp_path: Path,
+) -> None:
+    model_path = tmp_path / "model"
+    write_exact_glm_4_7_flash_config(model_path)
+    contract_path = tmp_path / "contract.json"
+    verified = SglangKtVerifiedModelSnapshot(
+        model_path=str(model_path),
+        model_id=GLM_4_7_FLASH_BF16_MODEL_ID,
+        revision=GLM_4_7_FLASH_BF16_MODEL_REVISION,
+        weight_format="safetensors",
+        ktransformers_method="BF16",
+        full_indexer_layer_starts=(0,),
+        contract_path=str(contract_path),
+        contract_receipt_sha256=GLM_4_7_FLASH_BF16_MODEL_CONTRACT_SHA256,
+        contract_sha256=GLM_4_7_FLASH_BF16_MODEL_CONTRACT_SHA256,
+        config_sha256=GLM_4_7_FLASH_BF16_CONFIG_SHA256,
+        index_sha256="9" * 64,
+        weight_map_entries=9_703,
+        shard_count=48,
+        physical_weight_bytes=62_444_175_504,
+    )
+    contract_probe = StaticModelContractProbe(verified)
+    probe = LocalSglangKtFilesystemProbe(
+        model_snapshot_completeness_checker=(lambda _path, _model_id, _revision: True),
+        model_contract_probe=contract_probe,
+    )
+
+    receipt = probe.observe_model_snapshot(
+        str(model_path),
+        GLM_4_7_FLASH_BF16_MODEL_ID,
+        GLM_4_7_FLASH_BF16_MODEL_REVISION,
+    )
+
+    assert receipt is not None
+    assert receipt.contract_path == str(contract_path)
+    assert receipt.contract_receipt_sha256 == GLM_4_7_FLASH_BF16_MODEL_CONTRACT_SHA256
+    assert receipt.contract_sha256 == GLM_4_7_FLASH_BF16_MODEL_CONTRACT_SHA256
+    assert receipt.index_sha256 == "9" * 64
+    assert receipt.weight_map_entries == 9_703
+    assert receipt.shard_count == 48
+    assert receipt.physical_weight_bytes == 62_444_175_504
+    assert contract_probe.calls == [
+        (
+            str(model_path),
+            GLM_4_7_FLASH_BF16_MODEL_ID,
+            GLM_4_7_FLASH_BF16_MODEL_REVISION,
+            "BF16",
+        )
+    ]
+
+
+def test_local_model_contract_probe_rejects_duplicate_identity_bindings() -> None:
+    binding = SglangKtModelContractBinding(
+        model_id=GLM_4_7_FLASH_BF16_MODEL_ID,
+        revision=GLM_4_7_FLASH_BF16_MODEL_REVISION,
+        ktransformers_method="BF16",
+        contract_path="/contracts/glm47.json",
+        contract_sha256=GLM_4_7_FLASH_BF16_MODEL_CONTRACT_SHA256,
+    )
+
+    with pytest.raises(ValueError, match="unique identities"):
+        LocalSglangKtModelContractProbe((binding, binding))
 
 
 def test_default_glm_4_7_flash_verifier_rejects_wrong_revision_or_config_bytes(

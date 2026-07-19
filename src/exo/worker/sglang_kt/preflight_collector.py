@@ -15,6 +15,7 @@ from exo.shared.types.compute_resources import NvidiaGpuComputeResource
 from exo.shared.types.worker.sglang_kt import (
     AbsoluteRuntimePath,
     GitRevision,
+    GpuUuid,
     HcaDevice,
     KTransformersMethod,
     NetworkPort,
@@ -31,12 +32,20 @@ from exo.worker.sglang_kt.launch_spec import (
     GLM_5_2_FP8_MODEL_ID,
     SglangKtProcessLaunchSpec,
 )
+from exo.worker.sglang_kt.model_contract import (
+    SglangKtVerifiedModelSnapshot,
+    verify_sglang_kt_model_snapshot,
+)
 from exo.worker.sglang_kt.preflight import (
     SglangKtHostPreflightObservation,
     SglangKtModelSnapshotReceiptObservation,
     SglangKtRuntimeObservation,
     SglangKtRuntimeValidationReceiptObservation,
     Sha256Digest,
+)
+from exo.worker.sglang_kt.runtime_validation_receipt import (
+    SglangKtKernelRuntimeValidationReceiptObservation,
+    load_sglang_kt_kernel_runtime_validation_receipt,
 )
 
 _DEFAULT_NUMA_NODES_PATH = Path("/sys/devices/system/node")
@@ -230,6 +239,56 @@ class SglangKtHostInventoryProbe(Protocol):
     ) -> SglangKtLocalHostInventory: ...
 
 
+class SglangKtRuntimeValidationProbe(Protocol):
+    def observe_runtime_validation(
+        self, process_spec: SglangKtProcessLaunchSpec
+    ) -> SglangKtRuntimeValidationReceiptObservation | None: ...
+
+
+class SglangKtKernelRuntimeValidationProbe(Protocol):
+    def observe_kernel_runtime_validation(
+        self, process_spec: SglangKtProcessLaunchSpec
+    ) -> SglangKtKernelRuntimeValidationReceiptObservation | None: ...
+
+
+@final
+class SglangKtKernelRuntimeValidationBinding(FrozenModel):
+    gpu_uuid: GpuUuid
+    receipt_path: AbsoluteRuntimePath
+    receipt_sha256: Sha256Digest
+
+
+@final
+class LocalSglangKtKernelRuntimeValidationProbe:
+    """Load only explicit per-GPU kernel receipts with expected file hashes."""
+
+    def __init__(
+        self, bindings: Sequence[SglangKtKernelRuntimeValidationBinding]
+    ) -> None:
+        self._bindings = tuple(bindings)
+        gpu_uuids = tuple(binding.gpu_uuid for binding in self._bindings)
+        if len(set(gpu_uuids)) != len(gpu_uuids):
+            raise ValueError("kernel runtime validation bindings require unique GPUs")
+
+    def observe_kernel_runtime_validation(
+        self, process_spec: SglangKtProcessLaunchSpec
+    ) -> SglangKtKernelRuntimeValidationReceiptObservation | None:
+        binding = next(
+            (
+                candidate
+                for candidate in self._bindings
+                if candidate.gpu_uuid == process_spec.gpu_uuid
+            ),
+            None,
+        )
+        if binding is None:
+            return None
+        return load_sglang_kt_kernel_runtime_validation_receipt(
+            Path(binding.receipt_path),
+            expected_receipt_sha256=binding.receipt_sha256,
+        )
+
+
 class SglangKtPortProbe(Protocol):
     def can_bind_endpoint(self, endpoint: Host) -> bool: ...
 
@@ -292,6 +351,67 @@ class SglangKtModelSnapshotCompatibility(FrozenModel):
 type ModelSnapshotCompatibilityVerifier = Callable[
     [Path, ModelId, GitRevision], SglangKtModelSnapshotCompatibility | None
 ]
+
+
+class SglangKtModelContractProbe(Protocol):
+    def verify_snapshot(
+        self,
+        path: AbsoluteRuntimePath,
+        model_id: ModelId,
+        revision: GitRevision,
+        ktransformers_method: KTransformersMethod,
+    ) -> SglangKtVerifiedModelSnapshot | None: ...
+
+
+@final
+class SglangKtModelContractBinding(FrozenModel):
+    model_id: ModelId
+    revision: GitRevision
+    ktransformers_method: KTransformersMethod
+    contract_path: AbsoluteRuntimePath
+    contract_sha256: Sha256Digest
+
+
+@final
+class LocalSglangKtModelContractProbe:
+    """Verify only explicitly bound contracts; never scan for a latest receipt."""
+
+    def __init__(self, bindings: Sequence[SglangKtModelContractBinding]) -> None:
+        self._bindings = tuple(bindings)
+        identities = tuple(
+            (binding.model_id, binding.revision, binding.ktransformers_method)
+            for binding in self._bindings
+        )
+        if len(set(identities)) != len(identities):
+            raise ValueError("model contract bindings must have unique identities")
+
+    def verify_snapshot(
+        self,
+        path: AbsoluteRuntimePath,
+        model_id: ModelId,
+        revision: GitRevision,
+        ktransformers_method: KTransformersMethod,
+    ) -> SglangKtVerifiedModelSnapshot | None:
+        binding = next(
+            (
+                candidate
+                for candidate in self._bindings
+                if candidate.model_id == model_id
+                and candidate.revision == revision
+                and candidate.ktransformers_method == ktransformers_method
+            ),
+            None,
+        )
+        if binding is None:
+            return None
+        return verify_sglang_kt_model_snapshot(
+            Path(path),
+            Path(binding.contract_path),
+            expected_contract_sha256=binding.contract_sha256,
+            expected_model_id=model_id,
+            expected_revision=revision,
+            expected_ktransformers_method=ktransformers_method,
+        )
 
 
 @final
@@ -500,12 +620,14 @@ class LocalSglangKtFilesystemProbe:
         model_snapshot_completeness_checker: ModelSnapshotCompletenessChecker = (
             _is_model_snapshot_complete
         ),
+        model_contract_probe: SglangKtModelContractProbe | None = None,
     ) -> None:
         self._readable_directory_checker = readable_directory_checker
         self._model_snapshot_completeness_checker = model_snapshot_completeness_checker
         self._model_snapshot_compatibility_verifier = (
             model_snapshot_compatibility_verifier
         )
+        self._model_contract_probe = model_contract_probe
 
     def is_readable_directory(self, path: AbsoluteRuntimePath) -> bool:
         try:
@@ -526,9 +648,31 @@ class LocalSglangKtFilesystemProbe:
             compatibility = self._model_snapshot_compatibility_verifier(
                 Path(path), model_id, revision
             )
+            verified_contract = (
+                None
+                if self._model_contract_probe is None or compatibility is None
+                else self._model_contract_probe.verify_snapshot(
+                    path,
+                    model_id,
+                    revision,
+                    compatibility.ktransformers_method,
+                )
+            )
         except Exception:
             return None
         if compatibility is None:
+            return None
+        if verified_contract is not None and (
+            verified_contract.model_path != path
+            or verified_contract.model_id != model_id
+            or verified_contract.revision != revision
+            or verified_contract.weight_format != compatibility.weight_format
+            or verified_contract.ktransformers_method
+            != compatibility.ktransformers_method
+            or verified_contract.config_sha256 != compatibility.config_sha256
+            or verified_contract.full_indexer_layer_starts
+            != compatibility.full_indexer_layer_starts
+        ):
             return None
         return SglangKtModelSnapshotReceiptObservation(
             model_path=path,
@@ -540,6 +684,33 @@ class LocalSglangKtFilesystemProbe:
             full_indexer_layer_starts=compatibility.full_indexer_layer_starts,
             receipt_verified=True,
             snapshot_complete=snapshot_complete is True,
+            contract_path=(
+                None if verified_contract is None else verified_contract.contract_path
+            ),
+            contract_receipt_sha256=(
+                None
+                if verified_contract is None
+                else verified_contract.contract_receipt_sha256
+            ),
+            contract_sha256=(
+                None if verified_contract is None else verified_contract.contract_sha256
+            ),
+            index_sha256=(
+                None if verified_contract is None else verified_contract.index_sha256
+            ),
+            weight_map_entries=(
+                None
+                if verified_contract is None
+                else verified_contract.weight_map_entries
+            ),
+            shard_count=(
+                None if verified_contract is None else verified_contract.shard_count
+            ),
+            physical_weight_bytes=(
+                None
+                if verified_contract is None
+                else verified_contract.physical_weight_bytes
+            ),
         )
 
 
@@ -676,9 +847,8 @@ def collect_sglang_kt_local_host_preflight_observation(
     filesystem_probe: SglangKtFilesystemProbe,
     inventory_probe: SglangKtHostInventoryProbe,
     port_probe: SglangKtPortProbe,
-    runtime_validation_receipts: Sequence[
-        SglangKtRuntimeValidationReceiptObservation
-    ] = (),
+    runtime_validation_probe: SglangKtRuntimeValidationProbe | None = None,
+    kernel_runtime_validation_probe: SglangKtKernelRuntimeValidationProbe | None = None,
 ) -> SglangKtHostPreflightObservation:
     """Collect one host observation from explicitly supplied local effects."""
 
@@ -710,21 +880,49 @@ def collect_sglang_kt_local_host_preflight_observation(
         for endpoint in _planned_bind_endpoints(process_specs)
         if _is_observed_bind_endpoint_available(port_probe, endpoint)
     )
-    supplied_validation_receipts = tuple(runtime_validation_receipts)
     planned_gpu_uuids = {spec.gpu_uuid for spec in process_specs}
     observed_gpu_uuids = {resource.device_uuid for resource in inventory.gpu_resources}
-    receipt_gpu_uuids = tuple(
-        receipt.gpu_uuid for receipt in supplied_validation_receipts
-    )
-    if len(set(receipt_gpu_uuids)) != len(receipt_gpu_uuids) or any(
-        gpu_uuid not in planned_gpu_uuids or gpu_uuid not in observed_gpu_uuids
-        for gpu_uuid in receipt_gpu_uuids
-    ):
-        supplied_validation_receipts = ()
+    runtime_validation_receipts: list[SglangKtRuntimeValidationReceiptObservation] = []
+    kernel_runtime_validation_receipts: list[
+        SglangKtKernelRuntimeValidationReceiptObservation
+    ] = []
+    if runtime_validation_probe is not None:
+        for process_spec in process_specs:
+            if (
+                process_spec.gpu_uuid not in planned_gpu_uuids
+                or process_spec.gpu_uuid not in observed_gpu_uuids
+            ):
+                continue
+            try:
+                receipt = runtime_validation_probe.observe_runtime_validation(
+                    process_spec
+                )
+            except Exception:
+                continue
+            if receipt is not None and receipt.gpu_uuid == process_spec.gpu_uuid:
+                runtime_validation_receipts.append(receipt)
+    if kernel_runtime_validation_probe is not None:
+        for process_spec in process_specs:
+            if process_spec.gpu_uuid not in observed_gpu_uuids:
+                continue
+            try:
+                kernel_receipt = (
+                    kernel_runtime_validation_probe.observe_kernel_runtime_validation(
+                        process_spec
+                    )
+                )
+            except Exception:
+                continue
+            if (
+                kernel_receipt is not None
+                and kernel_receipt.gpu_uuid == process_spec.gpu_uuid
+            ):
+                kernel_runtime_validation_receipts.append(kernel_receipt)
     return SglangKtHostPreflightObservation(
         node_id=node_id,
         runtime=runtime,
-        runtime_validation_receipts=supplied_validation_receipts,
+        runtime_validation_receipts=tuple(runtime_validation_receipts),
+        kernel_runtime_validation_receipts=tuple(kernel_runtime_validation_receipts),
         readable_directories=readable_directories,
         model_snapshot_receipts=model_snapshot_receipts,
         gpu_uuids=tuple(resource.device_uuid for resource in inventory.gpu_resources),

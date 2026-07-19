@@ -353,6 +353,27 @@ above.
 | `glm47-kt-kernel-dwagon-20260719-v4` | **PASS** | Exact dwagon build/runtime provenance, SM86 CUDA BF16, direct AMX-BF16 qlen 1/16, and the non-default CUDA-to-host-to-AMX-to-host-to-CUDA dependency chain passed. Relative L1 errors were `0.0014008`, `0.0033588`, `0.0036068`, and `0.0040199`, all below `0.02`. Receipt/result/manifest SHA-256: `b4f6fd1718bb3145a17c97cf8113bbfcd186416cfde3cd0fcc9eada301b78eef` / `3b2ad0463a575cf659f7793a2ef65c684b50207de39836d5e508b8da1e6ffb61` / `b5173d4efedcd83d8283b0800dc58263f113a97200cb54e89972911c709febc5`. Capability is only `kt_bf16_amx_executed_v1`; cleanup was unforced. |
 | `glm47-kt-kernel-fwuff-20260719-v1` | **PASS** | Fwuff independently reproduced the same four deterministic numerical errors using its own native build and GPU UUID. Local and remote receipt/log hashes matched, no remote validator survived, and cleanup was unforced. Receipt/result/manifest SHA-256: `efe770fc84f7e28614e0d2c9ff3ca3b9e9337d511fbd78d19c5a3bade65bb782` / `093ec960fc39aaace7fc99b3abe2d6daaf02f73aba7277f14c9c06da3a7c9d3d` / `be8a450a83a424a4d39604bf2f658d04bedf707da92d58a8418fa5843fc657d4`. Capability is only `kt_bf16_amx_executed_v1`. |
 
+### File-backed GLM-4.7 admission checkpoint
+
+- Exo now loads kernel-validation receipts only from explicit per-GPU paths
+  paired with expected raw-file SHA-256 values. The strict v1 consumer rejects
+  unknown or partial evidence and derives only `kt_bf16_amx_executed_v1`.
+- The real dwagon v4 receipt loaded successfully from
+  `/var/lib/exo/benchmarks/glm47-kt-kernel-dwagon-20260719-v4/runtime-validation-receipt.json`
+  with pinned SHA-256
+  `b4f6fd1718bb3145a17c97cf8113bbfcd186416cfde3cd0fcc9eada301b78eef`.
+  This was a read-only parser validation, not a new hardware benchmark.
+- Exact model-contract verification is likewise available only through an
+  explicit model/revision/method/path/hash binding; no newest-receipt scan or
+  caller-constructed kernel receipt is accepted by the local collector.
+- Launch specs serialize and canonically hash the pinned GLM-4.7 model-contract
+  identity. Preflight requires the exact raw contract receipt, canonical
+  contract, index, shard count, map count, and physical-byte evidence, plus a
+  separate exact kernel receipt and the still-required model-level execution
+  receipt. Kernel evidence alone remains fail-closed.
+- The focused launch-spec, preflight, collector, and receipt-loader suites pass:
+  `189 passed`. No profiler or hardware workload ran for this checkpoint.
+
 ### Profiler safety incident
 
 - A previous out-of-tree VTune SEP/PAX kernel profiler (`sep5`/`pax`) crashed
@@ -362,10 +383,10 @@ above.
 
 ## Pending tests
 
-1. Add the file-backed runtime/model-validation receipt chain around the
-   completed exact snapshot contract, then run a real one-layer loader and
-   short-forward check. Keep kernel-level capability evidence separate from
-   model-level launch admission.
+1. Finish the file-backed model-level validation receipt and launch-time
+   revalidation chain around the completed exact snapshot and kernel receipt
+   bindings, then run a real one-layer loader and short-forward check. Keep
+   kernel-level capability evidence separate from model-level launch admission.
 2. Run the fail-closed 0-expert BF16 CPU-routed control and the mixed 1/4
    resident-GPU-expert controls with complete 46-layer wrapper and routing
    evidence.

@@ -1,6 +1,7 @@
-from typing import Final, Literal, final
+import hashlib
+from typing import Annotated, Final, Literal, final
 
-from pydantic import PositiveInt, model_validator
+from pydantic import PositiveInt, StringConstraints, model_validator
 
 from exo.shared.types.common import Host, ModelId, NodeId
 from exo.shared.types.worker.sglang_kt import (
@@ -15,6 +16,7 @@ from exo.shared.types.worker.sglang_kt import (
     SglangKtTargetProfile,
 )
 from exo.utils.pydantic_ext import FrozenModel
+from exo.worker.sglang_kt.receipt_io import canonical_sglang_kt_json
 
 GLM_5_2_FP8_MODEL_ID: Final = ModelId("zai-org/GLM-5.2-FP8")
 GLM_5_2_LAYER_COUNT: Final = 78
@@ -66,6 +68,10 @@ GLM_5_2_KV_CACHE_DTYPE: Final = "fp8_e4m3"
 GLM_4_7_FLASH_KV_CACHE_DTYPE: Final = "bfloat16"
 
 EnvironmentVariable = tuple[str, str]
+Sha256Digest = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
+SGLANG_KT_PROCESS_LAUNCH_SPEC_CANONICALIZATION: Final = (
+    "exo-sglang-kt-process-launch-spec-v1"
+)
 
 
 @final
@@ -75,6 +81,7 @@ class SglangKtProcessLaunchSpec(FrozenModel):
     plan: SglangKtLaunchPlan
     pipeline_rank: ResourceIndex
     executable: AbsoluteRuntimePath
+    model_contract_sha256: Sha256Digest | None
 
     @property
     def stage(self) -> SglangKtStageSpec:
@@ -142,9 +149,7 @@ class SglangKtProcessLaunchSpec(FrozenModel):
 
     @property
     def expected_model_contract_sha256(self) -> str | None:
-        if self.target_profile in GLM_4_7_FLASH_TARGET_PROFILES:
-            return GLM_4_7_FLASH_BF16_MODEL_CONTRACT_SHA256
-        return None
+        return self.model_contract_sha256
 
     @property
     def expected_sglang_revision(self) -> GitRevision:
@@ -309,7 +314,24 @@ class SglangKtProcessLaunchSpec(FrozenModel):
         _validate_supported_plan(self.plan)
         if self.pipeline_rank >= len(self.plan.stages):
             raise ValueError("SGLang process rank is absent from its launch plan")
+        expected_contract_sha256 = (
+            GLM_4_7_FLASH_BF16_MODEL_CONTRACT_SHA256
+            if self.target_profile in GLM_4_7_FLASH_TARGET_PROFILES
+            else None
+        )
+        if self.model_contract_sha256 != expected_contract_sha256:
+            raise ValueError("model contract SHA-256 does not match the target profile")
         return self
+
+
+def calculate_sglang_kt_process_launch_spec_sha256(
+    process_spec: SglangKtProcessLaunchSpec,
+) -> str:
+    payload = {
+        "canonicalization": SGLANG_KT_PROCESS_LAUNCH_SPEC_CANONICALIZATION,
+        "process_spec": process_spec.model_dump(mode="json"),
+    }
+    return hashlib.sha256(canonical_sglang_kt_json(payload)).hexdigest()
 
 
 def build_glm_5_2_fp8_process_launch_specs(
@@ -372,6 +394,11 @@ def build_sglang_kt_process_launch_specs(
             plan=plan,
             pipeline_rank=stage.pipeline_rank,
             executable=python_executable,
+            model_contract_sha256=(
+                GLM_4_7_FLASH_BF16_MODEL_CONTRACT_SHA256
+                if plan.target_profile in GLM_4_7_FLASH_TARGET_PROFILES
+                else None
+            ),
         )
         for stage in plan.stages
     )

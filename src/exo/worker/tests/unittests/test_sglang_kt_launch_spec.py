@@ -27,6 +27,7 @@ from exo.worker.sglang_kt.launch_spec import (
     build_glm_4_7_flash_bf16_cpu_routed_experts_process_launch_specs,
     build_glm_4_7_flash_bf16_process_launch_specs,
     build_glm_5_2_fp8_process_launch_specs,
+    calculate_sglang_kt_process_launch_spec_sha256,
 )
 
 MODEL_REVISION = "4" * 40
@@ -310,6 +311,10 @@ def test_builds_fail_closed_glm_4_7_flash_bf16_hybrid_smoke() -> None:
     assert (
         spec.expected_model_contract_sha256 == GLM_4_7_FLASH_BF16_MODEL_CONTRACT_SHA256
     )
+    assert (
+        spec.model_dump(mode="json")["model_contract_sha256"]
+        == GLM_4_7_FLASH_BF16_MODEL_CONTRACT_SHA256
+    )
     assert spec.pipeline_rank == 0
     assert argument_value(spec.arguments, "--pp-size") == "1"
     assert argument_value(spec.arguments, "--tp-size") == "1"
@@ -481,6 +486,37 @@ def test_process_launch_spec_roundtrip() -> None:
 
     assert SglangKtProcessLaunchSpec.model_validate_json(spec.model_dump_json()) == spec
     assert spec.expected_model_contract_sha256 is None
+
+
+def test_process_launch_spec_digest_binds_serialized_contract() -> None:
+    (spec,) = build_glm_4_7_flash_bf16_process_launch_specs(
+        make_glm_4_7_flash_bf16_plan(), PYTHON_EXECUTABLE
+    )
+
+    digest = calculate_sglang_kt_process_launch_spec_sha256(spec)
+    round_tripped = SglangKtProcessLaunchSpec.model_validate_json(
+        spec.model_dump_json()
+    )
+
+    assert len(digest) == 64
+    assert calculate_sglang_kt_process_launch_spec_sha256(round_tripped) == digest
+    assert (
+        calculate_sglang_kt_process_launch_spec_sha256(
+            spec.model_copy(update={"executable": "/different/python"})
+        )
+        != digest
+    )
+
+
+def test_process_launch_spec_rejects_wrong_profile_contract_digest() -> None:
+    (spec,) = build_glm_4_7_flash_bf16_process_launch_specs(
+        make_glm_4_7_flash_bf16_plan(), PYTHON_EXECUTABLE
+    )
+    payload = spec.model_dump()
+    payload["model_contract_sha256"] = "0" * 64
+
+    with pytest.raises(ValidationError, match="contract SHA-256"):
+        SglangKtProcessLaunchSpec.model_validate(payload)
 
 
 def test_launch_plan_requires_an_explicit_target_profile() -> None:

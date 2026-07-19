@@ -4,6 +4,7 @@ from pydantic import ValidationError
 from exo.shared.models.model_cards import ModelId
 from exo.worker.sglang_kt.launch_spec import (
     GLM_4_7_FLASH_BF16_CONFIG_SHA256,
+    GLM_4_7_FLASH_BF16_MODEL_CONTRACT_SHA256,
     GLM_4_7_FLASH_CPU_ROUTED_EXPERTS_TARGET_PROFILE,
     GLM_4_7_FLASH_TARGET_PROFILES,
     SglangKtProcessLaunchSpec,
@@ -22,6 +23,9 @@ from exo.worker.sglang_kt.preflight import (
     SglangKtRuntimeValidationReceiptObservation,
     evaluate_sglang_kt_preflight,
 )
+from exo.worker.sglang_kt.runtime_validation_receipt import (
+    SglangKtKernelRuntimeValidationReceiptObservation,
+)
 from exo.worker.tests.unittests.test_sglang_kt_launch_spec import (
     PYTHON_EXECUTABLE,
     make_glm_4_7_flash_bf16_cpu_routed_experts_plan,
@@ -33,9 +37,12 @@ CONFIG_SHA256 = "a" * 64
 FULL_INDEXER_LAYER_STARTS = (0, 1, 2, *range(6, 78, 4))
 TORCH_VERSION = "2.10.0+cu130"
 CUDA_VERSION = "13.0"
-SGL_KERNEL_BUILD_ID = "sgl-kernel-test-build"
-DEEP_GEMM_BUILD_ID = "deep-gemm-test-build"
-KT_KERNEL_BUILD_ID = "kt-kernel-test-build"
+SGL_KERNEL_BUILD_ID = "1" * 64
+DEEP_GEMM_BUILD_ID = "2" * 64
+KT_KERNEL_BUILD_ID = "3" * 64
+GLM_4_7_FLASH_INDEX_SHA256 = (
+    "91e6e95ca21700f50904a680c8c4212f5aa16dc7c10a013f01c906957c889791"
+)
 
 
 def make_specs() -> tuple[SglangKtProcessLaunchSpec, ...]:
@@ -136,6 +143,49 @@ def make_runtime_validation_receipt(
     )
 
 
+def make_kernel_runtime_validation_receipt(
+    spec: SglangKtProcessLaunchSpec,
+) -> SglangKtKernelRuntimeValidationReceiptObservation:
+    return SglangKtKernelRuntimeValidationReceiptObservation(
+        receipt_path=f"/receipts/kernel-rank-{spec.pipeline_rank}.json",
+        receipt_size_bytes=1,
+        receipt_sha256=f"{spec.pipeline_rank + 4:x}" * 64,
+        schema_version=1,
+        generated_at_utc="2026-07-19T00:00:00+00:00",
+        capabilities=("kt_bf16_amx_executed_v1",),
+        gpu_uuid=spec.gpu_uuid,
+        gpu_compute_capability=(8, 6),
+        gpu_pci_bus_id=f"0000:{spec.pipeline_rank + 1:02x}:00.0",
+        gpu_name="NVIDIA GeForce RTX 3090",
+        gpu_total_memory_bytes=24 * 1024**3,
+        driver_version="test-driver",
+        hostname=str(spec.node_id),
+        executable=spec.executable,
+        cpu_cores=spec.cpu_cores,
+        allowed_memory_nodes=spec.memory_nodes,
+        memory_nodes=spec.memory_nodes,
+        threads_per_subpool=(spec.stage.cpu_infer_threads,),
+        build_receipt_path=f"/receipts/build-rank-{spec.pipeline_rank}.json",
+        build_receipt_sha256="6" * 64,
+        runtime_build_id="7" * 64,
+        builder_sha256="8" * 64,
+        kt_extension_sha256="9" * 64,
+        host_profile=str(spec.node_id),
+        package_version="0.6.3.post1",
+        sglang_revision=spec.expected_sglang_revision,
+        ktransformers_revision=spec.expected_ktransformers_revision,
+        torch_version=TORCH_VERSION,
+        cuda_version=CUDA_VERSION,
+        transformers_distribution_version=(
+            spec.required_transformers_distribution_version
+        ),
+        transformers_module_version=spec.required_transformers_module_version,
+        sgl_kernel_build_id=SGL_KERNEL_BUILD_ID,
+        deep_gemm_build_id=DEEP_GEMM_BUILD_ID,
+        kt_kernel_build_id=KT_KERNEL_BUILD_ID,
+    )
+
+
 def make_host_observation(
     host_specs: tuple[SglangKtProcessLaunchSpec, ...],
 ) -> SglangKtHostPreflightObservation:
@@ -155,6 +205,11 @@ def make_host_observation(
         runtime_validation_receipts=tuple(
             make_runtime_validation_receipt(spec) for spec in host_specs
         ),
+        kernel_runtime_validation_receipts=tuple(
+            make_kernel_runtime_validation_receipt(spec)
+            for spec in host_specs
+            if spec.target_profile in GLM_4_7_FLASH_TARGET_PROFILES
+        ),
         readable_directories=tuple(dict.fromkeys((*model_paths, *weight_paths))),
         model_snapshot_receipts=tuple(
             SglangKtModelSnapshotReceiptObservation(
@@ -168,9 +223,48 @@ def make_host_observation(
                     if first_spec.target_profile in GLM_4_7_FLASH_TARGET_PROFILES
                     else CONFIG_SHA256
                 ),
-                full_indexer_layer_starts=FULL_INDEXER_LAYER_STARTS,
+                full_indexer_layer_starts=(
+                    (0,)
+                    if first_spec.target_profile in GLM_4_7_FLASH_TARGET_PROFILES
+                    else FULL_INDEXER_LAYER_STARTS
+                ),
                 receipt_verified=True,
                 snapshot_complete=True,
+                contract_path=(
+                    "/contracts/glm47-flash-bf16.json"
+                    if first_spec.target_profile in GLM_4_7_FLASH_TARGET_PROFILES
+                    else None
+                ),
+                contract_receipt_sha256=(
+                    GLM_4_7_FLASH_BF16_MODEL_CONTRACT_SHA256
+                    if first_spec.target_profile in GLM_4_7_FLASH_TARGET_PROFILES
+                    else None
+                ),
+                contract_sha256=(
+                    GLM_4_7_FLASH_BF16_MODEL_CONTRACT_SHA256
+                    if first_spec.target_profile in GLM_4_7_FLASH_TARGET_PROFILES
+                    else None
+                ),
+                index_sha256=(
+                    GLM_4_7_FLASH_INDEX_SHA256
+                    if first_spec.target_profile in GLM_4_7_FLASH_TARGET_PROFILES
+                    else None
+                ),
+                weight_map_entries=(
+                    9_703
+                    if first_spec.target_profile in GLM_4_7_FLASH_TARGET_PROFILES
+                    else None
+                ),
+                shard_count=(
+                    48
+                    if first_spec.target_profile in GLM_4_7_FLASH_TARGET_PROFILES
+                    else None
+                ),
+                physical_weight_bytes=(
+                    62_444_175_504
+                    if first_spec.target_profile in GLM_4_7_FLASH_TARGET_PROFILES
+                    else None
+                ),
             )
             for snapshot_path in snapshot_paths
         ),
@@ -236,6 +330,127 @@ def test_flash_smoke_requires_exact_executed_hybrid_runtime_receipt() -> None:
     assert isinstance(passed, SglangKtPreflightPassed)
     assert isinstance(missing_receipt, SglangKtPreflightFailed)
     assert checks_for_rank(missing_receipt, 0) == ("runtime_validation_receipt",)
+
+
+def test_flash_smoke_requires_independent_file_bound_kernel_evidence() -> None:
+    (spec,) = build_glm_4_7_flash_bf16_process_launch_specs(
+        make_glm_4_7_flash_bf16_plan(), PYTHON_EXECUTABLE
+    )
+    observation = make_host_observation((spec,))
+
+    result = evaluate_sglang_kt_preflight(
+        (spec,),
+        (observation.model_copy(update={"kernel_runtime_validation_receipts": ()}),),
+    )
+
+    assert isinstance(result, SglangKtPreflightFailed)
+    assert checks_for_rank(result, 0) == ("runtime_validation_receipt",)
+
+
+def test_flash_smoke_rejects_kernel_evidence_from_another_executable() -> None:
+    (spec,) = build_glm_4_7_flash_bf16_process_launch_specs(
+        make_glm_4_7_flash_bf16_plan(), PYTHON_EXECUTABLE
+    )
+    observation = make_host_observation((spec,))
+    (kernel_receipt,) = observation.kernel_runtime_validation_receipts
+
+    result = evaluate_sglang_kt_preflight(
+        (spec,),
+        (
+            observation.model_copy(
+                update={
+                    "kernel_runtime_validation_receipts": (
+                        kernel_receipt.model_copy(
+                            update={"executable": "/different/python"}
+                        ),
+                    )
+                }
+            ),
+        ),
+    )
+
+    assert isinstance(result, SglangKtPreflightFailed)
+    assert checks_for_rank(result, 0) == ("runtime_validation_receipt",)
+
+
+def test_runtime_validation_rejects_a_capability_superset() -> None:
+    (spec,) = build_glm_4_7_flash_bf16_process_launch_specs(
+        make_glm_4_7_flash_bf16_plan(), PYTHON_EXECUTABLE
+    )
+    observation = make_host_observation((spec,))
+    (receipt,) = observation.runtime_validation_receipts
+    receipt_with_unrelated_capability = receipt.model_copy(
+        update={
+            "capabilities": (
+                *receipt.capabilities,
+                "kt_tp_group_local_broadcast_v1",
+            )
+        }
+    )
+
+    result = evaluate_sglang_kt_preflight(
+        (spec,),
+        (
+            observation.model_copy(
+                update={
+                    "runtime_validation_receipts": (receipt_with_unrelated_capability,)
+                }
+            ),
+        ),
+    )
+
+    assert isinstance(result, SglangKtPreflightFailed)
+    assert checks_for_rank(result, 0) == ("runtime_validation_receipt",)
+
+
+def test_flash_smoke_requires_the_exact_model_contract_evidence() -> None:
+    (spec,) = build_glm_4_7_flash_bf16_process_launch_specs(
+        make_glm_4_7_flash_bf16_plan(), PYTHON_EXECUTABLE
+    )
+    observation = make_host_observation((spec,))
+    (snapshot_receipt,) = observation.model_snapshot_receipts
+    without_contract = snapshot_receipt.model_copy(
+        update={
+            "contract_path": None,
+            "contract_receipt_sha256": None,
+            "contract_sha256": None,
+            "index_sha256": None,
+            "weight_map_entries": None,
+            "shard_count": None,
+            "physical_weight_bytes": None,
+        }
+    )
+
+    result = evaluate_sglang_kt_preflight(
+        (spec,),
+        (
+            observation.model_copy(
+                update={"model_snapshot_receipts": (without_contract,)}
+            ),
+        ),
+    )
+
+    assert isinstance(result, SglangKtPreflightFailed)
+    assert checks_for_rank(result, 0) == (
+        "model_revision_receipt",
+        "ktransformers_weight_revision_receipt",
+    )
+
+
+def test_snapshot_contract_evidence_must_be_complete_or_absent() -> None:
+    with pytest.raises(ValidationError, match="contract evidence must be complete"):
+        SglangKtModelSnapshotReceiptObservation(
+            model_path="/model",
+            model_id=ModelId("zai-org/GLM-4.7-Flash"),
+            revision="7" * 40,
+            weight_format="safetensors",
+            ktransformers_method="BF16",
+            config_sha256=GLM_4_7_FLASH_BF16_CONFIG_SHA256,
+            full_indexer_layer_starts=(0,),
+            receipt_verified=True,
+            snapshot_complete=True,
+            contract_path="/contract.json",
+        )
 
 
 @pytest.mark.parametrize(
