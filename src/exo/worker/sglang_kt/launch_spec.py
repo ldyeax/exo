@@ -29,6 +29,10 @@ GLM_4_7_FLASH_BF16_MODEL_REVISION: Final = "7dd20894a642a0aa287e9827cb1a1f7f9138
 GLM_4_7_FLASH_BF16_CONFIG_SHA256: Final = (
     "dc9b97c7c9bed726a2e6939da4234d5c43abb3edec8812068c9a1af1dbc13acb"
 )
+GLM_4_7_FLASH_BF16_MODEL_CONTRACT_SHA256: Final = (
+    "4e7333f341ddc5855aa4253d454e3210d84427fae0159eb956104ff00c437479"
+)
+GLM_4_7_FLASH_BF16_MODEL_CONTRACT_FILENAME: Final = "glm47_flash_bf16_7dd20894.json"
 GLM_4_7_FLASH_LAYER_COUNT: Final = 47
 GLM_4_7_FLASH_CONTEXT_LENGTH: Final = 202_752
 GLM_4_7_FLASH_MAX_TOTAL_TOKENS: Final = 4_096
@@ -135,6 +139,12 @@ class SglangKtProcessLaunchSpec(FrozenModel):
     @property
     def expected_model_revision(self) -> GitRevision:
         return self.plan.model_revision
+
+    @property
+    def expected_model_contract_sha256(self) -> str | None:
+        if self.target_profile in GLM_4_7_FLASH_TARGET_PROFILES:
+            return GLM_4_7_FLASH_BF16_MODEL_CONTRACT_SHA256
+        return None
 
     @property
     def expected_sglang_revision(self) -> GitRevision:

@@ -6,6 +6,11 @@ from pathlib import Path
 import pytest
 
 from exo.shared.types.common import ModelId
+from exo.worker.sglang_kt import model_contract as model_contract_module
+from exo.worker.sglang_kt.launch_spec import (
+    GLM_4_7_FLASH_BF16_MODEL_CONTRACT_FILENAME,
+    GLM_4_7_FLASH_BF16_MODEL_CONTRACT_SHA256,
+)
 from exo.worker.sglang_kt.model_contract import (
     SglangKtModelContractError,
     calculate_sglang_kt_model_contract_sha256,
@@ -127,6 +132,38 @@ def test_exact_contract_round_trip_verifies_all_indexed_shards(tmp_path: Path) -
     assert verified.shard_count == 2
     assert verified.weight_map_entries == 2
     assert verified.physical_weight_bytes == len(b"first-shardsecond-shard")
+
+
+def test_packaged_glm47_contract_matches_launch_pin() -> None:
+    contract_path = (
+        Path(model_contract_module.__file__).parent
+        / "manifests"
+        / GLM_4_7_FLASH_BF16_MODEL_CONTRACT_FILENAME
+    )
+
+    loaded = load_sglang_kt_model_contract(
+        contract_path,
+        expected_contract_sha256=GLM_4_7_FLASH_BF16_MODEL_CONTRACT_SHA256,
+    )
+
+    assert loaded.contract.model_id == ModelId("zai-org/GLM-4.7-Flash")
+    assert loaded.contract.revision == "7dd20894a642a0aa287e9827cb1a1f7f91386b67"
+    assert loaded.receipt_sha256 == GLM_4_7_FLASH_BF16_MODEL_CONTRACT_SHA256
+    assert loaded.contract_sha256 == GLM_4_7_FLASH_BF16_MODEL_CONTRACT_SHA256
+    assert loaded.contract.ktransformers_method == "BF16"
+    assert loaded.contract.full_indexer_layer_starts == (0,)
+    assert loaded.contract.weight_map_entries == 9_703
+    assert loaded.contract.physical_weight_bytes == 62_444_175_504
+    assert sum(file.role == "weight_shard" for file in loaded.contract.files) == 48
+    files_by_path = {file.path: file for file in loaded.contract.files}
+    assert (
+        files_by_path["config.json"].sha256
+        == "dc9b97c7c9bed726a2e6939da4234d5c43abb3edec8812068c9a1af1dbc13acb"
+    )
+    assert (
+        files_by_path["model.safetensors.index.json"].sha256
+        == "91e6e95ca21700f50904a680c8c4212f5aa16dc7c10a013f01c906957c889791"
+    )
 
 
 def test_contract_rejects_same_size_shard_mutation(tmp_path: Path) -> None:

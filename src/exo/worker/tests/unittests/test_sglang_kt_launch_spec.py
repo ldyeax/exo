@@ -9,6 +9,7 @@ from exo.shared.types.worker.sglang_kt import (
     SglangKtStageSpec,
 )
 from exo.worker.sglang_kt.launch_spec import (
+    GLM_4_7_FLASH_BF16_MODEL_CONTRACT_SHA256,
     GLM_4_7_FLASH_BF16_MODEL_ID,
     GLM_4_7_FLASH_BF16_MODEL_REVISION,
     GLM_4_7_FLASH_CPU_ROUTED_EXPERTS_TARGET_PROFILE,
@@ -306,6 +307,9 @@ def test_builds_fail_closed_glm_4_7_flash_bf16_hybrid_smoke() -> None:
     (spec,) = build_glm_4_7_flash_bf16_process_launch_specs(plan, PYTHON_EXECUTABLE)
 
     assert spec.target_profile == GLM_4_7_FLASH_TARGET_PROFILE
+    assert (
+        spec.expected_model_contract_sha256 == GLM_4_7_FLASH_BF16_MODEL_CONTRACT_SHA256
+    )
     assert spec.pipeline_rank == 0
     assert argument_value(spec.arguments, "--pp-size") == "1"
     assert argument_value(spec.arguments, "--tp-size") == "1"
@@ -346,6 +350,9 @@ def test_builds_fail_closed_glm_4_7_flash_cpu_routed_experts_control() -> None:
     assert spec.target_profile == GLM_4_7_FLASH_CPU_ROUTED_EXPERTS_TARGET_PROFILE
     assert spec.model_id == GLM_4_7_FLASH_BF16_MODEL_ID
     assert spec.expected_model_revision == GLM_4_7_FLASH_BF16_MODEL_REVISION
+    assert (
+        spec.expected_model_contract_sha256 == GLM_4_7_FLASH_BF16_MODEL_CONTRACT_SHA256
+    )
     assert spec.expected_sglang_revision == GLM_4_7_FLASH_SGLANG_REVISION
     assert spec.expected_ktransformers_revision == GLM_4_7_FLASH_KTRANSFORMERS_REVISION
     assert len(spec.plan.stages) == 1
@@ -473,6 +480,7 @@ def test_process_launch_spec_roundtrip() -> None:
     spec = build_glm_5_2_fp8_process_launch_specs(make_plan(), PYTHON_EXECUTABLE)[0]
 
     assert SglangKtProcessLaunchSpec.model_validate_json(spec.model_dump_json()) == spec
+    assert spec.expected_model_contract_sha256 is None
 
 
 def test_launch_plan_requires_an_explicit_target_profile() -> None:

@@ -83,6 +83,7 @@ def make_plan(
             ),
         )
     values: dict[str, object] = {
+        "target_profile": "glm52_fp8_pp3_sm86_v1",
         "model_id": ModelId("zai-org/GLM-5.2-FP8"),
         "model_revision": REVISION,
         "sglang_revision": "2" * 40,

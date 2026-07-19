@@ -38,13 +38,14 @@ source of truth. Update this file in the same commit that records each new test.
 - Latest kernel result: independent dwagon and fwuff native runtimes each
   passed the leased SM86 CUDA plus AMX-BF16 validator and claimed only
   `kt_bf16_amx_executed_v1`. Both runs cleaned up without force.
-- Latest artifact result: the exact GLM-4.7 Flash SGLang-KTransformers source
-  was built independently on dwagon and fwuff, installed into immutable
-  overlays, and statically reconstructed from each host's complete receipt.
+- Latest artifact result: the official GLM-4.7 Flash BF16 snapshot now has a
+  packaged contract covering every launch-relevant file, all 48 indexed
+  shards, and their Hugging Face revision metadata. A leased full rehash
+  verified that 62.4 GB contract on the shared read-only snapshot.
 - Historical Ornith AMXINT8 conversion and serving receipts were recovered and
   hashed below. They inform the GLM hybrid-runtime work but are not Exo tests.
-- Next work: add file-backed model admission receipts and an exact model-shard
-  manifest, then run the real loader/short-forward gate before CPU-only and
+- Next work: bind file-backed build/install/kernel/model receipts into model
+  admission, then run the real loader/short-forward gate before CPU-only and
   mixed AMX-BF16/RTX-3090 PP1 correctness controls. The Qwen3-Coder ladder rung
   is deferred until that hybrid path has trustworthy model execution receipts.
 
@@ -63,7 +64,9 @@ test total.
 | Pinned fwuff GLM-4.7 native runtime build | **PASS (artifact)** | Build ID `e21ef087b1c50cf961339e1bd1a2e1a3f60047579f811385614297de6a2abfc9`; receipt SHA-256 `051b78a5238adac99721eb268c95d8ab5e8721d8c1c61114bbda967468433dfb`; native KT wheel/extension SHA-256 `f57c574cc190f8817a51cf0b08c5f2165e2f761c3a1b2999560abcbdcc792d45` / `b2f60ec18aba53223e27cfd925f2c23083a281c109cf53ca06f1ac98bff6e99b` |
 | Immutable fwuff runtime overlay | **PASS (artifact)** | Install ID `82d20634f743ed87ae9cc71f2b7f4936d9451363db1ca46a207218f22de51ef8`; receipt SHA-256 `fe57f9fe10160ebf2f0a0ba3731e69c8ddb4608841f07880bac2ff6bd0640eb4`; its old base runtime remains untouched |
 | Leased two-host CUDA/AMX kernel validation | **PASS** | Dwagon v4 and fwuff v1 independently passed exact provenance, SM86 BF16 CUDA math, AMX-BF16 qlen 1/16, and the bidirectional non-default CUDA-stream bridge; each claimed only `kt_bf16_amx_executed_v1` and cleaned up without force |
-| Focused GLM-4.7 source, build, overlay, validator, launch, and preflight suite | **PASS** | 214 tests passed on 2026-07-19, including an isolated validator-import regression with the model-download stack deliberately unavailable and canonical/raw PyTorch GPU UUID coverage |
+| Official GLM-4.7 Flash BF16 model contract | **PASS (artifact)** | The packaged contract binds 54 launch-relevant files, 48 indexed shards totaling 62,444,175,504 bytes, exact Hugging Face metadata, tokenizer/template inputs, and absence of executable remote-code files; leased live verification returned 0 and cleaned up unforced |
+| Focused GLM-4.7 source, build, overlay, model-contract, validator, launch, and preflight suite | **PASS** | 277 tests passed on 2026-07-19, including exact packaged-contract pinning, the repaired required-profile launch-plan fixture, isolated validator import, and canonical/raw PyTorch GPU UUID coverage |
+| GLM-4.7 packaged-contract wheel inclusion | **PASS (artifact)** | `uv build --wheel` produced `exo-0.3.70-py3-none-any.whl`; its package contains the exact 16,218-byte `exo/worker/sglang_kt/manifests/glm47_flash_bf16_7dd20894.json` resource |
 | Changed GLM-4.7 Flash Python files, strict targeted type checks and Ruff | **PASS** | Three targeted Basedpyright configurations reported 0 errors; repository-wide `ruff check` passed; all 16 changed Python files passed `ruff format --check` on 2026-07-19 |
 | Repository-wide Basedpyright in the existing `.venv` | **BLOCKED** | The environment cannot resolve installed project dependencies (including `httpx`, AnyIO, and pytest), producing dependency-driven diagnostics across the untouched tree; `uv run` could not complete the pinned MLX wheel acquisition |
 | Repository-wide pytest collection | **BLOCKED** | `tests/conftest.py` imports unavailable `exo_tools`; collection stopped before tests ran |
@@ -279,8 +282,25 @@ above.
   `91e6e95ca21700f50904a680c8c4212f5aa16dc7c10a013f01c906957c889791`.
   The new exact-profile verifier accepted the live snapshot as BF16 with 47
   main layers. The index's embedded `metadata.total_size` is 31,221,488,576,
-  not the real shard byte total, so later receipts must bind the Hugging Face
-  manifest and actual shard sizes.
+  not the real shard byte total; the packaged model contract therefore binds
+  the actual size and SHA-256 of every shard instead.
+- The canonical contract is
+  `src/exo/worker/sglang_kt/manifests/glm47_flash_bf16_7dd20894.json`, pinned by
+  the launch profile at SHA-256
+  `4e7333f341ddc5855aa4253d454e3210d84427fae0159eb956104ff00c437479`.
+  It covers 54 launch-relevant files: config, index, all indexed shards,
+  tokenizer inputs, generation config, and chat template. It also verifies
+  each file's exact Hugging Face revision/blob metadata, rejects unindexed or
+  extra shards, and rejects executable remote-code files.
+- The leased full-snapshot validation passed at
+  `/var/lib/exo/benchmarks/glm47-model-contract-20260719-v1` in 586.367 seconds
+  with `profiler=none`, return code 0, and unforced cleanup. Result and manifest
+  SHA-256 are
+  `9b7b5a5a5f054e79f0606111fbdc9a4e7aa80506d762cffc537a75c437c9d284`
+  and
+  `2f7666e286ad89ec3ec556a56e5250ea42fba9b9ce175f89334b42dda0e7f419`.
+  This is artifact identity evidence only; it does not prove a model load,
+  forward pass, wrapper coverage, expert routing, or launch admission.
 - The final clean prepared source is
   `/var/lib/exo/sources/ktransformers-glm47-7e70d75`, at KTransformers
   `7e70d7518edd26af6a0638593037d68c9b6bd6bf`, embedded SGLang
@@ -315,8 +335,8 @@ above.
   CUDA-to-pinned-host-to-AMX-to-pinned-host-to-CUDA dependency chain. It cannot
   satisfy a GLM model-execution receipt or authorize a model launch.
 - Model admission remains fail-closed until Exo parses receipts from verified
-  files and binds the kernel/build/install receipts, the exact model index and
-  shard manifest, runtime artifact hashes, wrapper coverage for layers 1-46,
+  files and binds the kernel/build/install receipts, the now-pinned model
+  contract, runtime artifact hashes, wrapper coverage for layers 1-46,
   a real short forward, and the CPU-only or mixed expert-execution capability.
   Caller-constructed Pydantic receipt objects are not sufficient evidence.
 - The live kernel receipts below establish AMX execution but still do not
@@ -342,9 +362,10 @@ above.
 
 ## Pending tests
 
-1. Add a file-backed model-receipt parser and exact index/shard manifest binding,
-   then run a real one-layer loader and short-forward check. Keep kernel-level
-   capability evidence separate from model-level launch admission.
+1. Add the file-backed runtime/model-validation receipt chain around the
+   completed exact snapshot contract, then run a real one-layer loader and
+   short-forward check. Keep kernel-level capability evidence separate from
+   model-level launch admission.
 2. Run the fail-closed 0-expert BF16 CPU-routed control and the mixed 1/4
    resident-GPU-expert controls with complete 46-layer wrapper and routing
    evidence.

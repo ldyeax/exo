@@ -22,7 +22,6 @@ from exo.shared.types.worker.sglang_kt import (
     KTransformersMethod,
     ResourceIndex,
 )
-from exo.worker.sglang_kt.preflight import Sha256Digest
 from exo.worker.sglang_kt.receipt_io import (
     SglangKtBoundFile,
     SglangKtReceiptFileError,
@@ -56,6 +55,7 @@ HuggingFaceEtagDigest = Annotated[
     str,
     StringConstraints(pattern=r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$"),
 ]
+Sha256Digest = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 _SINGLETON_RUNTIME_FILES: tuple[tuple[str, ModelContractFileRole], ...] = (
     ("chat_template.jinja", "chat_template"),
     ("config.json", "config"),
