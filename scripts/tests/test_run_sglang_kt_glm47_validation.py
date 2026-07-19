@@ -149,6 +149,47 @@ def open_results(config: harness.ValidationConfig) -> harness.ResultDirectory:
         os.close(descriptor)
 
 
+def test_parse_command_json_accepts_one_clean_object(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    results = open_results(config)
+    outcome = command_outcome("model-validator")
+    try:
+        with results.create_log(outcome.stdout_name) as stdout:
+            stdout.write(b'{"schema_version":1,"status":"passed"}\n')
+
+        assert harness._parse_command_json(results, outcome) == {
+            "schema_version": 1,
+            "status": "passed",
+        }
+    finally:
+        results.close()
+
+
+@pytest.mark.parametrize(
+    "contents",
+    (
+        b'native diagnostic\n{"status":"passed"}\n',
+        b'{"status":"passed"}\nnative diagnostic\n',
+        b'{"status":"passed"}\n{"status":"passed"}\n',
+    ),
+)
+def test_parse_command_json_rejects_contaminated_stream(
+    tmp_path: Path,
+    contents: bytes,
+) -> None:
+    config = make_config(tmp_path)
+    results = open_results(config)
+    outcome = command_outcome("model-validator")
+    try:
+        with results.create_log(outcome.stdout_name) as stdout:
+            stdout.write(contents)
+
+        with pytest.raises(harness.Glm47HarnessError, match="stdout is invalid JSON"):
+            harness._parse_command_json(results, outcome)
+    finally:
+        results.close()
+
+
 def fake_owned_cgroup(tmp_path: Path) -> harness.OwnedCgroup:
     parent = tmp_path / f"fake-cgroup-parent-{uuid.uuid4().hex}"
     child = parent / "validators-test"

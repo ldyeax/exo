@@ -508,11 +508,13 @@ def run_disposable_live_child(
             evidence_descriptor_argument,
             str(descriptor),
         )
+        # The memfd carries evidence; reserve parent stdout for its JSON response.
         process = subprocess.Popen(
             child_command,
             env=environment,
             pass_fds=(descriptor,),
             start_new_session=True,
+            stdout=sys.stderr,
         )
         try:
             returncode = _wait_for_direct_child_exit_without_reaping(process)

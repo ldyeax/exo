@@ -319,6 +319,31 @@ def test_disposable_child_evidence_is_visible_only_after_clean_exit(
     assert evidence.sha256 == hashlib.sha256(evidence.contents).hexdigest()
 
 
+def test_disposable_child_routes_runtime_stdout_to_parent_stderr(
+    tmp_path: Path,
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    child = tmp_path / "noisy-child.py"
+    child.write_text(
+        "import os, sys\n"
+        "fd = int(sys.argv[sys.argv.index('--evidence-fd') + 1])\n"
+        "os.write(1, b'native runtime stdout\\n')\n"
+        "os.write(2, b'runtime stderr\\n')\n"
+        'os.write(fd, b\'{"status":"passed"}\')\n'
+    )
+
+    evidence = live.run_disposable_live_child(
+        (sys.executable, str(child)),
+        evidence_descriptor_argument="--evidence-fd",
+        environment=os.environ.copy(),
+    )
+    captured = capfd.readouterr()
+
+    assert evidence.contents == b'{"status":"passed"}'
+    assert captured.out == ""
+    assert captured.err == "native runtime stdout\nruntime stderr\n"
+
+
 def test_disposable_child_uses_libc_when_python_omits_memfd_uapi(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
