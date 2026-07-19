@@ -27,27 +27,28 @@ source of truth. Update this file in the same commit that records each new test.
 ## Current summary
 
 - Latest published proof-harness source: clean commit
-  `57a57e1221a5f1199cc90e9dc9391ec925395f2c`.
+  `f333c6d5f335483dae46050fc196baf92a262d4c`.
 - Latest completed live-benchmark source: clean commit
-  `6da455c8e3eb5e21d09812f10e44a31712545816`.
+  `f7687d6cfc8c232655c317146dd20ff5bc04aa55`.
 - Completed ladder rungs: Llama 3.2 1B, Llama 3.2 3B, Llama 3.1 8B,
   GPT-OSS 20B, and GLM-4.7 Flash.
 - Latest live result: GLM-4.7 Flash TP=2 passed exact TP1 output equality,
   two-rank NCCL initialization, payload on both QDR rails, clean HCA health
   counters, instance deletion, process cleanup, and resource release.
-- Latest kernel result: independent dwagon and fwuff native runtimes each
-  passed the leased SM86 CUDA plus AMX-BF16 validator and claimed only
-  `kt_bf16_amx_executed_v1`. Both runs cleaned up without force.
+- Latest kernel result: dwagon's fresh lease-harness v6 receipt passed through
+  the exact overlay interpreter and claimed only `kt_bf16_amx_executed_v1`.
+  Earlier native dwagon and fwuff receipts independently passed the same
+  numerical gate; every run cleaned up without force.
 - Latest artifact result: the official GLM-4.7 Flash BF16 snapshot now has a
   packaged contract covering every launch-relevant file, all 48 indexed
   shards, and their Hugging Face revision metadata. A leased full rehash
   verified that 62.4 GB contract on the shared read-only snapshot.
 - Historical Ornith AMXINT8 conversion and serving receipts were recovered and
   hashed below. They inform the GLM hybrid-runtime work but are not Exo tests.
-- Next work: deploy the completed admission-grade model-receipt producer, make
-  a fresh overlay-interpreter kernel receipt, then run the real CPU-control and
-  mixed AMX-BF16/RTX-3090 PP1 correctness gates. The Qwen3-Coder ladder rung is
-  deferred until that hybrid path has trustworthy live model evidence.
+- Next work: prepare a fresh cgroup-contained CPU-control model proof from
+  `f333c6d5`, then run the mixed AMX-BF16/RTX-3090 PP1 correctness gate. The
+  Qwen3-Coder ladder rung is deferred until that hybrid path has trustworthy
+  live model evidence.
 
 ## Automated validation
 
@@ -66,7 +67,9 @@ test total.
 | Leased two-host CUDA/AMX kernel validation | **PASS** | Dwagon v4 and fwuff v1 independently passed exact provenance, SM86 BF16 CUDA math, AMX-BF16 qlen 1/16, and the bidirectional non-default CUDA-stream bridge; each claimed only `kt_bf16_amx_executed_v1` and cleaned up without force |
 | Official GLM-4.7 Flash BF16 model contract | **PASS (artifact)** | The packaged contract binds 54 launch-relevant files, 48 indexed shards totaling 62,444,175,504 bytes, exact Hugging Face metadata, tokenizer/template inputs, and absence of executable remote-code files; leased live verification returned 0 and cleaned up unforced |
 | Focused GLM-4.7 source, build, overlay, model-contract, validator, launch, and preflight suite | **PASS** | 277 tests passed on 2026-07-19, including exact packaged-contract pinning, the repaired required-profile launch-plan fixture, isolated validator import, and canonical/raw PyTorch GPU UUID coverage |
-| Dedicated leased GLM-4.7 live-validation harness | **PASS (software)** | 30 focused tests cover immutable preparation, exact runtime/GPU/HCA binding, kernel/model result semantics, partial failure receipts, descriptor-anchored scratch cleanup, and fail-closed cleanup of nested session descendants; strict targeted Basedpyright and Ruff pass |
+| Dedicated leased GLM-4.7 live-validation harness | **PASS (software)** | 37 focused tests cover immutable preparation, exact runtime/GPU/HCA binding, kernel/model result semantics, descriptor-anchored scratch cleanup, delegated cgroup-v2 placement, pre-exec attachment, identity replacement, and fail-closed process/cgroup cleanup; strict targeted Basedpyright and Ruff pass |
+| Lease plus GLM containment contract slice | **PASS (software)** | 103 tests validate the optional static containment contract, exact systemd invocation/UID/owner-token leaf binding, one-way runtime binding, immutable evidence, final result reconciliation, and backward compatibility for leases without containment |
+| Broad GLM producer/consumer and lease regression slice | **PASS** | 672 tests passed on 2026-07-19 after cgroup containment and lease-evidence binding were added |
 | GLM-4.7 packaged-contract wheel inclusion | **PASS (artifact)** | `uv build --wheel` produced `exo-0.3.70-py3-none-any.whl`; its package contains the exact 16,218-byte `exo/worker/sglang_kt/manifests/glm47_flash_bf16_7dd20894.json` resource |
 | Changed GLM-4.7 Flash Python files, strict targeted type checks and Ruff | **PASS** | Three targeted Basedpyright configurations reported 0 errors; repository-wide `ruff check` passed; all 16 changed Python files passed `ruff format --check` on 2026-07-19 |
 | Repository-wide Basedpyright in the existing `.venv` | **BLOCKED** | The environment cannot resolve installed project dependencies (including `httpx`, AnyIO, and pytest), producing dependency-driven diagnostics across the untouched tree; `uv run` could not complete the pinned MLX wheel acquisition |
@@ -91,6 +94,21 @@ test total.
 | Broad non-image Python baseline | **KNOWN BASELINE** | 459 passed, 5 skipped, plus the unchanged stale Rust-binding failure |
 | Fresh full-repository pytest collection | **BLOCKED** | Root collection lacks external `exo_tools`; adding `tools/src` exposes 23 pre-existing collection/import failures |
 | Required `uv run basedpyright` and `nix fmt` | **BLOCKED** | `uv` and Nix are not installed on dwagon; direct full Basedpyright has environment-wide dependency/stub failures |
+
+### Host cgroup-v2 containment probes
+
+These probes used only short-lived sleeping processes. They did not touch the
+model, GPUs, AMX, storage, InfiniBand, or the benchmark lease and make no
+performance claim.
+
+| Probe | Result | Evidence and lesson |
+| --- | --- | --- |
+| Delegated service layout | **PASS (diagnostic)** | systemd 260 created `exo-containment-probe.service` at `/system.slice/exo-containment-probe.service/supervisor`, supplied invocation ID `f17ba218fa9a44eaac3ecb11e82e4064`, kept the unit root empty, and exposed all cgroup-v2 controllers under `Delegate=yes`. |
+| Empty-leaf `cgroup.kill` | **PASS (diagnostic)** | Writing `1` to `cgroup.kill` on an empty `0700` sibling leaf returned successfully, `cgroup.events` remained `populated 0`, and the leaf was removed. |
+| First harness containment invocation | **EXPECTED FAIL (setup)** | The transient service omitted `WorkingDirectory`, so the ad hoc `python -c` probe could not import `scripts` and exited before creating a validator leaf. The corrected probe set `/root/exo`; generated benchmark commands use absolute immutable script paths and do not depend on this ad hoc import setup. |
+| Detached-descendant cleanup | **PASS (diagnostic)** | The real harness helpers placed outer PID 3461326 and detached `setsid` PID 3461327 in `/sys/fs/cgroup/system.slice/exo-glm47-b9ccc8603b8f2c76ec5a1f1b972eb733.service/validators-df6c87dd68918eca906ef969c5755d1d`; `cgroup.kill` removed both, `cleanup_owned_cgroup` returned true, and the exact leaf disappeared. |
+| Sequential leaf reuse | **PASS (diagnostic)** | The same delegated validator leaf accepted and killed two successive pre-exec-attached processes (PIDs 3480737 and 3480738), then final cleanup removed the leaf. This proves one leaf can safely contain the generator, kernel validator, and model validator in sequence. |
+| Unit collection | **PASS (diagnostic)** | `exo-containment-probe.service`, `exo-cgroup-empty-kill-probe.service`, and `exo-glm47-b9ccc8603b8f2c76ec5a1f1b972eb733.service` all report `LoadState=not-found`; all three unit cgroup paths are absent. |
 
 ## Live interconnect and lifecycle tests
 
@@ -352,7 +370,20 @@ above.
 | `glm47-kt-kernel-dwagon-20260719-v2` | **EXPECTED FAIL (diagnostic)** | Supplying the clean source exposed an accidental import of Exo's `aiofiles`-dependent download stack through `preflight_collector.py`; failure again preceded Torch, CUDA, and AMX. The artifact identity helper is now isolated in a standard-library-only module with a regression test. Cleanup was unforced and the lease was released. Result/manifest SHA-256: `ff242d7164e9805f0e18434e115300ee85ac054516e3c5d798d917c184e463f6` / `321b449f7283a73f5c8fb7f8f97b7b9bbe424431a0123b583a291469941011a5`. |
 | `glm47-kt-kernel-dwagon-20260719-v3` | **EXPECTED FAIL (diagnostic)** | CUDA BF16, AMX BF16 at query lengths 1 and 16, and the bidirectional CUDA-stream bridge all executed within numerical tolerance. Admission failed only because Torch exposed the selected GPU UUID without `nvidia-smi`'s `GPU-` prefix. The validator now retains the raw value and compares a syntax-validated canonical value. Receipt/result/manifest SHA-256: `824ed5604e93380b59a485fdbf76cce9632591faf8edecd269e4e4214fdad995` / `d219e67258d146636253d2533a65c7906c1abe1bbf5da674f55b90b29e08b2ef` / `5a2e56bf95609041237049e1ff878a4254155a36d86179513dc759d36a4f8eae`. Cleanup was unforced and the lease was released. |
 | `glm47-kt-kernel-dwagon-20260719-v4` | **PASS** | Exact dwagon build/runtime provenance, SM86 CUDA BF16, direct AMX-BF16 qlen 1/16, and the non-default CUDA-to-host-to-AMX-to-host-to-CUDA dependency chain passed. Relative L1 errors were `0.0014008`, `0.0033588`, `0.0036068`, and `0.0040199`, all below `0.02`. Receipt/result/manifest SHA-256: `b4f6fd1718bb3145a17c97cf8113bbfcd186416cfde3cd0fcc9eada301b78eef` / `3b2ad0463a575cf659f7793a2ef65c684b50207de39836d5e508b8da1e6ffb61` / `b5173d4efedcd83d8283b0800dc58263f113a97200cb54e89972911c709febc5`. Capability is only `kt_bf16_amx_executed_v1`; cleanup was unforced. |
+| `glm47-kt-kernel-dwagon-20260719-v5` | **EXPECTED FAIL (preflight)** | The new lease harness rejected an earlier owner-started `/proc` diagnostic shell whose still-running command line contained the literal SEP/PAX search terms. No generator, CUDA, or AMX validator started; no kernel receipt was created. The diagnostic completed normally, harness cleanup was unforced and proven, the scratch path was removed, and the lease/lock/GPU were clean. Result/manifest/runtime-metadata SHA-256: `4ed3d2b0e7a4cc7cffd57e86d777e010b72b93b0d2992f9d859cdac893661aea` / `aa11f2340f75ca1e3b22d93d02a0eb3110176c16932e84173a68010a516fb62f` / `b25c83da3d98317ea25a65df641ca4bd0455f8608beefa3c0027ef0b6b043925`. |
+| `glm47-kt-kernel-dwagon-20260719-v6` | **PASS (diagnostic)** | The dedicated lease harness passed exact overlay-interpreter/build provenance, SM86 CUDA BF16, direct AMX-BF16 qlen 1/16, and the CUDA-host-AMX-host-CUDA dependency chain. Relative L1 errors were `0.0014008`, `0.0033588`, `0.0036068`, and `0.0040199`, all below `0.02`; capability is only `kt_bf16_amx_executed_v1`. Both QDR ports were physically `LinkUp` with exact GIDs but subnet `INIT`, recorded under `metadata_only` with no traffic expected. Model verification/reportability and performance comparability are false. Receipt/result/manifest/runtime-metadata SHA-256: `53132ee63e92ef62ec752ebb44d98f61316fc21ea57c2022e9c18d5f8f9fd5e4` / `4cd9c6ad3ae14b8810a8c2b0dec8fa9bcfd780ad51ea60673327f267fb986e3c` / `1419c96652c9186320beb8de1bdab93f5f9f10c9576fa375c6d4db226b2c9e28` / `147c521b6ba28b7563cb5db2fe976985dfa793d03ee5618393278dc9903f42bc`. Cleanup was unforced; lease, lock, GPU processes, and scratch were clean. |
 | `glm47-kt-kernel-fwuff-20260719-v1` | **PASS** | Fwuff independently reproduced the same four deterministic numerical errors using its own native build and GPU UUID. Local and remote receipt/log hashes matched, no remote validator survived, and cleanup was unforced. Receipt/result/manifest SHA-256: `efe770fc84f7e28614e0d2c9ff3ca3b9e9337d511fbd78d19c5a3bade65bb782` / `093ec960fc39aaace7fc99b3abe2d6daaf02f73aba7277f14c9c06da3a7c9d3d` / `be8a450a83a424a4d39604bf2f658d04bedf707da92d58a8418fa5843fc657d4`. Capability is only `kt_bf16_amx_executed_v1`. |
+
+### Model validation attempt ledger
+
+| Attempt | Result | Evidence and lesson |
+| --- | --- | --- |
+| `glm47-kt-cpu-control-dwagon-20260719-v1` | **EXPECTED FAIL (preflight)** | The generator and fresh overlay kernel validation passed, then the model validator rejected the exact snapshot before hashing or loading because its 117 files and 6 directories were writable (`0644`/`0755`). No model receipt was created. The revision-pinned NFS snapshot on fwuff was subsequently made immutable (`0444` files, `0555` directories) without changing content. Result/manifest/runtime-metadata/kernel-receipt SHA-256: `d061131a2bbdca73fd9f7659cb977bb72aea9a0d4a553e49d5d8e684fbc868ed` / `4417fb1c5b484873891e2c879329e56b3f480a2659d018c40718251a972bc611` / `954feef4b3a2be0148614b58db273498dd92492f28d3fc6bb0ed21eea27cf7ed` / `742f5838e9457e86caacab6ba06d0ff2ee8b6aa598677651d2ba4733654dc45f`. Cleanup was unforced; lease, lock, GPU processes, and scratch were clean. |
+
+The prepared but never executed `glm47-kt-cpu-control-dwagon-20260719-v2`
+deployment predates cgroup containment and its 15-minute metadata window has
+expired. It is retained as an unused artifact only; prepare v3 or later from
+commit `f333c6d5` before the next live attempt.
 
 ### File-backed GLM-4.7 admission checkpoint
 
@@ -518,8 +549,8 @@ above.
 
 ## Pending tests
 
-1. Deploy the pinned model-level receipt producer, create a fresh kernel receipt
-   through the exact overlay interpreter, then run the real layer-1 probe and
+1. Prepare a fresh cgroup-contained CPU-control run from `f333c6d5`. Generate
+   its kernel receipt in the same lease, then run the real layer-1 probe and
    admission-grade full short forward. Bind and reload its output through the
    completed file-backed pre-launch gate. Keep kernel capability evidence
    separate from model-level launch admission.
