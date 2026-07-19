@@ -24,14 +24,14 @@ source of truth. Update this file in the same commit that records each new test.
 - Latest published proof-harness source: clean commit
   `57a57e1221a5f1199cc90e9dc9391ec925395f2c`.
 - Latest completed live-benchmark source: clean commit
-  `8bee9f933c24ba88b6dd5cefc705d56aaa5a2231`.
-- Completed ladder rungs: Llama 3.2 1B, Llama 3.2 3B, Llama 3.1 8B, and the
-  first MoE rung, GPT-OSS 20B.
-- Latest result: GPT-OSS 20B TP=2 passed exact TP1 output equality, two-rank
+  `6da455c8e3eb5e21d09812f10e44a31712545816`.
+- Completed ladder rungs: Llama 3.2 1B, Llama 3.2 3B, Llama 3.1 8B,
+  GPT-OSS 20B, and GLM-4.7 Flash.
+- Latest result: GLM-4.7 Flash TP=2 passed exact TP1 output equality, two-rank
   NCCL initialization, payload on both QDR rails, clean HCA health counters,
   instance deletion, process cleanup, and resource release.
-- Next model: `mlx-community/GLM-4.7-Flash-4bit` at revision
-  `1454cffb1a21737e162f508e5bc70be9def89276`.
+- Next model: `mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit` at revision
+  `6e302ea604ad9ab206367e2c501d1571023e7b6d`.
 
 ## Automated validation
 
@@ -92,10 +92,13 @@ test total.
 | GPT-OSS 20B exact stage | **STAGE PASS** | `/var/lib/exo/benchmarks/gptoss20b-stage-20260718-v1`; 27 identical files, 3 weight shards, 12,076,119,168 indexed bytes; model-manifest SHA `017c642a3c72c47b74bb8720e7aa4b0c5cb8802c366345da8356929ab411e03a` |
 | GPT-OSS 20B TP1 oracle | **PASS** | `/var/lib/exo/benchmarks/tp1-gptoss20b-20260718-v1`; three identical 76-input/32-output-token generations; completion SHA `48ef860d9ff0fc9aea399357da450eb3bcb6495825f25043254f4ba4f22dd9d1` |
 | GPT-OSS 20B TP=2 | **PASS (diagnostic)** | `/var/lib/exo/benchmarks/tp2-gptoss20b-20260718-v1`; exact TP1 equality, 1.652 s mean, 148.77/38.13 prefill/decode tok/s, 208,864,908 and 204,248,888 matched PMA bytes on the two rails |
+| GLM-4.7 Flash exact stage | **STAGE PASS** | `/var/lib/exo/benchmarks/glm47flash-stage-20260719-v1`; 26 identical files, 4 weight shards, 16,852,202,496 indexed bytes; model-manifest SHA `c9de2620a4cd99025abfc4758555637f3a8dbedb8cb69daf198be5edb3e6d64e` |
+| GLM-4.7 Flash TP1 oracle | **PASS** | `/var/lib/exo/benchmarks/tp1-glm47flash-20260719-v1`; three identical non-thinking 16-input/32-output-token generations; completion SHA `de1349c105ffe29ab10b68492986aa6c081672d045b02d474570fbf5bda3a40d` |
+| GLM-4.7 Flash TP=2 | **PASS (diagnostic)** | `/var/lib/exo/benchmarks/tp2-glm47flash-20260719-v1`; exact TP1 equality, 2.374 s mean, 45.31/19.57 prefill/decode tok/s, 199,084,700 and 199,080,292 matched PMA bytes on the two rails; reported peak memory 9,380,021,417 bytes |
 
 All strict TP runs above that are marked clean completed ownership-confirmed process
 termination, instance deletion, lease removal, lock release, and reserved-port
-release. The three HCA-enabled TP=2 receipts also have zero selected HCA
+release. The four HCA-enabled TP=2 receipts also have zero selected HCA
 health/error deltas and `dual_rail_payload_verified=true`.
 
 ## SmolLM2 TP=3 failure ledger
@@ -109,7 +112,7 @@ health/error deltas and `dual_rail_payload_verified=true`.
 | v5 | **EXPECTED FAIL** | `multiprocessing.Queue` feeder/GIL stall prevented all ranks receiving `ConnectToGroup`; bounded flush added by `96230c4b` |
 | v6 | **PASS (diagnostic)** | Three-rank proof completed and cleaned up normally |
 
-## Latest GPT-OSS artifact integrity
+## GPT-OSS artifact integrity
 
 - Model revision: `773a7da77e569019bb0fd17a554b263738d669a3`.
 - Verified model locations:
@@ -135,9 +138,34 @@ health/error deltas and `dual_rail_payload_verified=true`.
   `7238881f92798045a8485b8f8cc1f12430fa078228488ed252452569d25b8afd`,
   `c087ec61417858c9c5d03395ad3ba5469ac7f1c8ac84cee838184ca5ae301613`.
 
+## GLM-4.7 Flash artifact integrity
+
+- Model revision: `1454cffb1a21737e162f508e5bc70be9def89276`.
+- Verified model locations:
+  `dwagon:/var/lib/exo/models/mlx-community--GLM-4.7-Flash-4bit--1454cffb1a21737e162f508e5bc70be9def89276`
+  and
+  `fwuff:/mnt/sanic/exo/models/mlx-community--GLM-4.7-Flash-4bit--1454cffb1a21737e162f508e5bc70be9def89276`.
+- Stage result/manifest/runtime/config SHA-256:
+  `d3eb9fd0e854b13494a115c872dc127fa569e525a14e115054283284f271fdec`,
+  `f6360fd6eac23adf709fa109eee0dd45122ff5d09b706c7ae3e94f87e29d1a8b`,
+  `b7cd82896c65af0bd4cee5a6417cfe34c845c669af096e17d274d5bdb1766ca8`,
+  `538831b0a93226c70d4d808d3331555a99bcb1a998feb8e91777efdcf3c05c58`.
+- TP1 result/manifest/runtime/log/raw-config SHA-256:
+  `0064768cb29f20072b22a6ac7fff5b9b947c0da70dcd0e446e0e25c820eaa890`,
+  `2fbe883160900818e4d9cf46ab7c5c9a12d2a2d755996fee114d9e8def65ca53`,
+  `c689c0358e802a00b6dc584c54750431f229ff283c614e5ac3975b274f0dbde3`,
+  `6fffc3286c57a6b9da6408ffe916c52dacc9fac3fccdacddf56cf3dee048ba38`,
+  `719a89b29bb51fa8a8936d4f8fc03c9d4c251103ccc2cf77088abb4fc23a23ca`.
+- TP2 result/manifest/runtime/dwagon-log/fwuff-log/config SHA-256:
+  `503ac516604293c9e41e7fb7b7c2fa2805fbdaa8827c2053d4caae2c1c7bfc91`,
+  `7f1ca0a897d1ec85c858a6cbf8504c4de522fd3ef62d96b75b8f1ad56082f568`,
+  `f0bdf0541d7ae67c808dbd4fde03d3819c85bcf1ad040ed7b80b7a98edb91240`,
+  `feaffc4148da1578b60dd48e2293800bec4e4290b7fab6c180f02f5147df33a8`,
+  `f8c3ebda6bba21fd27cd4eb10e1125916a00bd6aaaa388a6f0b8f379ff9c2232`,
+  `7b3ff5a572c6319fc2f65632b1dd710f7f4e365929fee1ab6bb2710dec201a4f`.
+
 ## Pending tests
 
-1. Run GLM-4.7 Flash exact staging, deterministic TP1, then strict TP=2 with
-   TP1 equality, ownership-safe cleanup, and per-rail HCA payload evidence.
-2. Repeat the same progression for Qwen3-Coder 30B A3B and Qwen3.5 35B A3B.
-3. Re-run the preserved QDR receipts after the ConnectX-5 EDR hardware swap.
+1. Run exact staging, deterministic TP1, and strict TP=2 for Qwen3-Coder 30B
+   A3B, followed by Qwen3.5 35B A3B.
+2. Re-run the preserved QDR receipts after the ConnectX-5 EDR hardware swap.
