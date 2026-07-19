@@ -66,6 +66,7 @@ test total.
 | Leased two-host CUDA/AMX kernel validation | **PASS** | Dwagon v4 and fwuff v1 independently passed exact provenance, SM86 BF16 CUDA math, AMX-BF16 qlen 1/16, and the bidirectional non-default CUDA-stream bridge; each claimed only `kt_bf16_amx_executed_v1` and cleaned up without force |
 | Official GLM-4.7 Flash BF16 model contract | **PASS (artifact)** | The packaged contract binds 54 launch-relevant files, 48 indexed shards totaling 62,444,175,504 bytes, exact Hugging Face metadata, tokenizer/template inputs, and absence of executable remote-code files; leased live verification returned 0 and cleaned up unforced |
 | Focused GLM-4.7 source, build, overlay, model-contract, validator, launch, and preflight suite | **PASS** | 277 tests passed on 2026-07-19, including exact packaged-contract pinning, the repaired required-profile launch-plan fixture, isolated validator import, and canonical/raw PyTorch GPU UUID coverage |
+| Dedicated leased GLM-4.7 live-validation harness | **PASS (software)** | 30 focused tests cover immutable preparation, exact runtime/GPU/HCA binding, kernel/model result semantics, partial failure receipts, descriptor-anchored scratch cleanup, and fail-closed cleanup of nested session descendants; strict targeted Basedpyright and Ruff pass |
 | GLM-4.7 packaged-contract wheel inclusion | **PASS (artifact)** | `uv build --wheel` produced `exo-0.3.70-py3-none-any.whl`; its package contains the exact 16,218-byte `exo/worker/sglang_kt/manifests/glm47_flash_bf16_7dd20894.json` resource |
 | Changed GLM-4.7 Flash Python files, strict targeted type checks and Ruff | **PASS** | Three targeted Basedpyright configurations reported 0 errors; repository-wide `ruff check` passed; all 16 changed Python files passed `ruff format --check` on 2026-07-19 |
 | Repository-wide Basedpyright in the existing `.venv` | **BLOCKED** | The environment cannot resolve installed project dependencies (including `httpx`, AnyIO, and pytest), producing dependency-driven diagnostics across the untouched tree; `uv run` could not complete the pinned MLX wheel acquisition |
@@ -479,6 +480,34 @@ above.
   than the overlay interpreter, so a fresh kernel receipt is required before
   the CPU-control model run. Multi-host admission still requires the separate
   event-sourced verify/commit/abort barrier.
+
+### Dedicated leased live-validation harness checkpoint
+
+- `scripts/run_sglang_kt_glm47_validation.py` prepares separate immutable
+  orchestrator and exact 22-file validator trees, an immutable configuration,
+  and lease metadata bound to the pinned model contract, model snapshot,
+  runtime interpreter symlink chain and executable hash, build receipt, GPU
+  UUID/PCI identity, CPU/NUMA allocation, ports, and HCA GIDs.
+- Local validation explicitly uses `hca_requirement=metadata_only`: both QDR
+  ports must retain physical `LinkUp`, expected GIDs, and rate metadata, while
+  subnet `INIT` is admissible because the run sends no network traffic. Future
+  distributed/comparison runs must use `active` and a benchmark-owned subnet
+  manager. Every harness phase remains `performance_comparable=false`.
+- Kernel-only completion cannot claim model verification or reportability.
+  CPU-control and hybrid completion become reportable only after the pinned
+  model-level checkpoint is produced, reparsed, admission-bound, and all owned
+  process and scratch cleanup is proven.
+- Cleanup records process group/start identities and an owner token, discovers
+  detached descendants through `/proc`, re-signals descendants created during
+  termination, waits through a quiet interval, reaps adopted children, and
+  fails closed on unreadable process state or receipt-publication errors.
+  Result, preflight, partial pipeline, command, and cleanup evidence survive
+  validation and cleanup failures. The harness rejects active SEP/PAX or other
+  profiler use; dormant loaded modules are evidence only and are never invoked.
+- The harness suite passes `30 passed`; the unchanged producer/consumer suite
+  separately passes `569 passed`. Strict targeted Basedpyright reports zero
+  errors and Ruff lint/format checks pass. This checkpoint ran no model, GPU,
+  AMX, InfiniBand, benchmark, or profiler workload.
 
 ### Profiler safety incident
 
