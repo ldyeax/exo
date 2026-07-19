@@ -18,6 +18,7 @@ import argparse
 import contextlib
 import ctypes
 import fcntl
+import functools
 import hashlib
 import importlib.util
 import ipaddress
@@ -86,6 +87,10 @@ DEFAULT_LOCK_PATH = Path("/var/lock/fwuffydwagon-benchmark.lock")
 DEFAULT_LEASE_PATH = Path("/var/lib/exo/coordination/benchmark-lease.json")
 DEFAULT_RESULT_ROOT = Path("/var/lib/exo/benchmarks")
 REQUIRED_SCRATCH_ROOT = Path("/var/lib/exo/validation-scratch")
+CGROUP_FILESYSTEM_ROOT = Path("/sys/fs/cgroup")
+SYSTEMD_RUN_EXECUTABLE = Path("/usr/bin/systemd-run")
+SYSTEMD_SLICE = "system.slice"
+SYSTEMD_DELEGATE_SUBGROUP = "supervisor"
 MAXIMUM_JSON_BYTES = 16 * 1024 * 1024
 MINIMUM_CLEANUP_GRACE_SECONDS = 180.0
 LEASE_CHILD_BIND_SECONDS = 5.0
@@ -94,6 +99,8 @@ CLEANUP_QUIET_SECONDS = 0.5
 _SAFE_IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _COMMIT = re.compile(r"[0-9a-f]{40}")
+_INVOCATION_ID = re.compile(r"[0-9a-f]{32}")
+_SYSTEMD_UNIT = re.compile(r"exo-glm47-[0-9a-f]{32}\.service")
 _GPU_UUID = re.compile(
     r"GPU-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
@@ -465,6 +472,7 @@ class LeasePreparation:
     metadata_output: str
     child_argv: tuple[str, ...]
     benchmark_lease_argv: tuple[str, ...]
+    systemd_unit_name: str
     deployment: DeploymentIdentity
     minimum_cleanup_grace_seconds: float
 
@@ -500,6 +508,18 @@ class OwnedScratchDirectory:
     descriptor: int
     device: int
     inode: int
+
+
+@dataclass(frozen=True)
+class OwnedCgroup:
+    path: Path
+    parent_descriptor: int
+    descriptor: int
+    device: int
+    inode: int
+    owner_uid: int
+    invocation_id: str
+    systemd_unit_name: str
 
 
 @dataclass
@@ -1044,6 +1064,15 @@ def build_static_metadata(
             }
         },
         "owner_pids": {host: []},
+        "containment_contract": {
+            "schema": "systemd_delegated_cgroup_v1",
+            "systemd_unit_name": _systemd_unit_name(config),
+            "systemd_slice": SYSTEMD_SLICE,
+            "delegate_subgroup": SYSTEMD_DELEGATE_SUBGROUP,
+            "validator_cgroup_layout": "delegated-sibling-v1",
+            "attach_method": "preexec-cgroup.procs-v1",
+            "cleanup_method": "cgroup.kill-v1",
+        },
         "validation_contract": {
             "kind": "glm47_sglang_kt_admission_validation",
             "phase": config.phase,
@@ -1113,6 +1142,48 @@ def _immutable_child_argv(
     )
 
 
+def _systemd_unit_name(config: ValidationConfig) -> str:
+    binding = hashlib.sha256(
+        f"glm47-validation-v1\0{config.run_id}\0{config.namespace}".encode()
+    ).hexdigest()[:32]
+    return f"exo-glm47-{binding}.service"
+
+
+def _systemd_benchmark_argv(
+    config: ValidationConfig,
+    benchmark_argv: Sequence[str],
+    *,
+    expected_duration_seconds: float,
+    cleanup_grace_seconds: float,
+) -> tuple[str, ...]:
+    unit_name = _systemd_unit_name(config)
+    if _SYSTEMD_UNIT.fullmatch(unit_name) is None:
+        raise Glm47HarnessError("generated systemd unit name is invalid")
+    runtime_max_seconds = (
+        expected_duration_seconds + (2.0 * cleanup_grace_seconds) + 300.0
+    )
+    return (
+        str(SYSTEMD_RUN_EXECUTABLE),
+        "--system",
+        "--quiet",
+        "--wait",
+        "--pipe",
+        "--collect",
+        "--service-type=exec",
+        f"--unit={unit_name}",
+        f"--slice={SYSTEMD_SLICE}",
+        "--expand-environment=no",
+        "--property=Delegate=yes",
+        f"--property=DelegateSubgroup={SYSTEMD_DELEGATE_SUBGROUP}",
+        "--property=KillMode=control-group",
+        "--property=SendSIGKILL=yes",
+        f"--property=TimeoutStopSec={cleanup_grace_seconds}s",
+        f"--property=RuntimeMaxSec={runtime_max_seconds}s",
+        "--",
+        *benchmark_argv,
+    )
+
+
 def prepare_lease(
     *,
     config_path: Path,
@@ -1167,6 +1238,8 @@ def prepare_lease(
     _verify_artifact(config.build_receipt, "build receipt")
     if not os.access(config.numactl_executable, os.X_OK):
         raise Glm47HarnessError("numactl is not executable")
+    if not os.access(SYSTEMD_RUN_EXECUTABLE, os.X_OK):
+        raise Glm47HarnessError("systemd-run is not executable")
 
     source_identity = read_source_identity(repository)
     deployment = create_immutable_deployment(config, config_contents, source_identity)
@@ -1191,7 +1264,7 @@ def prepare_lease(
         raise Glm47HarnessError(
             "immutable deployment changed during metadata validation"
         )
-    benchmark_argv = (
+    lease_argv = (
         "/usr/bin/env",
         "PYTHONDONTWRITEBYTECODE=1",
         config.runtime_python.path,
@@ -1221,12 +1294,19 @@ def prepare_lease(
         "--",
         *child_argv,
     )
+    benchmark_argv = _systemd_benchmark_argv(
+        config,
+        lease_argv,
+        expected_duration_seconds=expected_duration_seconds,
+        cleanup_grace_seconds=cleanup_grace_seconds,
+    )
     _write_new_json(metadata_output, cast(Mapping[str, object], metadata), 0o444)
     return LeasePreparation(
         metadata=metadata,
         metadata_output=str(metadata_output),
         child_argv=child_argv,
         benchmark_lease_argv=benchmark_argv,
+        systemd_unit_name=_systemd_unit_name(config),
         deployment=deployment,
         minimum_cleanup_grace_seconds=minimum_grace,
     )
@@ -1847,6 +1927,20 @@ def _process_identity(
     )
 
 
+def _owned_cgroup_evidence(owned: OwnedCgroup) -> JsonObject:
+    return {
+        "schema_version": 1,
+        "path": str(owned.path),
+        "device": owned.device,
+        "inode": owned.inode,
+        "owner_uid": owned.owner_uid,
+        "invocation_id": owned.invocation_id,
+        "systemd_unit_name": owned.systemd_unit_name,
+        "attach_method": "preexec-cgroup.procs-v1",
+        "cleanup_method": "cgroup.kill-v1",
+    }
+
+
 class OwnershipRegistry:
     def __init__(
         self,
@@ -1859,6 +1953,7 @@ class OwnershipRegistry:
         self.owner_token = owner_token
         self.processes: list[OwnedProcess] = []
         self.identities: set[tuple[str, int, int]] = set()
+        self.containment: JsonObject | None = None
         self.publish()
 
     def publish(self) -> None:
@@ -1869,6 +1964,7 @@ class OwnershipRegistry:
                 "run_id": self.config.run_id,
                 "namespace": self.config.namespace,
                 "owner_token": self.owner_token,
+                "containment": self.containment,
                 "owned_processes": [asdict(process) for process in self.processes],
             },
             replace=True,
@@ -1886,6 +1982,12 @@ class OwnershipRegistry:
             return
         self.identities.add(identity)
         self.processes.append(process)
+        self.publish()
+
+    def bind_cgroup(self, owned: OwnedCgroup) -> None:
+        if self.containment is not None:
+            raise Glm47HarnessError("owned cgroup is already bound")
+        self.containment = _owned_cgroup_evidence(owned)
         self.publish()
 
 
@@ -2054,6 +2156,308 @@ def _enable_child_subreaper() -> None:
     set_child_subreaper(True)
 
 
+def _systemd_cgroup_path(
+    config: ValidationConfig,
+    proc_self_cgroup: Path = Path("/proc/self/cgroup"),
+) -> PurePosixPath:
+    try:
+        contents = proc_self_cgroup.read_text(encoding="ascii")
+    except (OSError, UnicodeError) as error:
+        raise Glm47HarnessError("cannot read the unified process cgroup") from error
+    lines = contents.splitlines()
+    if len(lines) != 1 or not lines[0].startswith("0::"):
+        raise Glm47HarnessError("process is not in one unified cgroup-v2 hierarchy")
+    raw_path = lines[0][3:]
+    path = PurePosixPath(raw_path)
+    expected = (
+        PurePosixPath("/")
+        / SYSTEMD_SLICE
+        / _systemd_unit_name(config)
+        / SYSTEMD_DELEGATE_SUBGROUP
+    )
+    if (
+        not raw_path
+        or "\\" in raw_path
+        or "\0" in raw_path
+        or not path.is_absolute()
+        or path.as_posix() != raw_path
+        or os.path.normpath(raw_path) != raw_path
+        or path != expected
+    ):
+        raise Glm47HarnessError(
+            "validation harness is not in its exact delegated systemd subgroup"
+        )
+    return path
+
+
+def _open_directory_components(root: Path, relative: PurePosixPath) -> int:
+    if not root.is_absolute() or relative.is_absolute():
+        raise Glm47HarnessError("cgroup directory roots must be canonical")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    descriptor = os.open(root, flags)
+    try:
+        for component in relative.parts:
+            if component in {"", ".", ".."} or "\0" in component:
+                raise Glm47HarnessError("cgroup path contains an unsafe component")
+            child_descriptor = os.open(
+                component,
+                flags,
+                dir_fd=descriptor,
+            )
+            os.close(descriptor)
+            descriptor = child_descriptor
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _read_descriptor_file(
+    directory_descriptor: int,
+    name: str,
+    *,
+    expected_device: int,
+    expected_uid: int,
+) -> bytes:
+    descriptor = os.open(
+        name,
+        os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        dir_fd=directory_descriptor,
+    )
+    try:
+        observed = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(observed.st_mode)
+            or observed.st_dev != expected_device
+            or observed.st_uid != expected_uid
+        ):
+            raise Glm47HarnessError(f"cgroup control {name} changed identity")
+        contents = os.read(descriptor, 4097)
+        if len(contents) > 4096:
+            raise Glm47HarnessError(f"cgroup control {name} is oversized")
+        return contents
+    finally:
+        os.close(descriptor)
+
+
+def _owned_cgroup_identity_matches(owned: OwnedCgroup) -> bool:
+    try:
+        retained = os.fstat(owned.descriptor)
+        current = os.stat(
+            owned.path.name,
+            dir_fd=owned.parent_descriptor,
+            follow_symlinks=False,
+        )
+    except OSError:
+        return False
+    return (
+        stat.S_ISDIR(retained.st_mode)
+        and stat.S_ISDIR(current.st_mode)
+        and retained.st_uid == owned.owner_uid
+        and current.st_uid == owned.owner_uid
+        and stat.S_IMODE(retained.st_mode) == 0o700
+        and stat.S_IMODE(current.st_mode) == 0o700
+        and (retained.st_dev, retained.st_ino) == (owned.device, owned.inode)
+        and (current.st_dev, current.st_ino) == (owned.device, owned.inode)
+    )
+
+
+def _open_owned_cgroup_control(
+    owned: OwnedCgroup,
+    name: Literal["cgroup.procs", "cgroup.events", "cgroup.kill"],
+    flags: int,
+) -> int:
+    if not _owned_cgroup_identity_matches(owned):
+        raise Glm47HarnessError("owned validator cgroup changed identity")
+    descriptor = os.open(
+        name,
+        flags | os.O_CLOEXEC | os.O_NOFOLLOW,
+        dir_fd=owned.descriptor,
+    )
+    try:
+        observed = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(observed.st_mode)
+            or observed.st_dev != owned.device
+            or observed.st_uid != owned.owner_uid
+        ):
+            raise Glm47HarnessError(f"cgroup control {name} changed identity")
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _validate_owned_cgroup_controls(owned: OwnedCgroup) -> None:
+    for name, flags in (
+        ("cgroup.procs", os.O_WRONLY),
+        ("cgroup.events", os.O_RDONLY),
+        ("cgroup.kill", os.O_WRONLY),
+    ):
+        descriptor = _open_owned_cgroup_control(
+            owned,
+            cast(Literal["cgroup.procs", "cgroup.events", "cgroup.kill"], name),
+            flags,
+        )
+        os.close(descriptor)
+
+
+def _create_owned_cgroup(
+    config: ValidationConfig,
+    owner_token: str,
+    *,
+    cgroup_root: Path = CGROUP_FILESYSTEM_ROOT,
+    proc_self_cgroup: Path = Path("/proc/self/cgroup"),
+    environment: Mapping[str, str] | None = None,
+) -> OwnedCgroup:
+    invocation_id = (os.environ if environment is None else environment).get(
+        "INVOCATION_ID", ""
+    )
+    if _INVOCATION_ID.fullmatch(invocation_id) is None:
+        raise Glm47HarnessError("delegated systemd invocation identity is missing")
+    current_path = _systemd_cgroup_path(config, proc_self_cgroup)
+    unit_path = current_path.parent
+    relative_unit = PurePosixPath(*unit_path.parts[1:])
+    parent_descriptor = _open_directory_components(cgroup_root, relative_unit)
+    child_descriptor: int | None = None
+    child_created = False
+    child_name = "validators-" + hashlib.sha256(owner_token.encode()).hexdigest()[:32]
+    path = cgroup_root.joinpath(*unit_path.parts[1:], child_name)
+    try:
+        parent = os.fstat(parent_descriptor)
+        supervisor = os.stat(
+            SYSTEMD_DELEGATE_SUBGROUP,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISDIR(parent.st_mode)
+            or not stat.S_ISDIR(supervisor.st_mode)
+            or parent.st_uid != os.geteuid()
+            or supervisor.st_uid != os.geteuid()
+            or parent.st_mode & 0o022
+            or supervisor.st_mode & 0o022
+        ):
+            raise Glm47HarnessError("delegated systemd cgroup identity is unsafe")
+        unit_processes = _read_descriptor_file(
+            parent_descriptor,
+            "cgroup.procs",
+            expected_device=parent.st_dev,
+            expected_uid=os.geteuid(),
+        )
+        if unit_processes.strip():
+            raise Glm47HarnessError("delegated systemd unit root is not empty")
+        try:
+            os.stat(child_name, dir_fd=parent_descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise Glm47HarnessError("validator cgroup must be a new direct child")
+        os.mkdir(child_name, mode=0o700, dir_fd=parent_descriptor)
+        child_created = True
+        child_descriptor = os.open(
+            child_name,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=parent_descriptor,
+        )
+        observed = os.fstat(child_descriptor)
+        owned = OwnedCgroup(
+            path=path,
+            parent_descriptor=parent_descriptor,
+            descriptor=child_descriptor,
+            device=observed.st_dev,
+            inode=observed.st_ino,
+            owner_uid=os.geteuid(),
+            invocation_id=invocation_id,
+            systemd_unit_name=_systemd_unit_name(config),
+        )
+        if not _owned_cgroup_identity_matches(owned):
+            raise Glm47HarnessError("new validator cgroup identity is unsafe")
+        _validate_owned_cgroup_controls(owned)
+        return owned
+    except BaseException:
+        if child_descriptor is not None:
+            os.close(child_descriptor)
+        if child_created:
+            with contextlib.suppress(OSError):
+                os.rmdir(child_name, dir_fd=parent_descriptor)
+        os.close(parent_descriptor)
+        raise
+
+
+def _cgroup_is_populated(owned: OwnedCgroup) -> bool:
+    descriptor = _open_owned_cgroup_control(owned, "cgroup.events", os.O_RDONLY)
+    try:
+        contents = os.read(descriptor, 4097)
+    finally:
+        os.close(descriptor)
+    if len(contents) > 4096:
+        raise Glm47HarnessError("cgroup.events is oversized")
+    values: dict[str, str] = {}
+    try:
+        for line in contents.decode("ascii").splitlines():
+            key, value = line.split()
+            if key in values:
+                raise ValueError("duplicate key")
+            values[key] = value
+    except (UnicodeError, ValueError) as error:
+        raise Glm47HarnessError("cgroup.events is malformed") from error
+    populated = values.get("populated")
+    if populated not in {"0", "1"}:
+        raise Glm47HarnessError("cgroup.events has no canonical populated state")
+    return populated == "1"
+
+
+def quiesce_owned_cgroup(owned: OwnedCgroup, timeout_seconds: float) -> bool:
+    try:
+        descriptor = _open_owned_cgroup_control(owned, "cgroup.kill", os.O_WRONLY)
+        try:
+            if os.write(descriptor, b"1\n") != 2:
+                return False
+        finally:
+            os.close(descriptor)
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            _reap_adopted_children()
+            if not _cgroup_is_populated(owned):
+                return True
+            time.sleep(0.05)
+        _reap_adopted_children()
+        return not _cgroup_is_populated(owned)
+    except (Glm47HarnessError, OSError):
+        return False
+
+
+def cleanup_owned_cgroup(owned: OwnedCgroup, timeout_seconds: float) -> bool:
+    try:
+        if not quiesce_owned_cgroup(owned, timeout_seconds):
+            return False
+        if not _owned_cgroup_identity_matches(owned):
+            return False
+        os.rmdir(owned.path.name, dir_fd=owned.parent_descriptor)
+        return True
+    except OSError:
+        return False
+    finally:
+        os.close(owned.descriptor)
+        os.close(owned.parent_descriptor)
+
+
+def _enter_owned_cgroup(cgroup_procs_descriptor: int) -> None:
+    if os.write(cgroup_procs_descriptor, b"0\n") != 2:
+        raise OSError("short write while entering validator cgroup")
+    os.close(cgroup_procs_descriptor)
+
+
+def _require_single_threaded_harness() -> None:
+    try:
+        tasks = tuple(entry.name for entry in Path("/proc/self/task").iterdir())
+    except OSError as error:
+        raise Glm47HarnessError("cannot verify harness thread count") from error
+    if tasks != (str(os.getpid()),):
+        raise Glm47HarnessError("pre-exec cgroup entry requires one harness thread")
+
+
 def _reap_adopted_children() -> None:
     while True:
         try:
@@ -2212,6 +2616,7 @@ def run_owned_command(
     config: ValidationConfig,
     results: ResultDirectory,
     registry: OwnershipRegistry,
+    owned_cgroup: OwnedCgroup,
     latch: SignalLatch,
     *,
     name: str,
@@ -2226,18 +2631,29 @@ def run_owned_command(
     cleanup_succeeded = True
     return_code = 75
     caught_error: BaseException | None = None
+    cgroup_procs_descriptor: int | None = None
     with (
         results.create_log(stdout_name) as stdout,
         results.create_log(stderr_name) as stderr,
     ):
         try:
+            _require_single_threaded_harness()
+            cgroup_procs_descriptor = _open_owned_cgroup_control(
+                owned_cgroup, "cgroup.procs", os.O_WRONLY
+            )
             process = subprocess.Popen(
                 tuple(command),
                 stdout=stdout,
                 stderr=stderr,
                 env=dict(environment),
+                pass_fds=(cgroup_procs_descriptor,),
+                preexec_fn=functools.partial(
+                    _enter_owned_cgroup, cgroup_procs_descriptor
+                ),
                 start_new_session=True,
             )
+            os.close(cgroup_procs_descriptor)
+            cgroup_procs_descriptor = None
             registry.register(
                 _process_identity(
                     config,
@@ -2259,6 +2675,8 @@ def run_owned_command(
         except BaseException as error:
             caught_error = error
         finally:
+            if cgroup_procs_descriptor is not None:
+                os.close(cgroup_procs_descriptor)
             if process is not None:
                 cleanup_succeeded = _terminate_owned_group(
                     process.pid,
@@ -2269,6 +2687,13 @@ def run_owned_command(
                     process.wait(timeout=0.1)
                 if process.returncode is not None:
                     return_code = process.returncode
+            cleanup_succeeded = (
+                quiesce_owned_cgroup(
+                    owned_cgroup,
+                    min(5.0, config.timeouts.cleanup_seconds),
+                )
+                and cleanup_succeeded
+            )
     return CommandOutcome(
         name=name,
         argv=tuple(command),
@@ -2577,6 +3002,7 @@ def run_pipeline(
     deployment: DeploymentIdentity,
     results: ResultDirectory,
     registry: OwnershipRegistry,
+    owned_cgroup: OwnedCgroup,
     latch: SignalLatch,
     environment: Mapping[str, str],
     evidence: JsonObject,
@@ -2590,6 +3016,7 @@ def run_pipeline(
         config,
         results,
         registry,
+        owned_cgroup,
         latch,
         name="process-spec-generator",
         command=build_generator_command(
@@ -2617,6 +3044,7 @@ def run_pipeline(
         config,
         results,
         registry,
+        owned_cgroup,
         latch,
         name="kernel-validator",
         command=build_kernel_command(config, deployment, results.path_for(kernel_name)),
@@ -2635,6 +3063,7 @@ def run_pipeline(
             config,
             results,
             registry,
+            owned_cgroup,
             latch,
             name="model-validator",
             command=build_model_command(
@@ -2682,12 +3111,17 @@ def run_validation(
     preflight: JsonObject | None = None
     outcomes: list[CommandOutcome] = []
     scratch: OwnedScratchDirectory | None = None
+    owned_cgroup: OwnedCgroup | None = None
+    cgroup_evidence: JsonObject | None = None
     cleanup_succeeded = True
     cleanup_errors: list[str] = []
     default_log = str(results.path_for("model-validator.stderr.log"))
     try:
         _enable_child_subreaper()
         latch.checkpoint()
+        owned_cgroup = _create_owned_cgroup(config, owner_token)
+        cgroup_evidence = _owned_cgroup_evidence(owned_cgroup)
+        registry.bind_cgroup(owned_cgroup)
         preflight = collect_live_preflight(config)
         scratch = _create_scratch(config)
         environment = build_child_environment(config, owner_token)
@@ -2696,6 +3130,7 @@ def run_validation(
             deployment,
             results,
             registry,
+            owned_cgroup,
             latch,
             environment,
             pipeline_evidence,
@@ -2722,6 +3157,25 @@ def run_validation(
                 "owned process cleanup raised "
                 f"{type(cleanup_error).__name__}: {cleanup_error}"
             )
+        if owned_cgroup is not None:
+            try:
+                cgroup_cleanup_succeeded = cleanup_owned_cgroup(
+                    owned_cgroup, config.timeouts.cleanup_seconds
+                )
+                cleanup_succeeded = cgroup_cleanup_succeeded and cleanup_succeeded
+                if not cgroup_cleanup_succeeded:
+                    cleanup_errors.append(
+                        "owned validator cgroup cleanup was not proven complete"
+                    )
+            except BaseException as cleanup_error:
+                cleanup_succeeded = False
+                cleanup_errors.append(
+                    "owned validator cgroup cleanup raised "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                )
+        else:
+            cleanup_succeeded = False
+            cleanup_errors.append("owned validator cgroup was not established")
         if scratch is not None:
             try:
                 scratch_cleanup_succeeded = cleanup_owned_scratch(scratch)
@@ -2769,6 +3223,7 @@ def run_validation(
         ),
         "profiler": "none",
         "unsafe_profiler_drivers_used": False,
+        "containment": cgroup_evidence,
         "deployment": {
             "root": deployment.root,
             "orchestrator_sha256": deployment.orchestrator_sha256,
@@ -2869,6 +3324,7 @@ def preparation_main(arguments: Sequence[str]) -> int:
                 "deployment": asdict(prepared.deployment),
                 "child_argv": list(prepared.child_argv),
                 "benchmark_lease_argv": list(prepared.benchmark_lease_argv),
+                "systemd_unit_name": prepared.systemd_unit_name,
                 "benchmark_lease_shell_command": shlex.join(
                     prepared.benchmark_lease_argv
                 ),

@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import fcntl
+import hashlib
 import ipaddress
 import json
 import math
@@ -48,6 +49,32 @@ RESULT_DIRECTORY_FD_ENVIRONMENT = "EXO_BENCHMARK_RESULT_DIRECTORY_FD"
 _IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _COMMIT_PATTERN = re.compile(r"^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$")
 _SHA256_PATTERN = re.compile(r"^[0-9a-fA-F]{64}$")
+_INVOCATION_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
+_SYSTEMD_UNIT_PATTERN = re.compile(r"^exo-glm47-[0-9a-f]{32}\.service$")
+_CONTAINMENT_CONTRACT_KEYS = frozenset(
+    {
+        "schema",
+        "systemd_unit_name",
+        "systemd_slice",
+        "delegate_subgroup",
+        "validator_cgroup_layout",
+        "attach_method",
+        "cleanup_method",
+    }
+)
+_RUNTIME_CONTAINMENT_KEYS = frozenset(
+    {
+        "schema_version",
+        "path",
+        "device",
+        "inode",
+        "owner_uid",
+        "invocation_id",
+        "systemd_unit_name",
+        "attach_method",
+        "cleanup_method",
+    }
+)
 
 
 class LeaseError(RuntimeError):
@@ -152,6 +179,103 @@ def _parse_metadata_timestamp(value: object) -> datetime:
     return parsed.astimezone(timezone.utc)
 
 
+def _expected_glm47_systemd_unit(run_id: str, namespace: str) -> str:
+    binding = hashlib.sha256(
+        f"glm47-validation-v1\0{run_id}\0{namespace}".encode()
+    ).hexdigest()[:32]
+    return f"exo-glm47-{binding}.service"
+
+
+def _validate_containment_contract(
+    value: object, *, run_id: str, namespace: str
+) -> dict[str, object]:
+    contract = dict(_require_mapping(value, "containment_contract"))
+    if set(contract) != set(_CONTAINMENT_CONTRACT_KEYS):
+        raise LeaseError("metadata.containment_contract has an unexpected schema")
+    expected_values = {
+        "schema": "systemd_delegated_cgroup_v1",
+        "systemd_unit_name": _expected_glm47_systemd_unit(run_id, namespace),
+        "systemd_slice": "system.slice",
+        "delegate_subgroup": "supervisor",
+        "validator_cgroup_layout": "delegated-sibling-v1",
+        "attach_method": "preexec-cgroup.procs-v1",
+        "cleanup_method": "cgroup.kill-v1",
+    }
+    if (
+        contract != expected_values
+        or _SYSTEMD_UNIT_PATTERN.fullmatch(cast(str, contract.get("systemd_unit_name")))
+        is None
+    ):
+        raise LeaseError(
+            "metadata.containment_contract is not the bound GLM-4.7 "
+            "systemd-cgroup contract"
+        )
+    return contract
+
+
+def _metadata_containment_contract(
+    metadata: Mapping[str, object],
+) -> dict[str, object] | None:
+    containment = metadata.get("containment_contract")
+    if containment is None:
+        return None
+    run_id = _require_nonempty_string(metadata.get("run_id"), "run_id")
+    namespace = _require_nonempty_string(metadata.get("namespace"), "namespace")
+    return _validate_containment_contract(
+        containment,
+        run_id=run_id,
+        namespace=namespace,
+    )
+
+
+def _validate_runtime_containment(
+    value: object,
+    *,
+    contract: Mapping[str, object],
+    owner_token: str,
+    expected_owner_uid: int,
+    expected_invocation_id: str,
+) -> dict[str, object] | None:
+    if value is None:
+        return None
+    containment = dict(_require_mapping(value, "runtime.containment"))
+    if set(containment) != set(_RUNTIME_CONTAINMENT_KEYS):
+        raise LeaseError("runtime containment has an unexpected schema")
+    schema_version = containment.get("schema_version")
+    if type(schema_version) is not int or schema_version != 1:
+        raise LeaseError("runtime containment schema_version must be 1")
+    for field_name in ("device", "inode"):
+        field_value = containment.get(field_name)
+        if type(field_value) is not int or field_value <= 0:
+            raise LeaseError(
+                f"runtime containment {field_name} must be a positive integer"
+            )
+    owner_uid = containment.get("owner_uid")
+    if type(owner_uid) is not int or owner_uid != expected_owner_uid:
+        raise LeaseError("runtime containment owner_uid does not match the lease")
+    invocation_id = containment.get("invocation_id")
+    if (
+        not isinstance(invocation_id, str)
+        or _INVOCATION_ID_PATTERN.fullmatch(invocation_id) is None
+        or invocation_id != expected_invocation_id
+    ):
+        raise LeaseError("runtime containment invocation_id does not match the lease")
+    unit_name = cast(str, contract["systemd_unit_name"])
+    leaf_name = "validators-" + hashlib.sha256(owner_token.encode()).hexdigest()[:32]
+    expected_path = f"/sys/fs/cgroup/system.slice/{unit_name}/{leaf_name}"
+    expected_values = {
+        "path": expected_path,
+        "systemd_unit_name": unit_name,
+        "attach_method": contract["attach_method"],
+        "cleanup_method": contract["cleanup_method"],
+    }
+    if any(
+        containment.get(name) != expected for name, expected in expected_values.items()
+    ):
+        raise LeaseError("runtime containment does not match the lease contract")
+    return containment
+
+
 def validate_run_metadata(
     metadata: Mapping[str, object], *, now: datetime | None = None
 ) -> dict[str, object]:
@@ -174,6 +298,7 @@ def validate_run_metadata(
         raise LeaseError("metadata.run_id is not a valid identifier")
     if not _IDENTIFIER_PATTERN.fullmatch(namespace):
         raise LeaseError("metadata.namespace is not a valid identifier")
+    _metadata_containment_contract(validated)
     reserved_ports = _require_sequence(
         validated.get("reserved_ports"), "reserved_ports"
     )
@@ -787,9 +912,32 @@ class BenchmarkLease:
         owner_token = _require_nonempty_string(
             validated.get("owner_token"), "runtime.owner_token"
         )
+        containment_contract = _metadata_containment_contract(self.metadata)
+        runtime_containment: dict[str, object] | None = None
+        if containment_contract is not None:
+            if "containment" not in validated:
+                raise LeaseError("runtime metadata containment is required")
+            invocation_id = os.environ.get("INVOCATION_ID", "")
+            if _INVOCATION_ID_PATTERN.fullmatch(invocation_id) is None:
+                raise LeaseError("lease wrapper systemd invocation identity is missing")
+            runtime_containment = _validate_runtime_containment(
+                validated.get("containment"),
+                contract=containment_contract,
+                owner_token=owner_token,
+                expected_owner_uid=os.geteuid(),
+                expected_invocation_id=invocation_id,
+            )
         owned_processes = _require_sequence(
             validated.get("owned_processes"), "runtime.owned_processes"
         )
+        if (
+            containment_contract is not None
+            and runtime_containment is None
+            and owned_processes
+        ):
+            raise LeaseError(
+                "runtime owned processes require bound containment evidence"
+            )
         host_values = _require_sequence(self.metadata.get("hosts"), "hosts")
         allowed_hosts = {
             _require_nonempty_string(host, "hosts entry") for host in host_values
@@ -858,6 +1006,14 @@ class BenchmarkLease:
                     if runtime_metadata["owner_token"] != previous["owner_token"]:
                         raise LeaseError(
                             "runtime metadata owner_token changed during the run"
+                        )
+                    previous_containment = previous.get("containment")
+                    current_containment = runtime_metadata.get("containment")
+                    if previous_containment is not None and (
+                        current_containment != previous_containment
+                    ):
+                        raise LeaseError(
+                            "runtime metadata containment changed after binding"
                         )
                     previous_processes = self._runtime_process_map(previous)
                     current_processes = self._runtime_process_map(runtime_metadata)
@@ -944,6 +1100,14 @@ class BenchmarkLease:
             {"owned_processes": owned_processes}
         )
         runtime_metadata = self._runtime_metadata_cache
+        containment_contract = _metadata_containment_contract(self.metadata)
+        if containment_contract is not None:
+            if runtime_metadata is None or runtime_metadata.get("containment") is None:
+                raise LeaseError("final runtime containment evidence is required")
+            if validated.get("containment") != runtime_metadata.get("containment"):
+                raise LeaseError(
+                    "benchmark result containment does not match runtime metadata"
+                )
         if runtime_metadata is None:
             if result_process_map:
                 raise LeaseError(

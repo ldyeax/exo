@@ -149,11 +149,41 @@ def open_results(config: harness.ValidationConfig) -> harness.ResultDirectory:
         os.close(descriptor)
 
 
+def fake_owned_cgroup(tmp_path: Path) -> harness.OwnedCgroup:
+    parent = tmp_path / f"fake-cgroup-parent-{uuid.uuid4().hex}"
+    child = parent / "validators-test"
+    parent.mkdir(mode=0o700)
+    child.mkdir(mode=0o700)
+    (child / "cgroup.procs").write_bytes(b"")
+    (child / "cgroup.events").write_bytes(b"populated 0\nfrozen 0\n")
+    (child / "cgroup.kill").write_bytes(b"")
+    parent_descriptor = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+    descriptor = os.open(child, os.O_RDONLY | os.O_DIRECTORY)
+    observed = os.fstat(descriptor)
+    return harness.OwnedCgroup(
+        path=child,
+        parent_descriptor=parent_descriptor,
+        descriptor=descriptor,
+        device=observed.st_dev,
+        inode=observed.st_ino,
+        owner_uid=os.geteuid(),
+        invocation_id="1" * 32,
+        systemd_unit_name="exo-glm47-" + ("2" * 32) + ".service",
+    )
+
+
+def close_fake_owned_cgroup(owned: harness.OwnedCgroup) -> None:
+    os.close(owned.descriptor)
+    os.close(owned.parent_descriptor)
+
+
 def install_run_validation_prerequisites(
     monkeypatch: pytest.MonkeyPatch,
     identity: harness.DeploymentIdentity,
     preflight: harness.JsonObject,
 ) -> None:
+    owned_cgroup = fake_owned_cgroup(Path(identity.root).parent)
+
     def enable_child_subreaper() -> None:
         return None
 
@@ -166,6 +196,12 @@ def install_run_validation_prerequisites(
         _config: harness.ValidationConfig,
     ) -> harness.OwnedScratchDirectory | None:
         return None
+
+    def create_cgroup(
+        _config: harness.ValidationConfig,
+        _owner_token: str,
+    ) -> harness.OwnedCgroup:
+        return owned_cgroup
 
     def child_environment(
         _config: harness.ValidationConfig,
@@ -190,14 +226,24 @@ def install_run_validation_prerequisites(
     ) -> bool:
         return True
 
+    def cleanup_cgroup(
+        observed: harness.OwnedCgroup,
+        _timeout_seconds: float,
+    ) -> bool:
+        assert observed == owned_cgroup
+        close_fake_owned_cgroup(observed)
+        return True
+
     monkeypatch.setattr(harness, "_enable_child_subreaper", enable_child_subreaper)
     monkeypatch.setattr(harness, "collect_live_preflight", collect_preflight)
     monkeypatch.setattr(harness, "_create_scratch", create_scratch)
+    monkeypatch.setattr(harness, "_create_owned_cgroup", create_cgroup)
     monkeypatch.setattr(harness, "build_child_environment", child_environment)
     monkeypatch.setattr(harness, "verify_runtime_python", verify_runtime)
     monkeypatch.setattr(harness, "_verify_artifact", verify_artifact)
     monkeypatch.setattr(harness, "load_deployment_identity", load_identity)
     monkeypatch.setattr(harness, "cleanup_all_owned_processes", cleanup_processes)
+    monkeypatch.setattr(harness, "cleanup_owned_cgroup", cleanup_cgroup)
 
 
 def command_names(result: harness.JsonObject) -> tuple[str, ...]:
@@ -221,6 +267,8 @@ def assert_persisted_result(
     assert manifest["pipeline"] == result["pipeline"]
     assert manifest["commands"] == result["commands"]
     assert manifest["config"] == config.model_dump(mode="json")
+    runtime_metadata = results.read_json(harness.RUNTIME_METADATA_FILENAME)
+    assert runtime_metadata["containment"] == result["containment"]
 
 
 def test_import_is_inert_without_model_or_gpu_runtimes() -> None:
@@ -402,6 +450,161 @@ def test_child_environment_is_minimal_and_disables_bytecode(tmp_path: Path) -> N
     assert "NCCL_DEBUG" not in environment
 
 
+def fake_delegated_cgroup_tree(
+    tmp_path: Path, config: harness.ValidationConfig
+) -> tuple[Path, Path]:
+    root = tmp_path / "cgroup-root"
+    unit = (
+        root / harness.SYSTEMD_SLICE / harness._systemd_unit_name(config)  # pyright: ignore[reportPrivateUsage]
+    )
+    (unit / harness.SYSTEMD_DELEGATE_SUBGROUP).mkdir(parents=True)
+    (unit / "cgroup.procs").write_bytes(b"")
+    proc_self_cgroup = tmp_path / "proc-self-cgroup"
+    proc_self_cgroup.write_text(
+        "0::/"
+        f"{harness.SYSTEMD_SLICE}/"
+        f"{harness._systemd_unit_name(config)}/"  # pyright: ignore[reportPrivateUsage]
+        f"{harness.SYSTEMD_DELEGATE_SUBGROUP}\n"
+    )
+    return root, proc_self_cgroup
+
+
+def test_systemd_cgroup_path_requires_exact_delegated_subgroup(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    _root, proc_self_cgroup = fake_delegated_cgroup_tree(tmp_path, config)
+    observed = harness._systemd_cgroup_path(  # pyright: ignore[reportPrivateUsage]
+        config, proc_self_cgroup
+    )
+    assert observed.name == harness.SYSTEMD_DELEGATE_SUBGROUP
+    proc_self_cgroup.write_text("0::/system.slice/foreign.service/supervisor\n")
+    with pytest.raises(harness.Glm47HarnessError, match="exact delegated"):
+        harness._systemd_cgroup_path(  # pyright: ignore[reportPrivateUsage]
+            config, proc_self_cgroup
+        )
+
+
+def test_create_owned_cgroup_uses_new_sibling_of_supervisor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = make_config(tmp_path)
+    root, proc_self_cgroup = fake_delegated_cgroup_tree(tmp_path, config)
+
+    def accept_controls(_owned: harness.OwnedCgroup) -> None:
+        return None
+
+    monkeypatch.setattr(harness, "_validate_owned_cgroup_controls", accept_controls)
+    owner_token = f"{config.run_id}:owner"
+    owned = harness._create_owned_cgroup(  # pyright: ignore[reportPrivateUsage]
+        config,
+        owner_token,
+        cgroup_root=root,
+        proc_self_cgroup=proc_self_cgroup,
+        environment={"INVOCATION_ID": "3" * 32},
+    )
+    try:
+        assert owned.path.parent.name == harness._systemd_unit_name(  # pyright: ignore[reportPrivateUsage]
+            config
+        )
+        assert owned.path.parent / harness.SYSTEMD_DELEGATE_SUBGROUP != owned.path
+        assert stat.S_IMODE(owned.path.stat().st_mode) == 0o700
+        assert owned.invocation_id == "3" * 32
+    finally:
+        os.close(owned.descriptor)
+        os.close(owned.parent_descriptor)
+        owned.path.rmdir()
+
+
+def test_create_owned_cgroup_rejects_existing_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = make_config(tmp_path)
+    root, proc_self_cgroup = fake_delegated_cgroup_tree(tmp_path, config)
+
+    def accept_controls(_owned: harness.OwnedCgroup) -> None:
+        return None
+
+    monkeypatch.setattr(harness, "_validate_owned_cgroup_controls", accept_controls)
+    owner_token = f"{config.run_id}:owner"
+    child_name = "validators-" + hashlib.sha256(owner_token.encode()).hexdigest()[:32]
+    unit = (
+        root
+        / harness.SYSTEMD_SLICE
+        / harness._systemd_unit_name(  # pyright: ignore[reportPrivateUsage]
+            config
+        )
+    )
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (unit / child_name).symlink_to(outside, target_is_directory=True)
+    with pytest.raises(harness.Glm47HarnessError, match="new direct child"):
+        harness._create_owned_cgroup(  # pyright: ignore[reportPrivateUsage]
+            config,
+            owner_token,
+            cgroup_root=root,
+            proc_self_cgroup=proc_self_cgroup,
+            environment={"INVOCATION_ID": "4" * 32},
+        )
+    assert outside.is_dir()
+
+
+def test_owned_cgroup_cleanup_rejects_replaced_path(tmp_path: Path) -> None:
+    owned = fake_owned_cgroup(tmp_path)
+    original = owned.path.with_name("renamed-original")
+    owned.path.rename(original)
+    outside = tmp_path / "outside-cgroup"
+    outside.mkdir()
+    owned.path.symlink_to(outside, target_is_directory=True)
+    assert harness.cleanup_owned_cgroup(owned, 0.1) is False
+    assert (original / "cgroup.kill").read_bytes() == b""
+    assert outside.is_dir()
+
+
+def test_preexec_cgroup_entry_failure_never_executes_validator(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = make_config(tmp_path)
+    result_path = Path(config.result_directory)
+    result_path.mkdir(parents=True)
+    descriptor = os.open(result_path, os.O_RDONLY | os.O_DIRECTORY)
+    results = harness.ResultDirectory(result_path, descriptor)
+    os.close(descriptor)
+    token = f"{config.run_id}:preexec-failure"
+    registry = harness.OwnershipRegistry(config, results, token)
+    owned = fake_owned_cgroup(tmp_path)
+    marker = tmp_path / "validator-executed"
+
+    def fail_entry(_descriptor: int) -> None:
+        raise OSError("synthetic cgroup attach failure")
+
+    monkeypatch.setattr(harness, "_enter_owned_cgroup", fail_entry)
+    try:
+        outcome = harness.run_owned_command(
+            config,
+            results,
+            registry,
+            owned,
+            harness.SignalLatch(),
+            name="preexec-failure",
+            command=(
+                sys.executable,
+                "-c",
+                f"from pathlib import Path; Path({str(marker)!r}).touch()",
+            ),
+            timeout_seconds=5,
+            environment={
+                "EXO_BENCHMARK_OWNER_TOKEN": token,
+                "EXO_NAMESPACE": config.namespace,
+                "PATH": "/usr/bin:/bin",
+            },
+        )
+        assert outcome.error is not None
+        assert "preexec_fn" in outcome.error
+        assert not marker.exists()
+    finally:
+        close_fake_owned_cgroup(owned)
+        results.close()
+
+
 def test_commands_use_separate_immutable_deployments_and_exact_resources(
     tmp_path: Path,
 ) -> None:
@@ -489,6 +692,7 @@ def test_real_successful_subprocess_is_reaped_and_cleanup_confirms(
     os.close(descriptor)
     token = f"{config.run_id}:test"
     registry = harness.OwnershipRegistry(config, results, token)
+    owned_cgroup = fake_owned_cgroup(tmp_path)
     environment = {
         "EXO_BENCHMARK_OWNER_TOKEN": token,
         "EXO_NAMESPACE": config.namespace,
@@ -500,12 +704,17 @@ def test_real_successful_subprocess_is_reaped_and_cleanup_confirms(
             config,
             results,
             registry,
+            owned_cgroup,
             harness.SignalLatch(),
             name="success",
             command=(
                 sys.executable,
                 "-c",
-                "import time; time.sleep(0.1)",
+                (
+                    "from pathlib import Path; import sys, time; "
+                    f"sys.exit(91) if Path({str(owned_cgroup.path / 'cgroup.procs')!r})"
+                    ".read_text() != '0\\n' else time.sleep(0.1)"
+                ),
             ),
             timeout_seconds=5,
             environment=environment,
@@ -513,7 +722,10 @@ def test_real_successful_subprocess_is_reaped_and_cleanup_confirms(
         assert outcome.return_code == 0
         assert outcome.cleanup_succeeded is True
         assert len(registry.processes) == 1
+        assert (owned_cgroup.path / "cgroup.procs").read_bytes() == b"0\n"
+        assert (owned_cgroup.path / "cgroup.kill").read_bytes() == b"1\n"
     finally:
+        close_fake_owned_cgroup(owned_cgroup)
         results.close()
 
 
@@ -581,6 +793,7 @@ def test_timeout_cleanup_finds_and_reaps_nested_session(tmp_path: Path) -> None:
     os.close(descriptor)
     token = f"{config.run_id}:nested-test"
     registry = harness.OwnershipRegistry(config, results, token)
+    owned_cgroup = fake_owned_cgroup(tmp_path)
     environment = {
         "EXO_BENCHMARK_OWNER_TOKEN": token,
         "EXO_NAMESPACE": config.namespace,
@@ -610,6 +823,7 @@ def test_timeout_cleanup_finds_and_reaps_nested_session(tmp_path: Path) -> None:
             config,
             results,
             registry,
+            owned_cgroup,
             harness.SignalLatch(),
             name="nested-timeout",
             command=(
@@ -638,7 +852,10 @@ def test_timeout_cleanup_finds_and_reaps_nested_session(tmp_path: Path) -> None:
             try:
                 harness.set_child_subreaper(previous_subreaper_state)
             finally:
-                results.close()
+                try:
+                    close_fake_owned_cgroup(owned_cgroup)
+                finally:
+                    results.close()
 
 
 def test_run_validation_kernel_success_is_completed_but_not_reportable(
@@ -658,6 +875,7 @@ def test_run_validation_kernel_success_is_completed_but_not_reportable(
         _deployment: harness.DeploymentIdentity,
         _results: harness.ResultDirectory,
         _registry: harness.OwnershipRegistry,
+        _owned_cgroup: harness.OwnedCgroup,
         _latch: harness.SignalLatch,
         _environment: Mapping[str, str],
         evidence: harness.JsonObject,
@@ -716,6 +934,7 @@ def test_run_validation_model_success_verifies_checkpoint_and_is_reportable(
         _deployment: harness.DeploymentIdentity,
         _results: harness.ResultDirectory,
         _registry: harness.OwnershipRegistry,
+        _owned_cgroup: harness.OwnedCgroup,
         _latch: harness.SignalLatch,
         _environment: Mapping[str, str],
         evidence: harness.JsonObject,
@@ -769,6 +988,117 @@ def test_run_validation_model_success_verifies_checkpoint_and_is_reportable(
         results.close()
 
 
+def test_run_validation_cgroup_cleanup_failure_is_not_reportable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = make_config(tmp_path, phase="cpu_control")
+    identity = deployment(tmp_path)
+    preflight: harness.JsonObject = {"schema_version": 1, "status": "passed"}
+    install_run_validation_prerequisites(monkeypatch, identity, preflight)
+
+    def run_model_pipeline(
+        _config: harness.ValidationConfig,
+        _deployment: harness.DeploymentIdentity,
+        _results: harness.ResultDirectory,
+        _registry: harness.OwnershipRegistry,
+        _owned_cgroup: harness.OwnedCgroup,
+        _latch: harness.SignalLatch,
+        _environment: Mapping[str, str],
+        evidence: harness.JsonObject,
+        outcomes: list[harness.CommandOutcome],
+    ) -> None:
+        evidence["model_validator"] = {"schema_version": 1, "status": "passed"}
+        outcomes.append(command_outcome("model-validator"))
+
+    cleanup_called = False
+
+    def fail_cgroup_cleanup(
+        owned: harness.OwnedCgroup, _timeout_seconds: float
+    ) -> bool:
+        nonlocal cleanup_called
+        cleanup_called = True
+        close_fake_owned_cgroup(owned)
+        return False
+
+    monkeypatch.setattr(harness, "run_pipeline", run_model_pipeline)
+    monkeypatch.setattr(harness, "cleanup_owned_cgroup", fail_cgroup_cleanup)
+    results = open_results(config)
+    try:
+        result = harness.run_validation(
+            config, identity, results, harness.SignalLatch()
+        )
+        assert cleanup_called is True
+        assert result["status"] == "cleanup_failed"
+        assert result["completed_normally"] is True
+        assert result["cleanup_succeeded"] is False
+        assert result["reportable"] is False
+        assert result["model_checkpoint_verified"] is False
+        assert result["cleanup_errors"] == [
+            "owned validator cgroup cleanup was not proven complete"
+        ]
+        assert_persisted_result(config, results, result)
+    finally:
+        results.close()
+
+
+def test_process_cleanup_exception_still_attempts_cgroup_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = make_config(tmp_path, phase="kernel")
+    identity = deployment(tmp_path)
+    preflight: harness.JsonObject = {"schema_version": 1, "status": "passed"}
+    install_run_validation_prerequisites(monkeypatch, identity, preflight)
+
+    def run_kernel_pipeline(
+        _config: harness.ValidationConfig,
+        _deployment: harness.DeploymentIdentity,
+        _results: harness.ResultDirectory,
+        _registry: harness.OwnershipRegistry,
+        _owned_cgroup: harness.OwnedCgroup,
+        _latch: harness.SignalLatch,
+        _environment: Mapping[str, str],
+        _evidence: harness.JsonObject,
+        outcomes: list[harness.CommandOutcome],
+    ) -> None:
+        outcomes.append(command_outcome("kernel-validator"))
+
+    def fail_process_cleanup(
+        _config: harness.ValidationConfig,
+        _registry: harness.OwnershipRegistry,
+        _default_log_path: str,
+    ) -> bool:
+        raise OSError("synthetic process cleanup failure")
+
+    cgroup_cleanup_called = False
+
+    def confirm_cgroup_cleanup(
+        owned: harness.OwnedCgroup, _timeout_seconds: float
+    ) -> bool:
+        nonlocal cgroup_cleanup_called
+        cgroup_cleanup_called = True
+        close_fake_owned_cgroup(owned)
+        return True
+
+    monkeypatch.setattr(harness, "run_pipeline", run_kernel_pipeline)
+    monkeypatch.setattr(harness, "cleanup_all_owned_processes", fail_process_cleanup)
+    monkeypatch.setattr(harness, "cleanup_owned_cgroup", confirm_cgroup_cleanup)
+    results = open_results(config)
+    try:
+        result = harness.run_validation(
+            config, identity, results, harness.SignalLatch()
+        )
+        assert cgroup_cleanup_called is True
+        assert result["status"] == "cleanup_failed"
+        assert result["cleanup_succeeded"] is False
+        cleanup_errors = cast(list[harness.JsonValue], result["cleanup_errors"])
+        assert cleanup_errors == [
+            "owned process cleanup raised OSError: synthetic process cleanup failure"
+        ]
+        assert_persisted_result(config, results, result)
+    finally:
+        results.close()
+
+
 def test_run_validation_mid_pipeline_failure_persists_partial_nonreportable_result(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -786,6 +1116,7 @@ def test_run_validation_mid_pipeline_failure_persists_partial_nonreportable_resu
         _deployment: harness.DeploymentIdentity,
         _results: harness.ResultDirectory,
         _registry: harness.OwnershipRegistry,
+        _owned_cgroup: harness.OwnedCgroup,
         _latch: harness.SignalLatch,
         _environment: Mapping[str, str],
         evidence: harness.JsonObject,
@@ -925,7 +1256,32 @@ def test_prepare_lease_builds_exact_no_bytecode_deployments(
         "/usr/bin/env",
         "PYTHONDONTWRITEBYTECODE=1",
     )
-    assert prepared.benchmark_lease_argv[:2] == (
+    assert prepared.benchmark_lease_argv[:7] == (
+        "/usr/bin/systemd-run",
+        "--system",
+        "--quiet",
+        "--wait",
+        "--pipe",
+        "--collect",
+        "--service-type=exec",
+    )
+    assert f"--unit={prepared.systemd_unit_name}" in prepared.benchmark_lease_argv
+    assert "--property=Delegate=yes" in prepared.benchmark_lease_argv
+    assert "--property=DelegateSubgroup=supervisor" in prepared.benchmark_lease_argv
+    containment = cast(dict[str, object], prepared.metadata["containment_contract"])
+    assert containment == {
+        "schema": "systemd_delegated_cgroup_v1",
+        "systemd_unit_name": prepared.systemd_unit_name,
+        "systemd_slice": "system.slice",
+        "delegate_subgroup": "supervisor",
+        "validator_cgroup_layout": "delegated-sibling-v1",
+        "attach_method": "preexec-cgroup.procs-v1",
+        "cleanup_method": "cgroup.kill-v1",
+    }
+    command_separator = prepared.benchmark_lease_argv.index("--")
+    assert prepared.benchmark_lease_argv[
+        command_separator + 1 : command_separator + 3
+    ] == (
         "/usr/bin/env",
         "PYTHONDONTWRITEBYTECODE=1",
     )

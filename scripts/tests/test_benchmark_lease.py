@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import os
 import signal
@@ -205,6 +206,45 @@ def make_runtime_metadata(
     }
 
 
+def make_containment_metadata(run_id: str) -> dict[str, object]:
+    namespace = f"namespace-{run_id}"
+    metadata = make_metadata(run_id=run_id, namespace=namespace)
+    binding = hashlib.sha256(
+        f"glm47-validation-v1\0{run_id}\0{namespace}".encode()
+    ).hexdigest()[:32]
+    metadata["containment_contract"] = {
+        "schema": "systemd_delegated_cgroup_v1",
+        "systemd_unit_name": f"exo-glm47-{binding}.service",
+        "systemd_slice": "system.slice",
+        "delegate_subgroup": "supervisor",
+        "validator_cgroup_layout": "delegated-sibling-v1",
+        "attach_method": "preexec-cgroup.procs-v1",
+        "cleanup_method": "cgroup.kill-v1",
+    }
+    return metadata
+
+
+def make_runtime_containment(
+    lease: BenchmarkLease,
+    *,
+    owner_token: str,
+    invocation_id: str,
+) -> dict[str, object]:
+    contract = cast(dict[str, object], lease.metadata["containment_contract"])
+    leaf = "validators-" + hashlib.sha256(owner_token.encode()).hexdigest()[:32]
+    return {
+        "schema_version": 1,
+        "path": (f"/sys/fs/cgroup/system.slice/{contract['systemd_unit_name']}/{leaf}"),
+        "device": 27,
+        "inode": 12345,
+        "owner_uid": os.geteuid(),
+        "invocation_id": invocation_id,
+        "systemd_unit_name": contract["systemd_unit_name"],
+        "attach_method": contract["attach_method"],
+        "cleanup_method": contract["cleanup_method"],
+    }
+
+
 def append_owned_process(
     runtime_metadata: dict[str, object], lease: BenchmarkLease
 ) -> None:
@@ -328,6 +368,15 @@ def test_metadata_requires_complete_fresh_reproducibility_context() -> None:
         deployment["dirty_file_hashes"] = {"other.py": "d" * 64}
     with pytest.raises(LeaseError, match="must match git.dirty_file_hashes"):
         validate_run_metadata(mismatched_dirty_source_metadata)
+
+
+def test_metadata_validates_exact_optional_containment_contract() -> None:
+    metadata = make_containment_metadata("containment-contract")
+    assert validate_run_metadata(metadata) == metadata
+    contract = cast(dict[str, object], metadata["containment_contract"])
+    contract["cleanup_method"] = "unbound-cleanup"
+    with pytest.raises(LeaseError, match="containment_contract"):
+        validate_run_metadata(metadata)
 
 
 def test_metadata_accepts_exact_raw_verbs_gid_as_hca_identity() -> None:
@@ -1072,6 +1121,139 @@ def test_runtime_process_identity_metadata_cannot_mutate(tmp_path: Path) -> None
     lease.preserve_after_cleanup_failure("runtime identity mutated")
     lease.release()
     assert read_json_object(lease.lease_path)["runtime_metadata"] == initial
+
+
+def test_runtime_containment_may_bind_once_and_reconciles_with_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    invocation_id = "1" * 32
+    monkeypatch.setenv("INVOCATION_ID", invocation_id)
+    run_id = "containment-valid"
+    lease = make_lease(
+        tmp_path,
+        run_id=run_id,
+        metadata=make_containment_metadata(run_id),
+        allow_unconfirmed_cleanup_for_tests=False,
+    )
+    lease.acquire()
+    runtime_path = (
+        lease.result_directory / benchmark_lease_module.RUNTIME_METADATA_FILENAME
+    )
+    initial = make_runtime_metadata(lease)
+    initial["containment"] = None
+    initial["owned_processes"] = []
+    atomic_write_json(runtime_path, initial)
+    lease.update_heartbeat()
+
+    active = make_runtime_metadata(lease)
+    active["containment"] = make_runtime_containment(
+        lease,
+        owner_token=cast(str, active["owner_token"]),
+        invocation_id=invocation_id,
+    )
+    atomic_write_json(runtime_path, active)
+    lease.update_heartbeat()
+    result = make_benchmark_result(
+        lease,
+        cleanup_succeeded=True,
+        owned_processes=cast(Sequence[object], active["owned_processes"]),
+    )
+    result["containment"] = active["containment"]
+    atomic_write_json(
+        lease.result_directory / benchmark_lease_module.BENCHMARK_RESULT_FILENAME,
+        result,
+    )
+    assert lease.cleanup_succeeded(True) is True
+    lease.release()
+    assert not lease.lease_path.exists()
+
+
+def test_runtime_containment_cannot_change_after_binding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    invocation_id = "2" * 32
+    monkeypatch.setenv("INVOCATION_ID", invocation_id)
+    run_id = "containment-mutation"
+    lease = make_lease(
+        tmp_path,
+        run_id=run_id,
+        metadata=make_containment_metadata(run_id),
+    )
+    lease.acquire()
+    runtime_path = (
+        lease.result_directory / benchmark_lease_module.RUNTIME_METADATA_FILENAME
+    )
+    initial = make_runtime_metadata(lease)
+    initial["containment"] = make_runtime_containment(
+        lease,
+        owner_token=cast(str, initial["owner_token"]),
+        invocation_id=invocation_id,
+    )
+    atomic_write_json(runtime_path, initial)
+    lease.update_heartbeat()
+    mutated = make_runtime_metadata(lease)
+    mutated_containment = dict(initial["containment"])
+    mutated_containment["inode"] = 54321
+    mutated["containment"] = mutated_containment
+    atomic_write_json(runtime_path, mutated)
+    with pytest.raises(LeaseError, match="containment changed"):
+        lease.update_heartbeat()
+    lease.preserve_after_cleanup_failure("runtime containment mutated")
+    lease.release()
+    assert read_json_object(lease.lease_path)["runtime_metadata"] == initial
+
+
+def test_containment_contract_rejects_missing_or_mismatched_final_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    invocation_id = "3" * 32
+    monkeypatch.setenv("INVOCATION_ID", invocation_id)
+    for suffix, runtime_is_active in (("missing", False), ("mismatch", True)):
+        run_id = f"containment-{suffix}"
+        lease = make_lease(
+            tmp_path / suffix,
+            run_id=run_id,
+            metadata=make_containment_metadata(run_id),
+            allow_unconfirmed_cleanup_for_tests=False,
+        )
+        lease.acquire()
+        runtime = make_runtime_metadata(lease)
+        runtime["containment"] = (
+            make_runtime_containment(
+                lease,
+                owner_token=cast(str, runtime["owner_token"]),
+                invocation_id=invocation_id,
+            )
+            if runtime_is_active
+            else None
+        )
+        if not runtime_is_active:
+            runtime["owned_processes"] = []
+        atomic_write_json(
+            lease.result_directory / benchmark_lease_module.RUNTIME_METADATA_FILENAME,
+            runtime,
+        )
+        lease.update_heartbeat()
+        result = make_benchmark_result(
+            lease,
+            cleanup_succeeded=True,
+            owned_processes=cast(Sequence[object], runtime["owned_processes"]),
+        )
+        if runtime_is_active:
+            mismatched = dict(cast(dict[str, object], runtime["containment"]))
+            mismatched["inode"] = 99999
+            result["containment"] = mismatched
+        else:
+            result["containment"] = None
+        atomic_write_json(
+            lease.result_directory / benchmark_lease_module.BENCHMARK_RESULT_FILENAME,
+            result,
+        )
+        assert lease.cleanup_succeeded(True) is False
+        error = cast(str, lease.cleanup_confirmation_error())
+        assert "containment" in error
+        lease.preserve_after_cleanup_failure(f"{suffix} containment evidence")
+        lease.release()
 
 
 def test_benchmark_result_is_bound_and_reconciles_owned_processes(
