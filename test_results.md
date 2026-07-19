@@ -27,9 +27,9 @@ source of truth. Update this file in the same commit that records each new test.
 ## Current summary
 
 - Latest published proof-harness source: clean commit
-  `f1c778939c55858ab609569584675c0022e6d4f4`.
+  `ca732fe670d30ffbf32f79c8ae6ac1700ca94197`.
 - Latest completed live-benchmark source: clean commit
-  `143403208b52be416797714b2acd17343b0e68e3`.
+  `ca732fe670d30ffbf32f79c8ae6ac1700ca94197`.
 - Completed ladder rungs: Llama 3.2 1B, Llama 3.2 3B, Llama 3.1 8B,
   GPT-OSS 20B, and GLM-4.7 Flash.
 - Latest live result: GLM-4.7 Flash TP=2 passed exact TP1 output equality,
@@ -43,17 +43,17 @@ source of truth. Update this file in the same commit that records each new test.
   packaged contract covering every launch-relevant file, all 48 indexed
   shards, and their Hugging Face revision metadata. A leased full rehash
   verified that 62.4 GB contract on the shared read-only snapshot.
-- Latest hybrid attempt: CPU-control v4 proved the corrected immutable service
-  working directory and early strict kernel admission, then failed closed before
-  child creation because the pinned portable CPython omitted its memfd wrappers.
-  Cleanup and containment passed; commit `f1c77893` adds a verified libc fallback
-  and tests the sealed evidence transport before model traversal.
+- Latest hybrid attempt: CPU-control v5 used the portable sealed-evidence
+  fallback, loaded all 48 GLM-4.7 Flash BF16 shards, built AMX wrappers for all
+  46 routed layers, and passed the layer-one AMX probe twice. The first full
+  eight-token extend then exposed a deterministic SGLang constructor-drift bug:
+  `Glm4MoeLiteSparseMoeBlock` lacks `is_hash`. Cleanup and containment passed.
 - Historical Ornith AMXINT8 conversion and serving receipts were recovered and
   hashed below. They inform the GLM hybrid-runtime work but are not Exo tests.
-- Next work: prepare a fresh cgroup-contained CPU-control v5 proof from
-  `f1c77893`, then run the mixed AMX-BF16/RTX-3090 PP1 correctness gate. The
-  Qwen3-Coder ladder rung is deferred until that hybrid path has trustworthy
-  live model evidence.
+- Next work: pin and rebuild the corrected SGLang runtime, run a fresh
+  cgroup-contained CPU-control v6 proof, then run the mixed AMX-BF16/RTX-3090
+  PP1 correctness gate. The Qwen3-Coder ladder rung is deferred until that
+  hybrid path has trustworthy live model evidence.
 
 ## Automated validation
 
@@ -388,12 +388,13 @@ above.
 | `glm47-kt-cpu-control-dwagon-20260719-v1` | **EXPECTED FAIL (preflight)** | The generator and fresh overlay kernel validation passed, then the model validator rejected the exact snapshot before hashing or loading because its 117 files and 6 directories were writable (`0644`/`0755`). No model receipt was created. The revision-pinned NFS snapshot on fwuff was subsequently made immutable (`0444` files, `0555` directories) without changing content. Result/manifest/runtime-metadata/kernel-receipt SHA-256: `d061131a2bbdca73fd9f7659cb977bb72aea9a0d4a553e49d5d8e684fbc868ed` / `4417fb1c5b484873891e2c879329e56b3f480a2659d018c40718251a972bc611` / `954feef4b3a2be0148614b58db273498dd92492f28d3fc6bb0ed21eea27cf7ed` / `742f5838e9457e86caacab6ba06d0ff2ee8b6aa598677651d2ba4733654dc45f`. Cleanup was unforced; lease, lock, GPU processes, and scratch were clean. |
 | `glm47-kt-cpu-control-dwagon-20260719-v3` | **EXPECTED FAIL (diagnostic)** | Clean source `b4c9710f` ran in the delegated systemd/cgroup-v2 containment. The generator passed in 0.401 s and the fresh kernel validator passed CUDA BF16, direct AMX BF16 qlen 1/16, and the CUDA-stream bridge in 8.121 s. The model validator then spent 588.969 s verifying the immutable 62.4 GB snapshot before strict receipt admission rejected only `host.process.cwd="/"`; the transient service had inherited systemd's root working directory, while execution-path evidence intentionally excludes `/`. No model construction, GPU allocation, forward, or model receipt occurred. Commit `5ddf2aa7` sets the immutable deployment as the service working directory and admits the kernel receipt before model traversal. Result/manifest/runtime-metadata/kernel-receipt/process-spec SHA-256: `47043acfd362e7e7825568b095cd201b59a162d74a695ef83f2ec523223035a8` / `0fd6e8c7a6f0199d46a945f5ac93bf1b0fd292b17b61554777c7287b1ece073d` / `508a93c38589171c2feffd194096d9b77f07acc9f19e213d7a0a23b028433a9c` / `a034ee6ca9d4062fc2a8ba2787ad6ac9c9c3bf3e80217f22d9cea7eb4fe09aa2` / `0f86db96dcc2dc6ff7e0565359cea5a2af57389fe2edb68c1de14a1882e00142`. Result was nonreportable and non-comparable; cgroup kill/empty/removal, unit collection, lease/lock release, scratch removal, and idle GPUs were all verified. |
 | `glm47-kt-cpu-control-dwagon-20260719-v4` | **EXPECTED FAIL (diagnostic)** | Clean source `14340320` proved the transient-service cwd fix and early strict kernel-receipt admission. Generator and fresh CUDA/AMX validation passed in 0.370 s and 7.605 s; the model stage then failed in 45.349 s before child creation because pinned CPython 3.12.13 exposed no callable `os.memfd_create`. No model construction, model-load GPU allocation, forward, or model receipt occurred. Result/manifest/runtime-metadata/kernel-receipt/process-spec SHA-256: `05732f405f7c5cc622d5a539a10d362fa464718abafac4869971c86861ca2125` / `657aa82595d4bbe4e2d908eb75e7813b9fc83419deaf6f07d13dded7b208de8d` / `4e3def2938ecf98a885add0d5c3caad7066bf2678291436968e0cd1c27214807` / `8bdb2453c7d9e47381df2ce24642e867b3283c5f8638d852659bdbdd5caaf31c` / `99b41e60975a189b65d6627c004f7543dfbd53410b032f788c27ad7d29d7a01a`. Result was nonreportable/non-comparable; cleanup was unforced and the lease, lock, cgroups, unit, processes, GPU, and scratch were clean. `profiler=none`; the run did not use the unsafe profiler drivers, although preflight observed the already-loaded `pax` and `sep5` modules. |
+| `glm47-kt-cpu-control-dwagon-20260719-v5` | **EXPECTED FAIL (diagnostic)** | Clean source `ca732fe6` passed generation in 0.368 s and fresh CUDA/AMX validation in 8.393 s. The 144.213 s model stage used sealed memfd evidence successfully, independently verified the immutable 62,444,175,504-byte checkpoint in parent and child, loaded all 48 BF16 shards, built KT/AMX wrappers for routed layers 1-46, and passed the layer-one AMX probe twice against its FP32 reference. The first real eight-token extend then failed before expert dispatch at `deepseek_v2.py:770`: `Glm4MoeLiteSparseMoeBlock` lacks `is_hash`. Zero experts were GPU-resident; weights used 4.52 GB, the 4,096-token BF16 KV cache used 0.21 GB, and 18.46 GB remained available, directly disproving the claimed unavoidable 2 GB ceiling for this split. No extend result, decode, model receipt, performance result, or InfiniBand traffic was produced. Result/manifest/runtime-metadata/kernel-receipt/process-spec SHA-256: `0ae112e4acd713270914a2a51ac7a344d4d9224933881ed7168c2f2a1fa14010` / `dfc1ad00e53bdab4f3c3e9eddb4dda8be993802bb1f748dafce51571b94787f9` / `28f50e5d2ce61a494de9ee793504c71eca467b248da9e25f63bb7087008225f7` / `0fe16ea3d3a67e63c216ea69adfa23b79c7402b09e77c258746a204f8a8b6933` / `54a8d049f1ec26d73cfd8e9f85f526bb1c626a9bae0598bbf3adf19420215d4f`; canonical process-spec SHA-256 `8718ec41c3f4cad77baa50759a9ea0e002bfb500b11537f295540f4d2c9ac6f8`. Cleanup was unforced and complete; the lease, lock, cgroup/unit, owned processes, ports, GPU, and scratch were clean. `profiler=none`; loaded `pax`/`sep5` modules were observed but never used. |
 
 The prepared but never executed `glm47-kt-cpu-control-dwagon-20260719-v2`
 deployment predates cgroup containment and its 15-minute metadata window has
-expired. It is retained as an unused artifact only. V3 and v4 are completed
-diagnostic artifacts and must not be reused; prepare v5 or later from
-`f1c778939c55858ab609569584675c0022e6d4f4` before the next live attempt. V4's
+expired. It is retained as an unused artifact only. V3 through v5 are completed
+diagnostic artifacts and must not be reused; prepare v6 or later only after the
+corrected SGLang revision and rebuilt immutable runtime are pinned. V4's
 canonical process-spec/config SHA-256 values are
 `f5c954368c0e66bdb5ba494cb4dcf3176da1bc054369f0516051d71924530de5` and
 `212791580cee9e8a028d5b0b8237ddfc474385bbc3455537b45d13b59ad9428d`.
