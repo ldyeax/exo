@@ -342,7 +342,15 @@ import scripts.run_sglang_kt_glm47_validation
 
 @pytest.mark.parametrize(
     ("phase", "residents"),
-    (("kernel", 0), ("kernel", 4), ("cpu_control", 0), ("hybrid", 1), ("hybrid", 4)),
+    (
+        ("kernel", 0),
+        ("kernel", 4),
+        ("cpu_control", 0),
+        ("hybrid", 1),
+        ("hybrid", 4),
+        ("serving_baseline", 1),
+        ("serving_baseline", 4),
+    ),
 )
 def test_config_accepts_exact_validation_phases(
     tmp_path: Path, phase: str, residents: int
@@ -358,7 +366,7 @@ def test_config_accepts_exact_validation_phases(
 
 @pytest.mark.parametrize(
     ("phase", "residents"),
-    (("cpu_control", 1), ("hybrid", 0)),
+    (("cpu_control", 1), ("hybrid", 0), ("serving_baseline", 0)),
 )
 def test_config_rejects_phase_resident_mismatch(
     tmp_path: Path, phase: str, residents: int
@@ -685,6 +693,23 @@ def test_commands_use_separate_immutable_deployments_and_exact_resources(
         in model_command[1]
     )
     assert "PYTHONDONTWRITEBYTECODE" not in " ".join(generator)
+
+
+def test_serving_baseline_generator_selects_exact_launch_mode(tmp_path: Path) -> None:
+    config = make_config(
+        tmp_path,
+        phase="serving_baseline",
+        resident_gpu_experts=4,
+    )
+
+    command = harness.build_generator_command(
+        config,
+        deployment(tmp_path),
+        tmp_path / "result/process.json",
+    )
+
+    assert command.count("--launch-mode") == 1
+    assert command[command.index("--launch-mode") + 1] == "serving_baseline"
 
 
 def test_descriptor_anchored_scratch_cleanup_removes_ipc_files_dirs_and_links(

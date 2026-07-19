@@ -75,7 +75,9 @@ from scripts.sglang_kt_glm47_live import (  # noqa: E402
 JsonScalar: TypeAlias = str | int | float | bool | None
 JsonValue: TypeAlias = JsonScalar | list["JsonValue"] | dict[str, "JsonValue"]
 JsonObject: TypeAlias = dict[str, JsonValue]
-ValidationPhase: TypeAlias = Literal["kernel", "cpu_control", "hybrid"]
+ValidationPhase: TypeAlias = Literal[
+    "kernel", "cpu_control", "hybrid", "serving_baseline"
+]
 
 RESULT_DIRECTORY_FD_ENVIRONMENT = "EXO_BENCHMARK_RESULT_DIRECTORY_FD"
 RUNTIME_METADATA_FILENAME = "runtime-metadata.json"
@@ -421,8 +423,12 @@ class ValidationConfig(StrictModel):
             )
         if self.phase == "cpu_control" and self.resident_gpu_experts != 0:
             raise ValueError("CPU-control validation requires zero GPU experts")
-        if self.phase == "hybrid" and not 1 <= self.resident_gpu_experts <= 4:
-            raise ValueError("hybrid validation requires one to four GPU experts")
+        if self.phase in {"hybrid", "serving_baseline"} and not (
+            1 <= self.resident_gpu_experts <= 4
+        ):
+            raise ValueError(
+                f"{self.phase} validation requires one to four GPU experts"
+            )
         expected_contract_path = (
             Path(self.source.deployment_root)
             / "orchestrator"
@@ -2723,9 +2729,15 @@ def build_generator_command(
     script = Path(deployment.root) / (
         "orchestrator/scripts/create_sglang_kt_glm47_validation_process_spec.py"
     )
+    launch_mode_arguments = (
+        ("--launch-mode", "serving_baseline")
+        if config.phase == "serving_baseline"
+        else ()
+    )
     return (
         config.runtime_python.path,
         str(script),
+        *launch_mode_arguments,
         "--model-path",
         config.model_path,
         "--runtime-python",
