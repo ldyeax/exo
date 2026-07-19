@@ -557,6 +557,7 @@ def _validate_numerical_evidence(
         or evidence.shape != expected_shape
         or evidence.seed != expected_seed
         or evidence.relative_l1_tolerance != expected_tolerance
+        or evidence.relative_l1_error < 0
         or evidence.relative_l1_error > expected_tolerance
         or evidence.mean_absolute_error < 0
         or evidence.maximum_absolute_error < 0

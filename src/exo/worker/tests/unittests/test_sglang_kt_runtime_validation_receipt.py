@@ -200,6 +200,7 @@ def test_rejects_changed_runtime_or_resource_identity(
         (("amx", 1, "qlen"), 1),
         (("amx", 0, "route"), "cuda_stream"),
         (("amx", 0, "extension_sha256"), "e" * 64),
+        (("amx", 0, "numerical", "relative_l1_error"), -1.0),
         (("amx", 1, "numerical", "relative_l1_error"), 0.5),
         (("cuda_stream", "default_cuda_stream_id"), 713_304_304),
         (("cuda_stream", "cuda_output_consumer_count"), 0),

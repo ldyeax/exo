@@ -372,7 +372,7 @@ above.
   separate exact kernel receipt and the still-required model-level execution
   receipt. Kernel evidence alone remains fail-closed.
 - The focused launch-spec, preflight, collector, and receipt-loader suites pass:
-  `189 passed`. No profiler or hardware workload ran for this checkpoint.
+  `190 passed`. No profiler or hardware workload ran for this checkpoint.
 
 ### Profiler safety incident
 
