@@ -149,7 +149,17 @@ def build_cpu_bound_sglang_kt_command(
     process_spec: SglangKtProcessLaunchSpec,
 ) -> tuple[str, ...]:
     cpu_list = ",".join(str(cpu_core) for cpu_core in sorted(process_spec.cpu_cores))
-    return ("/usr/bin/taskset", "--cpu-list", cpu_list, "--", *process_spec.command)
+    memory_node_list = ",".join(
+        str(memory_node) for memory_node in sorted(process_spec.memory_nodes)
+    )
+    return (
+        "/usr/bin/numactl",
+        "--physcpubind",
+        cpu_list,
+        "--membind",
+        memory_node_list,
+        *process_spec.command,
+    )
 
 
 async def launch_sglang_kt_process(

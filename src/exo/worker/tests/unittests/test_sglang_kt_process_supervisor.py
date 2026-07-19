@@ -213,10 +213,11 @@ def test_builds_exact_cpu_bound_command_and_sanitized_environment() -> None:
     )
 
     assert command == (
-        "/usr/bin/taskset",
-        "--cpu-list",
+        "/usr/bin/numactl",
+        "--physcpubind",
         ",".join(str(cpu_core) for cpu_core in spec.cpu_cores),
-        "--",
+        "--membind",
+        ",".join(str(memory_node) for memory_node in spec.memory_nodes),
         *spec.command,
     )
     assert environment["KEEP"] == "yes"
