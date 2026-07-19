@@ -1,4 +1,4 @@
-from typing import Final, final
+from typing import Final, Literal, final
 
 from pydantic import PositiveInt, model_validator
 
@@ -12,22 +12,42 @@ from exo.shared.types.worker.sglang_kt import (
     ResourceIndex,
     SglangKtLaunchPlan,
     SglangKtStageSpec,
+    SglangKtTargetProfile,
 )
 from exo.utils.pydantic_ext import FrozenModel
 
 GLM_5_2_FP8_MODEL_ID: Final = ModelId("zai-org/GLM-5.2-FP8")
 GLM_5_2_LAYER_COUNT: Final = 78
+GLM_5_2_TARGET_PROFILE: Final[SglangKtTargetProfile] = "glm52_fp8_pp3_sm86_v1"
+GLM_5_2_PIPELINE_LAYER_PARTITION: Final = (30, 28, 20)
 GLM_5_2_FULL_INDEXER_LAYER_STARTS: Final = frozenset(
     (0, 1, 2, *range(6, GLM_5_2_LAYER_COUNT, 4))
+)
+
+GLM_4_7_FLASH_BF16_MODEL_ID: Final = ModelId("zai-org/GLM-4.7-Flash")
+GLM_4_7_FLASH_BF16_MODEL_REVISION: Final = "7dd20894a642a0aa287e9827cb1a1f7f91386b67"
+GLM_4_7_FLASH_BF16_CONFIG_SHA256: Final = (
+    "dc9b97c7c9bed726a2e6939da4234d5c43abb3edec8812068c9a1af1dbc13acb"
+)
+GLM_4_7_FLASH_LAYER_COUNT: Final = 47
+GLM_4_7_FLASH_CONTEXT_LENGTH: Final = 202_752
+GLM_4_7_FLASH_MAX_TOTAL_TOKENS: Final = 4_096
+GLM_4_7_FLASH_CHUNKED_PREFILL_SIZE: Final = 1_024
+GLM_4_7_FLASH_ROUTED_EXPERT_COUNT: Final = 64
+GLM_4_7_FLASH_TARGET_PROFILE: Final[SglangKtTargetProfile] = (
+    "glm47_flash_bf16_sm86_smoke_v1"
 )
 
 # KTransformers v0.6.3 is the first release with explicit GLM-5.2 support. Its
 # SGLang submodule pins the matching fork revision below.
 SUPPORTED_KTRANSFORMERS_REVISION: Final = "ce7c3ddbe93f7ac1f992375eed54058bbc512646"
 SUPPORTED_SGLANG_REVISION: Final = "8b636f9008dbad58c0a8e481b03e794739e6c146"
+GLM_4_7_FLASH_KTRANSFORMERS_REVISION: Final = "8e46e5896c3d993a1285052f2618f5a9f01882d4"
+GLM_4_7_FLASH_SGLANG_REVISION: Final = "5d6bef9f61637aaeaf047bf8209def2af3eaa83f"
 REQUIRED_TRANSFORMERS_DISTRIBUTION: Final = "transformers-kt"
 REQUIRED_TRANSFORMERS_VERSION: Final = "5.6.0.post1"
 GLM_5_2_KV_CACHE_DTYPE: Final = "fp8_e4m3"
+GLM_4_7_FLASH_KV_CACHE_DTYPE: Final = "bfloat16"
 
 EnvironmentVariable = tuple[str, str]
 
@@ -97,6 +117,10 @@ class SglangKtProcessLaunchSpec(FrozenModel):
         return self.plan.model_id
 
     @property
+    def target_profile(self) -> SglangKtTargetProfile:
+        return self.plan.target_profile
+
+    @property
     def expected_model_revision(self) -> GitRevision:
         return self.plan.model_revision
 
@@ -113,10 +137,22 @@ class SglangKtProcessLaunchSpec(FrozenModel):
         return REQUIRED_TRANSFORMERS_VERSION
 
     @property
+    def attention_backend(self) -> Literal["flashinfer", "nsa"]:
+        if self.target_profile == GLM_4_7_FLASH_TARGET_PROFILE:
+            return "flashinfer"
+        return "nsa"
+
+    @property
+    def kv_cache_dtype(self) -> Literal["bfloat16", "fp8_e4m3"]:
+        if self.target_profile == GLM_4_7_FLASH_TARGET_PROFILE:
+            return GLM_4_7_FLASH_KV_CACHE_DTYPE
+        return GLM_5_2_KV_CACHE_DTYPE
+
+    @property
     def arguments(self) -> tuple[str, ...]:
         stage = self.stage
         pipeline_size = len(self.plan.stages)
-        return (
+        common_arguments = (
             "-m",
             "sglang.launch_server",
             "--model-path",
@@ -159,10 +195,33 @@ class SglangKtProcessLaunchSpec(FrozenModel):
             str(self.plan.static_memory_fraction),
             "--max-running-requests",
             str(self.plan.max_concurrent_requests),
+        )
+        if self.target_profile == GLM_4_7_FLASH_TARGET_PROFILE:
+            return (
+                *common_arguments,
+                "--chunked-prefill-size",
+                str(GLM_4_7_FLASH_CHUNKED_PREFILL_SIZE),
+                "--disable-cuda-graph",
+                "--record-kt-gpu-expert-distribution",
+                "--attention-backend",
+                self.attention_backend,
+                "--kv-cache-dtype",
+                self.kv_cache_dtype,
+                "--disable-shared-experts-fusion",
+                "--tool-call-parser",
+                "glm47",
+                "--reasoning-parser",
+                "glm45",
+                "--served-model-name",
+                "GLM-4.7-Flash",
+                "--trust-remote-code",
+            )
+        return (
+            *common_arguments,
             "--attention-backend",
-            "nsa",
+            self.attention_backend,
             "--kv-cache-dtype",
-            GLM_5_2_KV_CACHE_DTYPE,
+            self.kv_cache_dtype,
             "--disable-shared-experts-fusion",
             "--tool-call-parser",
             "glm47",
@@ -175,24 +234,41 @@ class SglangKtProcessLaunchSpec(FrozenModel):
 
     @property
     def environment(self) -> tuple[EnvironmentVariable, ...]:
+        common_environment: tuple[EnvironmentVariable, ...] = (
+            ("CUDA_VISIBLE_DEVICES", self.stage.gpu_uuid),
+            ("PYTORCH_ALLOC_CONF", "expandable_segments:True"),
+        )
+        if self.target_profile == GLM_4_7_FLASH_TARGET_PROFILE:
+            return (
+                *common_environment,
+                ("SGLANG_KT_HYBRID_TIMING", "1"),
+            )
+
         layer_partition = ",".join(
             str(layer_count) for layer_count in self.plan.pipeline_layer_partition
         )
         return (
-            ("CUDA_VISIBLE_DEVICES", self.stage.gpu_uuid),
+            common_environment[0],
             ("NCCL_NET", "IB"),
             ("NCCL_IB_HCA", f"={','.join(self.stage.hca_devices)}"),
             ("NCCL_GIN_ENABLE", "0"),
             ("NCCL_GIN_TYPE", "0"),
             ("NCCL_NET_GDR_LEVEL", "LOC"),
-            ("PYTORCH_ALLOC_CONF", "expandable_segments:True"),
+            common_environment[1],
             ("SGLANG_ENABLE_JIT_DEEPGEMM", "0"),
             ("SGLANG_PP_LAYER_PARTITION", layer_partition),
         )
 
     @property
     def unset_environment_variables(self) -> tuple[str, ...]:
-        return ("SGLANG_DISTRIBUTED_INIT_METHOD_OVERRIDE",)
+        return ("CUDA_VISIBLE_DEVICES", "PYTORCH_ALLOC_CONF")
+
+    @property
+    def unset_environment_variable_prefixes(self) -> tuple[str, ...]:
+        # SGLang and NCCL use many behavior-changing environment variables. A
+        # launch profile must opt each one back in instead of inheriting shell
+        # or service state from a previous, incompatible run.
+        return ("NCCL_", "SGLANG_")
 
     @property
     def command(self) -> tuple[str, ...]:
@@ -216,6 +292,33 @@ def build_glm_5_2_fp8_process_launch_specs(
     revisions and apply CPU affinity before starting any process.
     """
 
+    if plan.target_profile != GLM_5_2_TARGET_PROFILE:
+        raise ValueError(
+            f"GLM-5.2 builder requires target profile {GLM_5_2_TARGET_PROFILE}"
+        )
+    return build_sglang_kt_process_launch_specs(plan, python_executable)
+
+
+def build_glm_4_7_flash_bf16_process_launch_specs(
+    plan: SglangKtLaunchPlan,
+    python_executable: str,
+) -> tuple[SglangKtProcessLaunchSpec, ...]:
+    """Build one inert, receipt-gated GLM-4.7-Flash hybrid smoke process."""
+
+    if plan.target_profile != GLM_4_7_FLASH_TARGET_PROFILE:
+        raise ValueError(
+            "GLM-4.7-Flash builder requires target profile "
+            f"{GLM_4_7_FLASH_TARGET_PROFILE}"
+        )
+    return build_sglang_kt_process_launch_specs(plan, python_executable)
+
+
+def build_sglang_kt_process_launch_specs(
+    plan: SglangKtLaunchPlan,
+    python_executable: str,
+) -> tuple[SglangKtProcessLaunchSpec, ...]:
+    """Build inert process descriptions for one statically admitted profile."""
+
     _validate_supported_plan(plan)
 
     # Each pipeline stage is one logical SGLang node. This permits two logical
@@ -231,12 +334,23 @@ def build_glm_5_2_fp8_process_launch_specs(
 
 
 def _validate_supported_plan(plan: SglangKtLaunchPlan) -> None:
+    if plan.target_profile == GLM_4_7_FLASH_TARGET_PROFILE:
+        _validate_glm_4_7_flash_bf16_plan(plan)
+        return
+    _validate_glm_5_2_fp8_plan(plan)
+
+
+def _validate_glm_5_2_fp8_plan(plan: SglangKtLaunchPlan) -> None:
+    if plan.target_profile != GLM_5_2_TARGET_PROFILE:
+        raise ValueError(f"unsupported SGLang-KT target profile {plan.target_profile}")
     if plan.model_id != GLM_5_2_FP8_MODEL_ID:
         raise ValueError(
             "the SGLang-KT launch builder only supports zai-org/GLM-5.2-FP8"
         )
     if plan.total_layers != GLM_5_2_LAYER_COUNT:
         raise ValueError("GLM-5.2 launch plans must contain exactly 78 layers")
+    if len(plan.stages) != len(GLM_5_2_PIPELINE_LAYER_PARTITION):
+        raise ValueError("GLM-5.2 PP=3 target profile requires exactly three stages")
     if plan.sglang_revision != SUPPORTED_SGLANG_REVISION:
         raise ValueError(f"SGLang revision must be {SUPPORTED_SGLANG_REVISION}")
     if plan.ktransformers_revision != SUPPORTED_KTRANSFORMERS_REVISION:
@@ -253,6 +367,10 @@ def _validate_supported_plan(plan: SglangKtLaunchPlan) -> None:
             "GLM-5.2 pipeline stages must begin on full IndexShare layers; "
             f"invalid starts: {invalid_pipeline_starts}"
         )
+    if plan.pipeline_layer_partition != GLM_5_2_PIPELINE_LAYER_PARTITION:
+        raise ValueError(
+            "GLM-5.2 PP=3 target profile requires the 30,28,20 layer partition"
+        )
     for stage in plan.stages:
         if stage.model_path != stage.ktransformers_weight_path:
             raise ValueError(
@@ -267,3 +385,55 @@ def _validate_supported_plan(plan: SglangKtLaunchPlan) -> None:
             )
         if not stage.hca_devices:
             raise ValueError("SGLang-KT InfiniBand stages require hca_devices")
+
+
+def _validate_glm_4_7_flash_bf16_plan(plan: SglangKtLaunchPlan) -> None:
+    if plan.model_id != GLM_4_7_FLASH_BF16_MODEL_ID:
+        raise ValueError(
+            "the GLM-4.7-Flash smoke profile only supports zai-org/GLM-4.7-Flash"
+        )
+    if plan.model_revision != GLM_4_7_FLASH_BF16_MODEL_REVISION:
+        raise ValueError(
+            f"GLM-4.7-Flash model revision must be {GLM_4_7_FLASH_BF16_MODEL_REVISION}"
+        )
+    if plan.sglang_revision != GLM_4_7_FLASH_SGLANG_REVISION:
+        raise ValueError(f"SGLang revision must be {GLM_4_7_FLASH_SGLANG_REVISION}")
+    if plan.ktransformers_revision != GLM_4_7_FLASH_KTRANSFORMERS_REVISION:
+        raise ValueError(
+            f"KTransformers revision must be {GLM_4_7_FLASH_KTRANSFORMERS_REVISION}"
+        )
+    if plan.total_layers != GLM_4_7_FLASH_LAYER_COUNT:
+        raise ValueError("GLM-4.7-Flash launch plans must contain exactly 47 layers")
+    if len(plan.stages) != 1:
+        raise ValueError("GLM-4.7-Flash smoke profile requires PP=1 and TP=1")
+    if plan.context_length != GLM_4_7_FLASH_CONTEXT_LENGTH:
+        raise ValueError(
+            f"GLM-4.7-Flash smoke context length must be {GLM_4_7_FLASH_CONTEXT_LENGTH}"
+        )
+    if plan.max_total_tokens != GLM_4_7_FLASH_MAX_TOTAL_TOKENS:
+        raise ValueError(
+            "GLM-4.7-Flash smoke max_total_tokens must be "
+            f"{GLM_4_7_FLASH_MAX_TOTAL_TOKENS}"
+        )
+    if plan.max_concurrent_requests != 1:
+        raise ValueError("GLM-4.7-Flash smoke profile requires one running request")
+    if plan.static_memory_fraction != 0.8:
+        raise ValueError("GLM-4.7-Flash smoke static memory fraction must be 0.8")
+
+    stage = plan.stages[0]
+    if stage.model_path != stage.ktransformers_weight_path:
+        raise ValueError(
+            "the GLM-4.7-Flash BF16 smoke profile requires model_path and "
+            "ktransformers_weight_path to match"
+        )
+    if stage.ktransformers_method != "BF16":
+        raise ValueError("GLM-4.7-Flash BF16 stage requires KTransformers method BF16")
+    if not 1 <= stage.resident_gpu_experts < GLM_4_7_FLASH_ROUTED_EXPERT_COUNT:
+        raise ValueError(
+            "GLM-4.7-Flash hybrid smoke requires between 1 and 63 resident GPU "
+            "experts per MoE layer"
+        )
+    if stage.max_deferred_experts_per_token != 0:
+        raise ValueError("GLM-4.7-Flash smoke requires deferred experts disabled")
+    if stage.hca_devices:
+        raise ValueError("GLM-4.7-Flash PP=1 smoke profile does not admit HCA devices")

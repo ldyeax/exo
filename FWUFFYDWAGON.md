@@ -44,6 +44,141 @@ Bring Exo to a working, efficient Linux/NVIDIA deployment that can serve GLM-5.2
 - The exact base runtime is blocked on RTX 3090/SM86: stage-local TP groups still broadcast from global rank 0, the GLM NSA indexer invokes a DeepGEMM path whose configured architectures exclude SM86, and FP8 KV selects FlashMLA builds that target SM90a or newer. Require a committed runtime fork plus a PP=3 initialization test and GLM-5.2 NSA prefill/decode short-forward receipt on each GPU before full-model work. [Global-root KT broadcast](https://github.com/kvcache-ai/sglang/blob/8b636f9008dbad58c0a8e481b03e794739e6c146/python/sglang/srt/layers/moe/kt_ep_wrapper.py#L1965-L2011) [NSA indexer](https://github.com/kvcache-ai/sglang/blob/8b636f9008dbad58c0a8e481b03e794739e6c146/python/sglang/srt/layers/attention/nsa/nsa_indexer.py#L359-L458) [DeepGEMM architectures](https://github.com/kvcache-ai/sglang/blob/8b636f9008dbad58c0a8e481b03e794739e6c146/python/sglang/srt/layers/deep_gemm_wrapper/configurer.py#L11-L34) [FlashMLA build targets](https://github.com/kvcache-ai/sglang/blob/8b636f9008dbad58c0a8e481b03e794739e6c146/sgl-kernel/cmake/flashmla.cmake#L20-L30)
 - KTransformers also needs CPU fixes before the preferred topology: physical NUMA IDs are incorrectly used as dense vector indices, worker threads can replace inherited affinity with overlapping full-node core selections, and the audited FP8 expert path dispatches AVX-512 rather than AMX tiles. Require patched physical-NUMA mapping, explicit process CPU sets with binding failures made fatal, and an executed-AMX backend receipt. [Worker-pool NUMA code](https://github.com/kvcache-ai/ktransformers/blob/ce7c3ddbe93f7ac1f992375eed54058bbc512646/kt-kernel/cpu_backend/worker_pool.cpp#L268-L441) [FP8 dispatch](https://github.com/kvcache-ai/ktransformers/blob/ce7c3ddbe93f7ac1f992375eed54058bbc512646/kt-kernel/operators/amx/la/amx_raw_kernels.hpp#L528-L616)
 
+## Imported Ornith/KTransformers Evidence
+
+The evidence in this section is historical and was recovered from the separate
+Ornith KTransformers/SGLang worktree. It was not produced by Exo, is not under
+`/var/lib/exo/benchmarks`, and does not satisfy the Exo lifecycle, source-pin,
+model-integrity, transport, or cleanup receipt contracts used elsewhere in this
+plan.
+
+### Recovered AMXINT8/RTX 3090 receipts
+
+- `/mnt/sanic/ornith-amxint8-conversion.log`, SHA-256
+  `86cb8ba6b3eb116683aa8072ad1ae5fbc011fc713444e9c97713c8934219d87a`,
+  was created `2026-06-29 00:06:54 -0400` and last modified
+  `2026-06-29 01:29:40 -0400`. It records a successful BF16-to-AMXINT8
+  conversion from `/mnt/sanic/ornith-397b` to
+  `/mnt/sanic/ornith-397b-AMXINT8`: two NUMA pools with 52 threads each, 60
+  fused-MoE layers, 512 experts per layer with top-10 routing, and an index with
+  369,891 tensors across 61 shards. The converted directory no longer exists,
+  so its size, index, shards, and hashes cannot now be independently verified.
+- The ignored decode receipt
+  `/home/kassie/projects/ornith-ktransformers-oscar-superrepo/runs/bench_internal_agent_decode_4x512_256.jsonl`,
+  SHA-256
+  `13ba0acb465305bbe36649e217dae0182b8d98eaf283df00e88b1fa81b78b23d`,
+  was created `2026-06-30 12:46:41 -0400` and last modified
+  `2026-06-30 13:11:35 -0400`. Its two four-request runs each completed 10,518
+  input and 1,024 output tokens without request errors. They measured 16.823 and
+  17.422 aggregate output tokens/s, 16.564 and 16.207 second mean TTFT, 172.837
+  and 166.142 ms mean TPOT, and 28 output tokens/s peak.
+- The ignored prefill receipt
+  `/home/kassie/projects/ornith-ktransformers-oscar-superrepo/runs/bench_internal_agent_prefill_4x20000_1.jsonl`,
+  SHA-256
+  `4fd9c2edb5412628b4e69562d6a9ccbbc9121d375cbadb0a42b614b0363df857`,
+  was created `2026-06-30 12:49:03 -0400` and last modified
+  `2026-06-30 14:40:19 -0400`. Six four-request runs each completed 79,377
+  input and four output tokens. Input throughput was 1,066.393, 1,061.920,
+  996.876, 80.551, 135.626, and 184.006 tokens/s, with corresponding durations
+  of 74.435, 74.749, 79.626, 985.429, 585.265, and 431.384 seconds. The last
+  three rows report zero TTFT despite long end-to-end latency and are degraded
+  diagnostics, not a stable performance baseline.
+- Every surviving inference row embeds the same relevant launch contract:
+  Ornith-1.0-397B FP8 GPU weights, BF16 activations, OSCAR INT2 KV with group
+  size 64, CUDA TP=2/PP=1, `KT_METHOD=AMXINT8`, CPU weights at the converted
+  path, 100 CPUInfer threads, two NUMA pools on nodes 0 and 1, four resident GPU
+  experts per layer, frequency placement, dynamic expert updates, a 4,096-token
+  GPU-prefill threshold, CUDA graphs for batch sizes 1/2/4, custom all-reduce
+  disabled, FP32 Mamba state, four running requests, 163,840 context, and a
+  655,360-token pool.
+- These receipts strongly establish a functioning hybrid configuration on the
+  dual-RTX-3090 host. They do not prove simultaneous AMX tile and GPU expert
+  execution to the standard required here: no launch/server log, AMX PMU or
+  instruction counter, per-backend expert count, CPU/GPU timeline, H2D counter,
+  GPU identity/utilization trace, source or model hash, deterministic output
+  oracle, exact per-row timestamp, or cleanup receipt survives. Treat
+  AMX-plus-GPU overlap as probable but unverified.
+- The superrepo README's 13.47 output tokens/s `Validated frequency run` is not
+  AMX evidence. Commit `99d6430` added that result before commit `b28784b`
+  inserted the AMX section above it. The recovered AMX-configured decode rows
+  are the 16.823 and 17.422 tokens/s results above.
+
+### Reusable fork changes
+
+The recoverable development heads are KTransformers `56dc52a`, its embedded
+SGLang fork `f2d46685c`, and orchestration superrepo `55934e6`. Mine focused
+changes forward onto the audited GLM-capable base rather than adopting these
+historical branches wholesale:
+
+- KTransformers `e5f1771` handles fused BF16 expert orientations during CPU
+  conversion, but the official GLM-4.7 Flash checkpoint stores separate
+  per-expert gate/up/down BF16 tensors and does not need that fix. `1e86695`
+  adds channel-wise FP8 conversion, but that path is for reproducing the
+  Ornith format and must not replace BF16 as the AMXINT8 source. `56dc52a`
+  adds packed MXFP4 expert loading and is useful for later MXFP4 models, not
+  automatically for GLM-4.7 Flash.
+- SGLang `4c267d946` fixes per-layer frequency placement with dynamic expert
+  updates; `464ffce91` fixes the AMXINT8 full-prefill fallback;
+  `af0fea990` fixes layerwise FP8/Marlin GPU-expert prefill; and `477d69557`
+  fixes OpenAI benchmark prompt-token accounting. These are the highest-value
+  generic candidates for the GLM pivot.
+- SGLang `ab2d8be5f` ports the Ornith FP8 and OSCAR INT2 stack, while
+  `f2d46685c` adds the Ornith MXFP4/OSCAR hybrid path. Both are large,
+  model-coupled changes and require selective extraction plus new GLM tests.
+  KTransformers commits `293fcdf`, `f502b6d`, `28fe171`, and `351b0a3` only
+  advance the embedded SGLang pointer to the corresponding implementation; do
+  not treat those pointer updates as standalone fixes.
+
+### GLM-4.7 Flash pivot boundary
+
+- GLM-4.7 Flash is a useful fast systems proxy for Exo-managed external-process
+  lifecycle, SGLang API forwarding, SM86 packaging, NUMA/CPU binding, resident
+  expert placement, CPU/GPU staging and overlap, AMX execution receipts, and
+  benchmark telemetry. The recovered SGLang fork contains a
+  `Glm4MoeLiteForCausalLM` implementation and the generic KT wrapper is designed
+  to split CPU and GPU experts, but no surviving test proves this exact model
+  through that hybrid path.
+- Do not feed the staged MLX 4-bit checkpoint to the KTransformers converter.
+  Establish the SGLang baseline from an exact runtime-supported BF16 or FP8
+  checkpoint, and derive AMXINT8 CPU expert weights from BF16. Preserve the
+  current Exo/MLX TP1 and TP2 results as the output and transport reference.
+- The exact official BF16 source is verified at
+  `/mnt/sanic/exo/models/zai-org--GLM-4.7-Flash--7dd20894a642a0aa287e9827cb1a1f7f91386b67`.
+  All 58 Hugging Face metadata records name revision
+  `7dd20894a642a0aa287e9827cb1a1f7f91386b67`; a post-download dry run requires
+  zero files, no `.incomplete` file remains, and the 48 Safetensors shards total
+  62,444,175,504 bytes. `config.json` SHA-256 is
+  `dc9b97c7c9bed726a2e6939da4234d5c43abb3edec8812068c9a1af1dbc13acb` and
+  the index SHA-256 is
+  `91e6e95ca21700f50904a680c8c4212f5aa16dc7c10a013f01c906957c889791`.
+  The index's own `metadata.total_size` is only 31,221,488,576, so integrity
+  checks must use the Hugging Face manifest and real shard sizes rather than
+  trusting that field as the downloaded byte total.
+- The 16.85 GB MLX checkpoint fits on one RTX 3090 and therefore does not force
+  host offload. Exercise the hybrid machinery deliberately with resident-expert
+  sweeps at 0/1/2/4, AMX on/off, GPU-only and CPU-only controls, NUMA-local
+  counters, backend-specific expert counts, H2D volume, and an overlap timeline.
+  The admitted hybrid smoke profile requires 1-63 GPU experts; create a separate
+  fail-closed CPU-only target and execution receipt before running the 0-expert
+  control rather than weakening the mixed-backend contract.
+- Ornith has 60 MoE layers with 512 experts and top-10 routing, plus Qwen3.5
+  hybrid GDN/full attention. GLM-4.7 Flash has 47 layers, 64 routed experts with
+  top-4 routing, and MLA compressed cache. Frequency placement, dynamic expert
+  update, conversion, and CPU/GPU scheduling concepts transfer; expert budget
+  optima and absolute throughput do not.
+- The recovered OSCAR implementation targets a unified MHA/GQA high-precision
+  plus INT2 KV pool and was calibrated for Ornith's full-attention layers.
+  GLM-4.7 Flash uses MLA latent cache, for which no OSCAR receipt or compatible
+  port exists. Its compressed cache is already relatively small, so defer OSCAR
+  work until the GLM AMX/expert path is correct and profiling shows KV capacity
+  is limiting. Any later OSCAR port needs GLM-specific rotations, MLA cache
+  semantics, short-context parity, long-context retrieval, and quality tests.
+- GLM-4.7 Flash does not exercise GLM-5.2's DSA/NSA indexer, IndexShare, MTP,
+  FP8-KV/FlashMLA path, 78-layer three-stage topology, or 753B memory pressure.
+  Keep a deterministic GLM-5.2 IndexShare/NSA fixture alongside the Flash
+  sprint, then advance to a model that genuinely forces offload before using
+  Flash performance to make GLM-5.2 capacity claims.
+
 ## KV Cache Conclusion
 
 The claim that every GPU or memory node always needs a complete KV cache is false. Each pipeline stage stores cache only for its local layers. Exo's current MLX tensor sharder also splits Llama, Qwen softmax-attention, and GPT-OSS KV heads; Qwen linear-attention state is split along tensor dimensions. The pinned GPT-OSS 20B audit makes this concrete: 64 query heads and 8 KV heads become 4 KV heads per TP=2 rank. All 32 expert identities remain present on both ranks, but each expert matrix is tensor-sharded; embeddings, LM head, router, and norms remain replicated. GLM-4.7 Flash is different: its current TP sharder leaves the 512-element compressed KV plus 64-element RoPE key state replicated, about 54,144 BF16 bytes per token per rank across 47 layers, or roughly 423 MiB at 8K and 10.2 GiB at its 202,752-token maximum before padding and workspace. This is still much smaller than replicating a conventional full 20-head KV cache. Some latent/index state, prefix-cache entries, vision state, and model-specific tensors can still be replicated within a stage, so the initial GLM-5.2 topology uses TP=1 and every model still needs measured VRAM accounting.
@@ -64,7 +199,7 @@ Set `SGLANG_PP_LAYER_PARTITION=30,28,20`. Starts 0, 30, and 58 are valid full-in
 
 The current hardware enumeration places both dwagon GPUs on NUMA 0. Do not claim the preferred production topology is NUMA-local until a slot reshuffle or measured cross-socket fallback validates it. The unpatched KTransformers runtime must not receive a single-node list such as `--kt-numa-nodes 1`: its physical-ID indexing can go out of bounds and its distributor can bind memory to NUMA 0 instead. The patched runtime receipt must cover the exact CPU and memory-node assignment for every stage.
 
-If three logical resources cannot be launched reliably, use PP=2/TP=1 with `SGLANG_PP_LAYER_PARTITION=38,40`. That fallback requires swapping one eight-DIMM set so dwagon has 640 GB and fwuff has 384 GB; one dwagon GPU remains idle. Do not use equal `39,39`, which begins the second stage at an unsafe shared-indexer boundary.
+If three logical resources cannot be launched reliably, design a separate fail-closed PP=2/TP=1 target profile and receipt with `SGLANG_PP_LAYER_PARTITION=38,40`; the admitted `glm52_fp8_pp3_sm86_v1` profile intentionally rejects this topology. That fallback requires swapping one eight-DIMM set so dwagon has 640 GB and fwuff has 384 GB; one dwagon GPU remains idle. Do not use equal `39,39`, which begins the second stage at an unsafe shared-indexer boundary.
 
 ## Exo Implementation Plan
 
@@ -82,7 +217,10 @@ If three logical resources cannot be launched reliably, use PP=2/TP=1 with `SGLA
 - Serialized local runner creation with instance deletion. A stale precomputed `CreateRunner` cannot recreate a deleted instance, a failed `TaskCreated` publication cannot leave an untracked supervisor, and deletion emits positive shutdown acknowledgements only for assigned local runners that genuinely have no supervisor. Missing runner status still leases its assigned GPU until a confirmed terminal acknowledgement.
 - Added immutable `SglangKtLaunchPlan` and canonical `SglangKtProcessLaunchSpec` contracts for exact model/runtime revisions and the target `30,28,20` layer, GPU, CPU/NUMA, KTransformers-method, HCA, distributed coordinator, and service bindings. The builder expresses dwagon as logical ranks 0 and 1 plus fwuff as rank 2 using PP=3, TP=1, and `nnodes=3`. The common `--dist-init-addr` is the actual torch/NCCL rendezvous; the ignored per-stage `--nccl-port` and its false port gate were removed.
 - Added local SGLang preflight fact collection with injected runtime, filesystem, GPU/CPU/NUMA/HCA inventory, and endpoint effects. A structured default verifier parses the exact snapshot `config.json` and requires the GLM-5.2 architecture/topology, IndexShare frequency/pattern/skip inputs `4/null/3`, all 78 expanded `indexer_types`, FP8 e4m3 128x128 quantization, an exact revision receipt, and a SHA-256-bound complete snapshot. Pipeline starts must be full indexers in the observed config, not only a hard-coded model-name assumption; `39,39` is rejected while starts 30, 38, and 58 are legal for the audited snapshot.
-- The pure group preflight now fails closed unless every rank also has a target-specific validation receipt tied to the exact model/config hash, SGLang/KTransformers and `transformers-kt` versions, torch/CUDA/kernel build IDs, GPU UUID and SM86 capability, KV dtype, CPU set, NUMA nodes, and executed CPU backend. Required capabilities cover stage-local TP broadcasts, GLM-5.2 NSA prefill/decode on SM86, physical-NUMA mapping, process affinity, and actual AMX execution. The default version/SHA probe never fabricates these receipts, so the known-broken audited base cannot be launched accidentally. Launch specs explicitly bound `--max-total-tokens` and `--mem-fraction-static` and require removal of inherited `SGLANG_DISTRIBUTED_INIT_METHOD_OVERRIDE`. These types remain outside the active `Instance` union until a patched runtime, validation runner, external-process lifecycle, and API proxy exist.
+- The pure group preflight now fails closed unless every rank also has a target-specific validation receipt tied to the exact model/config hash, SGLang/KTransformers and `transformers-kt` versions, torch/CUDA/kernel build IDs, GPU UUID and SM86 capability, KV dtype, CPU set, NUMA nodes, and executed CPU backend. Required capabilities cover stage-local TP broadcasts, GLM-5.2 NSA prefill/decode on SM86, physical-NUMA mapping, process affinity, and actual AMX execution. The default version/SHA probe never fabricates these receipts, so the known-broken audited base cannot be launched accidentally. The Flash snapshot receipt requires the pinned config digest even when two other receipts agree on a different digest, and runtime receipts bind the current Torch, CUDA, `sgl_kernel`, `deep_gemm`, and `kt_kernel` artifacts. Launch specs explicitly bind `--max-total-tokens` and `--mem-fraction-static` and rebuild their environment after removing all inherited `NCCL_*` and `SGLANG_*` state. These types remain outside the active `Instance` union until a patched runtime, validation runner, external-process lifecycle, and API proxy exist.
+- Added an explicit `glm47_flash_bf16_sm86_smoke_v1` target profile alongside the GLM-5.2 profile. It admits only the official revision and config hash above, PP=1/TP=1, one RTX 3090, BF16 KTransformers and KV cache, 1-63 resident GPU experts, uniform placement, no deferred/dynamic/full-GPU-prefill path, no HCA, a 4,096-token pool, one request, FlashInfer attention, disabled CUDA graphs, expert-distribution recording, and hybrid timing. Preflight still refuses launch without exact executed receipts for all 46 normal-inference MoE layers being KT-wrapped, SM86 short-forward success, AMX BF16, and actual CPU-plus-GPU expert execution.
+- The initial Flash runtime base is KTransformers `8e46e5896c3d993a1285052f2618f5a9f01882d4` (`v0.6.3.post1`) with embedded SGLang `5d6bef9f61637aaeaf047bf8209def2af3eaa83f`; no Ornith patch is needed for the first BF16 hybrid smoke. Before live admission, patch SGLang to import/register `kt_ep_wrapper` fatally before `Glm4MoeLiteForCausalLM` construction and assert that exactly `model.layers.1..46.mlp.experts` use wrapper ID `kt_ep`. The current indirect DeepSeek-V4 side-effect import and suppressed registry errors are not acceptable proof.
+- Added a model-neutral local SGLang-KTransformers process-group supervisor with explicit spawn ownership handoff, per-rank CPU binding/environment sanitation, readiness gating, stdout/stderr draining, leader-independent process-group liveness, best-effort TERM/KILL across all ranks, accurate per-rank stop receipts, prompt startup cancellation, and explicit retry when cleanup retains ownership. Signal-delivery errors remain reportable after eventual process exit, and a stop signal is recorded only after successful delivery, including the exit-between-liveness-check-and-`killpg` race. Its focused suite includes real Linux descendant cleanup after leader exit and passes 25 tests. It is not yet wired into the active Worker/Instance/API path.
 - Added validated NVIDIA compute-resource discovery and resource IDs, including GPU UUID, PCI address, model name, total VRAM, Linux sysfs NUMA node, and CPU affinity. NVML PCI domains are normalized to sysfs BDFs; missing or malformed locality degrades to unknown without losing GPU enumeration. `MlxNccl` can create one runner per selected GPU, binds each child by GPU UUID before MLX import, reserves resources already used by current or legacy instances, validates resource ownership, and contains per-rank task-start failures.
 - Default NCCL placement remains one GPU per physical node. `use_all_compute_resources=true` explicitly selects every available GPU only when tensor dimensions are divisible and each rank satisfies `ceil(checkpoint size / world size) + max(1 GiB, 10% VRAM)`. This is a conservative weight/headroom gate, not a KV-cache or workspace model. Placement previews expose the policy and account host memory in proportion to ranks per node.
 - Corrected GLM-4.7-Flash and Qwen3-Coder-family EOS handling. Unknown MLX families now fall back to checkpoint `generation_config.json` and then `config.json`, preserving multiple EOS IDs instead of silently assuming a single token.
@@ -101,7 +239,7 @@ If three logical resources cannot be launched reliably, use PP=2/TP=1 with `SGLA
 - A leased live shutdown regression was aborted at preflight because fwuff's only RTX 3090 had an unowned ComfyUI compute process (PID 5334, 256 MiB). Nothing was launched or killed; the abort manifest is `/var/lib/exo/benchmarks/exo-nccl-shutdown-preflight-20260718T0450/manifest.json`. Repeat the live deletion test only when that GPU is idle.
 - The runtime and proof harness are committed and published through `57a57e1221a5f1199cc90e9dc9391ec925395f2c` on `origin/agent/linux-cuda-nccl`. Commit `36345e86` generalized the leased harness for explicit ordered TP2 resource selections, `e38ba19d` made launch wait for a reciprocal reachable two-host API topology, `96230c4b` added a bounded interprocess channel flush before native initialization, `34dd027f` made TP1 inputs reproducible, `94d27c7d` added fail-closed per-rail HCA counter evidence, `a7711e4e` admitted the exact pinned Llama 3.1 8B TP1 oracle contract, `c9c5ce25` recorded the completed Llama 8B proof, `35372e6c` quieted the closed-queue shutdown race, `8bee9f93` admitted the deterministic GPT-OSS oracle, and `57a57e12` admitted the deterministic GLM-4.7 Flash proof contract. The local remotes are normalized as `upstream=exo-explore/exo` and `origin=ldyeax/exo`; the fork was initialized and subsequent updates use ordinary fast-forward pushes after each verified commit.
 - `test_results.md` is the maintained human-readable ledger for automated suites, live passes, diagnostic receipts, expected failures, pending tests, and artifact integrity. Update it with every subsequent test; do not add overlapping suite counts into a fictitious unique total.
-- The other Codex task is stopped, and the user retired `/ai/coordinate.md` arbitration and cooldowns on 2026-07-18. Continue using the lease wrapper, unique namespaces and ports, strict preflight, ownership-safe cleanup, and per-run manifests as benchmark safety and receipt controls, not as cross-task scheduling policy.
+- Cross-task arbitration in `/ai/coordinate.md` was reactivated by the user on 2026-07-19. Every performance or model-staging run must use the shared lease wrapper, five-minute same-owner cooldown, unique namespace/ports, strict two-host preflight, ownership-safe cleanup, and per-run manifest. Coding and short unit tests remain non-benchmark work; they must still avoid resources held by an active lease.
 - The formal x8/x8 baseline is reportable and clean at `/var/lib/exo/benchmarks/ib-qdr-x8x8-20260718-v3`: child and wrapper returned 0, all eight owned client/server/OpenSM process groups terminated with verified ownership, and the lease was removed. It used clean commit `bbea0dc59a1a79f9c41b667d172d322348b44382`, config SHA-256 `a4937b973cb7337defa0edfa0b4a71de44f3b5bec37fecbb016c0c1bb9c2ebd6`, harness SHA-256 `0fda6ce29a8b172e915d2f2417309ed0952189d02385d4949b5957f615114852`, and perftest SHA-256 `60cf23a301b14d2a789fa5ea0776343c3081062d4baa46b0353800f98ae72d3a`. v1 failed before traffic because ports 58140-58142 overlapped the ephemeral range; v2's 31.74 Gb/s port-1 row is diagnostic only because its old post-case strict probe encountered expected TCP `TIME_WAIT`.
 - The definitive independent-process extension is reportable and clean at `/var/lib/exo/benchmarks/ib-qdr-x8x8-independent-20260718-v4`. It ran the same three v3 cases plus two concurrent per-rail client/server pairs on disjoint NUMA-local physical cores and SMT siblings. It used clean commit `0750642cff761401d3b633225317fb1822720154`, config SHA-256 `8d89ab83288653da74dacfac765b5e7fabb9bbbfa8fd80fa21b1b4941e566481`, harness SHA-256 `7485df84153d8a6eaca1a86405e93a360a5eb00686536219bb21a8f4ed8830dc`, perftest SHA-256 `60cf23a301b14d2a789fa5ea0776343c3081062d4baa46b0353800f98ae72d3a`, and result SHA-256 `7598faedf6e5343727e65352f00c17241ea5247891063760ba3511b076c538fd`.
 - The deterministic SmolLM2 TP1 oracle is reportable and clean at `/var/lib/exo/benchmarks/tp1-smollm2-20260718-v1`. Three repetitions produced the same completion SHA-256 `3f466ee4633b7a26654a26badb971ab41a08908ed4adf4ad9a5277a498c596ca`, each with 42 prompt tokens, 32 completion tokens, and `finish_reason=length`. It used clean commit `bbea0dc59a1a79f9c41b667d172d322348b44382`, config SHA-256 `2809b9890783d493fb258f725adbe26ca5b2175480d6c2cc6a5e5529bebbf59e`, request SHA-256 `5f937f417c5db8cb46974b1d8211dc9b6dc03afbdf402d51da7e157bf1d8f7d8`, result SHA-256 `744a4f1a19fe173aada16227e2f3f95a49c658b5fb581941e7f676b1792abb6a`, and manifest SHA-256 `def85d40285ace1fd422925e0f3670fb849e7f1faba20ab3bd7fec2975e2f8b3`. This exact completion hash is bound into the completed TP3 proof contract.
@@ -201,7 +339,7 @@ If three logical resources cannot be launched reliably, use PP=2/TP=1 with `SGLA
 4. Completed the strict Tensor=3 proof for `mlx-community/SmolLM2-135M-Instruct-8bit@0f0d9b8218915bc34d401e1a340b8c049d300d5e`. The model-stage receipt at `/var/lib/exo/benchmarks/smollm2-stage-20260718-v1`, TP1 oracle at `/var/lib/exo/benchmarks/tp1-smollm2-20260718-v1`, and three-rank proof at `/var/lib/exo/benchmarks/tp3-smollm2-20260718-v6` together bind identical revision-pinned model snapshots and deterministic output. The live proof exercised two runners on dwagon plus one on fwuff, explicit GPU ownership, distributed initialization, forced IB/NCCL, model load/warmup/generation, deletion, process termination, and resource release. Its timing remains diagnostic because this historical v6 receipt predates the HCA payload-counter evidence.
 5. Completed the pinned stage, deterministic TP1 oracle, and strict Tensor=2 proof for `mlx-community/Llama-3.2-3B-Instruct-4bit@7f0dc925e0d0afb0322d96f9255cfddf2ba5636e`. The receipts at `/var/lib/exo/benchmarks/llama32-3b-stage-20260718-v1`, `/var/lib/exo/benchmarks/tp1-llama32-3b-20260718-v1`, and `/var/lib/exo/benchmarks/tp2-llama32-3b-20260718-v1` bind identical model snapshots and output. The TP2 run used one selected dwagon GPU plus fwuff's GPU, preserved the unused dwagon GPU as observed but unowned, and proved that both QDR rails carried the bracketed NCCL workload with clean health counters.
 6. Completed the pinned stage, deterministic TP1 oracle, and strict Tensor=2 proof for `mlx-community/Llama-3.1-8B-Instruct-4bit@90215b22ec18e72f623dde2ea7af4097025160e2`. The receipts at `/var/lib/exo/benchmarks/llama31-8b-stage-20260718-v1`, `/var/lib/exo/benchmarks/tp1-llama31-8b-20260718-v1`, and `/var/lib/exo/benchmarks/tp2-llama31-8b-20260718-v1` bind identical model snapshots and output. The TP2 run again proved payload on both QDR rails with clean health counters.
-7. Completed the first two MoE rungs. GPT-OSS 20B receipts are `/var/lib/exo/benchmarks/gptoss20b-stage-20260718-v1`, `/var/lib/exo/benchmarks/tp1-gptoss20b-20260718-v1`, and `/var/lib/exo/benchmarks/tp2-gptoss20b-20260718-v1`; GLM-4.7 Flash receipts are `/var/lib/exo/benchmarks/glm47flash-stage-20260719-v1`, `/var/lib/exo/benchmarks/tp1-glm47flash-20260719-v1`, and `/var/lib/exo/benchmarks/tp2-glm47flash-20260719-v1`. Both strict TP2 runs bind exact snapshots and deterministic TP1 output, initialize their dedicated MoE sharders on both hosts, prove payload on both QDR rails with clean health counters, and clean up without force. Continue MoE coverage with `mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit@6e302ea604ad9ab206367e2c501d1571023e7b6d`, then `mlx-community/Qwen3.5-35B-A3B-4bit@1e20fd8d42056f870933bf98ca6211024744f7ec`. For each, require an exact pinned stage receipt, deterministic TP1 oracle when the chat contract supports it, strict TP2 correctness, clean lifecycle, and per-rail payload evidence before advancing.
+7. Completed the first two MoE rungs. GPT-OSS 20B receipts are `/var/lib/exo/benchmarks/gptoss20b-stage-20260718-v1`, `/var/lib/exo/benchmarks/tp1-gptoss20b-20260718-v1`, and `/var/lib/exo/benchmarks/tp2-gptoss20b-20260718-v1`; GLM-4.7 Flash receipts are `/var/lib/exo/benchmarks/glm47flash-stage-20260719-v1`, `/var/lib/exo/benchmarks/tp1-glm47flash-20260719-v1`, and `/var/lib/exo/benchmarks/tp2-glm47flash-20260719-v1`. Both strict TP2 runs bind exact snapshots and deterministic TP1 output, initialize their dedicated MoE sharders on both hosts, prove payload on both QDR rails with clean health counters, and clean up without force. Pause the size ladder while the GLM hybrid path is made trustworthy: patch fail-closed wrapper registration, add a separate fail-closed BF16 CPU-only admission profile, run its control, then run mixed 1- and 4-GPU-expert PP1 controls with 46-layer wrapper coverage, AMX creation/execution logs, expert masks/routing counts, greedy-output parity, CPU/GPU timing, and cleanup receipts. Resume later with `mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit@6e302ea604ad9ab206367e2c501d1571023e7b6d` and `mlx-community/Qwen3.5-35B-A3B-4bit@1e20fd8d42056f870933bf98ca6211024744f7ec`.
 8. Keep `mlx-community/Qwen3-0.6B-8bit` for single-GPU and Ring/Pipeline regression only. Pipeline over NCCL requires adding `ncclSend`/`ncclRecv` support to MLX first.
 9. Re-run the known Ornith-1.0-35B FP8/MXFP4 workload as an AMX/OSCAR regression baseline.
 10. Validate the hybrid AMX offload path with DeepSeek-V4-Flash (284B total/13B active, mixed FP4/FP8, 1M context support).
@@ -209,6 +347,50 @@ If three logical resources cannot be launched reliably, use PP=2/TP=1 with `SGLA
 12. Build a tiny deterministic GLM IndexShare fixture and require single-rank versus pipeline output parity. Keep deferred work at zero until stage-local final-layer flushing has its own parity test.
 13. Start full GLM-5.2 FP8 weights at 4K with a proven Ampere-compatible KV backend, then test 32K, 128K, and finally 245,760 input tokens plus a 16,384-token output reserve. Do not select FP8 KV merely to meet the cache estimate.
 14. Tune resident experts at 0/1/2/4, then enable MTP and deferred work independently with correctness and performance A/B tests.
+
+### Larger-model local versus InfiniBand optimization protocol
+
+After a larger target first passes its exact-revision load, deterministic
+correctness, lifecycle, and short-generation proof, optimize two independent
+deployment tracks:
+
+1. **Dwagon-only:** use dwagon's two RTX 3090s, 768 GB host memory, both useful
+   NUMA/AMX domains, and the best local GPU/CPU split. Fwuff and InfiniBand must
+   remain outside the data path.
+2. **Two-host InfiniBand:** use the best justified allocation across dwagon and
+   fwuff, including their GPUs and AMX-capable CPUs, with model traffic forced
+   over the selected InfiniBand port or ports and 10 GbE retained for control.
+
+Run at least five **distinct, reportable optimization configurations per
+track** after the proof of concept, for a minimum of ten optimization runs. A
+warmup plus repeated samples of one unchanged configuration counts as one run,
+not five. Start with a defensible baseline, record the lesson from each result,
+and make the next change answer a stated hypothesis. Tune each track for its
+own best interactive coding-agent performance rather than forcing identical
+placement where the hardware differs.
+
+Keep a fixed comparison workload with identical prompt bytes, context lengths,
+generation settings, concurrency, correctness oracle, and model revision.
+Report TTFT, prefill rate, decode rate, end-to-end latency, CPU/GPU memory,
+backend expert counts and timing, plus HCA payload/error deltas for the
+two-host track. Use multiple measured samples and compare distributions or
+medians; do not select a single favorable outlier.
+
+Candidate iteration variables include resident GPU experts, PP/TP boundaries,
+CPU thread pools and NUMA binding, prefill chunking/fallback, KV dtype, CUDA
+graphs, expert placement, overlap/deferred work, NCCL algorithm/protocol/channel
+counts, rail selection, and HCA/GPU locality. Change one causal group at a time
+unless a coupled change is explicitly justified in the manifest.
+
+Exact-revision Hugging Face quantizations or checkpoint formats may be staged
+when they plausibly improve either track. Before performance use, bind every
+artifact and conversion to a source revision and manifest, pass short-context
+greedy parity plus the selected coding-quality gate, and record disk/RAM/VRAM
+cost. If different formats win the two tracks, publish both topology-optimized
+results **and** at least one matched-artifact local-versus-InfiniBand control;
+otherwise format and topology effects would be confounded. Preserve every
+attempt, including regressions, in `test_results.md` and its immutable run
+manifest under `/var/lib/exo/benchmarks/`.
 
 ### Pre-ConnectX-5 MLX/NCCL benchmark ladder
 

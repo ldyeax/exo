@@ -1,7 +1,13 @@
+import hashlib
+import importlib
+import importlib.machinery
 import json
+import pathlib
+import sys
+import types
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal
+from typing import Callable, Literal, cast
 
 import pytest
 from pydantic import ValidationError
@@ -14,7 +20,11 @@ from exo.shared.types.worker.sglang_kt import (
     NetworkPort,
 )
 from exo.worker.sglang_kt.launch_spec import (
+    GLM_4_7_FLASH_BF16_CONFIG_SHA256,
+    GLM_4_7_FLASH_BF16_MODEL_ID,
+    GLM_4_7_FLASH_BF16_MODEL_REVISION,
     SglangKtProcessLaunchSpec,
+    build_glm_4_7_flash_bf16_process_launch_specs,
     build_glm_5_2_fp8_process_launch_specs,
 )
 from exo.worker.sglang_kt.preflight import (
@@ -27,6 +37,7 @@ from exo.worker.sglang_kt.preflight import (
     evaluate_sglang_kt_preflight,
 )
 from exo.worker.sglang_kt.preflight_collector import (
+    SGLANG_KT_ARTIFACT_BUILD_ID_FUNCTION_SOURCE,
     ExternalPythonSglangKtRuntimeProbe,
     LinuxSglangKtHostInventoryProbe,
     LocalSglangKtFilesystemProbe,
@@ -34,15 +45,22 @@ from exo.worker.sglang_kt.preflight_collector import (
     SglangKtModelSnapshotCompatibility,
     SglangKtRuntimeCommandResult,
     SocketSglangKtPortProbe,
+    calculate_sglang_kt_artifact_build_id,
     collect_sglang_kt_local_host_preflight_observation,
 )
 from exo.worker.tests.unittests.test_sglang_kt_launch_spec import (
     PYTHON_EXECUTABLE,
+    make_glm_4_7_flash_bf16_plan,
     make_plan,
 )
 
 CONFIG_SHA256 = "a" * 64
 FULL_INDEXER_LAYER_STARTS = (0, 1, 2, *range(6, 78, 4))
+TORCH_VERSION = "2.10.0+cu130"
+CUDA_VERSION = "13.0"
+SGL_KERNEL_BUILD_ID = "sgl-kernel-test-build"
+DEEP_GEMM_BUILD_ID = "deep-gemm-test-build"
+KT_KERNEL_BUILD_ID = "kt-kernel-test-build"
 
 
 def make_specs() -> tuple[SglangKtProcessLaunchSpec, ...]:
@@ -80,9 +98,75 @@ def make_glm_5_2_fp8_config() -> dict[str, object]:
     }
 
 
+def make_glm_4_7_flash_bf16_config() -> dict[str, object]:
+    return {
+        "architectures": ["Glm4MoeLiteForCausalLM"],
+        "attention_bias": False,
+        "attention_dropout": 0.0,
+        "pad_token_id": 154820,
+        "eos_token_id": [154820, 154827, 154829],
+        "hidden_act": "silu",
+        "hidden_size": 2048,
+        "intermediate_size": 10240,
+        "max_position_embeddings": 202752,
+        "model_type": "glm4_moe_lite",
+        "moe_intermediate_size": 1536,
+        "topk_method": "noaux_tc",
+        "norm_topk_prob": True,
+        "num_attention_heads": 20,
+        "n_group": 1,
+        "topk_group": 1,
+        "n_routed_experts": 64,
+        "n_shared_experts": 1,
+        "routed_scaling_factor": 1.8,
+        "num_experts_per_tok": 4,
+        "first_k_dense_replace": 1,
+        "num_hidden_layers": 47,
+        "num_key_value_heads": 20,
+        "num_nextn_predict_layers": 1,
+        "partial_rotary_factor": 1.0,
+        "rms_norm_eps": 1e-05,
+        "rope_scaling": None,
+        "rope_theta": 1000000,
+        "tie_word_embeddings": False,
+        "dtype": "bfloat16",
+        "transformers_version": "5.0.0rc0",
+        "q_lora_rank": 768,
+        "kv_lora_rank": 512,
+        "qk_nope_head_dim": 192,
+        "qk_rope_head_dim": 64,
+        "v_head_dim": 256,
+        "vocab_size": 154880,
+    }
+
+
 def write_model_config(path: Path, config: dict[str, object]) -> None:
     path.mkdir()
     (path / "config.json").write_text(json.dumps(config), encoding="utf-8")
+
+
+def write_exact_glm_4_7_flash_config(path: Path) -> None:
+    path.mkdir()
+    config_json = json.dumps(make_glm_4_7_flash_bf16_config(), indent=2) + "\n"
+    (path / "config.json").write_text(config_json, encoding="utf-8")
+
+
+def observe_default_glm_4_7_flash_bf16_compatibility(
+    path: Path,
+    *,
+    revision: GitRevision = GLM_4_7_FLASH_BF16_MODEL_REVISION,
+) -> SglangKtModelSnapshotReceiptObservation | None:
+    (spec,) = build_glm_4_7_flash_bf16_process_launch_specs(
+        make_glm_4_7_flash_bf16_plan(), PYTHON_EXECUTABLE
+    )
+    probe = LocalSglangKtFilesystemProbe(
+        model_snapshot_completeness_checker=(lambda _path, _model_id, _revision: True)
+    )
+    return probe.observe_model_snapshot(
+        str(path),
+        spec.model_id,
+        revision,
+    )
 
 
 def observe_default_glm_5_2_fp8_compatibility(
@@ -112,6 +196,11 @@ def make_runtime(spec: SglangKtProcessLaunchSpec) -> SglangKtRuntimeObservation:
         ktransformers_revision=spec.expected_ktransformers_revision,
         transformers_distribution_version=spec.required_transformers_version,
         transformers_module_version=spec.required_transformers_version,
+        torch_version=TORCH_VERSION,
+        cuda_version=CUDA_VERSION,
+        sgl_kernel_build_id=SGL_KERNEL_BUILD_ID,
+        deep_gemm_build_id=DEEP_GEMM_BUILD_ID,
+        kt_kernel_build_id=KT_KERNEL_BUILD_ID,
     )
 
 
@@ -119,6 +208,7 @@ def make_runtime_validation_receipt(
     spec: SglangKtProcessLaunchSpec,
 ) -> SglangKtRuntimeValidationReceiptObservation:
     return SglangKtRuntimeValidationReceiptObservation(
+        target_profile=spec.target_profile,
         gpu_uuid=spec.gpu_uuid,
         gpu_compute_capability=(8, 6),
         cpu_cores=spec.cpu_cores,
@@ -131,11 +221,15 @@ def make_runtime_validation_receipt(
         ktransformers_revision=spec.expected_ktransformers_revision,
         transformers_distribution_version=spec.required_transformers_version,
         transformers_module_version=spec.required_transformers_version,
-        torch_version="2.10.0+cu130",
-        cuda_version="13.0",
-        sgl_kernel_build_id="sgl-kernel-test-build",
-        deep_gemm_build_id="deep-gemm-test-build",
-        kv_cache_dtype="fp8_e4m3",
+        torch_version=TORCH_VERSION,
+        cuda_version=CUDA_VERSION,
+        sgl_kernel_build_id=SGL_KERNEL_BUILD_ID,
+        deep_gemm_build_id=DEEP_GEMM_BUILD_ID,
+        kt_kernel_build_id=KT_KERNEL_BUILD_ID,
+        ktransformers_method=spec.ktransformers_method,
+        resident_gpu_experts=spec.stage.resident_gpu_experts,
+        attention_backend=spec.attention_backend,
+        kv_cache_dtype=spec.kv_cache_dtype,
         max_total_tokens=spec.plan.max_total_tokens,
         static_memory_fraction=spec.plan.static_memory_fraction,
         capabilities=(
@@ -447,9 +541,118 @@ def test_external_runtime_probe_parses_only_the_external_python_payload() -> Non
     assert 'source_revision("ktransformers")' in command[3]
     assert 'distribution_version("transformers-kt")' in command[3]
     assert 'module_version("transformers")' in command[3]
+    assert "torch_runtime_versions()" in command[3]
+    assert '"sgl_kernel", "common_ops"' in command[3]
+    assert '"deep_gemm", "deep_gemm"' in command[3]
+    assert '"kt_kernel", "kt_kernel_ext", ("kt_kernel_ext",)' in command[3]
+    assert "exo-sglang-kt-artifact-v1" in command[3]
     assert '"status"' in command[3]
     assert '"--untracked-files=no"' in command[3]
-    assert timeout_seconds == 15.0
+    assert timeout_seconds == 30.0
+
+
+def test_artifact_build_id_includes_discoverable_top_level_extension(
+    tmp_path: Path,
+) -> None:
+    extension_suffix = importlib.machinery.EXTENSION_SUFFIXES[0]
+    package_name = "_exo_test_kernel_package"
+    extension_module_name = "_exo_test_kernel_ext"
+    package_path = tmp_path / package_name
+    package_path.mkdir()
+    (package_path / "__init__.py").write_text("BUILD = 1\n", encoding="utf-8")
+    (package_path / f"kernel_ext{extension_suffix}").write_bytes(b"package-native")
+    top_level_extension = tmp_path / f"{extension_module_name}{extension_suffix}"
+    top_level_extension.write_bytes(b"top-level-native-v1")
+    sys.path.insert(0, str(tmp_path))
+    try:
+        importlib.invalidate_caches()
+        probe_namespace: dict[str, object] = {
+            "hashlib": hashlib,
+            "importlib": importlib,
+            "pathlib": pathlib,
+        }
+        exec(SGLANG_KT_ARTIFACT_BUILD_ID_FUNCTION_SOURCE, probe_namespace)
+        probe_calculator = cast(
+            Callable[[str, str, tuple[str, ...]], str | None],
+            probe_namespace["calculate_sglang_kt_artifact_build_id"],
+        )
+
+        first_build_id = calculate_sglang_kt_artifact_build_id(
+            package_name,
+            "kernel_ext",
+            (extension_module_name,),
+        )
+        first_probe_build_id = probe_calculator(
+            package_name,
+            "kernel_ext",
+            (extension_module_name,),
+        )
+        top_level_extension.write_bytes(b"top-level-native-v2")
+        second_build_id = calculate_sglang_kt_artifact_build_id(
+            package_name,
+            "kernel_ext",
+            (extension_module_name,),
+        )
+        second_probe_build_id = probe_calculator(
+            package_name,
+            "kernel_ext",
+            (extension_module_name,),
+        )
+
+        assert first_build_id is not None
+        assert len(first_build_id) == 64
+        assert first_probe_build_id == first_build_id
+        assert second_build_id is not None
+        assert second_probe_build_id == second_build_id
+        assert first_build_id != second_build_id
+        missing_build_id = calculate_sglang_kt_artifact_build_id(
+            package_name, "missing-native"
+        )
+        assert missing_build_id is None
+        assert probe_calculator(package_name, "missing-native", ()) == missing_build_id
+    finally:
+        sys.path.remove(str(tmp_path))
+        importlib.invalidate_caches()
+
+
+def test_artifact_build_id_is_stable_after_internal_extension_alias_load(
+    tmp_path: Path,
+) -> None:
+    extension_suffix = importlib.machinery.EXTENSION_SUFFIXES[0]
+    package_name = "_exo_test_internal_kernel_package"
+    extension_module_name = "_exo_test_internal_kernel_ext"
+    package_path = tmp_path / package_name
+    package_path.mkdir()
+    (package_path / "__init__.py").write_text("BUILD = 1\n", encoding="utf-8")
+    internal_extension = package_path / f"kernel_ext{extension_suffix}"
+    internal_extension.write_bytes(b"internal-native")
+    sys.path.insert(0, str(tmp_path))
+    try:
+        importlib.invalidate_caches()
+        before_alias = calculate_sglang_kt_artifact_build_id(
+            package_name,
+            "kernel_ext",
+            (extension_module_name,),
+        )
+        extension_module = types.ModuleType(extension_module_name)
+        extension_module.__spec__ = importlib.machinery.ModuleSpec(
+            extension_module_name,
+            loader=None,
+            origin=str(internal_extension),
+        )
+        sys.modules[extension_module_name] = extension_module
+        after_alias = calculate_sglang_kt_artifact_build_id(
+            package_name,
+            "kernel_ext",
+            (extension_module_name,),
+        )
+
+        assert before_alias is not None
+        assert after_alias == before_alias
+    finally:
+        sys.modules.pop(extension_module_name, None)
+        sys.path.remove(str(tmp_path))
+        importlib.invalidate_caches()
 
 
 @pytest.mark.parametrize(
@@ -521,6 +724,62 @@ def test_default_glm_5_2_fp8_compatibility_verifier_accepts_exact_config(
     assert len(receipt.config_sha256) == 64
     assert receipt.receipt_verified
     assert receipt.snapshot_complete
+
+
+def test_default_glm_4_7_flash_verifier_accepts_only_exact_official_bf16_config(
+    tmp_path: Path,
+) -> None:
+    model_path = tmp_path / "model"
+    write_exact_glm_4_7_flash_config(model_path)
+
+    receipt = observe_default_glm_4_7_flash_bf16_compatibility(model_path)
+
+    assert receipt is not None
+    assert receipt.model_id == GLM_4_7_FLASH_BF16_MODEL_ID
+    assert receipt.revision == GLM_4_7_FLASH_BF16_MODEL_REVISION
+    assert receipt.weight_format == "safetensors"
+    assert receipt.ktransformers_method == "BF16"
+    assert receipt.config_sha256 == GLM_4_7_FLASH_BF16_CONFIG_SHA256
+    assert receipt.full_indexer_layer_starts == (0,)
+    assert receipt.receipt_verified
+    assert receipt.snapshot_complete
+
+
+def test_default_glm_4_7_flash_verifier_rejects_wrong_revision_or_config_bytes(
+    tmp_path: Path,
+) -> None:
+    model_path = tmp_path / "model"
+    write_exact_glm_4_7_flash_config(model_path)
+
+    wrong_revision = observe_default_glm_4_7_flash_bf16_compatibility(
+        model_path,
+        revision="1" * 40,
+    )
+    config = make_glm_4_7_flash_bf16_config()
+    config["dtype"] = "float16"
+    (model_path / "config.json").write_text(
+        json.dumps(config, indent=2) + "\n", encoding="utf-8"
+    )
+    wrong_config = observe_default_glm_4_7_flash_bf16_compatibility(model_path)
+
+    assert wrong_revision is None
+    assert wrong_config is None
+
+
+def test_default_snapshot_verifier_rejects_unadmitted_model_family(
+    tmp_path: Path,
+) -> None:
+    model_path = tmp_path / "model"
+    write_exact_glm_4_7_flash_config(model_path)
+    probe = LocalSglangKtFilesystemProbe(
+        model_snapshot_completeness_checker=(lambda _path, _model_id, _revision: True)
+    )
+
+    receipt = probe.observe_model_snapshot(
+        str(model_path), ModelId("untrusted/model"), "1" * 40
+    )
+
+    assert receipt is None
 
 
 def test_default_glm_5_2_fp8_compatibility_verifier_rejects_malformed_json(

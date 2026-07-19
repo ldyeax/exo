@@ -39,6 +39,10 @@ KTransformersMethod = Literal[
     "MXFP4",
     "RAWINT4",
 ]
+SglangKtTargetProfile = Literal[
+    "glm52_fp8_pp3_sm86_v1",
+    "glm47_flash_bf16_sm86_smoke_v1",
+]
 
 
 def _validate_concrete_ipv4_endpoint(endpoint_name: str, endpoint: Host) -> None:
@@ -114,6 +118,7 @@ class SglangKtLaunchPlan(FrozenModel):
     model_revision: GitRevision
     sglang_revision: GitRevision
     ktransformers_revision: GitRevision
+    target_profile: SglangKtTargetProfile
     total_layers: PositiveInt
     context_length: PositiveInt
     max_total_tokens: PositiveInt

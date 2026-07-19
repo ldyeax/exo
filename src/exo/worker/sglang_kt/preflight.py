@@ -10,10 +10,14 @@ from exo.shared.types.worker.sglang_kt import (
     HcaDevice,
     KTransformersMethod,
     ResourceIndex,
+    SglangKtTargetProfile,
     StaticMemoryFraction,
 )
 from exo.utils.pydantic_ext import FrozenModel
 from exo.worker.sglang_kt.launch_spec import (
+    GLM_4_7_FLASH_BF16_CONFIG_SHA256,
+    GLM_4_7_FLASH_KV_CACHE_DTYPE,
+    GLM_4_7_FLASH_TARGET_PROFILE,
     GLM_5_2_KV_CACHE_DTYPE,
     REQUIRED_TRANSFORMERS_VERSION,
     SglangKtProcessLaunchSpec,
@@ -27,8 +31,12 @@ SglangKtRuntimeCapability = Literal[
     "kt_physical_numa_mapping_v1",
     "kt_process_cpu_affinity_v1",
     "kt_fp8_amx_executed_v1",
+    "glm47_flash_kt_wrapper_active_v1",
+    "glm47_flash_bf16_sm86_short_forward_v1",
+    "kt_bf16_amx_executed_v1",
+    "kt_bf16_cpu_gpu_hybrid_executed_v1",
 ]
-REQUIRED_RUNTIME_CAPABILITIES: frozenset[SglangKtRuntimeCapability] = frozenset(
+GLM_5_2_REQUIRED_RUNTIME_CAPABILITIES: frozenset[SglangKtRuntimeCapability] = frozenset(
     (
         "kt_tp_group_local_broadcast_v1",
         "glm52_nsa_sm86_short_forward_v1",
@@ -37,6 +45,20 @@ REQUIRED_RUNTIME_CAPABILITIES: frozenset[SglangKtRuntimeCapability] = frozenset(
         "kt_fp8_amx_executed_v1",
     )
 )
+GLM_4_7_FLASH_REQUIRED_RUNTIME_CAPABILITIES: frozenset[SglangKtRuntimeCapability] = (
+    frozenset(
+        (
+            "glm47_flash_kt_wrapper_active_v1",
+            "glm47_flash_bf16_sm86_short_forward_v1",
+            "kt_physical_numa_mapping_v1",
+            "kt_process_cpu_affinity_v1",
+            "kt_bf16_amx_executed_v1",
+            "kt_bf16_cpu_gpu_hybrid_executed_v1",
+        )
+    )
+)
+# Backwards-compatible name for callers that only know the original GLM-5.2 profile.
+REQUIRED_RUNTIME_CAPABILITIES = GLM_5_2_REQUIRED_RUNTIME_CAPABILITIES
 PreflightCheck = Literal[
     "host_observation",
     "python_executable",
@@ -89,6 +111,11 @@ class SglangKtRuntimeObservation(FrozenModel):
     ktransformers_revision: GitRevision | None = None
     transformers_distribution_version: ObservedText | None = None
     transformers_module_version: ObservedText | None = None
+    torch_version: ObservedText | None = None
+    cuda_version: ObservedText | None = None
+    sgl_kernel_build_id: ObservedText | None = None
+    deep_gemm_build_id: ObservedText | None = None
+    kt_kernel_build_id: ObservedText | None = None
 
 
 @final
@@ -100,11 +127,12 @@ class SglangKtRuntimeValidationReceiptObservation(FrozenModel):
     before the external process group can pass preflight.
     """
 
+    target_profile: SglangKtTargetProfile
     gpu_uuid: GpuUuid
     gpu_compute_capability: tuple[PositiveInt, ResourceIndex]
     cpu_cores: tuple[ResourceIndex, ...]
     memory_nodes: tuple[ResourceIndex, ...]
-    executed_cpu_backend: Literal["AMX"]
+    executed_cpu_backend: Literal["AMX", "AMX_BF16"]
     model_id: ModelId
     model_revision: GitRevision
     model_config_sha256: Sha256Digest
@@ -116,7 +144,11 @@ class SglangKtRuntimeValidationReceiptObservation(FrozenModel):
     cuda_version: ObservedText
     sgl_kernel_build_id: ObservedText
     deep_gemm_build_id: ObservedText
-    kv_cache_dtype: Literal["fp8_e4m3"]
+    kt_kernel_build_id: ObservedText
+    ktransformers_method: KTransformersMethod
+    resident_gpu_experts: ResourceIndex
+    attention_backend: Literal["flashinfer", "nsa"]
+    kv_cache_dtype: Literal["bfloat16", "fp8_e4m3"]
     max_total_tokens: PositiveInt
     static_memory_fraction: StaticMemoryFraction
     capabilities: tuple[SglangKtRuntimeCapability, ...]
@@ -434,6 +466,11 @@ def _evaluate_snapshot_receipt(
     detail: str,
     failures: list[SglangKtPreflightFailure],
 ) -> None:
+    expected_config_sha256 = (
+        GLM_4_7_FLASH_BF16_CONFIG_SHA256
+        if process_spec.target_profile == GLM_4_7_FLASH_TARGET_PROFILE
+        else None
+    )
     receipt = next(
         (
             candidate
@@ -448,6 +485,10 @@ def _evaluate_snapshot_receipt(
         and receipt.revision == process_spec.expected_model_revision
         and receipt.weight_format == "safetensors"
         and receipt.ktransformers_method == process_spec.ktransformers_method
+        and (
+            expected_config_sha256 is None
+            or receipt.config_sha256 == expected_config_sha256
+        )
         and all(
             stage.start_layer in receipt.full_indexer_layer_starts
             for stage in process_spec.plan.stages
@@ -480,7 +521,11 @@ def _evaluate_snapshot_receipt(
                 process_spec.expected_model_revision,
                 "safetensors",
                 process_spec.ktransformers_method,
-                "config_sha256=<verified>",
+                (
+                    "config_sha256=<verified>"
+                    if expected_config_sha256 is None
+                    else expected_config_sha256
+                ),
                 "pipeline starts on verified full indexers",
                 "receipt_verified=True",
                 "snapshot_complete=True",
@@ -495,6 +540,17 @@ def _evaluate_runtime_validation(
     observation: SglangKtHostPreflightObservation,
     failures: list[SglangKtPreflightFailure],
 ) -> None:
+    if process_spec.target_profile == GLM_4_7_FLASH_TARGET_PROFILE:
+        expected_cpu_backend: Literal["AMX", "AMX_BF16"] = "AMX_BF16"
+        expected_kv_cache_dtype: Literal["bfloat16", "fp8_e4m3"] = (
+            GLM_4_7_FLASH_KV_CACHE_DTYPE
+        )
+        required_capabilities = GLM_4_7_FLASH_REQUIRED_RUNTIME_CAPABILITIES
+    else:
+        expected_cpu_backend = "AMX"
+        expected_kv_cache_dtype = GLM_5_2_KV_CACHE_DTYPE
+        required_capabilities = GLM_5_2_REQUIRED_RUNTIME_CAPABILITIES
+
     validation_receipt = next(
         (
             receipt
@@ -514,10 +570,11 @@ def _evaluate_runtime_validation(
     receipt_matches = (
         validation_receipt is not None
         and snapshot_receipt is not None
+        and validation_receipt.target_profile == process_spec.target_profile
         and validation_receipt.gpu_compute_capability == (8, 6)
         and validation_receipt.cpu_cores == process_spec.cpu_cores
         and validation_receipt.memory_nodes == process_spec.memory_nodes
-        and validation_receipt.executed_cpu_backend == "AMX"
+        and validation_receipt.executed_cpu_backend == expected_cpu_backend
         and validation_receipt.model_id == process_spec.model_id
         and validation_receipt.model_revision == process_spec.expected_model_revision
         and validation_receipt.model_config_sha256 == snapshot_receipt.config_sha256
@@ -528,11 +585,23 @@ def _evaluate_runtime_validation(
         == process_spec.required_transformers_version
         and validation_receipt.transformers_module_version
         == process_spec.required_transformers_version
-        and validation_receipt.kv_cache_dtype == GLM_5_2_KV_CACHE_DTYPE
+        and validation_receipt.torch_version == observation.runtime.torch_version
+        and validation_receipt.cuda_version == observation.runtime.cuda_version
+        and validation_receipt.sgl_kernel_build_id
+        == observation.runtime.sgl_kernel_build_id
+        and validation_receipt.deep_gemm_build_id
+        == observation.runtime.deep_gemm_build_id
+        and validation_receipt.kt_kernel_build_id
+        == observation.runtime.kt_kernel_build_id
+        and validation_receipt.ktransformers_method == process_spec.ktransformers_method
+        and validation_receipt.resident_gpu_experts
+        == process_spec.stage.resident_gpu_experts
+        and validation_receipt.attention_backend == process_spec.attention_backend
+        and validation_receipt.kv_cache_dtype == expected_kv_cache_dtype
         and validation_receipt.max_total_tokens == process_spec.plan.max_total_tokens
         and validation_receipt.static_memory_fraction
         == process_spec.plan.static_memory_fraction
-        and REQUIRED_RUNTIME_CAPABILITIES.issubset(validation_receipt.capabilities)
+        and required_capabilities.issubset(validation_receipt.capabilities)
     )
     if receipt_matches:
         return
@@ -541,6 +610,7 @@ def _evaluate_runtime_validation(
         ("<missing>",)
         if validation_receipt is None
         else (
+            validation_receipt.target_profile,
             validation_receipt.gpu_uuid,
             "compute_capability="
             + ".".join(
@@ -562,6 +632,10 @@ def _evaluate_runtime_validation(
             validation_receipt.cuda_version,
             validation_receipt.sgl_kernel_build_id,
             validation_receipt.deep_gemm_build_id,
+            validation_receipt.kt_kernel_build_id,
+            validation_receipt.ktransformers_method,
+            f"resident_gpu_experts={validation_receipt.resident_gpu_experts}",
+            validation_receipt.attention_backend,
             validation_receipt.kv_cache_dtype,
             f"max_total_tokens={validation_receipt.max_total_tokens}",
             "static_memory_fraction=" + str(validation_receipt.static_memory_fraction),
@@ -573,26 +647,35 @@ def _evaluate_runtime_validation(
         process_spec,
         "runtime_validation_receipt",
         expected=(
+            process_spec.target_profile,
             process_spec.gpu_uuid,
             "compute_capability=8.6",
             "cpu_cores=" + ",".join(str(core) for core in process_spec.cpu_cores),
             "memory_nodes=" + ",".join(str(node) for node in process_spec.memory_nodes),
-            "executed_cpu_backend=AMX",
+            f"executed_cpu_backend={expected_cpu_backend}",
             str(process_spec.model_id),
             process_spec.expected_model_revision,
             "model_config_sha256=<snapshot receipt>",
             process_spec.expected_sglang_revision,
             process_spec.expected_ktransformers_revision,
             process_spec.required_transformers_version,
-            GLM_5_2_KV_CACHE_DTYPE,
+            "torch_version=<current runtime>",
+            "cuda_version=<current runtime>",
+            "sgl_kernel_build_id=<current runtime>",
+            "deep_gemm_build_id=<current runtime>",
+            "kt_kernel_build_id=<current runtime>",
+            process_spec.ktransformers_method,
+            f"resident_gpu_experts={process_spec.stage.resident_gpu_experts}",
+            process_spec.attention_backend,
+            expected_kv_cache_dtype,
             f"max_total_tokens={process_spec.plan.max_total_tokens}",
             "static_memory_fraction=" + str(process_spec.plan.static_memory_fraction),
-            *tuple(sorted(REQUIRED_RUNTIME_CAPABILITIES)),
+            *tuple(sorted(required_capabilities)),
         ),
         observed=observed,
         detail=(
-            "the exact GPU/runtime stack lacks bound PP=3 broadcast, SM86 NSA, "
-            "physical-NUMA, process-affinity, and executed-AMX validation evidence"
+            "the exact target profile lacks bound GPU, model, CPU/NUMA, runtime, "
+            "and executed-backend validation evidence"
         ),
     )
 

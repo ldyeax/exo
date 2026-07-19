@@ -18,6 +18,9 @@ source of truth. Update this file in the same commit that records each new test.
 - **EXPECTED FAIL:** a fail-closed check rejected an invalid or incomplete
   contract and exposed a defect that was subsequently fixed.
 - **BLOCKED:** the requested check could not execute in the current toolchain.
+- **IMPORTED HISTORICAL:** evidence recovered from another project's runtime;
+  it was not run by Exo and does not inherit Exo's source, lifecycle, transport,
+  integrity, or cleanup guarantees.
 
 ## Current summary
 
@@ -30,8 +33,11 @@ source of truth. Update this file in the same commit that records each new test.
 - Latest result: GLM-4.7 Flash TP=2 passed exact TP1 output equality, two-rank
   NCCL initialization, payload on both QDR rails, clean HCA health counters,
   instance deletion, process cleanup, and resource release.
-- Next model: `mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit` at revision
-  `6e302ea604ad9ab206367e2c501d1571023e7b6d`.
+- Historical Ornith AMXINT8 conversion and serving receipts were recovered and
+  hashed below. They inform the GLM hybrid-runtime work but are not Exo tests.
+- Next work: fail-closed GLM-4.7 Flash BF16 KTransformers registration, then
+  CPU-only and mixed AMX-BF16/RTX-3090 PP1 correctness controls. The Qwen3-Coder
+  ladder rung is deferred until that hybrid path has trustworthy receipts.
 
 ## Automated validation
 
@@ -41,6 +47,11 @@ test total.
 | Scope | Result | Evidence |
 | --- | --- | --- |
 | Corrected SGLang launch, snapshot, and preflight slice | **PASS** | 94 passed |
+| GLM-4.7 Flash target profile, preflight, snapshot verifier, and local process supervisor | **PASS** | 148 passed on 2026-07-19, including 25 supervisor lifecycle tests; inherited NCCL/SGLang isolation and shutdown/error-race receipt regressions included |
+| Changed GLM-4.7 Flash Python files, strict targeted type checks and Ruff | **PASS** | Both Basedpyright configurations reported 0 errors/0 warnings; repository-wide `ruff check` passed; all nine changed Python files passed `ruff format --check` on 2026-07-19 |
+| Repository-wide Basedpyright in the existing `.venv` | **BLOCKED** | The environment cannot resolve installed project dependencies (including `httpx`, AnyIO, and pytest), producing dependency-driven diagnostics across the untouched tree; `uv run` could not complete the pinned MLX wheel acquisition |
+| Repository-wide pytest collection | **BLOCKED** | `tests/conftest.py` imports unavailable `exo_tools`; collection stopped before tests ran |
+| Nix formatting | **BLOCKED** | `nix` is not installed on dwagon; Ruff formatting is clean for every changed Python file |
 | Scheduler, supervisor, compute-resource lifecycle, and SGLang slice | **PASS** | 138 passed |
 | TP2 harness and reciprocal-topology readiness | **PASS** | 260 passed at `e38ba19d` |
 | Interprocess flush, channels, runner ordering, supervisor, and planner | **PASS** | 59 passed at `96230c4b` |
@@ -100,6 +111,77 @@ All strict TP runs above that are marked clean completed ownership-confirmed pro
 termination, instance deletion, lease removal, lock release, and reserved-port
 release. The four HCA-enabled TP=2 receipts also have zero selected HCA
 health/error deltas and `dual_rail_payload_verified=true`.
+
+## Imported historical Ornith receipts
+
+These artifacts came from
+`/home/kassie/projects/ornith-ktransformers-oscar-superrepo` and `/mnt/sanic`.
+They are listed for hardware/runtime transfer work and are deliberately excluded
+from the Exo live-test table above.
+
+| Imported artifact or run | Result | Exact recovered evidence |
+| --- | --- | --- |
+| Ornith 397B BF16 to AMXINT8 conversion | **IMPORTED HISTORICAL: PASS** | `/mnt/sanic/ornith-amxint8-conversion.log`; created `2026-06-29 00:06:54 -0400`, final mtime `01:29:40 -0400`; two 52-thread NUMA pools converted 60 fused-MoE layers with 512 experts/layer and wrote 369,891 tensors across 61 shards; SHA `86cb8ba6b3eb116683aa8072ad1ae5fbc011fc713444e9c97713c8934219d87a` |
+| Four-request decode, row 1 | **IMPORTED HISTORICAL: PASS** | 10,518 input/1,024 output tokens, no errors, 60.870 s, 16.823 output tok/s, 16.564 s mean TTFT, 172.837 ms mean TPOT, 28 tok/s peak |
+| Four-request decode, row 2 | **IMPORTED HISTORICAL: PASS** | 10,518 input/1,024 output tokens, no errors, 58.778 s, 17.422 output tok/s, 16.207 s mean TTFT, 166.142 ms mean TPOT, 28 tok/s peak |
+| Four-request prefill, rows 1-3 | **IMPORTED HISTORICAL: PASS** | Each row completed 79,377 input/four output tokens without request errors; 1,066.393/1,061.920/996.876 input tok/s in 74.435/74.749/79.626 s |
+| Four-request prefill, rows 4-6 | **IMPORTED HISTORICAL: DEGRADED** | Each row completed the same token counts without request errors, but only 80.551/135.626/184.006 input tok/s in 985.429/585.265/431.384 s and each recorded zero TTFT despite long end-to-end latency; not a stable baseline |
+
+Decode receipt:
+`runs/bench_internal_agent_decode_4x512_256.jsonl`, created
+`2026-06-30 12:46:41 -0400`, final mtime `13:11:35 -0400`, SHA-256
+`13ba0acb465305bbe36649e217dae0182b8d98eaf283df00e88b1fa81b78b23d`.
+Prefill receipt:
+`runs/bench_internal_agent_prefill_4x20000_1.jsonl`, created
+`2026-06-30 12:49:03 -0400`, final mtime `14:40:19 -0400`, SHA-256
+`4fd9c2edb5412628b4e69562d6a9ccbbc9121d375cbadb0a42b614b0363df857`.
+
+Every inference row reports Ornith-1.0-397B FP8 GPU weights, BF16
+activations, OSCAR INT2 KV/group 64, CUDA TP=2/PP=1, AMXINT8 CPU weights,
+100 CPUInfer threads, two NUMA pools on nodes 0 and 1, four GPU experts per
+layer, frequency placement, dynamic expert updates, CUDA graphs at batch sizes
+1/2/4, four requests, 163,840 context, and a 655,360-token pool. This is strong
+configuration and successful-serving evidence for a hybrid dual-RTX-3090 run,
+but it is not counter-verified proof that AMX tile and GPU expert kernels ran
+concurrently. No launch/server log, AMX instruction counter, backend-specific
+expert count, overlap trace, GPU identity/utilization record, model/source hash,
+deterministic output oracle, exact per-row timestamp, or cleanup receipt
+survives. The converted AMXINT8 directory is also gone and cannot be rehashed.
+
+The superrepo README's 13.47 output tok/s frequency result predates the AMX
+launcher (`99d6430` came before `b28784b`) and is not an AMX result. The actual
+surviving AMX-configured decode rows are the 16.823 and 17.422 tok/s entries
+above.
+
+### Imported source revisions and applicability
+
+- Historical heads: KTransformers `56dc52a`, embedded SGLang `f2d46685c`, and
+  orchestration superrepo `55934e6`.
+- The initial GLM-4.7 Flash BF16 smoke instead targets the smaller stable pair
+  KTransformers `8e46e5896c3d993a1285052f2618f5a9f01882d4` and embedded SGLang
+  `5d6bef9f61637aaeaf047bf8209def2af3eaa83f`. No recovered Ornith commit is
+  required before that smoke; explicit fatal KT registration and 46-layer
+  wrapper coverage are still required runtime patches.
+- Highest-value generic candidates to mine forward are KTransformers `e5f1771`
+  for fused BF16 expert conversion, SGLang `4c267d946` for per-layer frequency
+  placement with dynamic updates, `464ffce91` for AMXINT8 full-prefill fallback,
+  `af0fea990` for FP8/Marlin layerwise prefill, and `477d69557` for benchmark
+  token accounting. KTransformers `1e86695` is specific to channel-FP8 source
+  conversion; `56dc52a` and SGLang `f2d46685c` target packed MXFP4 experts.
+- SGLang `ab2d8be5f` contains the large Ornith/OSCAR INT2 port. Its generic KV
+  kernels may be research input, but Ornith uses Qwen3.5 hybrid GDN/full
+  attention while GLM-4.7 Flash uses MLA compressed cache. No recovered receipt
+  validates OSCAR on GLM, and the existing unified MHA/GQA INT2 pool is not a
+  drop-in MLA cache.
+- GLM-4.7 Flash is therefore a proxy for lifecycle, SM86 packaging, NUMA and
+  affinity, AMX conversion/execution proof, expert placement, CPU/GPU staging,
+  overlap, and telemetry. It is not a proxy for GLM-5.2 NSA/DSA, IndexShare,
+  MTP, FP8 KV/FlashMLA, PP=3 behavior, or 753B-scale memory pressure. Use a
+  runtime-supported BF16 source for AMXINT8 conversion, force 0/1/2/4 resident
+  expert sweeps because the 16.85 GB Flash checkpoint fits a 3090, and retain a
+  separate deterministic GLM-5.2 architecture fixture. The 0-expert control
+  requires its own fail-closed CPU-only target and execution receipt; the mixed
+  profile intentionally admits only 1-63 resident GPU experts.
 
 ## SmolLM2 TP=3 failure ledger
 
@@ -164,8 +246,41 @@ health/error deltas and `dual_rail_payload_verified=true`.
   `f8c3ebda6bba21fd27cd4eb10e1125916a00bd6aaaa388a6f0b8f379ff9c2232`,
   `7b3ff5a572c6319fc2f65632b1dd710f7f4e365929fee1ab6bb2710dec201a4f`.
 
+### Official BF16 hybrid source
+
+- **PASS (artifact integrity):** `zai-org/GLM-4.7-Flash` revision
+  `7dd20894a642a0aa287e9827cb1a1f7f91386b67` is verified at
+  `/mnt/sanic/exo/models/zai-org--GLM-4.7-Flash--7dd20894a642a0aa287e9827cb1a1f7f91386b67`.
+- All 58 Hugging Face local-download metadata records name that revision, no
+  `.incomplete` file remains, and a final `hf download --dry-run` reported zero
+  of 58 files and zero bytes pending.
+- The 48 Safetensors shards total 62,444,175,504 bytes. `config.json` SHA-256 is
+  `dc9b97c7c9bed726a2e6939da4234d5c43abb3edec8812068c9a1af1dbc13acb`;
+  `model.safetensors.index.json` SHA-256 is
+  `91e6e95ca21700f50904a680c8c4212f5aa16dc7c10a013f01c906957c889791`.
+  The new exact-profile verifier accepted the live snapshot as BF16 with 47
+  main layers. The index's embedded `metadata.total_size` is 31,221,488,576,
+  not the real shard byte total, so later receipts must bind the Hugging Face
+  manifest and actual shard sizes.
+- This is source-artifact verification only. No SGLang-KTransformers model load,
+  AMX execution, CPU/GPU hybrid forward, output parity, or performance result is
+  claimed yet.
+
 ## Pending tests
 
-1. Run exact staging, deterministic TP1, and strict TP=2 for Qwen3-Coder 30B
+1. Patch and test fail-closed KT registration for all 46 normal GLM-4.7 Flash
+   MoE layers, add a separate fail-closed 0-expert CPU-only profile, then run
+   that BF16 control and the mixed 1/4 resident-GPU-expert controls under
+   `/ai/coordinate.md` lease arbitration.
+2. Convert the verified BF16 source to AMXINT8 only after BF16 parity and hybrid
+   execution evidence pass; keep packed-GPU mode disabled initially.
+3. Resume exact staging, deterministic TP1, and strict TP=2 for Qwen3-Coder 30B
    A3B, followed by Qwen3.5 35B A3B.
-2. Re-run the preserved QDR receipts after the ConnectX-5 EDR hardware swap.
+4. After the first larger-model correctness proof, complete at least five
+   distinct dwagon-only optimization runs and five distinct dwagon-plus-fwuff
+   InfiniBand optimization runs. Each run needs repeated samples and a recorded
+   hypothesis/lesson. Keep a matched-artifact comparison workload; when a
+   different exact-revision HF quantization or format wins one track, add a
+   quality-gated matched-format control so topology and format effects remain
+   separable.
+5. Re-run the preserved QDR receipts after the ConnectX-5 EDR hardware swap.

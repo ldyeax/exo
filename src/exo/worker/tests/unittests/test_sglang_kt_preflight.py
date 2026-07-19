@@ -3,7 +3,10 @@ from pydantic import ValidationError
 
 from exo.shared.models.model_cards import ModelId
 from exo.worker.sglang_kt.launch_spec import (
+    GLM_4_7_FLASH_BF16_CONFIG_SHA256,
+    GLM_4_7_FLASH_TARGET_PROFILE,
     SglangKtProcessLaunchSpec,
+    build_glm_4_7_flash_bf16_process_launch_specs,
     build_glm_5_2_fp8_process_launch_specs,
 )
 from exo.worker.sglang_kt.preflight import (
@@ -18,11 +21,17 @@ from exo.worker.sglang_kt.preflight import (
 )
 from exo.worker.tests.unittests.test_sglang_kt_launch_spec import (
     PYTHON_EXECUTABLE,
+    make_glm_4_7_flash_bf16_plan,
     make_plan,
 )
 
 CONFIG_SHA256 = "a" * 64
 FULL_INDEXER_LAYER_STARTS = (0, 1, 2, *range(6, 78, 4))
+TORCH_VERSION = "2.10.0+cu130"
+CUDA_VERSION = "13.0"
+SGL_KERNEL_BUILD_ID = "sgl-kernel-test-build"
+DEEP_GEMM_BUILD_ID = "deep-gemm-test-build"
+KT_KERNEL_BUILD_ID = "kt-kernel-test-build"
 
 
 def make_specs() -> tuple[SglangKtProcessLaunchSpec, ...]:
@@ -42,38 +51,62 @@ def make_runtime(spec: SglangKtProcessLaunchSpec) -> SglangKtRuntimeObservation:
         ktransformers_revision=spec.expected_ktransformers_revision,
         transformers_distribution_version=spec.required_transformers_version,
         transformers_module_version=spec.required_transformers_version,
+        torch_version=TORCH_VERSION,
+        cuda_version=CUDA_VERSION,
+        sgl_kernel_build_id=SGL_KERNEL_BUILD_ID,
+        deep_gemm_build_id=DEEP_GEMM_BUILD_ID,
+        kt_kernel_build_id=KT_KERNEL_BUILD_ID,
     )
 
 
 def make_runtime_validation_receipt(
     spec: SglangKtProcessLaunchSpec,
 ) -> SglangKtRuntimeValidationReceiptObservation:
+    is_flash = spec.target_profile == GLM_4_7_FLASH_TARGET_PROFILE
     return SglangKtRuntimeValidationReceiptObservation(
+        target_profile=spec.target_profile,
         gpu_uuid=spec.gpu_uuid,
         gpu_compute_capability=(8, 6),
         cpu_cores=spec.cpu_cores,
         memory_nodes=spec.memory_nodes,
-        executed_cpu_backend="AMX",
+        executed_cpu_backend="AMX_BF16" if is_flash else "AMX",
         model_id=spec.model_id,
         model_revision=spec.expected_model_revision,
-        model_config_sha256=CONFIG_SHA256,
+        model_config_sha256=(
+            GLM_4_7_FLASH_BF16_CONFIG_SHA256 if is_flash else CONFIG_SHA256
+        ),
         sglang_revision=spec.expected_sglang_revision,
         ktransformers_revision=spec.expected_ktransformers_revision,
         transformers_distribution_version=spec.required_transformers_version,
         transformers_module_version=spec.required_transformers_version,
-        torch_version="2.10.0+cu130",
-        cuda_version="13.0",
-        sgl_kernel_build_id="sgl-kernel-test-build",
-        deep_gemm_build_id="deep-gemm-test-build",
-        kv_cache_dtype="fp8_e4m3",
+        torch_version=TORCH_VERSION,
+        cuda_version=CUDA_VERSION,
+        sgl_kernel_build_id=SGL_KERNEL_BUILD_ID,
+        deep_gemm_build_id=DEEP_GEMM_BUILD_ID,
+        kt_kernel_build_id=KT_KERNEL_BUILD_ID,
+        ktransformers_method=spec.ktransformers_method,
+        resident_gpu_experts=spec.stage.resident_gpu_experts,
+        attention_backend=spec.attention_backend,
+        kv_cache_dtype=spec.kv_cache_dtype,
         max_total_tokens=spec.plan.max_total_tokens,
         static_memory_fraction=spec.plan.static_memory_fraction,
         capabilities=(
-            "kt_tp_group_local_broadcast_v1",
-            "glm52_nsa_sm86_short_forward_v1",
-            "kt_physical_numa_mapping_v1",
-            "kt_process_cpu_affinity_v1",
-            "kt_fp8_amx_executed_v1",
+            (
+                "glm47_flash_kt_wrapper_active_v1",
+                "glm47_flash_bf16_sm86_short_forward_v1",
+                "kt_physical_numa_mapping_v1",
+                "kt_process_cpu_affinity_v1",
+                "kt_bf16_amx_executed_v1",
+                "kt_bf16_cpu_gpu_hybrid_executed_v1",
+            )
+            if is_flash
+            else (
+                "kt_tp_group_local_broadcast_v1",
+                "glm52_nsa_sm86_short_forward_v1",
+                "kt_physical_numa_mapping_v1",
+                "kt_process_cpu_affinity_v1",
+                "kt_fp8_amx_executed_v1",
+            )
         ),
     )
 
@@ -105,7 +138,11 @@ def make_host_observation(
                 revision=first_spec.expected_model_revision,
                 weight_format="safetensors",
                 ktransformers_method=first_spec.ktransformers_method,
-                config_sha256=CONFIG_SHA256,
+                config_sha256=(
+                    GLM_4_7_FLASH_BF16_CONFIG_SHA256
+                    if first_spec.target_profile == GLM_4_7_FLASH_TARGET_PROFILE
+                    else CONFIG_SHA256
+                ),
                 full_indexer_layer_starts=FULL_INDEXER_LAYER_STARTS,
                 receipt_verified=True,
                 snapshot_complete=True,
@@ -159,6 +196,100 @@ def test_valid_observations_release_the_complete_process_group() -> None:
     )
 
 
+def test_flash_smoke_requires_exact_executed_hybrid_runtime_receipt() -> None:
+    (spec,) = build_glm_4_7_flash_bf16_process_launch_specs(
+        make_glm_4_7_flash_bf16_plan(), PYTHON_EXECUTABLE
+    )
+    observation = make_host_observation((spec,))
+
+    passed = evaluate_sglang_kt_preflight((spec,), (observation,))
+    missing_receipt = evaluate_sglang_kt_preflight(
+        (spec,),
+        (observation.model_copy(update={"runtime_validation_receipts": ()}),),
+    )
+
+    assert isinstance(passed, SglangKtPreflightPassed)
+    assert isinstance(missing_receipt, SglangKtPreflightFailed)
+    assert checks_for_rank(missing_receipt, 0) == ("runtime_validation_receipt",)
+
+
+def test_flash_smoke_rejects_unpinned_config_even_when_receipts_agree() -> None:
+    (spec,) = build_glm_4_7_flash_bf16_process_launch_specs(
+        make_glm_4_7_flash_bf16_plan(), PYTHON_EXECUTABLE
+    )
+    observation = make_host_observation((spec,))
+    unpinned_config_sha256 = "b" * 64
+    snapshot_receipts = tuple(
+        receipt.model_copy(update={"config_sha256": unpinned_config_sha256})
+        for receipt in observation.model_snapshot_receipts
+    )
+    runtime_receipt = observation.runtime_validation_receipts[0].model_copy(
+        update={"model_config_sha256": unpinned_config_sha256}
+    )
+
+    result = evaluate_sglang_kt_preflight(
+        (spec,),
+        (
+            observation.model_copy(
+                update={
+                    "model_snapshot_receipts": snapshot_receipts,
+                    "runtime_validation_receipts": (runtime_receipt,),
+                }
+            ),
+        ),
+    )
+
+    assert isinstance(result, SglangKtPreflightFailed)
+    assert checks_for_rank(result, 0) == (
+        "model_revision_receipt",
+        "ktransformers_weight_revision_receipt",
+    )
+    assert all(
+        failure.expected[4] == GLM_4_7_FLASH_BF16_CONFIG_SHA256
+        for failure in result.failures
+    )
+
+
+@pytest.mark.parametrize(
+    "receipt_update",
+    (
+        {"target_profile": "glm52_fp8_pp3_sm86_v1"},
+        {"executed_cpu_backend": "AMX"},
+        {"ktransformers_method": "FP8"},
+        {"resident_gpu_experts": 0},
+        {"attention_backend": "nsa"},
+        {"kv_cache_dtype": "fp8_e4m3"},
+        {
+            "capabilities": (
+                "glm47_flash_kt_wrapper_active_v1",
+                "glm47_flash_bf16_sm86_short_forward_v1",
+                "kt_physical_numa_mapping_v1",
+                "kt_process_cpu_affinity_v1",
+                "kt_bf16_amx_executed_v1",
+            )
+        },
+    ),
+)
+def test_flash_smoke_rejects_stale_or_incomplete_execution_evidence(
+    receipt_update: dict[str, object],
+) -> None:
+    (spec,) = build_glm_4_7_flash_bf16_process_launch_specs(
+        make_glm_4_7_flash_bf16_plan(), PYTHON_EXECUTABLE
+    )
+    observation = make_host_observation((spec,))
+    receipt = observation.runtime_validation_receipts[0].model_copy(
+        update=receipt_update
+    )
+
+    result = evaluate_sglang_kt_preflight(
+        (spec,),
+        (observation.model_copy(update={"runtime_validation_receipts": (receipt,)}),),
+    )
+
+    assert isinstance(result, SglangKtPreflightFailed)
+    assert checks_for_rank(result, 0) == ("runtime_validation_receipt",)
+
+
 def test_version_only_runtime_facts_cannot_release_the_process_group() -> None:
     specs = make_specs()
     observations = tuple(
@@ -185,6 +316,9 @@ def test_version_only_runtime_facts_cannot_release_the_process_group() -> None:
         {"model_config_sha256": "b" * 64},
         {"sglang_revision": "c" * 40},
         {"transformers_distribution_version": "5.6.0.post2"},
+        {"ktransformers_method": "BF16"},
+        {"resident_gpu_experts": 1},
+        {"attention_backend": "flashinfer"},
         {"capabilities": ("kt_tp_group_local_broadcast_v1",)},
     ),
 )
@@ -210,6 +344,33 @@ def test_stale_or_incomplete_runtime_validation_receipt_fails_closed(
     assert isinstance(result, SglangKtPreflightFailed)
     assert checks_for_rank(result, 0) == ("runtime_validation_receipt",)
     assert checks_for_rank(result, 1) == ()
+    assert checks_for_rank(result, 2) == ()
+
+
+@pytest.mark.parametrize(
+    ("runtime_field", "stale_value"),
+    (
+        ("torch_version", "2.11.0+cu130"),
+        ("cuda_version", "13.1"),
+        ("sgl_kernel_build_id", "stale-sgl-kernel-build"),
+        ("deep_gemm_build_id", "stale-deep-gemm-build"),
+        ("kt_kernel_build_id", "stale-kt-kernel-build"),
+    ),
+)
+def test_execution_receipt_must_match_current_runtime_artifacts(
+    runtime_field: str,
+    stale_value: str,
+) -> None:
+    specs = make_specs()
+    dwagon, fwuff = make_observations(specs)
+    current_runtime = dwagon.runtime.model_copy(update={runtime_field: stale_value})
+    dwagon = dwagon.model_copy(update={"runtime": current_runtime})
+
+    result = evaluate_sglang_kt_preflight(specs, (dwagon, fwuff))
+
+    assert isinstance(result, SglangKtPreflightFailed)
+    assert checks_for_rank(result, 0) == ("runtime_validation_receipt",)
+    assert checks_for_rank(result, 1) == ("runtime_validation_receipt",)
     assert checks_for_rank(result, 2) == ()
 
 
@@ -257,6 +418,11 @@ def test_runtime_mismatches_are_aggregated_for_each_affected_stage() -> None:
         ktransformers_revision="6" * 40,
         transformers_distribution_version="5.6.0.post2",
         transformers_module_version="5.6.0.post2",
+        torch_version=TORCH_VERSION,
+        cuda_version=CUDA_VERSION,
+        sgl_kernel_build_id=SGL_KERNEL_BUILD_ID,
+        deep_gemm_build_id=DEEP_GEMM_BUILD_ID,
+        kt_kernel_build_id=KT_KERNEL_BUILD_ID,
     )
     dwagon = dwagon.model_copy(update={"runtime": bad_runtime})
 
@@ -299,12 +465,13 @@ def test_unobserved_runtime_facts_fail_closed() -> None:
         "ktransformers_revision",
         "transformers_distribution_version",
         "transformers_module_version",
+        "runtime_validation_receipt",
     )
     assert checks_for_rank(result, 0) == expected_checks
     assert all(
         failure.observed == ("<unobserved>",)
         for failure in result.failures
-        if failure.pipeline_rank == 0
+        if failure.pipeline_rank == 0 and failure.check != "runtime_validation_receipt"
     )
 
 

@@ -1,4 +1,6 @@
 import hashlib
+import importlib.machinery
+import importlib.util
 import os
 import re
 import socket
@@ -21,7 +23,13 @@ from exo.shared.types.worker.sglang_kt import (
     ResourceIndex,
 )
 from exo.utils.pydantic_ext import FrozenModel
-from exo.worker.sglang_kt.launch_spec import SglangKtProcessLaunchSpec
+from exo.worker.sglang_kt.launch_spec import (
+    GLM_4_7_FLASH_BF16_CONFIG_SHA256,
+    GLM_4_7_FLASH_BF16_MODEL_ID,
+    GLM_4_7_FLASH_BF16_MODEL_REVISION,
+    GLM_5_2_FP8_MODEL_ID,
+    SglangKtProcessLaunchSpec,
+)
 from exo.worker.sglang_kt.preflight import (
     SglangKtHostPreflightObservation,
     SglangKtModelSnapshotReceiptObservation,
@@ -33,13 +41,223 @@ from exo.worker.sglang_kt.preflight import (
 _DEFAULT_NUMA_NODES_PATH = Path("/sys/devices/system/node")
 _DEFAULT_INFINIBAND_DEVICES_PATH = Path("/sys/class/infiniband")
 _HCA_DEVICE_NAME = re.compile(r"^[A-Za-z0-9_.-]+$")
-_RUNTIME_PROBE_TIMEOUT_SECONDS = 15.0
+_RUNTIME_PROBE_TIMEOUT_SECONDS = 30.0
+
+
+def calculate_sglang_kt_artifact_build_id(
+    module_name: str,
+    required_native_fragment: str,
+    additional_native_module_names: tuple[str, ...] = (),
+) -> str | None:
+    """Hash installed kernel sources and native extensions without absolute paths."""
+
+    try:
+        module_spec = importlib.util.find_spec(module_name)
+        if module_spec is None:
+            return None
+        roots: list[Path] = []
+        if module_spec.submodule_search_locations:
+            roots.extend(
+                Path(location).resolve()
+                for location in module_spec.submodule_search_locations
+            )
+        elif module_spec.origin is not None:
+            roots.append(Path(module_spec.origin).resolve())
+        if not roots:
+            return None
+
+        native_suffixes = tuple(importlib.machinery.EXTENSION_SUFFIXES)
+        source_suffixes = (
+            ".c",
+            ".cc",
+            ".cpp",
+            ".cu",
+            ".cuh",
+            ".h",
+            ".hpp",
+            ".json",
+            ".py",
+            ".pyi",
+        )
+        artifact_files: list[tuple[str, Path]] = []
+        native_names: list[str] = []
+        for root_index, root in enumerate(sorted(roots, key=str)):
+            candidates = (root,) if root.is_file() else root.rglob("*")
+            for candidate in candidates:
+                if not candidate.is_file() or "__pycache__" in candidate.parts:
+                    continue
+                candidate_name = candidate.name
+                is_native = candidate_name.endswith(native_suffixes)
+                if not is_native and not candidate_name.endswith(source_suffixes):
+                    continue
+                relative_name = (
+                    candidate.name
+                    if root.is_file()
+                    else candidate.relative_to(root).as_posix()
+                )
+                artifact_files.append(
+                    (f"package:{root_index}:{relative_name}", candidate.resolve())
+                )
+                if is_native:
+                    native_names.append(relative_name)
+
+        for additional_module_name in additional_native_module_names:
+            try:
+                additional_spec = importlib.util.find_spec(additional_module_name)
+            except ModuleNotFoundError:
+                additional_spec = None
+            if additional_spec is None or additional_spec.origin is None:
+                continue
+            additional_path = Path(additional_spec.origin).resolve()
+            if not additional_path.is_file() or not additional_path.name.endswith(
+                native_suffixes
+            ):
+                continue
+            if any(
+                artifact_path == additional_path
+                for _relative_name, artifact_path in artifact_files
+            ):
+                native_names.append(f"{additional_module_name}:{additional_path.name}")
+                continue
+            artifact_files.append(
+                (
+                    f"module:{additional_module_name}:{additional_path.name}",
+                    additional_path,
+                )
+            )
+            native_names.append(f"{additional_module_name}:{additional_path.name}")
+
+        if not artifact_files or not any(
+            required_native_fragment in name for name in native_names
+        ):
+            return None
+
+        digest = hashlib.sha256()
+        digest.update(b"exo-sglang-kt-artifact-v1\0")
+        for relative_name, artifact_path in sorted(artifact_files):
+            encoded_name = relative_name.encode("utf-8")
+            digest.update(len(encoded_name).to_bytes(8, "big"))
+            digest.update(encoded_name)
+            with artifact_path.open("rb") as artifact_file:
+                while chunk := artifact_file.read(1024 * 1024):
+                    digest.update(chunk)
+        return digest.hexdigest()
+    except Exception:
+        return None
+
+
+SGLANG_KT_ARTIFACT_BUILD_ID_FUNCTION_SOURCE = r"""
+def calculate_sglang_kt_artifact_build_id(
+    module_name,
+    required_native_fragment,
+    additional_native_module_names=(),
+):
+    try:
+        module_spec = importlib.util.find_spec(module_name)
+        if module_spec is None:
+            return None
+        roots = []
+        if module_spec.submodule_search_locations:
+            roots.extend(
+                pathlib.Path(location).resolve()
+                for location in module_spec.submodule_search_locations
+            )
+        elif module_spec.origin is not None:
+            roots.append(pathlib.Path(module_spec.origin).resolve())
+        if not roots:
+            return None
+
+        native_suffixes = tuple(importlib.machinery.EXTENSION_SUFFIXES)
+        source_suffixes = (
+            ".c",
+            ".cc",
+            ".cpp",
+            ".cu",
+            ".cuh",
+            ".h",
+            ".hpp",
+            ".json",
+            ".py",
+            ".pyi",
+        )
+        artifact_files = []
+        native_names = []
+        for root_index, root in enumerate(sorted(roots, key=str)):
+            candidates = (root,) if root.is_file() else root.rglob("*")
+            for candidate in candidates:
+                if not candidate.is_file() or "__pycache__" in candidate.parts:
+                    continue
+                candidate_name = candidate.name
+                is_native = candidate_name.endswith(native_suffixes)
+                if not is_native and not candidate_name.endswith(source_suffixes):
+                    continue
+                relative_name = (
+                    candidate.name
+                    if root.is_file()
+                    else candidate.relative_to(root).as_posix()
+                )
+                artifact_files.append(
+                    (f"package:{root_index}:{relative_name}", candidate.resolve())
+                )
+                if is_native:
+                    native_names.append(relative_name)
+
+        for additional_module_name in additional_native_module_names:
+            try:
+                additional_spec = importlib.util.find_spec(additional_module_name)
+            except ModuleNotFoundError:
+                additional_spec = None
+            if additional_spec is None or additional_spec.origin is None:
+                continue
+            additional_path = pathlib.Path(additional_spec.origin).resolve()
+            if not additional_path.is_file() or not additional_path.name.endswith(
+                native_suffixes
+            ):
+                continue
+            if any(
+                artifact_path == additional_path
+                for _relative_name, artifact_path in artifact_files
+            ):
+                native_names.append(
+                    f"{additional_module_name}:{additional_path.name}"
+                )
+                continue
+            artifact_files.append(
+                (
+                    f"module:{additional_module_name}:{additional_path.name}",
+                    additional_path,
+                )
+            )
+            native_names.append(f"{additional_module_name}:{additional_path.name}")
+
+        if not artifact_files or not any(
+            required_native_fragment in name for name in native_names
+        ):
+            return None
+
+        digest = hashlib.sha256()
+        digest.update(b"exo-sglang-kt-artifact-v1\0")
+        for relative_name, artifact_path in sorted(artifact_files):
+            encoded_name = relative_name.encode("utf-8")
+            digest.update(len(encoded_name).to_bytes(8, "big"))
+            digest.update(encoded_name)
+            with artifact_path.open("rb") as artifact_file:
+                while chunk := artifact_file.read(1024 * 1024):
+                    digest.update(chunk)
+        return digest.hexdigest()
+    except Exception:
+        return None
+""".strip()
+
 
 # This script runs only under the exact external Python named by the launch spec.
 # It deliberately uses only the standard library and reports partial facts when a
 # package is absent. The evaluator turns every absent fact into a failed check.
-_RUNTIME_PROBE_SCRIPT = r"""
+_RUNTIME_PROBE_SCRIPT = (
+    r"""
+import hashlib
 import importlib
+import importlib.machinery
 import importlib.metadata
 import importlib.util
 import json
@@ -50,6 +268,9 @@ import subprocess
 import sys
 
 
+"""
+    + SGLANG_KT_ARTIFACT_BUILD_ID_FUNCTION_SOURCE
+    + r"""
 def source_revision(module_name):
     try:
         module_spec = importlib.util.find_spec(module_name)
@@ -106,6 +327,21 @@ def module_version(module_name):
         return None
 
 
+def torch_runtime_versions():
+    try:
+        torch = importlib.import_module("torch")
+        torch_version = getattr(torch, "__version__", None)
+        cuda_version = getattr(getattr(torch, "version", None), "cuda", None)
+        if not isinstance(torch_version, str) or not torch_version:
+            torch_version = None
+        if not isinstance(cuda_version, str) or not cuda_version:
+            cuda_version = None
+        return torch_version, cuda_version
+    except Exception:
+        return None, None
+
+
+torch_version, cuda_version = torch_runtime_versions()
 print(json.dumps({
     "executable": sys.executable,
     "python_implementation": platform.python_implementation(),
@@ -118,8 +354,20 @@ print(json.dumps({
     "ktransformers_revision": source_revision("ktransformers"),
     "transformers_distribution_version": distribution_version("transformers-kt"),
     "transformers_module_version": module_version("transformers"),
+    "torch_version": torch_version,
+    "cuda_version": cuda_version,
+    "sgl_kernel_build_id": calculate_sglang_kt_artifact_build_id(
+        "sgl_kernel", "common_ops"
+    ),
+    "deep_gemm_build_id": calculate_sglang_kt_artifact_build_id(
+        "deep_gemm", "deep_gemm"
+    ),
+    "kt_kernel_build_id": calculate_sglang_kt_artifact_build_id(
+        "kt_kernel", "kt_kernel_ext", ("kt_kernel_ext",)
+    ),
 }))
-""".strip()
+"""
+).strip()
 
 
 @final
@@ -295,6 +543,61 @@ class _Glm52Fp8ModelConfig(BaseModel):
         return self
 
 
+@final
+class _Glm47FlashBf16ModelConfig(BaseModel):
+    """Exact architecture fields for the pinned official Flash BF16 snapshot."""
+
+    model_config = ConfigDict(extra="ignore", frozen=True, strict=True)
+
+    architectures: tuple[Literal["Glm4MoeLiteForCausalLM"]]
+    attention_bias: Literal[False]
+    attention_dropout: float
+    hidden_act: Literal["silu"]
+    hidden_size: Literal[2048]
+    intermediate_size: Literal[10240]
+    max_position_embeddings: Literal[202752]
+    model_type: Literal["glm4_moe_lite"]
+    moe_intermediate_size: Literal[1536]
+    topk_method: Literal["noaux_tc"]
+    norm_topk_prob: Literal[True]
+    num_attention_heads: Literal[20]
+    n_group: Literal[1]
+    topk_group: Literal[1]
+    n_routed_experts: Literal[64]
+    n_shared_experts: Literal[1]
+    routed_scaling_factor: float
+    num_experts_per_tok: Literal[4]
+    first_k_dense_replace: Literal[1]
+    num_hidden_layers: Literal[47]
+    num_key_value_heads: Literal[20]
+    num_nextn_predict_layers: Literal[1]
+    partial_rotary_factor: float
+    rms_norm_eps: float
+    rope_scaling: None
+    rope_theta: Literal[1000000]
+    tie_word_embeddings: Literal[False]
+    dtype: Literal["bfloat16"]
+    q_lora_rank: Literal[768]
+    kv_lora_rank: Literal[512]
+    qk_nope_head_dim: Literal[192]
+    qk_rope_head_dim: Literal[64]
+    v_head_dim: Literal[256]
+    vocab_size: Literal[154880]
+
+    @model_validator(mode="after")
+    def validate_float_constants(self) -> "_Glm47FlashBf16ModelConfig":
+        expected_values = (
+            ("attention_dropout", self.attention_dropout, 0.0),
+            ("routed_scaling_factor", self.routed_scaling_factor, 1.8),
+            ("partial_rotary_factor", self.partial_rotary_factor, 1.0),
+            ("rms_norm_eps", self.rms_norm_eps, 0.00001),
+        )
+        for field_name, actual, expected in expected_values:
+            if actual != expected:
+                raise ValueError(f"{field_name} must equal {expected}")
+        return self
+
+
 def verify_glm_5_2_fp8_model_snapshot_compatibility(
     path: Path,
     model_id: ModelId,
@@ -302,7 +605,9 @@ def verify_glm_5_2_fp8_model_snapshot_compatibility(
 ) -> SglangKtModelSnapshotCompatibility | None:
     """Verify the GLM-5.2-FP8 artifact contract from raw ``config.json``."""
 
-    del model_id, revision
+    del revision
+    if model_id != GLM_5_2_FP8_MODEL_ID:
+        return None
     try:
         config_bytes = (path / "config.json").read_bytes()
         config = _Glm52Fp8ModelConfig.model_validate_json(config_bytes)
@@ -318,6 +623,51 @@ def verify_glm_5_2_fp8_model_snapshot_compatibility(
             if indexer_type == "full"
         ),
     )
+
+
+def verify_glm_4_7_flash_bf16_model_snapshot_compatibility(
+    path: Path,
+    model_id: ModelId,
+    revision: GitRevision,
+) -> SglangKtModelSnapshotCompatibility | None:
+    """Verify the exact official GLM-4.7-Flash BF16 smoke artifact."""
+
+    if (
+        model_id != GLM_4_7_FLASH_BF16_MODEL_ID
+        or revision != GLM_4_7_FLASH_BF16_MODEL_REVISION
+    ):
+        return None
+    try:
+        config_bytes = (path / "config.json").read_bytes()
+        if hashlib.sha256(config_bytes).hexdigest() != GLM_4_7_FLASH_BF16_CONFIG_SHA256:
+            return None
+        _Glm47FlashBf16ModelConfig.model_validate_json(config_bytes)
+    except (OSError, UnicodeError, ValidationError):
+        return None
+    return SglangKtModelSnapshotCompatibility(
+        weight_format="safetensors",
+        ktransformers_method="BF16",
+        config_sha256=GLM_4_7_FLASH_BF16_CONFIG_SHA256,
+        # The first profile is deliberately PP=1. Multi-stage Flash requires a
+        # separate runtime validation contract.
+        full_indexer_layer_starts=(0,),
+    )
+
+
+def verify_sglang_kt_model_snapshot_compatibility(
+    path: Path,
+    model_id: ModelId,
+    revision: GitRevision,
+) -> SglangKtModelSnapshotCompatibility | None:
+    """Dispatch only exact model families admitted by the launch profiles."""
+
+    if model_id == GLM_5_2_FP8_MODEL_ID:
+        return verify_glm_5_2_fp8_model_snapshot_compatibility(path, model_id, revision)
+    if model_id == GLM_4_7_FLASH_BF16_MODEL_ID:
+        return verify_glm_4_7_flash_bf16_model_snapshot_compatibility(
+            path, model_id, revision
+        )
+    return None
 
 
 def _is_readable_directory(path: Path) -> bool:
@@ -347,7 +697,7 @@ class LocalSglangKtFilesystemProbe:
         self,
         *,
         model_snapshot_compatibility_verifier: ModelSnapshotCompatibilityVerifier = (
-            verify_glm_5_2_fp8_model_snapshot_compatibility
+            verify_sglang_kt_model_snapshot_compatibility
         ),
         readable_directory_checker: ReadableDirectoryChecker = _is_readable_directory,
         model_snapshot_completeness_checker: ModelSnapshotCompletenessChecker = (
