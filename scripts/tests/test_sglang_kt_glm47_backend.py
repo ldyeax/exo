@@ -349,17 +349,16 @@ class FakeGpuMethod:
     def __init__(self, gpu_value: float, torch: FakeTorch) -> None:
         self.gpu_value = gpu_value
         self.torch = torch
+        self.input_values: list[float] = []
 
-    def apply(self, *_args: object, **_kwargs: object) -> FakeHiddenStates:
+    def apply(self, *args: object, **_kwargs: object) -> FakeHiddenStates:
         self.torch.require_grad_disabled("gpu_apply")
-        return FakeHiddenStates(
-            FakeTensor(
-                self.gpu_value,
-                (1, 2_048),
-                GLM47_BF16_DTYPE,
-                device="cuda:0",
-            )
-        )
+        dispatch_output = args[-1]
+        assert isinstance(dispatch_output, FakeDispatchOutput)
+        hidden_states = dispatch_output.hidden_states
+        self.input_values.append(hidden_states.value)
+        hidden_states.value += self.gpu_value - 0.5
+        return FakeHiddenStates(hidden_states)
 
 
 class KTEPWrapperMethod:
@@ -1113,6 +1112,8 @@ def test_backend_runs_exact_probe_and_cleans_up(resident_count: int) -> None:
         quant_method = layer.mlp.experts.quant_method
         assert "apply" not in vars(quant_method)
     layer_one = runner.model.model.layers[1].mlp.experts.quant_method
+    if resident_count:
+        assert layer_one.gpu_method.input_values[:2] == [0.5, 0.5]
     assert "_submit_cpu_forward" not in vars(layer_one)
     assert "_sync_cpu_forward" not in vars(layer_one)
     assert "submit_forward" not in vars(layer_one.wrapper)

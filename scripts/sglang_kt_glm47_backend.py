@@ -1066,6 +1066,24 @@ def _synchronize(runtime: Glm47RuntimeBindings) -> None:
     _call(_attribute(cuda, "synchronize"))
 
 
+def _detached_clone(tensor: object) -> object:
+    detached = _call(_attribute(tensor, "detach"))
+    return _call(_attribute(detached, "clone"))
+
+
+def _fresh_layer_probe_dispatch(
+    runtime: Glm47RuntimeBindings,
+    pristine_hidden_states: object,
+    dispatch_template: object,
+) -> object:
+    return _call(
+        runtime.standard_dispatch_output_type,
+        hidden_states=_detached_clone(pristine_hidden_states),
+        hidden_states_scale=_attribute(dispatch_template, "hidden_states_scale"),
+        topk_output=_attribute(dispatch_template, "topk_output"),
+    )
+
+
 def _require_trace_count(
     trace: Glm47TraceSession,
     operation: str,
@@ -1466,8 +1484,8 @@ def _execute_glm47_backend(
     trace_events: tuple[Glm47TraceEventEvidence, ...] | None = None
     trace_counters: tuple[Glm47TraceCounterEvidence, ...] | None = None
     with runtime.inference_mode(), trace:
-        hidden_cpu, _hidden_device, dispatch_output = _create_layer_probe_inputs(
-            runtime, model_runner, route
+        hidden_cpu, pristine_hidden_device, dispatch_template = (
+            _create_layer_probe_inputs(runtime, model_runner, route)
         )
         decoder = _attribute(_attribute(model_runner, "model"), "model")
         layers = cast(Sequence[object], _attribute(decoder, "layers"))
@@ -1476,13 +1494,19 @@ def _execute_glm47_backend(
         combined_outputs: list[object] = []
         with trace.phase("layer_probe"):
             for _ in range(2):
+                # The pinned fused MoE runner may overwrite its dispatch input.
+                dispatch_output = _fresh_layer_probe_dispatch(
+                    runtime,
+                    pristine_hidden_device,
+                    dispatch_template,
+                )
                 result = _call(
                     _attribute(layer_one_quant_method, "apply"),
                     layer_one_expert_module,
                     dispatch_output,
                 )
-                combined_outputs.append(_hidden_states(result))
-        _synchronize(runtime)
+                _synchronize(runtime)
+                combined_outputs.append(_detached_clone(_hidden_states(result)))
         if len(combined_outputs) != 2:
             raise AssertionError("layer-one probe did not return twice")
         if _global_mask_sha256(runtime) != initial_mask_sha256:
