@@ -1,0 +1,19 @@
+From a4b0c45aa6f5f8d48f28b4f07d7591f0fb8960a8 Mon Sep 17 00:00:00 2001
+From: jimm <jimm@jimm.horse>
+Date: Sun, 19 Jul 2026 02:19:03 -0400
+Subject: [PATCH] build: pin GLM Flash KT registration
+
+---
+ third_party/sglang | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/third_party/sglang b/third_party/sglang
+index 5d6bef9..449c59f 160000
+--- a/third_party/sglang
++++ b/third_party/sglang
+@@ -1 +1 @@
+-Subproject commit 5d6bef9f61637aaeaf047bf8209def2af3eaa83f
++Subproject commit 449c59f07752189baf724630c6799c28736cee87
+-- 
+2.54.0
+

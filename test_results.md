@@ -35,9 +35,10 @@ source of truth. Update this file in the same commit that records each new test.
   instance deletion, process cleanup, and resource release.
 - Historical Ornith AMXINT8 conversion and serving receipts were recovered and
   hashed below. They inform the GLM hybrid-runtime work but are not Exo tests.
-- Next work: fail-closed GLM-4.7 Flash BF16 KTransformers registration, then
-  CPU-only and mixed AMX-BF16/RTX-3090 PP1 correctness controls. The Qwen3-Coder
-  ladder rung is deferred until that hybrid path has trustworthy receipts.
+- Next work: build and validate the clean pinned GLM-4.7 Flash BF16 runtime,
+  then run CPU-only and mixed AMX-BF16/RTX-3090 PP1 correctness controls. The
+  Qwen3-Coder ladder rung is deferred until that hybrid path has trustworthy
+  execution receipts.
 
 ## Automated validation
 
@@ -48,6 +49,7 @@ test total.
 | --- | --- | --- |
 | Corrected SGLang launch, snapshot, and preflight slice | **PASS** | 94 passed |
 | GLM-4.7 Flash target profile, preflight, snapshot verifier, and local process supervisor | **PASS** | 148 passed on 2026-07-19, including 25 supervisor lifecycle tests; inherited NCCL/SGLang isolation and shutdown/error-race receipt regressions included |
+| Reproducible GLM-4.7 SGLang-KTransformers source integration | **PASS** | 9 Exo bootstrap tests plus 12 SGLang registration/coverage tests; exact clean-base and partially initialized result-state replays produced SGLang `449c59f07752189baf724630c6799c28736cee87` and KTransformers `a4b0c45aa6f5f8d48f28b4f07d7591f0fb8960a8` without mutating rejected dirty parent or dependency sources |
 | Changed GLM-4.7 Flash Python files, strict targeted type checks and Ruff | **PASS** | Both Basedpyright configurations reported 0 errors/0 warnings; repository-wide `ruff check` passed; all nine changed Python files passed `ruff format --check` on 2026-07-19 |
 | Repository-wide Basedpyright in the existing `.venv` | **BLOCKED** | The environment cannot resolve installed project dependencies (including `httpx`, AnyIO, and pytest), producing dependency-driven diagnostics across the untouched tree; `uv run` could not complete the pinned MLX wheel acquisition |
 | Repository-wide pytest collection | **BLOCKED** | `tests/conftest.py` imports unavailable `exo_tools`; collection stopped before tests ran |
@@ -157,11 +159,13 @@ above.
 
 - Historical heads: KTransformers `56dc52a`, embedded SGLang `f2d46685c`, and
   orchestration superrepo `55934e6`.
-- The initial GLM-4.7 Flash BF16 smoke instead targets the smaller stable pair
+- The initial GLM-4.7 Flash BF16 smoke starts from the smaller stable pair
   KTransformers `8e46e5896c3d993a1285052f2618f5a9f01882d4` and embedded SGLang
   `5d6bef9f61637aaeaf047bf8209def2af3eaa83f`. No recovered Ornith commit is
-  required before that smoke; explicit fatal KT registration and 46-layer
-  wrapper coverage are still required runtime patches.
+  required. Exo's reproducible mail patches produce admitted revisions
+  KTransformers `a4b0c45aa6f5f8d48f28b4f07d7591f0fb8960a8` and SGLang
+  `449c59f07752189baf724630c6799c28736cee87`, with fatal registration and
+  structured 46-layer wrapper/mask coverage.
 - Highest-value generic candidates to mine forward are KTransformers `e5f1771`
   for fused BF16 expert conversion, SGLang `4c267d946` for per-layer frequency
   placement with dynamic updates, `464ffce91` for AMXINT8 full-prefill fallback,
@@ -268,10 +272,10 @@ above.
 
 ## Pending tests
 
-1. Patch and test fail-closed KT registration for all 46 normal GLM-4.7 Flash
-   MoE layers, add a separate fail-closed 0-expert CPU-only profile, then run
-   that BF16 control and the mixed 1/4 resident-GPU-expert controls under
-   `/ai/coordinate.md` lease arbitration.
+1. Build and validate the clean pinned SGLang-KTransformers runtime, add a
+   separate fail-closed 0-expert CPU-only profile, then run that BF16 control
+   and the mixed 1/4 resident-GPU-expert controls under `/ai/coordinate.md`
+   lease arbitration.
 2. Convert the verified BF16 source to AMXINT8 only after BF16 parity and hybrid
    execution evidence pass; keep packed-GPU mode disabled initially.
 3. Resume exact staging, deterministic TP1, and strict TP=2 for Qwen3-Coder 30B
