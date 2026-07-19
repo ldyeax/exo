@@ -270,6 +270,7 @@ class CudaExecutionEvidence:
     total_memory_bytes: int
     driver_version: str
     torch_cuda_version: str | None
+    torch_device_uuid_raw: str | None
     torch_device_uuid: str | None
     numerical: NumericalEvidence
 
@@ -1329,6 +1330,17 @@ def _nvidia_gpu_row(gpu_uuid: str) -> tuple[str, str, str, int, str]:
     return row[0], row[1], row[2], memory_bytes, row[4]
 
 
+def _canonical_torch_device_uuid(value: object) -> tuple[str | None, str | None]:
+    if value is None:
+        return None, None
+    raw_value = str(value)
+    candidate = raw_value if raw_value.startswith("GPU-") else f"GPU-{raw_value}"
+    canonical_value = (
+        candidate if GPU_UUID_PATTERN.fullmatch(candidate) is not None else None
+    )
+    return raw_value, canonical_value
+
+
 def _module_file_sha256(module: Any) -> tuple[str, str]:
     module_file = getattr(module, "__file__", None)
     if not isinstance(module_file, str) or not module_file:
@@ -1390,7 +1402,9 @@ class DirectRuntimeBackend:
         properties = torch.cuda.get_device_properties(0)
         capability = tuple(int(value) for value in torch.cuda.get_device_capability(0))
         property_uuid = getattr(properties, "uuid", None)
-        torch_device_uuid = str(property_uuid) if property_uuid is not None else None
+        torch_device_uuid_raw, torch_device_uuid = _canonical_torch_device_uuid(
+            property_uuid
+        )
 
         generator = torch.Generator(device="cpu")
         generator.manual_seed(RANDOM_SEED)
@@ -1421,6 +1435,7 @@ class DirectRuntimeBackend:
             total_memory_bytes=total_memory,
             driver_version=driver,
             torch_cuda_version=getattr(torch.version, "cuda", None),
+            torch_device_uuid_raw=torch_device_uuid_raw,
             torch_device_uuid=torch_device_uuid,
             numerical=numerical,
         )

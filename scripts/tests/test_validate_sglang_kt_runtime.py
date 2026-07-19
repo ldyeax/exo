@@ -218,9 +218,26 @@ def make_cuda() -> validator.CudaExecutionEvidence:
         total_memory_bytes=24 * 1024**3,
         driver_version="590.48.01",
         torch_cuda_version=validator.EXPECTED_TORCH_CUDA_VERSION,
+        torch_device_uuid_raw=GPU_UUID,
         torch_device_uuid=GPU_UUID,
         numerical=make_numerical((128, 96), validator.RANDOM_SEED),
     )
+
+
+def test_torch_device_uuid_is_canonicalized_without_losing_raw_evidence() -> None:
+    raw_uuid = GPU_UUID.removeprefix("GPU-")
+
+    raw_evidence, canonical_uuid = validator._canonical_torch_device_uuid(raw_uuid)
+
+    assert raw_evidence == raw_uuid
+    assert canonical_uuid == GPU_UUID
+
+
+def test_malformed_torch_device_uuid_has_no_canonical_identity() -> None:
+    raw_evidence, canonical_uuid = validator._canonical_torch_device_uuid("not-a-uuid")
+
+    assert raw_evidence == "not-a-uuid"
+    assert canonical_uuid is None
 
 
 def make_amx(
