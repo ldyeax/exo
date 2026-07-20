@@ -59,6 +59,9 @@ from exo.worker.sglang_kt.serving_benchmark_receipt import (
 type JsonScalar = str | int | float | bool | None
 type JsonValue = JsonScalar | list[JsonValue] | dict[str, JsonValue]
 type JsonObject = dict[str, JsonValue]
+type WorkloadPhaseObserver = Callable[
+    [Literal["warmups_complete", "samples_complete"]], None
+]
 
 GLM_4_7_FLASH_VOCABULARY_SIZE = 154_880
 DETERMINISTIC_INPUT_ID_FLOOR = 100
@@ -1019,12 +1022,15 @@ def run_glm47_serving_workload(
     *,
     warmup_count: int = WARM_SERVING_MINIMUM_WARMUPS,
     sample_count: int = WARM_SERVING_MINIMUM_SAMPLES,
+    phase_observer: WorkloadPhaseObserver | None = None,
 ) -> SglangKtServingWorkloadEvidence:
     """Collect one workload without collecting external JIT cache manifests.
 
     A performance receipt harness can interleave calls to
     ``run_glm47_serving_invocation`` so it can hash owned JIT cache directories
     after the penultimate warmup, final warmup, and measurement phases.
+    When supplied, ``phase_observer`` runs after all warmups and after all samples;
+    its work is outside every invocation's client timing window.
     """
 
     if warmup_count < WARM_SERVING_MINIMUM_WARMUPS:
@@ -1036,10 +1042,14 @@ def run_glm47_serving_workload(
         run_glm47_serving_invocation(client, workload, ordinal)
         for ordinal in range(1, warmup_count + 1)
     )
+    if phase_observer is not None:
+        phase_observer("warmups_complete")
     samples = tuple(
         run_glm47_serving_invocation(client, workload, ordinal)
         for ordinal in range(1, sample_count + 1)
     )
+    if phase_observer is not None:
+        phase_observer("samples_complete")
     return SglangKtServingWorkloadEvidence(
         request=workload.receipt_request,
         warmups=warmups,

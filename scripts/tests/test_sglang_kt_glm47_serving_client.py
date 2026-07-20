@@ -324,6 +324,7 @@ def test_health_flush_server_info_and_stream_generate() -> None:
 
 def test_workload_runner_flushes_every_warmup_and_sample() -> None:
     methods_and_paths: list[tuple[str, str]] = []
+    phase_boundaries: list[tuple[str, int]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         methods_and_paths.append((request.method, request.url.path))
@@ -343,6 +344,9 @@ def test_workload_runner_flushes_every_warmup_and_sample() -> None:
         evidence = run_glm47_serving_workload(
             client,
             prepare_glm47_serving_workload("prefill"),
+            phase_observer=lambda boundary: phase_boundaries.append(
+                (boundary, len(methods_and_paths))
+            ),
         )
 
     assert len(evidence.warmups) == 2
@@ -350,6 +354,10 @@ def test_workload_runner_flushes_every_warmup_and_sample() -> None:
     assert all(item.cached_tokens == 0 for item in evidence.samples)
     assert methods_and_paths.count(("POST", "/flush_cache")) == 5
     assert methods_and_paths.count(("POST", "/generate")) == 5
+    assert phase_boundaries == [
+        ("warmups_complete", 4),
+        ("samples_complete", 10),
+    ]
 
 
 def test_public_invocation_helper_flushes_then_generates() -> None:

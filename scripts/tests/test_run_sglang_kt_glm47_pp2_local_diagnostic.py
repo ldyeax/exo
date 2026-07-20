@@ -6,7 +6,9 @@ import json
 import os
 import signal
 import stat
+import subprocess
 import sys
+from collections.abc import Callable
 from dataclasses import asdict, replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,6 +19,39 @@ import pytest
 import scripts.run_sglang_kt_glm47_pp2_local_diagnostic as pp2
 from scripts import run_sglang_kt_glm47_pp3_diagnostic as pipeline
 from scripts.two_host_mlx_nccl_poc import ProcessCleanupReceipt
+
+
+@pytest.fixture(autouse=True)
+def deterministic_host_telemetry(monkeypatch: pytest.MonkeyPatch) -> None:
+    ordinal = 0
+
+    def collect(
+        phase: str,
+        _stage_cpu_bindings: tuple[pp2.StageCpuCoreBinding, ...],
+        _expected_gpu_uuids: tuple[str, ...],
+    ) -> pp2._HostTelemetrySnapshot:
+        nonlocal ordinal
+        ordinal += 1
+        monotonic_nanoseconds = ordinal * 1_000_000_000
+        return pp2._HostTelemetrySnapshot(
+            phase=phase,
+            monotonic_nanoseconds=monotonic_nanoseconds,
+            cpu_package_energy=(),
+            evidence={
+                "phase": phase,
+                "observed_at_utc": "2026-07-20T12:00:00+00:00",
+                "monotonic_nanoseconds": monotonic_nanoseconds,
+                "collection_elapsed_seconds": 0.001,
+                "status": "complete",
+                "cpu_stage_frequency": [],
+                "cpu_package_temperature": [],
+                "cpu_package_energy": [],
+                "gpu": {"devices": []},
+                "failures": [],
+            },
+        )
+
+    monkeypatch.setattr(pp2, "_safe_collect_host_telemetry_snapshot", collect)
 
 
 def make_config(tmp_path: Path) -> pp2.Pp2LocalDiagnosticConfig:
@@ -255,6 +290,161 @@ def fake_running_stage(
             log_path=str(log_path),
         )
     )
+
+
+def test_phase_telemetry_collects_two_cpu_packages_and_two_gpus(
+    tmp_path: Path,
+) -> None:
+    cpu_root = tmp_path / "sys/devices/system/cpu"
+    stage_frequencies = {
+        0: (0, 2_100_000),
+        1: (0, 2_300_000),
+        2: (1, 1_900_000),
+        3: (1, 2_500_000),
+    }
+    for cpu_id, (package_id, frequency) in stage_frequencies.items():
+        cpufreq = cpu_root / f"cpu{cpu_id}/cpufreq"
+        topology = cpu_root / f"cpu{cpu_id}/topology"
+        cpufreq.mkdir(parents=True)
+        topology.mkdir(parents=True)
+        (cpufreq / "scaling_cur_freq").write_text(f"{frequency}\n")
+        (topology / "physical_package_id").write_text(f"{package_id}\n")
+    for representative_cpu in (0, 2):
+        cpufreq = cpu_root / f"cpu{representative_cpu}/cpufreq"
+        (cpufreq / "scaling_driver").write_text("intel_pstate\n")
+        (cpufreq / "scaling_governor").write_text("performance\n")
+        (cpufreq / "scaling_min_freq").write_text("800000\n")
+        (cpufreq / "scaling_max_freq").write_text("3900000\n")
+
+    hwmon_root = tmp_path / "sys/class/hwmon"
+    for package_id, temperature in ((0, 61_000), (1, 67_000)):
+        hwmon = hwmon_root / f"hwmon{package_id}"
+        hwmon.mkdir(parents=True)
+        (hwmon / "name").write_text("coretemp\n")
+        (hwmon / "temp1_label").write_text(f"Package id {package_id}\n")
+        (hwmon / "temp1_input").write_text(f"{temperature}\n")
+
+    powercap_root = tmp_path / "sys/class/powercap"
+    for package_id, energy in ((0, 100_000_000), (1, 200_000_000)):
+        package = powercap_root / f"intel-rapl:{package_id}"
+        package.mkdir(parents=True)
+        (package / "name").write_text(f"package-{package_id}\n")
+        (package / "energy_uj").write_text(f"{energy}\n")
+        (package / "max_energy_range_uj").write_text("262143328850\n")
+
+    expected_gpu_uuids = ("GPU-stage-zero", "GPU-stage-one")
+
+    def run_command(
+        command: tuple[str, ...], timeout_seconds: float
+    ) -> subprocess.CompletedProcess[str]:
+        assert command == pp2._NVIDIA_SMI_COMMAND
+        assert timeout_seconds == 5.0
+        stdout = "\n".join(
+            (
+                "GPU-stage-zero, 0, 00000000:17:00.0, P2, 1710, 9751, "
+                "70, 250.5, 350.0, 98, 20000",
+                "GPU-stage-one, 1, 00000000:65:00.0, P0, 1695, 9751, "
+                "73, 275.0, 350.0, 99, 21000",
+            )
+        )
+        return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
+
+    snapshot = pp2._collect_host_telemetry_snapshot(
+        "after_decode_samples",
+        ((0, (0, 1)), (1, (2, 3))),
+        expected_gpu_uuids,
+        cpu_sysfs_root=cpu_root,
+        hwmon_sysfs_root=hwmon_root,
+        powercap_sysfs_root=powercap_root,
+        command_runner=run_command,
+    )
+
+    evidence = snapshot.evidence
+    assert evidence["status"] == "complete"
+    assert evidence["failures"] == []
+    cpu_stages = cast(list[dict[str, object]], evidence["cpu_stage_frequency"])
+    assert cast(dict[str, object], cpu_stages[0]["frequency"]) == {
+        "minimum_kilohertz": 2_100_000,
+        "median_kilohertz": 2_200_000.0,
+        "maximum_kilohertz": 2_300_000,
+        "mean_kilohertz": 2_200_000.0,
+    }
+    assert (
+        cast(dict[str, object], cpu_stages[1]["frequency"])["median_kilohertz"]
+        == 2_200_000.0
+    )
+    temperatures = cast(list[dict[str, object]], evidence["cpu_package_temperature"])
+    assert [item["temperature_celsius"] for item in temperatures] == [61.0, 67.0]
+    assert tuple(item.package_id for item in snapshot.cpu_package_energy) == (0, 1)
+    gpu = cast(dict[str, object], evidence["gpu"])
+    devices = cast(list[dict[str, object]], gpu["devices"])
+    assert [device["performance_state"] for device in devices] == ["P2", "P0"]
+    assert devices[0]["streaming_multiprocessor_clock_megahertz"] == 1710.0
+    assert devices[1]["power_draw_watts"] == 275.0
+
+
+def test_phase_telemetry_failures_are_partial_evidence(tmp_path: Path) -> None:
+    def timed_out(
+        command: tuple[str, ...], timeout_seconds: float
+    ) -> subprocess.CompletedProcess[str]:
+        raise subprocess.TimeoutExpired(command, timeout_seconds)
+
+    snapshot = pp2._collect_host_telemetry_snapshot(
+        "after_prefill_warmups",
+        ((0, (0,)),),
+        ("GPU-stage-zero",),
+        cpu_sysfs_root=tmp_path / "missing-cpu",
+        hwmon_sysfs_root=tmp_path / "missing-hwmon",
+        powercap_sysfs_root=tmp_path / "missing-powercap",
+        command_runner=timed_out,
+    )
+
+    assert snapshot.evidence["status"] == "partial"
+    failures = cast(list[dict[str, object]], snapshot.evidence["failures"])
+    assert {cast(str, failure["source"]) for failure in failures} >= {
+        "cpu_scaling_current_frequency",
+        "cpu_package_temperature_discovery",
+        "cpu_package_energy_discovery",
+        "nvidia_smi",
+    }
+    gpu = cast(dict[str, object], snapshot.evidence["gpu"])
+    assert gpu["devices"] == []
+    assert gpu["return_code"] is None
+
+
+def test_rapl_power_interval_handles_one_counter_wrap() -> None:
+    before = pp2._HostTelemetrySnapshot(
+        phase="after_prefill_warmups",
+        monotonic_nanoseconds=1_000_000_000,
+        cpu_package_energy=(
+            pp2._CpuPackageEnergySnapshot(0, 90, 100, "/rapl/package-0/energy_uj"),
+        ),
+        evidence={},
+    )
+    after = pp2._HostTelemetrySnapshot(
+        phase="after_prefill_samples",
+        monotonic_nanoseconds=3_000_000_000,
+        cpu_package_energy=(
+            pp2._CpuPackageEnergySnapshot(0, 10, 100, "/rapl/package-0/energy_uj"),
+        ),
+        evidence={},
+    )
+
+    intervals = pp2._cpu_package_power_intervals([before, after])
+
+    assert intervals == [
+        {
+            "start_phase": "after_prefill_warmups",
+            "end_phase": "after_prefill_samples",
+            "package_id": 0,
+            "elapsed_seconds": 2.0,
+            "energy_delta_microjoules": 20,
+            "average_power_watts": 0.00001,
+            "counter_wrapped_once": True,
+            "start_source_path": "/rapl/package-0/energy_uj",
+            "end_source_path": "/rapl/package-0/energy_uj",
+        }
+    ]
 
 
 def test_builds_exact_two_stage_numa_matched_local_plan(tmp_path: Path) -> None:
@@ -624,10 +814,13 @@ def test_receipt_is_local_pp2_and_runs_canonical_semantic_workloads(
         *,
         warmup_count: int,
         sample_count: int,
+        phase_observer: Callable[[str], None],
     ) -> Workload:
         assert warmup_count == 2
         assert sample_count == 3
         calls.append(kind)
+        phase_observer("warmups_complete")
+        phase_observer("samples_complete")
         return Workload(kind)
 
     monkeypatch.setattr(pipeline, "start_local_stage", start_local_stage)
@@ -646,8 +839,12 @@ def test_receipt_is_local_pp2_and_runs_canonical_semantic_workloads(
 
     payload = pp2.run_diagnostic(config)
 
+    assert payload["schema_version"] == 2
     assert payload["kind"] == "glm47_flash_pp2_local_engineering_diagnostic"
     assert payload["status"] == "passed"
+    assert payload["instrumentation"] == (
+        "nccl_info_logging_and_phase_boundary_host_telemetry"
+    )
     assert payload["cleanup_complete"] is True
     assert payload["configuration"] == {
         "host_name": "dwagon",
@@ -681,6 +878,25 @@ def test_receipt_is_local_pp2_and_runs_canonical_semantic_workloads(
         "cleared_after_verified_cleanup": True,
         "retained": False,
     }
+    host_telemetry = cast(dict[str, object], payload["host_telemetry"])
+    policy = cast(dict[str, object], host_telemetry["collection_policy"])
+    assert policy["mode"] == "named_phase_boundaries_only"
+    assert policy["polling"] is False
+    assert policy["non_fatal"] is True
+    assert policy["nvidia_smi_queries_per_observed_boundary"] == 1
+    assert policy["observed_phase_order"] == [
+        "before_stage_launch",
+        "after_readiness",
+        "after_sanity",
+        "after_prefill_warmups",
+        "after_prefill_samples",
+        "after_decode_warmups",
+        "after_decode_samples",
+        "after_cleanup",
+    ]
+    field_documentation = cast(dict[str, object], host_telemetry["field_documentation"])
+    assert "kilohertz" in cast(str, field_documentation["cpu_stage_frequency"])
+    assert "never invalidate" in cast(str, field_documentation["failures"])
     receipt_path = config.result_directory / "pp2-local-diagnostic-result.json"
     assert (
         json.loads(receipt_path.read_text())["receipt_content_sha256"]

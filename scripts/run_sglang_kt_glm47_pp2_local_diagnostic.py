@@ -19,6 +19,7 @@ import os
 import re
 import signal
 import stat
+import subprocess
 import sys
 import time
 import uuid
@@ -83,6 +84,10 @@ from scripts.sglang_kt_glm47_serving_client import (  # noqa: E402
 type JsonScalar = str | int | float | bool | None
 type JsonValue = JsonScalar | list[JsonValue] | dict[str, JsonValue]
 type JsonObject = dict[str, JsonValue]
+type StageCpuCoreBinding = tuple[int, tuple[int, ...]]
+type TelemetryCommandRunner = Callable[
+    [tuple[str, ...], float], subprocess.CompletedProcess[str]
+]
 
 DEFAULT_DWAGON_IP: Final = "192.168.40.24"
 DEFAULT_DISTRIBUTED_PORT: Final = 62500
@@ -123,6 +128,33 @@ _MODEL_STAGE_MANIFEST_SHA256: Final = (
 _MODEL_STAGE_RUNTIME_SHA256: Final = (
     "d82b90508b00ef0a1399e960a43de51f4a979a695426fe58b14dd98d2d561344"
 )
+_CPU_SYSFS_ROOT: Final = Path("/sys/devices/system/cpu")
+_HWMON_SYSFS_ROOT: Final = Path("/sys/class/hwmon")
+_POWERCAP_SYSFS_ROOT: Final = Path("/sys/class/powercap")
+_SYSFS_VALUE_MAXIMUM_BYTES: Final = 4_096
+_TELEMETRY_ERROR_MAXIMUM_CHARACTERS: Final = 4_096
+_NVIDIA_SMI_TIMEOUT_SECONDS: Final = 5.0
+_NVIDIA_SMI_COMMAND: Final = (
+    "nvidia-smi",
+    (
+        "--query-gpu=uuid,index,pci.bus_id,pstate,clocks.sm,clocks.mem,"
+        "temperature.gpu,power.draw,power.limit,utilization.gpu,memory.used"
+    ),
+    "--format=csv,noheader,nounits",
+)
+_TELEMETRY_PHASE_ORDER: Final = (
+    "before_stage_launch",
+    "after_readiness",
+    "after_sanity",
+    "after_prefill_warmups",
+    "after_prefill_samples",
+    "after_decode_warmups",
+    "after_decode_samples",
+    "after_cleanup",
+)
+_RAPL_PACKAGE_PATH_PATTERN: Final = re.compile(r"intel-rapl:\d+", re.ASCII)
+_RAPL_PACKAGE_NAME_PATTERN: Final = re.compile(r"package-(\d+)", re.ASCII)
+_PACKAGE_TEMPERATURE_LABEL_PATTERN: Final = re.compile(r"Package id (\d+)", re.ASCII)
 
 
 class Pp2LocalDiagnosticError(RuntimeError):
@@ -135,6 +167,22 @@ class Pp2LocalDiagnosticSignalError(Pp2LocalDiagnosticError):
     def __init__(self, signal_number: int) -> None:
         super().__init__(f"received managed signal {signal_number}")
         self.signal_number = signal_number
+
+
+@dataclass(frozen=True, slots=True)
+class _CpuPackageEnergySnapshot:
+    package_id: int
+    energy_microjoules: int
+    maximum_energy_range_microjoules: int
+    source_path: str
+
+
+@dataclass(frozen=True, slots=True)
+class _HostTelemetrySnapshot:
+    phase: str
+    monotonic_nanoseconds: int
+    cpu_package_energy: tuple[_CpuPackageEnergySnapshot, ...]
+    evidence: JsonObject
 
 
 @dataclass(slots=True)
@@ -202,6 +250,593 @@ def _canonical_sha256(value: JsonValue) -> str:
         sort_keys=True,
     ).encode()
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _bounded_telemetry_error(error: BaseException | str) -> str:
+    message = error if isinstance(error, str) else f"{type(error).__name__}: {error}"
+    return message[:_TELEMETRY_ERROR_MAXIMUM_CHARACTERS]
+
+
+def _append_telemetry_failure(
+    failures: list[JsonValue],
+    source: str,
+    error: BaseException | str,
+    *,
+    path: Path | None = None,
+    command: tuple[str, ...] | None = None,
+) -> None:
+    evidence: JsonObject = {
+        "source": source,
+        "error": _bounded_telemetry_error(error),
+    }
+    if path is not None:
+        evidence["path"] = str(path)
+    if command is not None:
+        evidence["command"] = list(command)
+    failures.append(evidence)
+
+
+def _read_sysfs_text(
+    path: Path,
+    source: str,
+    failures: list[JsonValue],
+) -> str | None:
+    try:
+        with path.open("rb") as input_file:
+            contents = input_file.read(_SYSFS_VALUE_MAXIMUM_BYTES + 1)
+        if len(contents) > _SYSFS_VALUE_MAXIMUM_BYTES:
+            raise ValueError("sysfs value exceeds the telemetry size bound")
+        value = contents.decode("ascii").strip()
+        if not value:
+            raise ValueError("sysfs value is empty")
+        return value
+    except (OSError, UnicodeError, ValueError) as error:
+        _append_telemetry_failure(failures, source, error, path=path)
+        return None
+
+
+def _read_sysfs_nonnegative_integer(
+    path: Path,
+    source: str,
+    failures: list[JsonValue],
+) -> int | None:
+    raw = _read_sysfs_text(path, source, failures)
+    if raw is None:
+        return None
+    try:
+        value = int(raw)
+        if value < 0:
+            raise ValueError("sysfs integer is negative")
+        return value
+    except ValueError as error:
+        _append_telemetry_failure(failures, source, error, path=path)
+        return None
+
+
+def _median_integer(values: list[int]) -> float:
+    ordered = sorted(values)
+    middle = len(ordered) // 2
+    if len(ordered) % 2 == 1:
+        return float(ordered[middle])
+    return (ordered[middle - 1] + ordered[middle]) / 2.0
+
+
+def _collect_cpu_stage_frequency_telemetry(
+    stage_cpu_bindings: tuple[StageCpuCoreBinding, ...],
+    cpu_sysfs_root: Path,
+    failures: list[JsonValue],
+) -> list[JsonValue]:
+    observations: list[JsonValue] = []
+    for pipeline_rank, cpu_cores in stage_cpu_bindings:
+        frequencies: list[int] = []
+        package_ids: set[int] = set()
+        for cpu_id in cpu_cores:
+            cpu_root = cpu_sysfs_root / f"cpu{cpu_id}"
+            frequency = _read_sysfs_nonnegative_integer(
+                cpu_root / "cpufreq/scaling_cur_freq",
+                "cpu_scaling_current_frequency",
+                failures,
+            )
+            if frequency is not None:
+                frequencies.append(frequency)
+            package_id = _read_sysfs_nonnegative_integer(
+                cpu_root / "topology/physical_package_id",
+                "cpu_physical_package",
+                failures,
+            )
+            if package_id is not None:
+                package_ids.add(package_id)
+
+        representative_cpufreq_root = cpu_sysfs_root / f"cpu{cpu_cores[0]}" / "cpufreq"
+        scaling_driver = _read_sysfs_text(
+            representative_cpufreq_root / "scaling_driver",
+            "cpu_scaling_driver",
+            failures,
+        )
+        scaling_governor = _read_sysfs_text(
+            representative_cpufreq_root / "scaling_governor",
+            "cpu_scaling_governor",
+            failures,
+        )
+        scaling_minimum = _read_sysfs_nonnegative_integer(
+            representative_cpufreq_root / "scaling_min_freq",
+            "cpu_scaling_minimum_frequency",
+            failures,
+        )
+        scaling_maximum = _read_sysfs_nonnegative_integer(
+            representative_cpufreq_root / "scaling_max_freq",
+            "cpu_scaling_maximum_frequency",
+            failures,
+        )
+        frequency_summary: JsonObject | None = None
+        if frequencies:
+            frequency_summary = {
+                "minimum_kilohertz": min(frequencies),
+                "median_kilohertz": _median_integer(frequencies),
+                "maximum_kilohertz": max(frequencies),
+                "mean_kilohertz": sum(frequencies) / len(frequencies),
+            }
+        observation: JsonObject = {
+            "pipeline_rank": pipeline_rank,
+            "bound_physical_cpu_ids": list(cpu_cores),
+            "physical_package_ids": sorted(package_ids),
+            "requested_sample_count": len(cpu_cores),
+            "observed_sample_count": len(frequencies),
+            "frequency": frequency_summary,
+            "representative_scaling_driver": scaling_driver,
+            "representative_scaling_governor": scaling_governor,
+            "representative_scaling_minimum_kilohertz": scaling_minimum,
+            "representative_scaling_maximum_kilohertz": scaling_maximum,
+        }
+        observations.append(observation)
+    return observations
+
+
+def _collect_cpu_package_temperature_telemetry(
+    hwmon_sysfs_root: Path,
+    failures: list[JsonValue],
+) -> list[JsonValue]:
+    observations: list[JsonValue] = []
+    try:
+        hwmon_directories = sorted(hwmon_sysfs_root.glob("hwmon*"))
+    except OSError as error:
+        _append_telemetry_failure(
+            failures, "cpu_package_temperature_discovery", error, path=hwmon_sysfs_root
+        )
+        return observations
+
+    for hwmon_directory in hwmon_directories:
+        name = _read_sysfs_text(hwmon_directory / "name", "hwmon_name", failures)
+        if name != "coretemp":
+            continue
+        try:
+            label_paths = sorted(hwmon_directory.glob("temp*_label"))
+        except OSError as error:
+            _append_telemetry_failure(
+                failures,
+                "cpu_package_temperature_discovery",
+                error,
+                path=hwmon_directory,
+            )
+            continue
+        for label_path in label_paths:
+            label = _read_sysfs_text(
+                label_path, "cpu_temperature_sensor_label", failures
+            )
+            if label is None:
+                continue
+            match = _PACKAGE_TEMPERATURE_LABEL_PATTERN.fullmatch(label)
+            if match is None:
+                continue
+            input_path = label_path.with_name(
+                f"{label_path.name.removesuffix('_label')}_input"
+            )
+            temperature_millicelsius = _read_sysfs_nonnegative_integer(
+                input_path, "cpu_package_temperature", failures
+            )
+            if temperature_millicelsius is None:
+                continue
+            observations.append(
+                {
+                    "package_id": int(match.group(1)),
+                    "temperature_celsius": temperature_millicelsius / 1_000.0,
+                    "source_path": str(input_path),
+                }
+            )
+    observations.sort(key=lambda item: cast(int, cast(JsonObject, item)["package_id"]))
+    if not observations:
+        _append_telemetry_failure(
+            failures,
+            "cpu_package_temperature_discovery",
+            "no coretemp package temperature sensors were readable",
+            path=hwmon_sysfs_root,
+        )
+    return observations
+
+
+def _collect_cpu_package_energy_telemetry(
+    powercap_sysfs_root: Path,
+    failures: list[JsonValue],
+) -> tuple[tuple[_CpuPackageEnergySnapshot, ...], list[JsonValue]]:
+    snapshots: list[_CpuPackageEnergySnapshot] = []
+    observations: list[JsonValue] = []
+    try:
+        package_directories = tuple(
+            path
+            for path in sorted(powercap_sysfs_root.glob("intel-rapl:*"))
+            if _RAPL_PACKAGE_PATH_PATTERN.fullmatch(path.name) is not None
+        )
+    except OSError as error:
+        _append_telemetry_failure(
+            failures, "cpu_package_energy_discovery", error, path=powercap_sysfs_root
+        )
+        return (), observations
+
+    for package_directory in package_directories:
+        package_name = _read_sysfs_text(
+            package_directory / "name", "cpu_package_energy_name", failures
+        )
+        if package_name is None:
+            continue
+        match = _RAPL_PACKAGE_NAME_PATTERN.fullmatch(package_name)
+        if match is None:
+            _append_telemetry_failure(
+                failures,
+                "cpu_package_energy_name",
+                f"unexpected RAPL package name: {package_name}",
+                path=package_directory / "name",
+            )
+            continue
+        energy_path = package_directory / "energy_uj"
+        energy = _read_sysfs_nonnegative_integer(
+            energy_path, "cpu_package_energy", failures
+        )
+        maximum_range = _read_sysfs_nonnegative_integer(
+            package_directory / "max_energy_range_uj",
+            "cpu_package_energy_maximum_range",
+            failures,
+        )
+        if energy is None or maximum_range is None or maximum_range == 0:
+            continue
+        package_id = int(match.group(1))
+        snapshot = _CpuPackageEnergySnapshot(
+            package_id=package_id,
+            energy_microjoules=energy,
+            maximum_energy_range_microjoules=maximum_range,
+            source_path=str(energy_path),
+        )
+        snapshots.append(snapshot)
+        observations.append(
+            {
+                "package_id": package_id,
+                "energy_microjoules": energy,
+                "maximum_energy_range_microjoules": maximum_range,
+                "source_path": str(energy_path),
+            }
+        )
+    snapshots.sort(key=lambda item: item.package_id)
+    observations.sort(key=lambda item: cast(int, cast(JsonObject, item)["package_id"]))
+    if not observations:
+        _append_telemetry_failure(
+            failures,
+            "cpu_package_energy_discovery",
+            "no package-level Intel RAPL energy counters were readable",
+            path=powercap_sysfs_root,
+        )
+    return tuple(snapshots), observations
+
+
+def _run_telemetry_command(
+    command: tuple[str, ...], timeout_seconds: float
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        command,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=timeout_seconds,
+    )
+
+
+def _optional_nonnegative_float(value: str) -> float | None:
+    normalized = value.strip()
+    if normalized in {"N/A", "[N/A]", "Not Supported", "[Not Supported]"}:
+        return None
+    parsed = float(normalized)
+    if not math.isfinite(parsed) or parsed < 0.0:
+        raise ValueError("GPU telemetry value must be finite and nonnegative")
+    return parsed
+
+
+def _collect_gpu_telemetry(
+    expected_gpu_uuids: tuple[str, ...],
+    failures: list[JsonValue],
+    command_runner: TelemetryCommandRunner,
+) -> JsonObject:
+    started = time.monotonic()
+    try:
+        completed = command_runner(_NVIDIA_SMI_COMMAND, _NVIDIA_SMI_TIMEOUT_SECONDS)
+    except (OSError, subprocess.SubprocessError) as error:
+        elapsed = time.monotonic() - started
+        _append_telemetry_failure(
+            failures, "nvidia_smi", error, command=_NVIDIA_SMI_COMMAND
+        )
+        return {
+            "command": list(_NVIDIA_SMI_COMMAND),
+            "timeout_seconds": _NVIDIA_SMI_TIMEOUT_SECONDS,
+            "elapsed_seconds": elapsed,
+            "return_code": None,
+            "devices": [],
+        }
+
+    elapsed = time.monotonic() - started
+    devices: list[JsonValue] = []
+    if completed.returncode != 0:
+        _append_telemetry_failure(
+            failures,
+            "nvidia_smi",
+            (f"command exited {completed.returncode}: {completed.stderr.strip()}"),
+            command=_NVIDIA_SMI_COMMAND,
+        )
+    else:
+        try:
+            rows = tuple(
+                csv.reader(completed.stdout.splitlines(), skipinitialspace=True)
+            )
+        except csv.Error as error:
+            _append_telemetry_failure(
+                failures, "nvidia_smi_csv", error, command=_NVIDIA_SMI_COMMAND
+            )
+            rows = ()
+        for row_number, row in enumerate(rows, start=1):
+            normalized = tuple(field.strip() for field in row)
+            if not normalized or all(not field for field in normalized):
+                continue
+            if len(normalized) != 11:
+                _append_telemetry_failure(
+                    failures,
+                    "nvidia_smi_csv",
+                    f"row {row_number} has {len(normalized)} columns instead of 11",
+                    command=_NVIDIA_SMI_COMMAND,
+                )
+                continue
+            try:
+                index = int(normalized[1])
+                if index < 0:
+                    raise ValueError("GPU index is negative")
+                devices.append(
+                    {
+                        "uuid": normalized[0],
+                        "index": index,
+                        "pci_bus_id": normalized[2].lower(),
+                        "performance_state": normalized[3],
+                        "streaming_multiprocessor_clock_megahertz": (
+                            _optional_nonnegative_float(normalized[4])
+                        ),
+                        "memory_clock_megahertz": _optional_nonnegative_float(
+                            normalized[5]
+                        ),
+                        "temperature_celsius": _optional_nonnegative_float(
+                            normalized[6]
+                        ),
+                        "power_draw_watts": _optional_nonnegative_float(normalized[7]),
+                        "power_limit_watts": _optional_nonnegative_float(normalized[8]),
+                        "gpu_utilization_percent": _optional_nonnegative_float(
+                            normalized[9]
+                        ),
+                        "memory_used_mebibytes": _optional_nonnegative_float(
+                            normalized[10]
+                        ),
+                    }
+                )
+            except ValueError as error:
+                _append_telemetry_failure(
+                    failures,
+                    "nvidia_smi_csv",
+                    f"row {row_number}: {error}",
+                    command=_NVIDIA_SMI_COMMAND,
+                )
+
+    observed_uuids = {cast(str, cast(JsonObject, device)["uuid"]) for device in devices}
+    missing_uuids = sorted(set(expected_gpu_uuids) - observed_uuids)
+    if completed.returncode == 0 and missing_uuids:
+        _append_telemetry_failure(
+            failures,
+            "nvidia_smi_inventory",
+            f"expected GPU UUIDs were absent: {','.join(missing_uuids)}",
+            command=_NVIDIA_SMI_COMMAND,
+        )
+    devices.sort(key=lambda item: cast(int, cast(JsonObject, item)["index"]))
+    return {
+        "command": list(_NVIDIA_SMI_COMMAND),
+        "timeout_seconds": _NVIDIA_SMI_TIMEOUT_SECONDS,
+        "elapsed_seconds": elapsed,
+        "return_code": completed.returncode,
+        "devices": devices,
+    }
+
+
+def _collect_host_telemetry_snapshot(
+    phase: str,
+    stage_cpu_bindings: tuple[StageCpuCoreBinding, ...],
+    expected_gpu_uuids: tuple[str, ...],
+    *,
+    cpu_sysfs_root: Path = _CPU_SYSFS_ROOT,
+    hwmon_sysfs_root: Path = _HWMON_SYSFS_ROOT,
+    powercap_sysfs_root: Path = _POWERCAP_SYSFS_ROOT,
+    command_runner: TelemetryCommandRunner = _run_telemetry_command,
+) -> _HostTelemetrySnapshot:
+    observed_at_utc = _utc_now()
+    monotonic_nanoseconds = time.monotonic_ns()
+    failures: list[JsonValue] = []
+    cpu_stage_frequencies = _collect_cpu_stage_frequency_telemetry(
+        stage_cpu_bindings, cpu_sysfs_root, failures
+    )
+    cpu_package_temperatures = _collect_cpu_package_temperature_telemetry(
+        hwmon_sysfs_root, failures
+    )
+    cpu_package_energy, cpu_package_energy_evidence = (
+        _collect_cpu_package_energy_telemetry(powercap_sysfs_root, failures)
+    )
+    gpu = _collect_gpu_telemetry(expected_gpu_uuids, failures, command_runner)
+    collection_elapsed_seconds = (
+        time.monotonic_ns() - monotonic_nanoseconds
+    ) / 1_000_000_000.0
+    return _HostTelemetrySnapshot(
+        phase=phase,
+        monotonic_nanoseconds=monotonic_nanoseconds,
+        cpu_package_energy=cpu_package_energy,
+        evidence={
+            "phase": phase,
+            "observed_at_utc": observed_at_utc,
+            "monotonic_nanoseconds": monotonic_nanoseconds,
+            "collection_elapsed_seconds": collection_elapsed_seconds,
+            "status": "complete" if not failures else "partial",
+            "cpu_stage_frequency": cpu_stage_frequencies,
+            "cpu_package_temperature": cpu_package_temperatures,
+            "cpu_package_energy": cpu_package_energy_evidence,
+            "gpu": gpu,
+            "failures": failures,
+        },
+    )
+
+
+def _safe_collect_host_telemetry_snapshot(
+    phase: str,
+    stage_cpu_bindings: tuple[StageCpuCoreBinding, ...],
+    expected_gpu_uuids: tuple[str, ...],
+) -> _HostTelemetrySnapshot:
+    try:
+        return _collect_host_telemetry_snapshot(
+            phase, stage_cpu_bindings, expected_gpu_uuids
+        )
+    except Pp2LocalDiagnosticSignalError:
+        raise
+    except Exception as error:
+        monotonic_nanoseconds = time.monotonic_ns()
+        return _HostTelemetrySnapshot(
+            phase=phase,
+            monotonic_nanoseconds=monotonic_nanoseconds,
+            cpu_package_energy=(),
+            evidence={
+                "phase": phase,
+                "observed_at_utc": _utc_now(),
+                "monotonic_nanoseconds": monotonic_nanoseconds,
+                "collection_elapsed_seconds": 0.0,
+                "status": "unavailable",
+                "cpu_stage_frequency": [],
+                "cpu_package_temperature": [],
+                "cpu_package_energy": [],
+                "gpu": None,
+                "failures": [
+                    {
+                        "source": "host_telemetry_collector",
+                        "error": _bounded_telemetry_error(error),
+                    }
+                ],
+            },
+        )
+
+
+def _cpu_package_power_intervals(
+    snapshots: list[_HostTelemetrySnapshot],
+) -> list[JsonValue]:
+    intervals: list[JsonValue] = []
+    for before, after in zip(snapshots, snapshots[1:], strict=False):
+        elapsed_nanoseconds = after.monotonic_nanoseconds - before.monotonic_nanoseconds
+        if elapsed_nanoseconds <= 0:
+            continue
+        before_by_package = {
+            snapshot.package_id: snapshot for snapshot in before.cpu_package_energy
+        }
+        after_by_package = {
+            snapshot.package_id: snapshot for snapshot in after.cpu_package_energy
+        }
+        for package_id in sorted(before_by_package.keys() & after_by_package.keys()):
+            start = before_by_package[package_id]
+            end = after_by_package[package_id]
+            if end.energy_microjoules >= start.energy_microjoules:
+                energy_delta = end.energy_microjoules - start.energy_microjoules
+                counter_wrapped = False
+            else:
+                energy_delta = (
+                    end.energy_microjoules
+                    + start.maximum_energy_range_microjoules
+                    - start.energy_microjoules
+                )
+                counter_wrapped = True
+            if energy_delta < 0:
+                continue
+            intervals.append(
+                {
+                    "start_phase": before.phase,
+                    "end_phase": after.phase,
+                    "package_id": package_id,
+                    "elapsed_seconds": elapsed_nanoseconds / 1_000_000_000.0,
+                    "energy_delta_microjoules": energy_delta,
+                    "average_power_watts": energy_delta * 1_000.0 / elapsed_nanoseconds,
+                    "counter_wrapped_once": counter_wrapped,
+                    "start_source_path": start.source_path,
+                    "end_source_path": end.source_path,
+                }
+            )
+    return intervals
+
+
+def _host_telemetry_receipt(
+    snapshots: list[_HostTelemetrySnapshot],
+) -> JsonObject:
+    return {
+        "schema_version": 1,
+        "collection_policy": {
+            "mode": "named_phase_boundaries_only",
+            "polling": False,
+            "non_fatal": True,
+            "expected_phase_order": list(_TELEMETRY_PHASE_ORDER),
+            "observed_phase_order": [snapshot.phase for snapshot in snapshots],
+            "nvidia_smi_queries_per_observed_boundary": 1,
+            "nvidia_smi_timeout_seconds": _NVIDIA_SMI_TIMEOUT_SECONDS,
+        },
+        "field_documentation": {
+            "cpu_stage_frequency": (
+                "one scaling_cur_freq read from every physical CPU bound to each "
+                "PP stage; summaries are in kilohertz"
+            ),
+            "cpu_package_temperature": (
+                "package-level coretemp readings in degrees Celsius"
+            ),
+            "cpu_package_energy": (
+                "raw package-level Intel RAPL counters in microjoules"
+            ),
+            "cpu_package_power_intervals": (
+                "average package watts derived between adjacent boundary snapshots"
+            ),
+            "gpu": (
+                "one bounded nvidia-smi query per boundary; clocks are MHz, "
+                "temperature is Celsius, power is watts, and memory is MiB"
+            ),
+            "failures": (
+                "telemetry collection errors are receipt evidence and never invalidate "
+                "an otherwise valid model benchmark"
+            ),
+        },
+        "limitations": [
+            (
+                "boundary snapshots are not a profiler and do not capture within-phase "
+                "clock or temperature excursions"
+            ),
+            (
+                "RAPL interval derivation can identify one counter wrap; intervals long "
+                "enough for multiple wraps may understate average power"
+            ),
+            (
+                "derived intervals include the small amount of boundary collection "
+                "overhead between timestamps"
+            ),
+        ],
+        "samples": [snapshot.evidence for snapshot in snapshots],
+        "cpu_package_power_intervals": _cpu_package_power_intervals(snapshots),
+    }
 
 
 def _sha256_file(path: Path) -> str:
@@ -1199,6 +1834,10 @@ def run_diagnostic(config: Pp2LocalDiagnosticConfig) -> JsonObject:
 
     runtime_contract = _verify_runtime_and_model_contract(config)
     specs = build_pp2_local_process_specs(config)
+    stage_cpu_bindings: tuple[StageCpuCoreBinding, ...] = tuple(
+        (spec.pipeline_rank, spec.cpu_cores) for spec in specs
+    )
+    expected_gpu_uuids = tuple(spec.gpu_uuid for spec in specs)
     config.result_directory.mkdir(mode=0o700, parents=False, exist_ok=False)
     owner_token = uuid.uuid4().hex
     started_at = _utc_now()
@@ -1209,6 +1848,7 @@ def run_diagnostic(config: Pp2LocalDiagnosticConfig) -> JsonObject:
     sanity: JsonObject | None = None
     workloads: list[JsonValue] = []
     summaries: list[JsonValue] = []
+    telemetry_snapshots: list[_HostTelemetrySnapshot] = []
     failure: BaseException | None = None
     cleanup: list[JsonValue] = []
     cleanup_complete = False
@@ -1224,6 +1864,12 @@ def run_diagnostic(config: Pp2LocalDiagnosticConfig) -> JsonObject:
             previous_handlers[managed_signal] = signal.getsignal(managed_signal)
             signal.signal(managed_signal, signal_state.handle)
         try:
+            telemetry_snapshots.append(
+                _safe_collect_host_telemetry_snapshot(
+                    "before_stage_launch", stage_cpu_bindings, expected_gpu_uuids
+                )
+            )
+            signal_state.checkpoint()
             for spec in specs:
                 with signal_state.defer():
                     running.append(
@@ -1235,6 +1881,11 @@ def run_diagnostic(config: Pp2LocalDiagnosticConfig) -> JsonObject:
                 specs,
                 running,
                 config.readiness_timeout_seconds,
+            )
+            telemetry_snapshots.append(
+                _safe_collect_host_telemetry_snapshot(
+                    "after_readiness", stage_cpu_bindings, expected_gpu_uuids
+                )
             )
             signal_state.checkpoint()
             rank_zero = specs[0]
@@ -1250,17 +1901,42 @@ def run_diagnostic(config: Pp2LocalDiagnosticConfig) -> JsonObject:
                     config.dwagon_model_path,
                 )
                 sanity = cast(JsonObject, sanity_evidence.model_dump(mode="json"))
+                telemetry_snapshots.append(
+                    _safe_collect_host_telemetry_snapshot(
+                        "after_sanity", stage_cpu_bindings, expected_gpu_uuids
+                    )
+                )
                 if not pipeline.all_stages_alive(running):
                     raise Pp2LocalDiagnosticError(
                         "a stage exited during semantic sanity"
                     )
                 signal_state.checkpoint()
+
+                def build_workload_phase_observer(
+                    workload_kind: str,
+                ) -> Callable[[str], None]:
+                    def record_workload_phase(boundary: str) -> None:
+                        suffix = (
+                            "warmups" if boundary == "warmups_complete" else "samples"
+                        )
+                        telemetry_snapshots.append(
+                            _safe_collect_host_telemetry_snapshot(
+                                f"after_{workload_kind}_{suffix}",
+                                stage_cpu_bindings,
+                                expected_gpu_uuids,
+                            )
+                        )
+                        signal_state.checkpoint()
+
+                    return record_workload_phase
+
                 for kind in ("prefill", "decode"):
                     workload = run_glm47_serving_workload(
                         client,
                         prepare_glm47_serving_workload(kind),
                         warmup_count=config.warmup_count,
                         sample_count=config.sample_count,
+                        phase_observer=build_workload_phase_observer(kind),
                     )
                     if not pipeline.all_stages_alive(running):
                         raise Pp2LocalDiagnosticError(
@@ -1317,6 +1993,11 @@ def run_diagnostic(config: Pp2LocalDiagnosticConfig) -> JsonObject:
                 except BaseException as error:
                     if failure is None:
                         failure = error
+            telemetry_snapshots.append(
+                _safe_collect_host_telemetry_snapshot(
+                    "after_cleanup", stage_cpu_bindings, expected_gpu_uuids
+                )
+            )
     finally:
         for managed_signal, previous_handler in previous_handlers.items():
             signal.signal(managed_signal, previous_handler)
@@ -1325,7 +2006,7 @@ def run_diagnostic(config: Pp2LocalDiagnosticConfig) -> JsonObject:
     journal_path = _ownership_journal_path(config)
     journal_retained = journal_path.exists()
     payload: JsonObject = {
-        "schema_version": 1,
+        "schema_version": 2,
         "kind": "glm47_flash_pp2_local_engineering_diagnostic",
         "status": (
             "passed"
@@ -1337,7 +2018,7 @@ def run_diagnostic(config: Pp2LocalDiagnosticConfig) -> JsonObject:
         ),
         "performance_comparable": False,
         "profiler": "none",
-        "instrumentation": "nccl_info_logging",
+        "instrumentation": "nccl_info_logging_and_phase_boundary_host_telemetry",
         "run_id": config.run_id,
         "started_at_utc": started_at,
         "completed_at_utc": _utc_now(),
@@ -1362,6 +2043,7 @@ def run_diagnostic(config: Pp2LocalDiagnosticConfig) -> JsonObject:
         "sanity": sanity,
         "workloads": workloads,
         "benchmark_summary": summaries,
+        "host_telemetry": _host_telemetry_receipt(telemetry_snapshots),
         "planned_rank_count": len(specs),
         "started_rank_count": len(running),
         "all_planned_stages_started": all_planned_stages_started,
