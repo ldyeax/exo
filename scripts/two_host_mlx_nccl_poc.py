@@ -2831,6 +2831,7 @@ try:
 
     def group_members():
         members = []
+        leader_seen = False
         for entry in Path("/proc").iterdir():
             if not entry.name.isdigit():
                 continue
@@ -2838,30 +2839,52 @@ try:
                 fields = (entry / "stat").read_text().rsplit(")", 1)[1].split()
                 state = fields[0]
                 observed_group = int(fields[2])
+                observed_session = int(fields[3])
                 start_ticks = int(fields[19])
-            except (OSError, IndexError, ValueError):
+            except (FileNotFoundError, ProcessLookupError):
+                continue
+            except OSError as error:
+                raise RuntimeError(
+                    "cannot enumerate process group ownership"
+                ) from error
+            except (IndexError, ValueError):
                 continue
             if observed_group != process_group_id:
                 continue
             member_pid = int(entry.name)
-            members.append(member_pid)
-            if member_pid == pid and start_ticks != int(receipt["start_time_ticks"]):
-                raise RuntimeError("PID start time no longer matches ownership receipt")
-            if state == "Z":
-                continue
-            environment = (entry / "environ").read_bytes().split(b"\0")
-            if owner_entry not in environment:
+            if observed_session != pid:
                 raise RuntimeError(
-                    f"process-group member {member_pid} has a different owner token"
+                    f"process-group member {member_pid} escaped the owned session"
                 )
             if member_pid == pid:
-                command_line = (entry / "cmdline").read_bytes().replace(
-                    b"\0", b" "
-                ).decode("utf-8", errors="replace")
+                leader_seen = True
+                if start_ticks != int(receipt["start_time_ticks"]):
+                    raise RuntimeError(
+                        "PID start time no longer matches ownership receipt"
+                    )
+            if state == "Z":
+                continue
+            if member_pid == pid:
+                try:
+                    environment = (entry / "environ").read_bytes().split(b"\0")
+                    command_line = (entry / "cmdline").read_bytes().replace(
+                        b"\0", b" "
+                    ).decode("utf-8", errors="replace")
+                except (FileNotFoundError, ProcessLookupError):
+                    continue
+                except OSError as error:
+                    raise RuntimeError(
+                        "cannot verify live owned process metadata"
+                    ) from error
+                if owner_entry not in environment:
+                    raise RuntimeError("owned process has a different owner token")
                 if receipt["namespace"] not in command_line:
                     raise RuntimeError(
                         "process command line no longer has owned namespace"
                     )
+            members.append(member_pid)
+        if leader_seen and process_group_id != pid:
+            raise RuntimeError("owned process is no longer its process-group leader")
         return members
 
     def wait_group_empty(wait_seconds):
@@ -2898,6 +2921,11 @@ except Exception as error:
     result["error"] = f"{type(error).__name__}: {error}"
 print(json.dumps(result, sort_keys=True))
 """
+
+# Public aliases let other hardware-specific harnesses reuse the audited
+# ownership protocol without copying its inline supervisor programs.
+REMOTE_PROCESS_LAUNCH_SUPERVISOR_PROGRAM = _REMOTE_LAUNCH_PROGRAM
+REMOTE_PROCESS_STOP_PROGRAM = _REMOTE_STOP_PROGRAM
 
 
 @dataclass
