@@ -609,6 +609,39 @@ def test_glm_4_7_flash_pp2_local_admits_reverse_layer_partition() -> None:
     }
 
 
+@pytest.mark.parametrize("static_memory_fraction", (0.8, 0.9, 0.95))
+def test_glm_4_7_flash_pp2_local_admits_bounded_static_memory_fraction(
+    static_memory_fraction: float,
+) -> None:
+    plan = make_glm_4_7_flash_bf16_pp2_local_diagnostic_plan().model_copy(
+        update={"static_memory_fraction": static_memory_fraction}
+    )
+
+    specs = build_glm_4_7_flash_bf16_pp2_local_diagnostic_process_launch_specs(
+        plan,
+        PYTHON_EXECUTABLE,
+    )
+
+    assert {
+        argument_value(spec.arguments, "--mem-fraction-static") for spec in specs
+    } == {str(static_memory_fraction)}
+
+
+@pytest.mark.parametrize("static_memory_fraction", (0.79, 0.96))
+def test_glm_4_7_flash_pp2_local_rejects_unsafe_static_memory_fraction(
+    static_memory_fraction: float,
+) -> None:
+    plan = make_glm_4_7_flash_bf16_pp2_local_diagnostic_plan().model_copy(
+        update={"static_memory_fraction": static_memory_fraction}
+    )
+
+    with pytest.raises(ValueError, match="between 0.8 and 0.95"):
+        build_glm_4_7_flash_bf16_pp2_local_diagnostic_process_launch_specs(
+            plan,
+            PYTHON_EXECUTABLE,
+        )
+
+
 def test_glm_4_7_flash_pp3_selects_python_executable_by_physical_node() -> None:
     plan = make_glm_4_7_flash_bf16_pp3_diagnostic_plan()
     executable_by_node = {

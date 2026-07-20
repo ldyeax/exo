@@ -619,7 +619,13 @@ def _validate_glm_4_7_flash_bf16_plan(plan: SglangKtLaunchPlan) -> None:
         )
     if plan.max_concurrent_requests != 1:
         raise ValueError("GLM-4.7-Flash smoke profile requires one running request")
-    if plan.static_memory_fraction != 0.8:
+    if plan.target_profile == GLM_4_7_FLASH_PP2_LOCAL_DIAGNOSTIC_TARGET_PROFILE:
+        if not 0.8 <= plan.static_memory_fraction <= 0.95:
+            raise ValueError(
+                "GLM-4.7-Flash local PP2 static memory fraction must be between "
+                "0.8 and 0.95"
+            )
+    elif plan.static_memory_fraction != 0.8:
         raise ValueError("GLM-4.7-Flash smoke static memory fraction must be 0.8")
 
     if plan.target_profile == GLM_4_7_FLASH_PP3_DIAGNOSTIC_TARGET_PROFILE:

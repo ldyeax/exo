@@ -34,6 +34,7 @@ def make_config(tmp_path: Path) -> pp2.Pp2LocalDiagnosticConfig:
         stage_ports=(62510, 62511),
         pipeline_layer_partition=(24, 23),
         resident_gpu_experts=40,
+        static_memory_fraction=0.9,
         readiness_timeout_seconds=60.0,
         request_timeout_seconds=900.0,
         cleanup_timeout_seconds=30.0,
@@ -474,14 +475,18 @@ def test_cli_defaults_to_safe_e40_and_supports_bounded_ab_options(
                 "23,24",
                 "--resident-gpu-experts",
                 "44",
+                "--static-memory-fraction",
+                "0.95",
             )
         )
     )
 
     assert default_config.pipeline_layer_partition == (24, 23)
     assert default_config.resident_gpu_experts == 40
+    assert default_config.static_memory_fraction == 0.9
     assert tuned_config.pipeline_layer_partition == (23, 24)
     assert tuned_config.resident_gpu_experts == 44
+    assert tuned_config.static_memory_fraction == 0.95
     assert "fwuff" not in parser.format_help().lower()
     assert "hca" not in parser.format_help().lower()
 
@@ -506,6 +511,8 @@ def test_cli_rejects_e45_and_unapproved_partition(tmp_path: Path) -> None:
         pp2._config_from_arguments(arguments)
     with pytest.raises(SystemExit):
         parser.parse_args((*required, "--pipeline-layer-partition", "22,25"))
+    with pytest.raises(SystemExit):
+        parser.parse_args((*required, "--static-memory-fraction", "0.96"))
 
 
 def test_receipt_is_local_pp2_and_runs_canonical_semantic_workloads(
@@ -649,6 +656,7 @@ def test_receipt_is_local_pp2_and_runs_canonical_semantic_workloads(
         "tensor_parallel_size": 1,
         "pipeline_layer_partition": [24, 23],
         "resident_gpu_experts_per_stage": 40,
+        "static_memory_fraction": 0.9,
         "nccl_transport_policy": "automatic_local_p2p_nvlink_allowed",
     }
     assert cast(dict[str, object], payload["topology"])["scope"] == "dwagon_local"

@@ -87,6 +87,7 @@ type JsonObject = dict[str, JsonValue]
 DEFAULT_DWAGON_IP: Final = "192.168.40.24"
 DEFAULT_DISTRIBUTED_PORT: Final = 62500
 DEFAULT_STAGE_PORTS: Final = (62510, 62511)
+DEFAULT_STATIC_MEMORY_FRACTION: Final = 0.9
 _LOG_MAXIMUM_BYTES: Final = 256 * 1024 * 1024
 _RECEIPT_MAXIMUM_BYTES: Final = 4 * 1024 * 1024
 _OWNERSHIP_JOURNAL_NAME: Final = "pp2-local-ownership-journal.json"
@@ -180,6 +181,7 @@ class Pp2LocalDiagnosticConfig:
     stage_ports: tuple[int, int]
     pipeline_layer_partition: tuple[int, int]
     resident_gpu_experts: int
+    static_memory_fraction: float
     readiness_timeout_seconds: float
     request_timeout_seconds: float
     cleanup_timeout_seconds: float
@@ -1044,7 +1046,7 @@ def build_pp2_local_plan(config: Pp2LocalDiagnosticConfig) -> SglangKtLaunchPlan
         total_layers=GLM_4_7_FLASH_LAYER_COUNT,
         context_length=GLM_4_7_FLASH_CONTEXT_LENGTH,
         max_total_tokens=GLM_4_7_FLASH_MAX_TOTAL_TOKENS,
-        static_memory_fraction=0.8,
+        static_memory_fraction=config.static_memory_fraction,
         max_concurrent_requests=1,
         distributed_coordinator=Host(
             ip=config.dwagon_ip,
@@ -1072,6 +1074,7 @@ def _configuration_receipt(config: Pp2LocalDiagnosticConfig) -> JsonObject:
         "tensor_parallel_size": 1,
         "pipeline_layer_partition": list(config.pipeline_layer_partition),
         "resident_gpu_experts_per_stage": config.resident_gpu_experts,
+        "static_memory_fraction": config.static_memory_fraction,
         "nccl_transport_policy": "automatic_local_p2p_nvlink_allowed",
     }
 
@@ -1405,6 +1408,15 @@ def _positive_float(raw: str) -> float:
     return value
 
 
+def _memory_fraction(raw: str) -> float:
+    value = float(raw)
+    if not 0.8 <= value <= 0.95 or not math.isfinite(value):
+        raise argparse.ArgumentTypeError(
+            "value must be finite and between 0.8 and 0.95"
+        )
+    return value
+
+
 def _sha256_argument(raw: str) -> str:
     if _SHA256_PATTERN.fullmatch(raw) is None:
         raise argparse.ArgumentTypeError("value must be a lowercase SHA-256 digest")
@@ -1482,6 +1494,12 @@ def _parser() -> argparse.ArgumentParser:
         help="resident experts per stage, at most 44 (default: 40)",
     )
     parser.add_argument(
+        "--static-memory-fraction",
+        type=_memory_fraction,
+        default=DEFAULT_STATIC_MEMORY_FRACTION,
+        help="GPU memory fraction available to weights and KV cache (default: 0.9)",
+    )
+    parser.add_argument(
         "--readiness-timeout-seconds",
         type=_positive_float,
         default=1800.0,
@@ -1549,6 +1567,7 @@ def _config_from_arguments(arguments: argparse.Namespace) -> Pp2LocalDiagnosticC
             tuple[int, int], arguments.pipeline_layer_partition
         ),
         resident_gpu_experts=resident_gpu_experts,
+        static_memory_fraction=cast(float, arguments.static_memory_fraction),
         readiness_timeout_seconds=cast(float, arguments.readiness_timeout_seconds),
         request_timeout_seconds=cast(float, arguments.request_timeout_seconds),
         cleanup_timeout_seconds=cast(float, arguments.cleanup_timeout_seconds),
