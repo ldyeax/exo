@@ -53,6 +53,18 @@ GLM_4_7_FLASH_SERVING_BASELINE_TARGET_PROFILE: Final[SglangKtTargetProfile] = (
 GLM_4_7_FLASH_PP3_DIAGNOSTIC_TARGET_PROFILE: Final[SglangKtTargetProfile] = (
     "glm47_flash_bf16_sm86_pp3_diagnostic_v1"
 )
+GLM_4_7_FLASH_PP2_LOCAL_DIAGNOSTIC_TARGET_PROFILE: Final[SglangKtTargetProfile] = (
+    "glm47_flash_bf16_sm86_pp2_local_diagnostic_v1"
+)
+GLM_4_7_FLASH_PP2_LOCAL_PIPELINE_LAYER_PARTITION: Final = (24, 23)
+GLM_4_7_FLASH_PP2_LOCAL_PIPELINE_LAYER_PARTITIONS: Final = frozenset(
+    (
+        GLM_4_7_FLASH_PP2_LOCAL_PIPELINE_LAYER_PARTITION,
+        (23, 24),
+    )
+)
+GLM_4_7_FLASH_PP2_LOCAL_DEFAULT_RESIDENT_GPU_EXPERTS: Final = 40
+GLM_4_7_FLASH_PP2_LOCAL_MAX_RESIDENT_GPU_EXPERTS: Final = 44
 GLM_4_7_FLASH_PP3_PIPELINE_LAYER_PARTITION: Final = (16, 16, 15)
 GLM_4_7_FLASH_PP3_PIPELINE_LAYER_PARTITIONS: Final = frozenset(
     (
@@ -66,6 +78,7 @@ GLM_4_7_FLASH_TARGET_PROFILES: Final = frozenset(
         GLM_4_7_FLASH_CPU_ROUTED_EXPERTS_TARGET_PROFILE,
         GLM_4_7_FLASH_SERVING_BASELINE_TARGET_PROFILE,
         GLM_4_7_FLASH_PP3_DIAGNOSTIC_TARGET_PROFILE,
+        GLM_4_7_FLASH_PP2_LOCAL_DIAGNOSTIC_TARGET_PROFILE,
     )
 )
 
@@ -74,7 +87,7 @@ GLM_4_7_FLASH_TARGET_PROFILES: Final = frozenset(
 SUPPORTED_KTRANSFORMERS_REVISION: Final = "ce7c3ddbe93f7ac1f992375eed54058bbc512646"
 SUPPORTED_SGLANG_REVISION: Final = "8b636f9008dbad58c0a8e481b03e794739e6c146"
 GLM_4_7_FLASH_KTRANSFORMERS_REVISION: Final = "f9ca69648421f5774215c4da9cf711dccf54f49e"
-GLM_4_7_FLASH_SGLANG_REVISION: Final = "3721d710102456b6bf849122e781129dc3f7d9c6"
+GLM_4_7_FLASH_SGLANG_REVISION: Final = "da64717bb2e87f7ebc6e69768ba575c18454ab3c"
 REQUIRED_TRANSFORMERS_DISTRIBUTION: Final = "transformers-kt"
 REQUIRED_TRANSFORMERS_DISTRIBUTION_VERSION: Final = "5.6.0.post1"
 REQUIRED_TRANSFORMERS_MODULE_VERSION: Final = "5.6.0"
@@ -270,6 +283,7 @@ class SglangKtProcessLaunchSpec(FrozenModel):
             if self.target_profile in (
                 GLM_4_7_FLASH_SERVING_BASELINE_TARGET_PROFILE,
                 GLM_4_7_FLASH_PP3_DIAGNOSTIC_TARGET_PROFILE,
+                GLM_4_7_FLASH_PP2_LOCAL_DIAGNOSTIC_TARGET_PROFILE,
             ):
                 return (*glm47_arguments, "--disable-radix-cache")
             return (*glm47_arguments, "--record-kt-gpu-expert-distribution")
@@ -295,6 +309,14 @@ class SglangKtProcessLaunchSpec(FrozenModel):
             ("CUDA_VISIBLE_DEVICES", self.stage.gpu_uuid),
             ("PYTORCH_ALLOC_CONF", "expandable_segments:True"),
         )
+        if self.target_profile == GLM_4_7_FLASH_PP2_LOCAL_DIAGNOSTIC_TARGET_PROFILE:
+            layer_partition = ",".join(
+                str(layer_count) for layer_count in self.plan.pipeline_layer_partition
+            )
+            return (
+                *common_environment,
+                ("SGLANG_PP_LAYER_PARTITION", layer_partition),
+            )
         if self.target_profile == GLM_4_7_FLASH_PP3_DIAGNOSTIC_TARGET_PROFILE:
             layer_partition = ",".join(
                 str(layer_count) for layer_count in self.plan.pipeline_layer_partition
@@ -445,6 +467,20 @@ def build_glm_4_7_flash_bf16_pp3_diagnostic_process_launch_specs(
     return build_sglang_kt_process_launch_specs(plan, python_executable)
 
 
+def build_glm_4_7_flash_bf16_pp2_local_diagnostic_process_launch_specs(
+    plan: SglangKtLaunchPlan,
+    python_executable: SglangKtPythonExecutable,
+) -> tuple[SglangKtProcessLaunchSpec, ...]:
+    """Build the two-stage, dwagon-local GLM-4.7 diagnostic process group."""
+
+    if plan.target_profile != GLM_4_7_FLASH_PP2_LOCAL_DIAGNOSTIC_TARGET_PROFILE:
+        raise ValueError(
+            "GLM-4.7-Flash local PP2 diagnostic builder requires target profile "
+            f"{GLM_4_7_FLASH_PP2_LOCAL_DIAGNOSTIC_TARGET_PROFILE}"
+        )
+    return build_sglang_kt_process_launch_specs(plan, python_executable)
+
+
 def build_sglang_kt_process_launch_specs(
     plan: SglangKtLaunchPlan,
     python_executable: SglangKtPythonExecutable,
@@ -564,7 +600,11 @@ def _validate_glm_4_7_flash_bf16_plan(plan: SglangKtLaunchPlan) -> None:
     if plan.total_layers != GLM_4_7_FLASH_LAYER_COUNT:
         raise ValueError("GLM-4.7-Flash launch plans must contain exactly 47 layers")
     if (
-        plan.target_profile != GLM_4_7_FLASH_PP3_DIAGNOSTIC_TARGET_PROFILE
+        plan.target_profile
+        not in (
+            GLM_4_7_FLASH_PP3_DIAGNOSTIC_TARGET_PROFILE,
+            GLM_4_7_FLASH_PP2_LOCAL_DIAGNOSTIC_TARGET_PROFILE,
+        )
         and len(plan.stages) != 1
     ):
         raise ValueError("GLM-4.7-Flash smoke profile requires PP=1 and TP=1")
@@ -584,6 +624,9 @@ def _validate_glm_4_7_flash_bf16_plan(plan: SglangKtLaunchPlan) -> None:
 
     if plan.target_profile == GLM_4_7_FLASH_PP3_DIAGNOSTIC_TARGET_PROFILE:
         _validate_glm_4_7_flash_bf16_pp3_diagnostic_plan(plan)
+        return
+    if plan.target_profile == GLM_4_7_FLASH_PP2_LOCAL_DIAGNOSTIC_TARGET_PROFILE:
+        _validate_glm_4_7_flash_bf16_pp2_local_diagnostic_plan(plan)
         return
 
     stage = plan.stages[0]
@@ -653,3 +696,67 @@ def _validate_glm_4_7_flash_bf16_pp3_diagnostic_plan(
             )
         if not stage.hca_devices:
             raise ValueError("GLM-4.7-Flash PP3 diagnostic stages require hca_devices")
+
+
+def _validate_glm_4_7_flash_bf16_pp2_local_diagnostic_plan(
+    plan: SglangKtLaunchPlan,
+) -> None:
+    if len(plan.stages) != len(GLM_4_7_FLASH_PP2_LOCAL_PIPELINE_LAYER_PARTITION):
+        raise ValueError(
+            "GLM-4.7-Flash local PP2 diagnostic profile requires two stages"
+        )
+    if (
+        plan.pipeline_layer_partition
+        not in GLM_4_7_FLASH_PP2_LOCAL_PIPELINE_LAYER_PARTITIONS
+    ):
+        raise ValueError(
+            "GLM-4.7-Flash local PP2 diagnostic profile requires the 24,23 or "
+            "23,24 layer partition"
+        )
+    if len({stage.node_id for stage in plan.stages}) != 1:
+        raise ValueError(
+            "GLM-4.7-Flash local PP2 diagnostic stages must share one physical node"
+        )
+    if len({stage.service_endpoint.ip for stage in plan.stages}) != 1:
+        raise ValueError(
+            "GLM-4.7-Flash local PP2 diagnostic stages must share one service IP"
+        )
+    if len({stage.model_path for stage in plan.stages}) != 1:
+        raise ValueError(
+            "GLM-4.7-Flash local PP2 diagnostic stages must share one model snapshot"
+        )
+    for stage in plan.stages:
+        if stage.model_path != stage.ktransformers_weight_path:
+            raise ValueError(
+                "the GLM-4.7-Flash BF16 local PP2 diagnostic profile requires "
+                "model_path and ktransformers_weight_path to match"
+            )
+        if stage.ktransformers_method != "BF16":
+            raise ValueError(
+                "GLM-4.7-Flash BF16 local PP2 diagnostic stages require "
+                "KTransformers method BF16"
+            )
+        if not (
+            1
+            <= stage.resident_gpu_experts
+            <= GLM_4_7_FLASH_PP2_LOCAL_MAX_RESIDENT_GPU_EXPERTS
+        ):
+            raise ValueError(
+                "GLM-4.7-Flash local PP2 diagnostic stages require between 1 and "
+                "44 resident GPU experts per MoE layer"
+            )
+        if stage.max_deferred_experts_per_token != 0:
+            raise ValueError(
+                "GLM-4.7-Flash local PP2 diagnostic stages require deferred experts "
+                "disabled"
+            )
+        if stage.hca_devices:
+            raise ValueError(
+                "GLM-4.7-Flash local PP2 diagnostic stages do not admit HCA devices"
+            )
+
+    if len({stage.resident_gpu_experts for stage in plan.stages}) != 1:
+        raise ValueError(
+            "GLM-4.7-Flash local PP2 diagnostic stages must use the same resident "
+            "GPU expert count"
+        )

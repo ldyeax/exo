@@ -45,6 +45,7 @@ SglangKtTargetProfile = Literal[
     "glm47_flash_bf16_sm86_cpu_routed_experts_control_v1",
     "glm47_flash_bf16_sm86_serving_baseline_v1",
     "glm47_flash_bf16_sm86_pp3_diagnostic_v1",
+    "glm47_flash_bf16_sm86_pp2_local_diagnostic_v1",
 ]
 
 

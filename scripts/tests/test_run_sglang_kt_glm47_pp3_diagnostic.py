@@ -378,6 +378,111 @@ def test_remote_pump_failure_hands_registered_stage_to_cleanup(
     assert cleaned[0].owned.owner_token == owner_token
 
 
+def test_pp3_cleanup_continues_after_wait_join_and_close_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = make_config(tmp_path)
+    waited: list[int] = []
+    joined: list[int] = []
+    closed: list[int] = []
+
+    class FakeProcess:
+        def __init__(self, rank: int) -> None:
+            self.pid = 9000 + rank
+            self.rank = rank
+
+        def wait(self, *, timeout: float) -> int:
+            assert timeout == 10.0
+            waited.append(self.rank)
+            if self.rank == 2:
+                raise RuntimeError("injected wait failure")
+            return 0
+
+    class FailingPump:
+        def join(self, *, timeout: float) -> None:
+            assert timeout == 5.0
+            joined.append(2)
+            raise RuntimeError("injected join failure")
+
+    class FakeLog:
+        def __init__(self, rank: int) -> None:
+            self.rank = rank
+
+        def close(self) -> None:
+            closed.append(self.rank)
+            if self.rank == 2:
+                raise RuntimeError("injected close failure")
+
+    def start_fake_stage(
+        spec: pp3.SglangKtProcessLaunchSpec,
+        _config: pp3.Pp3DiagnosticConfig,
+        owner_token: str,
+    ) -> pp3._RunningStage:
+        log_path = config.result_directory / f"rank-{spec.pipeline_rank}.log"
+        log_path.touch(exist_ok=False)
+        owned = pp3.OwnedStageProcess(
+            rank=spec.pipeline_rank,
+            host_name="dwagon",
+            pid=9000 + spec.pipeline_rank,
+            process_group_id=9000 + spec.pipeline_rank,
+            start_time_ticks=100 + spec.pipeline_rank,
+            owner_token=owner_token,
+            ownership_namespace=str(spec.service_endpoint.port),
+            remote=False,
+            transport_pid=9000 + spec.pipeline_rank,
+            log_path=str(log_path),
+        )
+        pump = FailingPump() if spec.pipeline_rank == 2 else None
+        return pp3._RunningStage(
+            owned,
+            cast(subprocess.Popen[str], FakeProcess(spec.pipeline_rank)),
+            cast(io.TextIOBase, FakeLog(spec.pipeline_rank)),
+            cast(pp3.threading.Thread | None, pump),
+        )
+
+    def fail_readiness(*_args: object) -> tuple[pp3.JsonObject, ...]:
+        raise pp3.Pp3DiagnosticError("injected readiness failure")
+
+    monkeypatch.setattr(pp3, "start_stage", start_fake_stage)
+    monkeypatch.setattr(pp3, "wait_for_all_stages", fail_readiness)
+    monkeypatch.setattr(
+        pp3,
+        "_stop_local_stage",
+        lambda *_args: pp3.ProcessCleanupReceipt(
+            host_name="dwagon",
+            ownership_verified=True,
+            terminated=True,
+            forced=False,
+        ),
+    )
+
+    with pytest.raises(pp3.Pp3DiagnosticError, match="injected readiness failure"):
+        pp3.run_diagnostic(config)
+
+    result = json.loads(
+        (config.result_directory / "pp3-diagnostic-result.json").read_text()
+    )
+    cleanup = {item["rank"]: item for item in result["cleanup"]}
+    assert waited == [2, 1, 0]
+    assert joined == [2]
+    assert closed == [2, 1, 0]
+    assert cleanup[0]["terminated"] is True
+    assert cleanup[1]["terminated"] is True
+    assert cleanup[2]["terminated"] is False
+    assert (
+        "process wait failed: RuntimeError: injected wait failure"
+        in cleanup[2]["error"]
+    )
+    assert (
+        "output pump join failed: RuntimeError: injected join failure"
+        in cleanup[2]["error"]
+    )
+    assert (
+        "log close failed: RuntimeError: injected close failure" in cleanup[2]["error"]
+    )
+
+
 def _start_owned_group_with_sanitized_child(
     owner_token: str,
     namespace: str,

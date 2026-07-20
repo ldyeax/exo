@@ -14,6 +14,9 @@ from exo.worker.sglang_kt.launch_spec import (
     GLM_4_7_FLASH_BF16_MODEL_REVISION,
     GLM_4_7_FLASH_CPU_ROUTED_EXPERTS_TARGET_PROFILE,
     GLM_4_7_FLASH_KTRANSFORMERS_REVISION,
+    GLM_4_7_FLASH_PP2_LOCAL_DEFAULT_RESIDENT_GPU_EXPERTS,
+    GLM_4_7_FLASH_PP2_LOCAL_DIAGNOSTIC_TARGET_PROFILE,
+    GLM_4_7_FLASH_PP2_LOCAL_PIPELINE_LAYER_PARTITION,
     GLM_4_7_FLASH_PP3_DIAGNOSTIC_TARGET_PROFILE,
     GLM_4_7_FLASH_PP3_PIPELINE_LAYER_PARTITION,
     GLM_4_7_FLASH_PP3_PIPELINE_LAYER_PARTITIONS,
@@ -29,6 +32,7 @@ from exo.worker.sglang_kt.launch_spec import (
     SUPPORTED_SGLANG_REVISION,
     SglangKtProcessLaunchSpec,
     build_glm_4_7_flash_bf16_cpu_routed_experts_process_launch_specs,
+    build_glm_4_7_flash_bf16_pp2_local_diagnostic_process_launch_specs,
     build_glm_4_7_flash_bf16_pp3_diagnostic_process_launch_specs,
     build_glm_4_7_flash_bf16_process_launch_specs,
     build_glm_4_7_flash_bf16_serving_baseline_process_launch_specs,
@@ -285,6 +289,36 @@ def make_glm_4_7_flash_bf16_pp3_diagnostic_plan(
     )
 
 
+def make_glm_4_7_flash_bf16_pp2_local_diagnostic_plan(
+    *, resident_gpu_experts: int = GLM_4_7_FLASH_PP2_LOCAL_DEFAULT_RESIDENT_GPU_EXPERTS
+) -> SglangKtLaunchPlan:
+    plan = make_glm_4_7_flash_bf16_pp3_diagnostic_plan(
+        resident_gpu_experts=resident_gpu_experts
+    )
+    stages = (
+        plan.stages[0].model_copy(
+            update={
+                "end_layer": 24,
+                "hca_devices": (),
+            }
+        ),
+        plan.stages[1].model_copy(
+            update={
+                "start_layer": 24,
+                "end_layer": 47,
+                "hca_devices": (),
+            }
+        ),
+    )
+    return plan.model_copy(
+        update={
+            "target_profile": GLM_4_7_FLASH_PP2_LOCAL_DIAGNOSTIC_TARGET_PROFILE,
+            "distributed_coordinator": Host(ip="192.168.40.248", port=29_530),
+            "stages": stages,
+        }
+    )
+
+
 def argument_value(arguments: tuple[str, ...], option: str) -> str:
     return arguments[arguments.index(option) + 1]
 
@@ -522,6 +556,56 @@ def test_glm_4_7_flash_pp3_admits_cross_host_heavier_partition() -> None:
     assert plan.pipeline_layer_partition in GLM_4_7_FLASH_PP3_PIPELINE_LAYER_PARTITIONS
     assert {dict(spec.environment)["SGLANG_PP_LAYER_PARTITION"] for spec in specs} == {
         "16,15,16"
+    }
+
+
+def test_builds_glm_4_7_flash_bf16_pp2_local_diagnostic_process_group() -> None:
+    plan = make_glm_4_7_flash_bf16_pp2_local_diagnostic_plan()
+
+    specs = build_glm_4_7_flash_bf16_pp2_local_diagnostic_process_launch_specs(
+        plan,
+        PYTHON_EXECUTABLE,
+    )
+
+    assert (
+        plan.pipeline_layer_partition
+        == GLM_4_7_FLASH_PP2_LOCAL_PIPELINE_LAYER_PARTITION
+    )
+    assert tuple(spec.pipeline_rank for spec in specs) == (0, 1)
+    assert tuple(spec.node_id for spec in specs) == (NodeId("dwagon"),) * 2
+    assert tuple(spec.stage.resident_gpu_experts for spec in specs) == (40, 40)
+    for expected_rank, spec in enumerate(specs):
+        assert spec.target_profile == GLM_4_7_FLASH_PP2_LOCAL_DIAGNOSTIC_TARGET_PROFILE
+        assert argument_value(spec.arguments, "--pp-size") == "2"
+        assert argument_value(spec.arguments, "--tp-size") == "1"
+        assert argument_value(spec.arguments, "--nnodes") == "2"
+        assert argument_value(spec.arguments, "--node-rank") == str(expected_rank)
+        assert argument_value(spec.arguments, "--kt-num-gpu-experts") == "40"
+        assert "--disable-radix-cache" in spec.arguments
+        assert dict(spec.environment) == {
+            "CUDA_VISIBLE_DEVICES": spec.gpu_uuid,
+            "PYTORCH_ALLOC_CONF": "expandable_segments:True",
+            "SGLANG_PP_LAYER_PARTITION": "24,23",
+        }
+        assert all(not name.startswith("NCCL_") for name, _ in spec.environment)
+
+
+def test_glm_4_7_flash_pp2_local_admits_reverse_layer_partition() -> None:
+    plan = make_glm_4_7_flash_bf16_pp2_local_diagnostic_plan()
+    stages = (
+        plan.stages[0].model_copy(update={"end_layer": 23}),
+        plan.stages[1].model_copy(update={"start_layer": 23}),
+    )
+    plan = plan.model_copy(update={"stages": stages})
+
+    specs = build_glm_4_7_flash_bf16_pp2_local_diagnostic_process_launch_specs(
+        plan,
+        PYTHON_EXECUTABLE,
+    )
+
+    assert plan.pipeline_layer_partition == (23, 24)
+    assert {dict(spec.environment)["SGLANG_PP_LAYER_PARTITION"] for spec in specs} == {
+        "23,24"
     }
 
 
@@ -770,6 +854,94 @@ def test_glm_4_7_flash_pp3_diagnostic_rejects_unvalidated_stage_options(
     with pytest.raises(ValueError, match=error_message):
         build_glm_4_7_flash_bf16_pp3_diagnostic_process_launch_specs(
             plan.model_copy(update={"stages": stages}),
+            PYTHON_EXECUTABLE,
+        )
+
+
+@pytest.mark.parametrize(
+    ("stage_update", "error_message"),
+    (
+        ({"ktransformers_method": "FP8"}, "method BF16"),
+        ({"resident_gpu_experts": 0}, "between 1 and 44"),
+        ({"resident_gpu_experts": 45}, "between 1 and 44"),
+        ({"max_deferred_experts_per_token": 1}, "deferred experts disabled"),
+        ({"hca_devices": ("mlx4_0:1",)}, "do not admit HCA devices"),
+        (
+            {"ktransformers_weight_path": "/var/lib/exo/models/other"},
+            "model_path and ktransformers_weight_path",
+        ),
+    ),
+)
+def test_glm_4_7_flash_pp2_local_rejects_unvalidated_stage_options(
+    stage_update: dict[str, object],
+    error_message: str,
+) -> None:
+    plan = make_glm_4_7_flash_bf16_pp2_local_diagnostic_plan()
+    stages = (
+        plan.stages[0],
+        plan.stages[1].model_copy(update=stage_update),
+    )
+
+    with pytest.raises(ValueError, match=error_message):
+        build_glm_4_7_flash_bf16_pp2_local_diagnostic_process_launch_specs(
+            plan.model_copy(update={"stages": stages}),
+            PYTHON_EXECUTABLE,
+        )
+
+
+def test_glm_4_7_flash_pp2_local_rejects_nonlocal_or_unapproved_partition() -> None:
+    plan = make_glm_4_7_flash_bf16_pp2_local_diagnostic_plan()
+    remote_stages = (
+        plan.stages[0],
+        plan.stages[1].model_copy(update={"node_id": NodeId("fwuff")}),
+    )
+    invalid_partition_stages = (
+        plan.stages[0].model_copy(update={"end_layer": 22}),
+        plan.stages[1].model_copy(update={"start_layer": 22}),
+    )
+    different_ip_stages = (
+        plan.stages[0],
+        plan.stages[1].model_copy(
+            update={"service_endpoint": Host(ip="192.168.40.249", port=30_201)}
+        ),
+    )
+    different_snapshot_stages = (
+        plan.stages[0],
+        plan.stages[1].model_copy(
+            update={
+                "model_path": "/var/lib/exo/models/other",
+                "ktransformers_weight_path": "/var/lib/exo/models/other",
+            }
+        ),
+    )
+    different_expert_count_stages = (
+        plan.stages[0],
+        plan.stages[1].model_copy(update={"resident_gpu_experts": 44}),
+    )
+
+    with pytest.raises(ValueError, match="share one physical node"):
+        build_glm_4_7_flash_bf16_pp2_local_diagnostic_process_launch_specs(
+            plan.model_copy(update={"stages": remote_stages}),
+            PYTHON_EXECUTABLE,
+        )
+    with pytest.raises(ValueError, match="24,23 or 23,24"):
+        build_glm_4_7_flash_bf16_pp2_local_diagnostic_process_launch_specs(
+            plan.model_copy(update={"stages": invalid_partition_stages}),
+            PYTHON_EXECUTABLE,
+        )
+    with pytest.raises(ValueError, match="share one service IP"):
+        build_glm_4_7_flash_bf16_pp2_local_diagnostic_process_launch_specs(
+            plan.model_copy(update={"stages": different_ip_stages}),
+            PYTHON_EXECUTABLE,
+        )
+    with pytest.raises(ValueError, match="share one model snapshot"):
+        build_glm_4_7_flash_bf16_pp2_local_diagnostic_process_launch_specs(
+            plan.model_copy(update={"stages": different_snapshot_stages}),
+            PYTHON_EXECUTABLE,
+        )
+    with pytest.raises(ValueError, match="same resident GPU expert count"):
+        build_glm_4_7_flash_bf16_pp2_local_diagnostic_process_launch_specs(
+            plan.model_copy(update={"stages": different_expert_count_stages}),
             PYTHON_EXECUTABLE,
         )
 

@@ -32,7 +32,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import IO, Final, Literal, cast
+from typing import IO, Final, Literal, Protocol, cast
 
 sys.dont_write_bytecode = True
 
@@ -55,6 +55,7 @@ from exo.worker.sglang_kt.launch_spec import (  # noqa: E402
     GLM_4_7_FLASH_KTRANSFORMERS_REVISION,
     GLM_4_7_FLASH_LAYER_COUNT,
     GLM_4_7_FLASH_MAX_TOTAL_TOKENS,
+    GLM_4_7_FLASH_PP2_LOCAL_DIAGNOSTIC_TARGET_PROFILE,
     GLM_4_7_FLASH_PP3_DIAGNOSTIC_TARGET_PROFILE,
     GLM_4_7_FLASH_PP3_PIPELINE_LAYER_PARTITION,
     GLM_4_7_FLASH_PP3_PIPELINE_LAYER_PARTITIONS,
@@ -156,6 +157,22 @@ class Pp3DiagnosticConfig:
     sample_count: int
 
 
+class LocalStageDiagnosticConfig(Protocol):
+    """Settings required to own one local pipeline-stage process."""
+
+    @property
+    def result_directory(self) -> Path: ...
+
+    @property
+    def local_source_directory(self) -> str: ...
+
+    @property
+    def dwagon_socket_interface(self) -> str: ...
+
+    @property
+    def cleanup_timeout_seconds(self) -> float: ...
+
+
 @dataclass(frozen=True, slots=True)
 class OwnedStageProcess:
     rank: int
@@ -176,6 +193,9 @@ class _RunningStage:
     process: subprocess.Popen[str]
     log_file: IO[str]
     pump_thread: threading.Thread | None
+
+
+type RunningStage = _RunningStage
 
 
 def _utc_now() -> str:
@@ -418,13 +438,18 @@ def build_stage_environment(
             "GLOO_SOCKET_IFNAME": socket_interface,
             "NCCL_DEBUG": "INFO",
             "NCCL_DEBUG_SUBSYS": "INIT,NET,ENV",
-            "NCCL_IB_MERGE_NICS": "1",
             "NCCL_SOCKET_IFNAME": socket_interface,
             "PYTHONDONTWRITEBYTECODE": "1",
             "PYTHONHASHSEED": "0",
             "TOKENIZERS_PARALLELISM": "false",
         }
     )
+    if spec.target_profile == GLM_4_7_FLASH_PP3_DIAGNOSTIC_TARGET_PROFILE:
+        environment["NCCL_IB_MERGE_NICS"] = "1"
+    elif spec.target_profile != GLM_4_7_FLASH_PP2_LOCAL_DIAGNOSTIC_TARGET_PROFILE:
+        raise Pp3DiagnosticError(
+            f"unsupported pipeline diagnostic profile {spec.target_profile}"
+        )
     validation.require_no_profiler_state(environment, spec.command, "")
     return environment
 
@@ -547,7 +572,7 @@ def _terminate_unregistered_local_process(
 
 def _start_local_stage(
     spec: SglangKtProcessLaunchSpec,
-    config: Pp3DiagnosticConfig,
+    config: LocalStageDiagnosticConfig,
     owner_token: str,
     log_file: IO[str],
 ) -> _RunningStage:
@@ -594,6 +619,22 @@ def _start_local_stage(
                 "local stage start failed and unregistered cleanup was incomplete: "
                 f"{cleanup.error}"
             ) from error
+        raise
+
+
+def start_local_stage(
+    spec: SglangKtProcessLaunchSpec,
+    config: LocalStageDiagnosticConfig,
+    owner_token: str,
+) -> RunningStage:
+    """Start one strictly owned local stage and retain its rank-specific log."""
+
+    log_path = config.result_directory / f"rank-{spec.pipeline_rank}.log"
+    log_file = log_path.open("x", encoding="utf-8")
+    try:
+        return _start_local_stage(spec, config, owner_token, log_file)
+    except BaseException:
+        log_file.close()
         raise
 
 
@@ -708,12 +749,13 @@ def start_stage(
     config: Pp3DiagnosticConfig,
     owner_token: str,
 ) -> _RunningStage:
+    if spec.node_id != FWUFF_NODE_ID:
+        return start_local_stage(spec, config, owner_token)
+
     log_path = config.result_directory / f"rank-{spec.pipeline_rank}.log"
     log_file = log_path.open("x", encoding="utf-8")
     try:
-        if spec.node_id == FWUFF_NODE_ID:
-            return _start_remote_stage(spec, config, owner_token, log_file)
-        return _start_local_stage(spec, config, owner_token, log_file)
+        return _start_remote_stage(spec, config, owner_token, log_file)
     except BaseException:
         log_file.close()
         raise
@@ -864,13 +906,11 @@ def stop_stage(
     running: _RunningStage,
     config: Pp3DiagnosticConfig,
 ) -> ProcessCleanupReceipt:
-    cleanup: ProcessCleanupReceipt
+    if not running.owned.remote:
+        return stop_local_stage(running, config.cleanup_timeout_seconds)
+
     try:
-        cleanup = (
-            _stop_remote_stage(running, config)
-            if running.owned.remote
-            else _stop_local_stage(running, config.cleanup_timeout_seconds)
-        )
+        cleanup = _stop_remote_stage(running, config)
     except BaseException as error:
         cleanup = ProcessCleanupReceipt(
             host_name=running.owned.host_name,
@@ -879,29 +919,77 @@ def stop_stage(
             forced=False,
             error=f"{type(error).__name__}: {error}",
         )
+    return _finalize_stage_cleanup(running, cleanup)
+
+
+def _finalize_stage_cleanup(
+    running: RunningStage,
+    cleanup: ProcessCleanupReceipt,
+) -> ProcessCleanupReceipt:
     finalization_errors: list[str] = []
     try:
         running.process.wait(timeout=10.0)
     except subprocess.TimeoutExpired:
         if running.owned.remote:
-            with contextlib.suppress(ProcessLookupError):
+            try:
                 os.killpg(running.process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            except BaseException as error:
+                finalization_errors.append(
+                    f"SSH transport SIGTERM failed: {type(error).__name__}: {error}"
+                )
             try:
                 running.process.wait(timeout=2.0)
             except subprocess.TimeoutExpired:
-                with contextlib.suppress(ProcessLookupError):
+                try:
                     os.killpg(running.process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                except BaseException as error:
+                    finalization_errors.append(
+                        f"SSH transport SIGKILL failed: {type(error).__name__}: {error}"
+                    )
                 try:
                     running.process.wait(timeout=2.0)
                 except subprocess.TimeoutExpired:
                     finalization_errors.append("SSH transport could not be reaped")
+                except BaseException as error:
+                    finalization_errors.append(
+                        f"SSH transport final wait failed: {type(error).__name__}: "
+                        f"{error}"
+                    )
+            except BaseException as error:
+                finalization_errors.append(
+                    f"SSH transport retry wait failed: {type(error).__name__}: {error}"
+                )
         else:
             finalization_errors.append("local process could not be reaped")
+    except BaseException as error:
+        finalization_errors.append(
+            f"process wait failed: {type(error).__name__}: {error}"
+        )
     if running.pump_thread is not None:
-        running.pump_thread.join(timeout=5.0)
-        if running.pump_thread.is_alive():
-            finalization_errors.append("remote output pump did not finish")
-    running.log_file.close()
+        try:
+            running.pump_thread.join(timeout=5.0)
+        except BaseException as error:
+            finalization_errors.append(
+                f"output pump join failed: {type(error).__name__}: {error}"
+            )
+        else:
+            try:
+                pump_alive = running.pump_thread.is_alive()
+            except BaseException as error:
+                finalization_errors.append(
+                    f"output pump status failed: {type(error).__name__}: {error}"
+                )
+            else:
+                if pump_alive:
+                    finalization_errors.append("remote output pump did not finish")
+    try:
+        running.log_file.close()
+    except BaseException as error:
+        finalization_errors.append(f"log close failed: {type(error).__name__}: {error}")
     if finalization_errors:
         prior_error = cleanup.error
         cleanup = cleanup.model_copy(
@@ -913,6 +1001,25 @@ def stop_stage(
             }
         )
     return cleanup
+
+
+def stop_local_stage(
+    running: RunningStage,
+    cleanup_timeout_seconds: float,
+) -> ProcessCleanupReceipt:
+    """Verify, stop, and reap one locally owned stage process group."""
+
+    try:
+        cleanup = _stop_local_stage(running, cleanup_timeout_seconds)
+    except BaseException as error:
+        cleanup = ProcessCleanupReceipt(
+            host_name=running.owned.host_name,
+            ownership_verified=False,
+            terminated=False,
+            forced=False,
+            error=f"{type(error).__name__}: {error}",
+        )
+    return _finalize_stage_cleanup(running, cleanup)
 
 
 def all_stages_alive(running_stages: Sequence[_RunningStage]) -> bool:
