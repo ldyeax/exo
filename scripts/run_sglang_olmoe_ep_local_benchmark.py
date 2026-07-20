@@ -238,6 +238,15 @@ class RunningServerProcess:
     log_file: IO[bytes]
 
 
+@dataclass(frozen=True, slots=True)
+class ProcessStatIdentity:
+    parent_pid: int
+    process_group_id: int
+    session_id: int
+    start_time_ticks: int
+    state: str
+
+
 @dataclass(slots=True)
 class _ManagedSignalState:
     signal_number: int | None = None
@@ -1003,7 +1012,7 @@ def verify_dwagon_cpu_topology(
     )
 
 
-def _read_process_stat_at(pid: int, proc_root: Path) -> tuple[int, int, str]:
+def _read_process_identity_at(pid: int, proc_root: Path) -> ProcessStatIdentity:
     try:
         contents = (proc_root / str(pid) / "stat").read_text()
     except OSError as error:
@@ -1016,7 +1025,21 @@ def _read_process_stat_at(pid: int, proc_root: Path) -> tuple[int, int, str]:
     fields = contents[closing + 2 :].split()
     if len(fields) < 20:
         raise OlmoeEpBenchmarkError(f"process {pid} stat is incomplete")
-    return int(fields[2]), int(fields[19]), fields[0]
+    try:
+        return ProcessStatIdentity(
+            parent_pid=int(fields[1]),
+            process_group_id=int(fields[2]),
+            session_id=int(fields[3]),
+            start_time_ticks=int(fields[19]),
+            state=fields[0],
+        )
+    except ValueError as error:
+        raise OlmoeEpBenchmarkError(f"process {pid} stat is invalid") from error
+
+
+def _read_process_stat_at(pid: int, proc_root: Path) -> tuple[int, int, str]:
+    identity = _read_process_identity_at(pid, proc_root)
+    return identity.process_group_id, identity.start_time_ticks, identity.state
 
 
 def _read_process_stat(pid: int) -> tuple[int, int, str]:
@@ -1055,18 +1078,35 @@ def _process_environment(pid: int) -> dict[str, str]:
     return environment
 
 
+def _validate_owned_member_identity(
+    owned: OwnedServerProcess, pid: int, identity: ProcessStatIdentity
+) -> None:
+    if (
+        identity.process_group_id != owned.process_group_id
+        or identity.session_id != owned.pid
+        or identity.start_time_ticks < owned.start_time_ticks
+        or (pid == owned.pid and identity.start_time_ticks != owned.start_time_ticks)
+    ):
+        raise OlmoeEpBenchmarkError(
+            f"process group {owned.process_group_id} contains an unowned process"
+        )
+
+
 def _owned_group_members(owned: OwnedServerProcess) -> tuple[int, ...]:
     members = _process_group_members(owned.process_group_id)
     for pid in members:
-        environment = _process_environment(pid)
-        if (
-            environment.get(_OWNER_TOKEN_ENVIRONMENT) != owned.owner_token
-            or environment.get(_OWNERSHIP_NAMESPACE_ENVIRONMENT)
-            != owned.ownership_namespace
-        ):
-            raise OlmoeEpBenchmarkError(
-                f"process group {owned.process_group_id} contains an unowned process"
-            )
+        identity = _read_process_identity_at(pid, Path("/proc"))
+        _validate_owned_member_identity(owned, pid, identity)
+        if pid == owned.pid:
+            environment = _process_environment(pid)
+            if (
+                environment.get(_OWNER_TOKEN_ENVIRONMENT) != owned.owner_token
+                or environment.get(_OWNERSHIP_NAMESPACE_ENVIRONMENT)
+                != owned.ownership_namespace
+            ):
+                raise OlmoeEpBenchmarkError(
+                    "native SGLang session leader identity changed"
+                )
     return members
 
 

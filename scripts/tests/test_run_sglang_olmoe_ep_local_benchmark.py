@@ -3,8 +3,10 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import signal
 import subprocess
 import sys
+import time
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -505,6 +507,123 @@ def test_listener_ownership_rejects_stale_process(tmp_path: Path) -> None:
             olmoe.verify_listener_owned(running, port, proc_root)
     finally:
         olmoe.stop_server(running, 2.0)
+
+
+def test_owned_group_accepts_multiprocessing_descendant_with_scrubbed_environ(
+    tmp_path: Path,
+) -> None:
+    script = tmp_path / "multiprocessing_tree.py"
+    script.write_text(
+        """
+import multiprocessing
+import os
+import sys
+import time
+
+
+def scrubbed_worker():
+    environment = dict(os.environ)
+    environment.pop("EXO_OLMOE_EP_OWNER_TOKEN", None)
+    environment.pop("EXO_OLMOE_EP_NAMESPACE", None)
+    os.execve(
+        sys.executable,
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        environment,
+    )
+
+
+if __name__ == "__main__":
+    context = multiprocessing.get_context("spawn")
+    child = context.Process(target=scrubbed_worker)
+    child.start()
+    time.sleep(60)
+""".lstrip()
+    )
+    owner = "multiprocessing-owner"
+    namespace = "multiprocessing-namespace"
+    environment = {
+        **os.environ,
+        olmoe._OWNER_TOKEN_ENVIRONMENT: owner,
+        olmoe._OWNERSHIP_NAMESPACE_ENVIRONMENT: namespace,
+    }
+    log_path = tmp_path / "multiprocessing-tree.log"
+    log_file = log_path.open("xb", buffering=0)
+    process = subprocess.Popen(
+        [sys.executable, str(script)],
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+        env=environment,
+        start_new_session=True,
+    )
+    process_group, start_ticks, _state = olmoe._read_process_stat(process.pid)
+    running = olmoe.RunningServerProcess(
+        owned=olmoe.OwnedServerProcess(
+            pid=process.pid,
+            process_group_id=process_group,
+            start_time_ticks=start_ticks,
+            owner_token=owner,
+            ownership_namespace=namespace,
+            command=(sys.executable, str(script)),
+            launch_environment=(),
+            log_path=str(log_path),
+        ),
+        process=process,
+        log_file=log_file,
+    )
+    deadline = time.monotonic() + 5.0
+    members: tuple[int, ...] = ()
+    scrubbed: list[int] = []
+    while time.monotonic() < deadline:
+        members = olmoe._process_group_members(process_group)
+        scrubbed = []
+        for pid in members:
+            if pid == process.pid:
+                continue
+            observed_environment = olmoe._process_environment(pid)
+            if (
+                olmoe._OWNER_TOKEN_ENVIRONMENT not in observed_environment
+                and olmoe._OWNERSHIP_NAMESPACE_ENVIRONMENT not in observed_environment
+            ):
+                scrubbed.append(pid)
+        if len(members) >= 3 and scrubbed:
+            break
+        time.sleep(0.05)
+    try:
+        assert len(members) >= 3
+        assert scrubbed
+        assert olmoe._owned_group_members(running.owned) == members
+        os.kill(process.pid, signal.SIGTERM)
+        process.wait(timeout=2.0)
+        remaining = olmoe._process_group_members(process_group)
+        assert remaining
+        assert process.pid not in remaining
+    finally:
+        cleanup = olmoe.stop_server(running, 2.0)
+
+    assert cleanup["cleanup_complete"] is True
+
+
+def test_owned_group_rejects_same_pgid_from_different_session() -> None:
+    owned = olmoe.OwnedServerProcess(
+        pid=100,
+        process_group_id=100,
+        start_time_ticks=1_000,
+        owner_token="owner",
+        ownership_namespace="namespace",
+        command=("/runtime/python",),
+        launch_environment=(),
+        log_path="/tmp/server.log",
+    )
+    unrelated = olmoe.ProcessStatIdentity(
+        parent_pid=99,
+        process_group_id=100,
+        session_id=99,
+        start_time_ticks=1_001,
+        state="S",
+    )
+
+    with pytest.raises(olmoe.OlmoeEpBenchmarkError, match="unowned"):
+        olmoe._validate_owned_member_identity(owned, 101, unrelated)
 
 
 def test_port_preflight_rejects_stale_listener(
