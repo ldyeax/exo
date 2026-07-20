@@ -1549,6 +1549,16 @@ def _cache_manifest_once(cache_directories: tuple[Path, ...]) -> str:
             if stat.S_ISDIR(observed.st_mode):
                 entries.append({"path": relative, "kind": "directory"})
                 continue
+            if stat.S_ISSOCK(observed.st_mode) and observed.st_nlink == 1:
+                entries.append(
+                    {
+                        "path": relative,
+                        "kind": "socket",
+                        "device": observed.st_dev,
+                        "inode": observed.st_ino,
+                    }
+                )
+                continue
             if not stat.S_ISREG(observed.st_mode) or observed.st_nlink != 1:
                 raise Glm47ServingHarnessError(
                     "owned cache contains a special or multiply linked file"

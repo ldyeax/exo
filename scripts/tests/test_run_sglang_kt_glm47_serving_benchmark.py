@@ -1180,7 +1180,9 @@ def test_serving_environment_is_sanitized_and_owns_all_caches(tmp_path: Path) ->
     )
 
 
-def test_cache_manifest_is_content_bound_and_rejects_links(tmp_path: Path) -> None:
+def test_cache_manifest_accepts_owned_socket_and_rejects_unsafe_entries(
+    tmp_path: Path,
+) -> None:
     first = tmp_path / "cache" / "triton"
     second = tmp_path / "cache" / "cuda"
     first.mkdir(parents=True)
@@ -1194,6 +1196,33 @@ def test_cache_manifest_is_content_bound_and_rejects_links(tmp_path: Path) -> No
         (second, first), timeout_seconds=0.1, quiet_seconds=0.001
     )
     assert initial != changed
+
+    with socket.socket(socket.AF_UNIX) as endpoint:
+        endpoint.bind(str(second / "endpoint.sock"))
+        socket_manifest = harness.stable_cache_manifest(
+            (second, first), timeout_seconds=0.1, quiet_seconds=0.001
+        )
+    assert socket_manifest != changed
+
+    hardlink = second / "hardlink"
+    os.link(first / "kernel.bin", hardlink)
+    with pytest.raises(
+        harness.Glm47ServingHarnessError, match="special or multiply linked"
+    ):
+        harness.stable_cache_manifest(
+            (second, first), timeout_seconds=0.1, quiet_seconds=0.001
+        )
+    hardlink.unlink()
+
+    os.mkfifo(second / "named-pipe")
+    with pytest.raises(
+        harness.Glm47ServingHarnessError, match="special or multiply linked"
+    ):
+        harness.stable_cache_manifest(
+            (second, first), timeout_seconds=0.1, quiet_seconds=0.001
+        )
+
+    (second / "named-pipe").unlink()
     (second / "foreign").symlink_to(first / "kernel.bin")
     with pytest.raises(harness.Glm47ServingHarnessError, match="foreign link"):
         harness.stable_cache_manifest(
