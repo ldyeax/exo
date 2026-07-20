@@ -39,14 +39,18 @@ Rows without a decode measurement follow the decoded rows for that model.
 | GLM-4.7 Flash 30B-A3B | `glm47-pp2-local-dwagon-20260719-v5` | dwagon; PP2/TP1; 23/24 split; 2x RTX 3090 over NV4; full 56/56 cores; E42 | 6.559804369* | 5.970868191 | **PASS (diagnostic)**; prefill improved while decode regressed |
 | GPT-OSS 20B | `tp2-gptoss20b-20260718-v1` | dwagon 1x RTX 3090 + fwuff 1x RTX 3090; MLX/NCCL TP2; dual QDR | 148.77 | 38.13 | **PASS (diagnostic)**; exact TP1 equality; not a controlled performance comparison |
 | Llama 3.1 8B | `tp2-llama31-8b-20260718-v1` | dwagon 1x RTX 3090 + fwuff 1x RTX 3090; MLX/NCCL TP2; dual QDR | 134.15 | 26.02 | **PASS (diagnostic)**; exact TP1 equality; not a controlled performance comparison |
+| OLMoE-1B-7B-0924 7B-total/1B-active | `olmoe-ep1-local-dwagon-kernel-ab-tuned-20260720-v1` | dwagon; 2x RTX 3090 over NV4; full 56/56 physical cores; PP1/TP2/EP1; admitted RTX 3090 Triton config | 238.766833771* | 332.249496235 | **PASS (controlled A/B)**; exact baseline output; +5.80% prefill-heavy E2E and +8.21% decode-window throughput |
 | OLMoE-1B-7B-0924 7B-total/1B-active | `olmoe-ep1-local-dwagon-20260720-v1` | dwagon; 2x RTX 3090 over NV4; full 56/56 physical cores; PP1/TP2/EP1; 64 half-width experts per rank; standard dispatcher; CPU performance policy | 225.543915539* | 308.808973660 | **PASS (diagnostic)**; exact prefill-heavy output parity; decode token 4 is an exact-logprob tie |
+| OLMoE-1B-7B-0924 7B-total/1B-active | `olmoe-ep1-local-dwagon-kernel-ab-base-20260720-v2` | same controlled EP1 topology; SGLang fallback config | 225.678633105* | 307.030114217 | **PASS (controlled A/B baseline)**; exact tuned-run output |
+| OLMoE-1B-7B-0924 7B-total/1B-active | `olmoe-ep2-local-dwagon-kernel-ab-tuned-20260720-v1` | dwagon; 2x RTX 3090 over NV4; full 56/56 physical cores; PP1/TP2/EP2; admitted RTX 3090 Triton config | 221.397945372* | 303.929139921 | **PASS (controlled A/B)**; exact baseline output; +9.29% prefill-heavy E2E and +12.58% decode-window throughput |
 | OLMoE-1B-7B-0924 7B-total/1B-active | `olmoe-ep2-local-dwagon-20260720-v1` | dwagon; 2x RTX 3090 over NV4; full 56/56 physical cores; PP1/TP2/EP2; 32 full-width experts per rank; standard dispatcher; CPU performance policy | 202.942340498* | 270.100859149 | **PASS (diagnostic)**; true expert-ID/weight sharding; tied token 4 resolves differently and changes later routes |
+| OLMoE-1B-7B-0924 7B-total/1B-active | `olmoe-ep2-local-dwagon-kernel-ab-base-20260720-v1` | same controlled EP2 topology; SGLang fallback config | 202.582297555* | 269.964001023 | **PASS (controlled A/B baseline)**; exact tuned-run output |
 | Llama 3.2 3B | `tp2-llama32-3b-20260718-v1` | dwagon 1x RTX 3090 + fwuff 1x RTX 3090; MLX/NCCL TP2; dual QDR | 210.46 | 33.17 | **PASS (diagnostic)**; exact TP1 equality; not a controlled performance comparison |
 | SmolLM2 135M | `tp3-smollm2-20260718-v6` | dwagon 2x RTX 3090 + fwuff 1x RTX 3090; MLX/NCCL TP3 over InfiniBand | 210.53 | 29.20 | **PASS (diagnostic)**; no per-rail PMA proof; not a controlled performance comparison |
 
 This is an inventory, not a cross-row leaderboard: request shapes,
 concurrency, quantization, and harness definitions differ. `*` The local v10,
-PP2 v2-v9, local TP2 v1-v2, PP3 v2-v6/v8/v10, and OLMoE EP1/EP2 values are
+PP2 v2-v9, local TP2 v1-v2, PP3 v2-v6/v8/v10, and all OLMoE EP values are
 median end-to-end output rates for their 1,024-input/32-output prefill-heavy
 workload, not the input-token prefill metric used by the older harness.
 Approximate live-log rates from failed v8/v9 transactions remain in the
@@ -58,6 +62,9 @@ detailed ledger but are excluded here because no exact measurement survived.
 - **PASS (diagnostic):** correctness, transport, or lifecycle passed, but the
   receipt has `performance_comparable=false`; timing must not be used as a
   controlled hardware comparison.
+- **PASS (controlled A/B):** the run changed one admitted variable from its
+  paired baseline, retained exact output hashes, and passed lifecycle checks.
+- **PASS (controlled A/B baseline):** the unchanged half of that matched pair.
 - **PASS (artifact):** immutable source/build/install integrity passed without
   executing the model or making an inference-performance claim.
 - **STAGE PASS:** exact model acquisition and cross-host manifest equality
@@ -71,26 +78,32 @@ detailed ledger but are excluded here because no exact measurement survived.
 
 ## Current summary
 
-- Latest published proof-harness source: native OLMoE EP commit `14302708`,
-  including exact completion sanity, bounded logit-parity evidence,
+- Latest published proof-harness source: commit `371cf1ef`, including
+  fail-closed external MoE config snapshots, exact per-rank config-load proof,
+  immutable v2 stage-evidence admission, exact completion sanity,
   authenticated process ownership, bounded KV allocation, transactional CPU
   policy, and stable NUMA attestation.
-- Latest completed live-validation source: OLMoE EP at `14302708`, using the
+- Latest completed live-validation source: OLMoE EP at `371cf1ef`, using the
   exact SGLang `7fea582043df06ebdde549ee3de602a3d11b96c6` overlay and model contract
-  listed below.
+  listed below. The tuned bundle was produced by source `4dd86dda`.
 - Completed ladder rungs: Llama 3.2 1B, Llama 3.2 3B, Llama 3.1 8B,
   GPT-OSS 20B, and GLM-4.7 Flash.
-- Latest expert-parallel result: OLMoE PP1/TP2/EP1 reached 308.808973660
-  generation-window decode tok/s and PP1/TP2/EP2 reached 270.100859149 tok/s.
-  EP2 is true expert-ID/weight sharding through SGLang's standard masked-local
-  dispatcher and output all-reduce, not token A2A. It was 12.53% slower at
-  batch-one decode and 10.02% slower in the matched-output prefill-heavy test.
+- Latest expert-parallel result: controlled OLMoE kernel A/B runs raised
+  PP1/TP2/EP1 from 307.030114217 to 332.249496235 decode tok/s (+8.214%) and
+  PP1/TP2/EP2 from 269.964001023 to 303.929139921 tok/s (+12.581%).
+  Prefill-heavy end-to-end output improved 5.799% and 9.288%, respectively.
+  Every A/B pair had exact output hashes, exact sanity, unforced cleanup, and
+  restored CPU policy; each tuned run also had four authenticated config-load
+  markers with no fallback. Tuned EP2 remains 8.524% slower than tuned EP1 at
+  batch-one decode. EP2 is true
+  expert-ID/weight sharding through SGLang's standard masked-local dispatcher
+  and output all-reduce, not token A2A.
   Both modes passed exact one-token sanity and all prefill-heavy outputs matched.
   The receipt-backed 131-token probe found IDs 139 and 1769 at exactly equal
   logprob in both modes: `-4.532527446746826` under EP1 and
   `-4.558165073394775` under EP2. The token-4 split is therefore benign tie
-  resolution, not evidence of broken sharding. Its later decode timing remains
-  route-diverged and should not be treated as an exact-output A/B.
+  resolution, not evidence of broken sharding. Cross-mode later decode timing
+  remains route-diverged and should not be treated as an exact-output A/B.
 - Latest GLM topology result: local PP1/TP2 v2 raised residency from E40 to
   E44 while retaining both RTX 3090s over four NCCL P2P/IPC channels, all 112
   physical cores in two AMX pools, and the CPU performance policy. It reached
@@ -299,6 +312,14 @@ performance claim.
 | OLMoE EP2 tied-logit capture v1 | **EXPECTED FAIL (setup)** | `/var/lib/exo/benchmarks/olmoe-ep2-logit-capture-dwagon-20260720-v1`; the contract-required port 62630 was still in TCP `TIME_WAIT` immediately after EP1. The preflight failed before model launch or GPU allocation, and CPU policy restored exactly. Receipt SHA `b5dbef3a82454b69e7cbc50c6b8407a7c6272c0f0df7a003a01fe8eb4f66b972`. |
 | OLMoE EP2 tied-logit capture v2 | **PASS** | `/var/lib/exo/benchmarks/olmoe-ep2-logit-capture-dwagon-20260720-v2`; after the kernel timeout cleared, the identical context gave both candidate IDs 139 and 1769 logprob `-4.558165073394775`. Exact equality in both EP modes clears the token-4 semantic concern: later output divergence begins at a legitimate greedy tie. Exact sanity, expert identity, NUMA admission, unforced cleanup, and CPU-policy restoration passed. Receipt SHA `6d7643ac06de9f145a616ee22869fd4e14835c258d72ccca379f806da27c153d`; log SHA `eb5145305f31244f89f2d96137f18f8d246df297472013168572811f2640871b`; capture SHA `2da2ba24d5efb3e51fdeb0a851787357829c24c57093683f519a3449f2e6a753`. |
 | OLMoE paired stage contract v2 | **PASS (artifact)** | `/var/lib/exo/benchmarks/olmoe-stage-contract-dwagon-20260720-v2/olmoe-stage-contract.json`; full-rehashes the exact 13,838,721,960-byte snapshot and binds the committed-source EP1/EP2 captures with exact one-token ` 42` equality. Contract SHA `d54c92f60483f3786c85a2e92f2dbb8d3898bb924902fd9a87c3093912976881`; snapshot canonical SHA `b12f837d25b4a085e7a9dcd64fe35f6d7414c380fceb3720b1cea9d4bcfb5abc`. |
+| OLMoE RTX 3090 tuner attempt 1 | **EXPECTED FAIL (unreceipted development)** | The first live EP1 M=1 setup stopped before timing because BF16 expert output multiplied by FP32 route weights produced an FP32 Torch reference. No candidate directory or durable receipt was published. Commit `4dd86dda` adds the serving-equivalent BF16 cast. |
+| OLMoE RTX 3090 tuner attempt 2 | **EXPECTED FAIL (unreceipted development)** | The corrected sweep reached EP1 M=1024, where SGLang's own fallback differed from the Torch reference by one BF16 step (`0.03125` at magnitude about `5.1`) while relative L1 remained about `0.0012`. No candidate directory or durable receipt was published. The measured gate is now max-absolute `0.04` plus relative-L1 `0.02`. |
+| OLMoE RTX 3090 tuner v1 | **PASS (artifact)** | `/var/lib/exo/benchmarks/olmoe-moe-tuning-dwagon-20260720-v1`; exact EP1/EP2 shapes, three route seeds, six candidates, four anchors, repeat-exact numerical evidence, and five fallback-candidate-fallback samples. Only M=1 cleared the 5% gate. Manifest SHA `8674a01e0754f472b345c5bcd92b90e03271d6c404f4027ac240c35873168e99`; receipt SHA `067784d4395d682a590549162553f3af38799c173d013219330a7058388d1947`; tuner SHA `5ab443031117535b2a0336af231f1458b3f4bfe8cfaefe1a1a2d7fedb622650b`. |
+| OLMoE EP1 kernel A/B baseline v1 | **EXPECTED FAIL (admission)** | `/var/lib/exo/benchmarks/olmoe-ep1-local-dwagon-kernel-ab-base-20260720-v1`; failed before model launch because the immutable v2 captures bind historical committed harness `14302708`. Exact-receipt-scoped historical admission was added without rewriting or recapturing evidence. Receipt SHA `16b7dde4081405e4daf44cc5c0750a9136e79c0ea963c2638a17abed2d0e972d`. |
+| OLMoE EP1 kernel A/B baseline v2 | **PASS (controlled A/B baseline)** | `/var/lib/exo/benchmarks/olmoe-ep1-local-dwagon-kernel-ab-base-20260720-v2`; exact sanity and outputs, 225.678633105 prefill-heavy E2E and 307.030114217 decode-window tok/s, verified fallback logs, unforced cleanup, and policy restoration. Receipt SHA `e0b4bc375b2c7a4e7b8080008fb08a778ba7cd7a87d0125e75e71de44fd060c6`; log SHA `fbb01a730d865a57d86ce14b2474385ec0bafbf4e580843ccb5815cefca016bf`. |
+| OLMoE EP1 kernel A/B tuned v1 | **PASS (controlled A/B)** | `/var/lib/exo/benchmarks/olmoe-ep1-local-dwagon-kernel-ab-tuned-20260720-v1`; exact baseline outputs, 238.766833771 prefill-heavy E2E (+5.799%) and 332.249496235 decode-window tok/s (+8.214%). Both ranks loaded exactly the admitted gate/up and down files with no fallback; cleanup was unforced. Receipt SHA `0de953a82b9b3c4ca131f9736ad00429a55270336db36a8be2dbb2acc68d6676`; log SHA `c86d8c3a8798f44a2c6fd890065a0591aacafcd2b580ecbf74d8001d146aedee`. |
+| OLMoE EP2 kernel A/B baseline v1 | **PASS (controlled A/B baseline)** | `/var/lib/exo/benchmarks/olmoe-ep2-local-dwagon-kernel-ab-base-20260720-v1`; exact sanity and outputs, 202.582297555 prefill-heavy E2E and 269.964001023 decode-window tok/s, verified fallback logs, unforced cleanup, and policy restoration. Receipt SHA `8851ba66a1f51c6411f91992de8d9a43f5df99936f18bfc83a61e76a3da710de`; log SHA `4f039c8c9c777756b143e627718f4debcd2b31296f08e9bd55e425d4c72a990c`. |
+| OLMoE EP2 kernel A/B tuned v1 | **PASS (controlled A/B)** | `/var/lib/exo/benchmarks/olmoe-ep2-local-dwagon-kernel-ab-tuned-20260720-v1`; exact baseline outputs, 221.397945372 prefill-heavy E2E (+9.288%) and 303.929139921 decode-window tok/s (+12.581%). EP0/EP1 each loaded exactly the admitted gate/up and down files with no fallback; cleanup was unforced. Receipt SHA `a440ac65d0ce7a4c4764cc7e9855a41f3671890f0d0122a96812f74e31eeb241`; log SHA `37dba0f0bf821ad2533e4ed18931d5760aa867bacf25afb43c986b3b08dd1ff5`. |
 
 All strict TP runs above that are marked clean completed ownership-confirmed process
 termination, instance deletion, lease removal, lock release, and reserved-port
@@ -994,23 +1015,36 @@ canonical process-spec/config SHA-256 values are
   15.84 GB free after CUDA graph capture. This directly shows that a full,
   overprovisioned KV pool per GPU is avoidable; replicated/shared model weights
   and expert placement remain the larger memory cost in this configuration.
-- GLM-4.7 has 64 routed experts. BF16 EP2 still leaves about 25.875 GiB of
-  routed weights per rank before shared weights, activations, and KV cache, so
-  it cannot fit a 24 GiB RTX 3090. EP3 is not a valid even expert/head topology;
-  EP4 is the first plausible native-BF16 distributed layout. OSCAR remains a
-  later KV-cache compression and placement candidate, not an expert dispatcher.
+- The bounded RTX 3090 sweep selected only M=1 overrides. Controlled serving
+  A/B then improved EP1 decode by 8.214% and EP2 decode by 12.581%, with exact
+  output hashes and authenticated config loads. Tuned EP2 remains 8.524% slower
+  than tuned EP1, so batch-one route/reduction overhead still outweighs native
+  sharding despite the better rank-local kernel geometry.
+- GLM-4.7 has 64 routed experts and 20 attention heads. The model layout is
+  feasible with `TP3`, `DP3`, DP attention, dense-MLP TP1, and two padded
+  experts, producing 22 physical expert slots per rank. Checkpoint-header
+  accounting estimates about 20.34 GiB static parameters/rank for TP3/EP1 and
+  20.88 GiB/rank for TP3/EP3 before buffers, activations, and KV. The pinned
+  GLM-Lite class already inherits the required expert-location metadata, but
+  pinned SGLang requires `(tp_size * pp_size) % nnodes == 0`; a three-rank
+  world cannot therefore use its standard launcher across the 2+1 physical
+  host layout. Add a heterogeneous 2-local+1-remote launcher/controller before
+  treating either topology as a native admission test. Use standard
+  host-staged NCCL, not DeepEP, on SM86. OSCAR remains a later KV-cache
+  compression and placement candidate, not an expert dispatcher.
 
 ## Pending tests
 
-1. Add an immutable external Triton MoE config contract and tune the exact RTX
-   3090 EP1 `E=64,N=512` and EP2 `E=32,N=1024` shapes with a small route-aware
-   candidate sweep, followed by interleaved serving A/B validation.
-2. Sweep concurrency 1/2/4/8 using aggregate group throughput and stable
+1. Sweep concurrency 1/2/4/8 using aggregate group throughput and stable
    per-lane requests, with expert-load telemetry kept in separate untimed runs
    so its device-to-host synchronization cannot contaminate timing.
-3. Repeat the matched OLMoE matrix with one GPU per host over InfiniBand,
+2. Repeat the matched OLMoE matrix with one GPU per host over InfiniBand,
    retaining host-staged NCCL, exact output checks, HCA counters, and a local
    NVLink control.
+3. Add the heterogeneous SGLang 2-local+1-remote launcher/controller, then run
+   a native GLM TP3/EP1 control followed by TP3/EP3 with DP attention, dense
+   TP1, two padded experts, small token pools, and CUDA graphs initially
+   disabled.
 4. Add feasible mixed TP/PP trials after the local controls, and implement the
    operational collective stage-local receipt producer before claiming
    production Exo PP3 admission. The current engineering harness directly
