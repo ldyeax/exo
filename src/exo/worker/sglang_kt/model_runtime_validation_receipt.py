@@ -52,6 +52,9 @@ MODEL_RUNTIME_VALIDATION_RECEIPT_MAXIMUM_BYTES = 4 * 1024 * 1024
 MODEL_RUNTIME_VALIDATOR_SOURCE_BUNDLE_CANONICALIZATION = (
     "exo-sglang-kt-model-runtime-validator-source-bundle-v1"
 )
+MODEL_RUNTIME_VALIDATOR_CONTENT_CANONICALIZATION = (
+    "exo-sglang-kt-model-runtime-validator-content-v1"
+)
 GLM_4_7_FLASH_BF16_INDEX_SHA256 = (
     "91e6e95ca21700f50904a680c8c4212f5aa16dc7c10a013f01c906957c889791"
 )
@@ -202,6 +205,19 @@ def calculate_sglang_kt_model_runtime_validator_bundle_sha256(
 ) -> str:
     """Hash an exact, ordered bundle of validator source files."""
 
+    _validator_relative_sources(sources)
+    payload = {
+        "canonicalization": MODEL_RUNTIME_VALIDATOR_SOURCE_BUNDLE_CANONICALIZATION,
+        "sources": [{"path": path, "sha256": sha256} for path, sha256 in sources],
+    }
+    return hashlib.sha256(canonical_sglang_kt_json(payload)).hexdigest()
+
+
+def _validator_relative_sources(
+    sources: tuple[tuple[str, str], ...],
+) -> tuple[tuple[str, str], ...]:
+    """Validate absolute sources and return their exact relative content set."""
+
     if not sources or tuple(path for path, _ in sources) != tuple(
         sorted({path for path, _ in sources})
     ):
@@ -228,9 +244,28 @@ def calculate_sglang_kt_model_runtime_validator_bundle_sha256(
         source_roots.append(path[: -len(suffix)])
     if not source_roots[0] or len(set(source_roots)) != 1:
         raise ValueError("validator sources must belong to one repository root")
+    return tuple(
+        (relative_path, sha256)
+        for relative_path, (_, sha256) in zip(
+            MODEL_RUNTIME_VALIDATOR_SOURCE_RELATIVE_PATHS,
+            sources,
+            strict=True,
+        )
+    )
+
+
+def calculate_sglang_kt_model_runtime_validator_content_sha256(
+    sources: tuple[tuple[str, str], ...],
+) -> str:
+    """Hash the exact validator relative paths and contents independent of root."""
+
+    relative_sources = _validator_relative_sources(sources)
     payload = {
-        "canonicalization": MODEL_RUNTIME_VALIDATOR_SOURCE_BUNDLE_CANONICALIZATION,
-        "sources": [{"path": path, "sha256": sha256} for path, sha256 in sources],
+        "canonicalization": MODEL_RUNTIME_VALIDATOR_CONTENT_CANONICALIZATION,
+        "sources": [
+            {"relative_path": path, "sha256": sha256}
+            for path, sha256 in relative_sources
+        ],
     }
     return hashlib.sha256(canonical_sglang_kt_json(payload)).hexdigest()
 
@@ -732,6 +767,7 @@ class SglangKtModelRuntimeValidationReceiptObservation(_StrictModel):
     schema_version: Literal[1]
     generated_at_utc: NonemptyText
     validator_sha256: Sha256Digest
+    validator_content_sha256: Sha256Digest
     process_spec_sha256: Sha256Digest
     model_contract_path: AbsoluteRuntimePath
     model_path: AbsoluteRuntimePath
@@ -889,6 +925,9 @@ def load_sglang_kt_model_runtime_validation_receipt(
     runtime = receipt.runtime
     contract = parents.model_contract
     kernel = parents.kernel_runtime_validation
+    validator_sources = tuple(
+        (source.path, source.sha256) for source in receipt.validator_sources
+    )
     return SglangKtModelRuntimeValidationReceiptObservation(
         receipt_path=str(bound_file.path),
         receipt_size_bytes=len(bound_file.contents),
@@ -896,6 +935,11 @@ def load_sglang_kt_model_runtime_validation_receipt(
         schema_version=MODEL_RUNTIME_VALIDATION_RECEIPT_SCHEMA_VERSION,
         generated_at_utc=receipt.generated_at_utc,
         validator_sha256=receipt.validator_sha256,
+        validator_content_sha256=(
+            calculate_sglang_kt_model_runtime_validator_content_sha256(
+                validator_sources
+            )
+        ),
         process_spec_sha256=parents.process_spec_sha256,
         model_contract_path=contract.path,
         model_path=contract.model_path,

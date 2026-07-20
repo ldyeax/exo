@@ -25,6 +25,12 @@ from exo.worker.sglang_kt.launch_spec import (
     GLM_4_7_FLASH_SGLANG_REVISION,
     SglangKtProcessLaunchSpec,
 )
+from exo.worker.sglang_kt.model_runtime_validation_receipt import (
+    MODEL_RUNTIME_VALIDATOR_SOURCE_RELATIVE_PATHS,
+    SglangKtModelRuntimeValidationReceiptObservation,
+    calculate_sglang_kt_model_runtime_validator_bundle_sha256,
+    calculate_sglang_kt_model_runtime_validator_content_sha256,
+)
 from exo.worker.sglang_kt.serving_benchmark_receipt import (
     SGLANG_KT_SERVING_CLIENT_RELATIVE_PATH,
     SGLANG_KT_SERVING_RECEIPT_RELATIVE_PATH,
@@ -406,6 +412,16 @@ def config_payload(tmp_path: Path) -> dict[str, object]:
 def make_config(tmp_path: Path) -> harness.ServingBenchmarkConfig:
     return harness.ServingBenchmarkConfig.model_validate_json(
         json.dumps(config_payload(tmp_path))
+    )
+
+
+def validator_sources(root: Path) -> tuple[tuple[str, str], ...]:
+    return tuple(
+        (
+            str(root / relative_path),
+            hashlib.sha256(relative_path.encode()).hexdigest(),
+        )
+        for relative_path in MODEL_RUNTIME_VALIDATOR_SOURCE_RELATIVE_PATHS
     )
 
 
@@ -920,16 +936,102 @@ def test_measurement_v2_requires_sanity(tmp_path: Path) -> None:
         harness.WarmServingMeasurementV2.model_validate_json(json.dumps(payload))
 
 
-def test_fresh_deployment_must_match_admitted_validator(tmp_path: Path) -> None:
-    config = make_config(tmp_path)
+def relocated_validator_admission(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    change_current_content: bool,
+) -> tuple[harness.ServingBenchmarkConfig, validation.DeploymentIdentity]:
+    admitted_sources = validator_sources(tmp_path / "admitted" / "validator")
+    current_sources = validator_sources(tmp_path / "deployment" / "validator")
+    if change_current_content:
+        current_sources = ((current_sources[0][0], "f" * 64), *current_sources[1:])
+
+    payload = config_payload(tmp_path)
+    admission = cast(dict[str, object], payload["admission"])
+    admission["validator_sha256"] = (
+        calculate_sglang_kt_model_runtime_validator_bundle_sha256(admitted_sources)
+    )
+    config = harness.ServingBenchmarkConfig.model_validate_json(json.dumps(payload))
     deployment = validation.DeploymentIdentity(
         root=config.source.deployment_root,
         orchestrator_sha256="1" * 64,
-        validator_sha256="2" * 64,
-        validator_files=(),
+        validator_sha256=(
+            calculate_sglang_kt_model_runtime_validator_bundle_sha256(current_sources)
+        ),
+        validator_files=tuple(
+            {
+                "path": path,
+                "size_bytes": 0 if path.endswith("/__init__.py") else 123,
+                "sha256": sha256,
+            }
+            for path, sha256 in current_sources
+        ),
         source=validation.SourceIdentity("3" * 40, {}),
     )
-    with pytest.raises(harness.Glm47ServingHarnessError, match="validator differs"):
+
+    def load_admitted_receipt(
+        path: Path,
+        *,
+        expected_validator_sha256: str,
+        expected_process_spec_sha256: str,
+        expected_model_contract_receipt_sha256: str,
+        expected_kernel_receipt_sha256: str,
+        expected_receipt_sha256: str | None = None,
+    ) -> SglangKtModelRuntimeValidationReceiptObservation:
+        assert path == Path(config.admission.model_runtime_validation_receipt.path)
+        assert expected_validator_sha256 == config.admission.validator_sha256
+        assert expected_process_spec_sha256 == config.admission.process_spec_sha256
+        assert (
+            expected_model_contract_receipt_sha256
+            == config.admission.model_contract_receipt.sha256
+        )
+        assert (
+            expected_kernel_receipt_sha256
+            == config.admission.kernel_runtime_validation_receipt.sha256
+        )
+        assert (
+            expected_receipt_sha256
+            == config.admission.model_runtime_validation_receipt.sha256
+        )
+        return cast(
+            SglangKtModelRuntimeValidationReceiptObservation,
+            SimpleNamespace(
+                validator_content_sha256=(
+                    calculate_sglang_kt_model_runtime_validator_content_sha256(
+                        admitted_sources
+                    )
+                )
+            ),
+        )
+
+    monkeypatch.setattr(
+        harness,
+        "load_sglang_kt_model_runtime_validation_receipt",
+        load_admitted_receipt,
+    )
+    return config, deployment
+
+
+def test_relocated_validator_content_matches_admission(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, deployment = relocated_validator_admission(
+        tmp_path, monkeypatch, change_current_content=False
+    )
+    assert deployment.validator_sha256 != config.admission.validator_sha256
+
+    harness.require_admitted_validator(config, deployment)
+
+
+def test_relocated_validator_rejects_changed_content(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, deployment = relocated_validator_admission(
+        tmp_path, monkeypatch, change_current_content=True
+    )
+
+    with pytest.raises(harness.Glm47ServingHarnessError, match="content differs"):
         harness.require_admitted_validator(config, deployment)
 
 

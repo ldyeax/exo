@@ -65,7 +65,10 @@ from exo.worker.sglang_kt.model_contract import (  # noqa: E402
     verify_sglang_kt_model_snapshot,
 )
 from exo.worker.sglang_kt.model_runtime_validation_receipt import (  # noqa: E402
+    MODEL_RUNTIME_VALIDATOR_SOURCE_RELATIVE_PATHS,
+    SglangKtModelRuntimeValidationReceiptError,
     SglangKtModelRuntimeValidationReceiptObservation,
+    calculate_sglang_kt_model_runtime_validator_content_sha256,
     load_sglang_kt_model_runtime_validation_receipt,
 )
 from exo.worker.sglang_kt.process_supervisor import (  # noqa: E402
@@ -1009,9 +1012,63 @@ def require_admitted_validator(
     config: ServingBenchmarkConfig,
     deployment: validation.DeploymentIdentity,
 ) -> None:
-    if deployment.validator_sha256 != config.admission.validator_sha256:
+    try:
+        admitted = load_sglang_kt_model_runtime_validation_receipt(
+            Path(config.admission.model_runtime_validation_receipt.path),
+            expected_validator_sha256=config.admission.validator_sha256,
+            expected_process_spec_sha256=config.admission.process_spec_sha256,
+            expected_model_contract_receipt_sha256=(
+                config.admission.model_contract_receipt.sha256
+            ),
+            expected_kernel_receipt_sha256=(
+                config.admission.kernel_runtime_validation_receipt.sha256
+            ),
+            expected_receipt_sha256=(
+                config.admission.model_runtime_validation_receipt.sha256
+            ),
+        )
+    except SglangKtModelRuntimeValidationReceiptError as error:
         raise Glm47ServingHarnessError(
-            "immutable validator differs from the admitted validator"
+            "admitted validator receipt is invalid"
+        ) from error
+
+    expected_root = Path(deployment.root) / "validator"
+    expected_paths = tuple(
+        str(expected_root / relative_path)
+        for relative_path in MODEL_RUNTIME_VALIDATOR_SOURCE_RELATIVE_PATHS
+    )
+    if len(deployment.validator_files) != len(expected_paths):
+        raise Glm47ServingHarnessError("immutable validator file set is incomplete")
+    sources: list[tuple[str, str]] = []
+    for expected_path, file_identity in zip(
+        expected_paths, deployment.validator_files, strict=True
+    ):
+        path = file_identity.get("path")
+        size_bytes = file_identity.get("size_bytes")
+        sha256 = file_identity.get("sha256")
+        if (
+            set(file_identity) != {"path", "size_bytes", "sha256"}
+            or not isinstance(path, str)
+            or path != expected_path
+            or type(size_bytes) is not int
+            or size_bytes < 0
+            or not isinstance(sha256, str)
+        ):
+            raise Glm47ServingHarnessError(
+                "immutable validator file identity is invalid"
+            )
+        sources.append((path, sha256))
+    try:
+        current_content_sha256 = (
+            calculate_sglang_kt_model_runtime_validator_content_sha256(tuple(sources))
+        )
+    except ValueError as error:
+        raise Glm47ServingHarnessError(
+            "immutable validator file identity is invalid"
+        ) from error
+    if current_content_sha256 != admitted.validator_content_sha256:
+        raise Glm47ServingHarnessError(
+            "immutable validator content differs from the admitted validator"
         )
 
 
