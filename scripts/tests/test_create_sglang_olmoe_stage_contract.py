@@ -141,6 +141,36 @@ def _managed_launch(ep_size: stage.ExpertParallelSize) -> stage.ManagedLaunchEvi
     )
 
 
+def test_published_harness_requires_exact_v2_receipt_context() -> None:
+    current = _managed_launch(1)
+    historical_payload = {
+        **current.model_dump(),
+        "harness_sha256": stage.PUBLISHED_STAGE_CONTRACT_V2_HARNESS_SHA256,
+    }
+    exact_context = stage._stage_contract_validation_context(
+        stage.PUBLISHED_STAGE_CONTRACT_V2_SHA256
+    )
+    assert exact_context is not None
+
+    historical = stage.ManagedLaunchEvidence.model_validate(
+        historical_payload,
+        context=exact_context,
+    )
+    assert historical.harness_sha256 == stage.PUBLISHED_STAGE_CONTRACT_V2_HARNESS_SHA256
+
+    with pytest.raises(ValidationError, match="managed launch evidence"):
+        stage.ManagedLaunchEvidence.model_validate(historical_payload)
+    with pytest.raises(ValidationError, match="managed launch evidence"):
+        stage.ManagedLaunchEvidence.model_validate(
+            historical_payload,
+            context=stage._stage_contract_validation_context("0" * 64),
+        )
+    with pytest.raises(ValidationError, match="managed launch evidence"):
+        stage.ManagedLaunchEvidence.model_validate(
+            current.model_dump(), context=exact_context
+        )
+
+
 def _capture(
     ep_size: stage.ExpertParallelSize,
     *,
@@ -178,6 +208,46 @@ def _capture(
             "2020-01-01T00:00:00+00:00" if ep_size == 1 else "2020-01-01T00:01:00+00:00"
         ),
     )
+
+
+def test_published_producer_requires_exact_v2_receipt_context() -> None:
+    current = _capture(1)
+    historical_payload = {
+        **current.model_dump(),
+        "producer_sha256": stage.PUBLISHED_STAGE_CONTRACT_V2_PRODUCER_SHA256,
+        "managed_launch": {
+            **current.managed_launch.model_dump(),
+            "harness_sha256": stage.PUBLISHED_STAGE_CONTRACT_V2_HARNESS_SHA256,
+        },
+    }
+    exact_context = stage._stage_contract_validation_context(
+        stage.PUBLISHED_STAGE_CONTRACT_V2_SHA256
+    )
+    assert exact_context is not None
+
+    historical = stage.SanityCapture.model_validate(
+        historical_payload,
+        context=exact_context,
+    )
+    assert (
+        historical.producer_sha256 == stage.PUBLISHED_STAGE_CONTRACT_V2_PRODUCER_SHA256
+    )
+
+    with pytest.raises(ValidationError):
+        stage.SanityCapture.model_validate(historical_payload)
+    with pytest.raises(ValidationError):
+        stage.SanityCapture.model_validate(
+            historical_payload,
+            context=stage._stage_contract_validation_context("0" * 64),
+        )
+    with pytest.raises(ValidationError, match="sanity capture"):
+        stage.SanityCapture.model_validate(
+            {
+                **historical_payload,
+                "producer_sha256": current.producer_sha256,
+            },
+            context=exact_context,
+        )
 
 
 def test_public_snapshot_admission_rejects_tiny_fake_path(tmp_path: Path) -> None:

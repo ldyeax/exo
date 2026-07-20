@@ -31,7 +31,14 @@ from pathlib import Path
 from typing import Final, Literal, Protocol, cast, final
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    ValidationInfo,
+    model_validator,
+)
 
 sys.dont_write_bytecode = True
 
@@ -83,6 +90,33 @@ _METADATA_MAXIMUM_BYTES: Final = 4_096
 _MANAGED_NAMESPACE_PATTERN: Final = re.compile(
     r"exo-olmoe-ep-[A-Za-z0-9_.-]{1,128}-[0-9a-f]{32}", re.ASCII
 )
+PUBLISHED_STAGE_CONTRACT_V2_SHA256: Final = (
+    "d54c92f60483f3786c85a2e92f2dbb8d3898bb924902fd9a87c3093912976881"
+)
+PUBLISHED_STAGE_CONTRACT_V2_HARNESS_SHA256: Final = (
+    "83c55233742e3d82957f99687f6064c086459cbecaae1326226a6f629fe847e1"
+)
+PUBLISHED_STAGE_CONTRACT_V2_PRODUCER_SHA256: Final = (
+    "9e89751a7b955c2cde1aa66e2bac998adf0cf1435eff770e23d74505299e6549"
+)
+_STAGE_CONTRACT_RECEIPT_CONTEXT_KEY: Final = "olmoe_stage_contract_receipt_sha256"
+
+
+def _is_published_v2_validation(info: ValidationInfo) -> bool:
+    raw_context: object = info.context
+    if not isinstance(raw_context, Mapping):
+        return False
+    context = cast(Mapping[object, object], raw_context)
+    return (
+        context.get(_STAGE_CONTRACT_RECEIPT_CONTEXT_KEY)
+        == PUBLISHED_STAGE_CONTRACT_V2_SHA256
+    )
+
+
+def _stage_contract_validation_context(receipt_sha256: str) -> Mapping[str, str] | None:
+    if receipt_sha256 != PUBLISHED_STAGE_CONTRACT_V2_SHA256:
+        return None
+    return {_STAGE_CONTRACT_RECEIPT_CONTEXT_KEY: receipt_sha256}
 
 
 class OlmoeStageContractError(RuntimeError):
@@ -238,15 +272,20 @@ class ManagedLaunchEvidence(_StrictModel):
     verified_at_utc: str
 
     @model_validator(mode="after")
-    def validate_managed_launch(self) -> "ManagedLaunchEvidence":
+    def validate_managed_launch(self, info: ValidationInfo) -> "ManagedLaunchEvidence":
         harness_path = (
             Path(__file__)
             .resolve(strict=True)
             .with_name("run_sglang_olmoe_ep_local_benchmark.py")
         )
+        expected_harness_sha256 = (
+            PUBLISHED_STAGE_CONTRACT_V2_HARNESS_SHA256
+            if _is_published_v2_validation(info)
+            else hash_sglang_kt_bound_file(harness_path).sha256
+        )
         environment_names = tuple(name for name, _value in self.launch_environment)
         if (
-            self.harness_sha256 != hash_sglang_kt_bound_file(harness_path).sha256
+            self.harness_sha256 != expected_harness_sha256
             or self.process_group_id != self.pid
             or _MANAGED_NAMESPACE_PATTERN.fullmatch(self.ownership_namespace) is None
             or any(not value or "\0" in value for value in self.command)
@@ -298,7 +337,12 @@ class SanityCapture(_StrictModel):
     captured_at_utc: str
 
     @model_validator(mode="after")
-    def validate_capture(self) -> "SanityCapture":
+    def validate_capture(self, info: ValidationInfo) -> "SanityCapture":
+        expected_producer_sha256 = (
+            PUBLISHED_STAGE_CONTRACT_V2_PRODUCER_SHA256
+            if _is_published_v2_validation(info)
+            else hash_sglang_kt_bound_file(Path(__file__).resolve(strict=True)).sha256
+        )
         if (
             self.sglang_revision != OLMOE_SGLANG_REVISION
             or token_ids_sha256(self.input_ids) != self.input_ids_sha256
@@ -307,8 +351,7 @@ class SanityCapture(_StrictModel):
             or hashlib.sha256(self.output_text.encode()).hexdigest()
             != self.output_text_sha256
             or self.output_text.strip() != OLMOE_SANITY_MARKER
-            or self.producer_sha256
-            != hash_sglang_kt_bound_file(Path(__file__).resolve(strict=True)).sha256
+            or self.producer_sha256 != expected_producer_sha256
         ):
             raise ValueError("sanity capture is not bound or coherent")
         try:
@@ -906,14 +949,22 @@ def load_stage_contract(
 ) -> LoadedStageContract:
     try:
         bound = read_sglang_kt_bound_file(path, maximum_bytes=_CAPTURE_MAXIMUM_BYTES)
-        contract = OlmoeStageContract.model_validate_json(bound.contents)
+        contract = OlmoeStageContract.model_validate_json(
+            bound.contents,
+            context=_stage_contract_validation_context(bound.sha256),
+        )
     except (SglangKtReceiptFileError, ValidationError) as error:
         raise OlmoeStageContractError(
             f"invalid OLMoE stage contract: {path}"
         ) from error
     observed_snapshot = verify_pinned_snapshot(snapshot_path)
     producer_path = Path(__file__).resolve(strict=True)
-    if contract.producer_sha256 != hash_sglang_kt_bound_file(producer_path).sha256:
+    expected_producer_sha256 = (
+        PUBLISHED_STAGE_CONTRACT_V2_PRODUCER_SHA256
+        if bound.sha256 == PUBLISHED_STAGE_CONTRACT_V2_SHA256
+        else hash_sglang_kt_bound_file(producer_path).sha256
+    )
+    if contract.producer_sha256 != expected_producer_sha256:
         raise OlmoeStageContractError("stage contract producer source changed")
     if contract.snapshot != observed_snapshot:
         raise OlmoeStageContractError("stage contract snapshot changed")
