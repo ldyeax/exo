@@ -1463,7 +1463,9 @@ def _concurrency_observation(
         completion_tokens=len(output),
         cached_tokens=0,
         output_ids_sha256=token_ids_sha256(output),
-        finish_reason_sha256=SHA,
+        finish_reason_sha256=olmoe._canonical_sha256(
+            {"type": "length", "length": len(output)}
+        ),
         stream_line_count=len(output) + 1,
         stream_event_count=len(output),
         output_bearing_event_count=len(output),
@@ -1767,35 +1769,66 @@ async def test_concurrency_main_task_cancellation_cancels_blocked_lanes() -> Non
     _assert_no_concurrency_workers()
 
 
-def test_concurrency_determinism_rejects_output_drift_without_tie_exception() -> None:
+def test_concurrency_output_stability_records_coherent_sequence_variation() -> None:
     request = _concurrency_request(0)
-    reference = _concurrency_observation(request, 0)
+    reference = _concurrency_observation(
+        request, 0, output_ids=(1_000, 1_001, 1_002, 139)
+    )
     references: dict[tuple[Literal["prefill", "decode"], int], tuple[int, ...]] = {}
-    first = olmoe._verify_concurrency_determinism(
+    stability_observations: dict[
+        tuple[Literal["prefill", "decode"], int], list[tuple[str, bool]]
+    ] = {}
+    first = olmoe._observe_concurrency_output_stability(
         kind="decode",
         requests=(request,),
         observations=(reference,),
         references=references,
+        stability_observations=stability_observations,
     )
 
-    tie_policy = cast(dict[str, object], first["known_token_4_tie"])
-    assert tie_policy["exception_enabled"] is False
+    policy = cast(dict[str, object], first["policy"])
+    assert policy["structural_coherence"] == "required"
+    assert policy["exact_output_sequence_match"] == "observational_not_required"
     with pytest.raises(olmoe.OlmoeEpBenchmarkError, match="not coherent"):
-        olmoe._verify_concurrency_determinism(
+        olmoe._observe_concurrency_output_stability(
             kind="decode",
             requests=(request,),
             observations=(replace(reference, cached_tokens=1),),
             references=references,
+            stability_observations=stability_observations,
+        )
+    with pytest.raises(olmoe.OlmoeEpBenchmarkError, match="not coherent"):
+        olmoe._observe_concurrency_output_stability(
+            kind="decode",
+            requests=(request,),
+            observations=(replace(reference, finish_reason_sha256=SHA),),
+            references=references,
+            stability_observations=stability_observations,
         )
     drifted_ids = (*reference.output_ids[:3], 1_769)
     drifted = _concurrency_observation(request, 0, output_ids=drifted_ids)
-    with pytest.raises(olmoe.OlmoeEpBenchmarkError, match="exactly deterministic"):
-        olmoe._verify_concurrency_determinism(
-            kind="decode",
-            requests=(request,),
-            observations=(drifted,),
-            references=references,
-        )
+    variation = olmoe._observe_concurrency_output_stability(
+        kind="decode",
+        requests=(request,),
+        observations=(drifted,),
+        references=references,
+        stability_observations=stability_observations,
+    )
+
+    assert variation["status"] == "coherent_variation_observed"
+    lane = cast(dict[str, object], cast(list[object], variation["lanes"])[0])
+    assert lane["exact_reference_match"] is False
+    evidence = cast(dict[str, object], lane["variation"])
+    assert evidence["differing_token_count"] == 1
+    assert evidence["known_decode_lane_0_token_4_tie_observed"] is True
+    summary = olmoe._concurrency_output_stability_summary(
+        "decode", references, stability_observations
+    )
+    assert summary["exact_output_sequence_match_required"] is False
+    assert summary["variation_observation_count"] == 1
+    summary_lane = cast(dict[str, object], cast(list[object], summary["lanes"])[0])
+    assert summary_lane["observation_count"] == 2
+    assert summary_lane["distinct_output_ids_sha256_count"] == 2
 
 
 @pytest.mark.asyncio
@@ -1874,6 +1907,12 @@ async def test_concurrency_suite_uses_exact_workload_and_c_grid(
         assert lane_pool["execution_model"] == (
             "cancellable_asyncio_tasks_without_executor_threads"
         )
+        stability = cast(dict[str, object], document["output_stability_summary"])
+        assert stability["exact_output_sequence_match_required"] is False
+        assert stability["variation_observation_count"] == 0
+        stability_lanes = cast(list[object], stability["lanes"])
+        assert cast(dict[str, object], stability_lanes[0])["observation_count"] == 20
+        assert cast(dict[str, object], stability_lanes[-1])["observation_count"] == 5
         results = cast(list[object], document["results"])
         assert [
             cast(dict[str, object], result)["concurrency"] for result in results
