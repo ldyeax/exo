@@ -303,8 +303,13 @@ def test_applies_followup_patch_stack_after_integrated_gitlink(
 
     receipt = prepare_sglang_kt_source(fixture.ktransformers_source, plan)
     second_receipt = prepare_sglang_kt_source(fixture.ktransformers_source, plan)
+    run_git(fixture.sglang_source, "checkout", "--detach", tp_qk_revision)
+    resumed_receipt = prepare_sglang_kt_source(
+        fixture.ktransformers_source,
+        plan,
+    )
 
-    assert receipt == second_receipt
+    assert receipt == second_receipt == resumed_receipt
     assert receipt.sglang_revision == final_revision
     assert run_git(fixture.sglang_source, "rev-parse", "HEAD") == final_revision
     assert run_git(fixture.sglang_source, "status", "--porcelain=v1") == ""

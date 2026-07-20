@@ -270,8 +270,24 @@ def _apply_sglang_patch_stack(
     if original_revision == plan.sglang_result_revision:
         _require_clean(repository, "SGLang integration")
         return
+    start_index = next(
+        (
+            index
+            for index, (_, base_revision, _) in enumerate(steps)
+            if base_revision == original_revision
+        ),
+        None,
+    )
+    if start_index is None:
+        valid_boundaries = {base_revision for _, base_revision, _ in steps} | {
+            plan.sglang_result_revision
+        }
+        raise SourcePreparationError(
+            f"SGLang patch stack revision is {original_revision}; expected one of "
+            f"{sorted(valid_boundaries)}"
+        )
     try:
-        for patch, base_revision, result_revision in steps:
+        for patch, base_revision, result_revision in steps[start_index:]:
             observed_revision = _head_revision(repository)
             if observed_revision == result_revision:
                 continue
