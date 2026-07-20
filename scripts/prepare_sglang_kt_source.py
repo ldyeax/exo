@@ -17,7 +17,8 @@ KTRANSFORMERS_BASE_REVISION = "8e46e5896c3d993a1285052f2618f5a9f01882d4"
 KTRANSFORMERS_RESULT_REVISION = "f9ca69648421f5774215c4da9cf711dccf54f49e"
 SGLANG_BASE_REVISION = "5d6bef9f61637aaeaf047bf8209def2af3eaa83f"
 SGLANG_GITLINK_REVISION = "3721d710102456b6bf849122e781129dc3f7d9c6"
-SGLANG_RESULT_REVISION = "da64717bb2e87f7ebc6e69768ba575c18454ab3c"
+SGLANG_OLMOE_TP_REVISION = "da64717bb2e87f7ebc6e69768ba575c18454ab3c"
+SGLANG_RESULT_REVISION = "7fea582043df06ebdde549ee3de602a3d11b96c6"
 SGLANG_SUBMODULE_PATH = Path("third_party/sglang")
 PATCH_DIRECTORY = Path(__file__).resolve().parent / "patches" / "sglang_kt"
 
@@ -85,6 +86,17 @@ class SglangKtSourcePlan:
                     committer_name="jimm",
                     committer_email="jimm@jimm.horse",
                     base_revision=SGLANG_GITLINK_REVISION,
+                    result_revision=SGLANG_OLMOE_TP_REVISION,
+                ),
+                MailPatch(
+                    path=PATCH_DIRECTORY
+                    / "0004-fix-allocate-GLM-Flash-LM-head-on-final-PP-rank.patch",
+                    sha256=(
+                        "df834f944082cec84e1ea6b2b812a5081cfd99cc6b33af4d0a5ad2c0903995c6"
+                    ),
+                    committer_name="jimm",
+                    committer_email="jimm@jimm.horse",
+                    base_revision=SGLANG_OLMOE_TP_REVISION,
                     result_revision=SGLANG_RESULT_REVISION,
                 ),
             ),
@@ -451,7 +463,7 @@ def prepare_sglang_kt_source(
     ktransformers_source: Path,
     plan: SglangKtSourcePlan | None = None,
 ) -> SglangKtSourceReceipt:
-    """Apply both exact mail patches and return a machine-readable receipt."""
+    """Apply the exact mail-patch stack and return a machine-readable receipt."""
     selected_plan = plan or SglangKtSourcePlan.exo_default()
     source = ktransformers_source.expanduser().resolve(strict=True)
     sglang_patch_steps = _resolved_sglang_patch_steps(selected_plan)

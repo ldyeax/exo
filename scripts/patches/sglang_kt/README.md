@@ -19,7 +19,13 @@ base and result commit and applies patches in this order:
    `da64717bb2e87f7ebc6e69768ba575c18454ab3c`. It preserves the optimized TP1
    Q/K RMSNorm path and makes TP2 use rank-local weights plus one fused FP32
    Q/K statistics all-reduce per layer.
-3. `0002-build-pin-GLM-Flash-KT-registration.patch` converts KTransformers
+3. `0004-fix-allocate-GLM-Flash-LM-head-on-final-PP-rank.patch` converts
+   SGLang `da64717bb2e87f7ebc6e69768ba575c18454ab3c` to
+   `7fea582043df06ebdde549ee3de602a3d11b96c6`. Non-final pipeline ranks use
+   `PPMissingLayer` instead of allocating the GLM-4.7-Flash BF16 language-model
+   head, saving 605 MiB of device memory per non-final TP1 stage while leaving
+   the final stage's logits path unchanged.
+4. `0002-build-pin-GLM-Flash-KT-registration.patch` converts KTransformers
    `8e46e5896c3d993a1285052f2618f5a9f01882d4` to
    `f9ca69648421f5774215c4da9cf711dccf54f49e` by recording that SGLang
    intermediate gitlink.

@@ -39,6 +39,28 @@ def test_default_plan_matches_admitted_launch_revisions() -> None:
     assert plan.sglang_result_revision == GLM_4_7_FLASH_SGLANG_REVISION
 
 
+def test_default_plan_declares_exact_hashed_followup_stack() -> None:
+    plan = SglangKtSourcePlan.exo_default()
+
+    assert tuple(
+        (patch.path.name, patch.base_revision, patch.result_revision)
+        for patch in plan.sglang_followup_patches
+    ) == (
+        (
+            "0003-fix-shard-OLMoE-QK-RMSNorm-across-TP-ranks.patch",
+            "3721d710102456b6bf849122e781129dc3f7d9c6",
+            "da64717bb2e87f7ebc6e69768ba575c18454ab3c",
+        ),
+        (
+            "0004-fix-allocate-GLM-Flash-LM-head-on-final-PP-rank.patch",
+            "da64717bb2e87f7ebc6e69768ba575c18454ab3c",
+            "7fea582043df06ebdde549ee3de602a3d11b96c6",
+        ),
+    )
+    for patch in plan.sglang_followup_patches:
+        assert hashlib.sha256(patch.path.read_bytes()).hexdigest() == patch.sha256
+
+
 def run_git(
     repository: Path,
     *arguments: str,
@@ -212,7 +234,9 @@ def test_prepares_exact_revisions_from_clean_bases_and_is_idempotent(
     )
 
 
-def test_applies_followup_patch_after_integrated_gitlink(tmp_path: Path) -> None:
+def test_applies_followup_patch_stack_after_integrated_gitlink(
+    tmp_path: Path,
+) -> None:
     fixture = make_source_fixture(tmp_path)
     prepare_sglang_kt_source(fixture.ktransformers_source, fixture.plan)
     gitlink_revision = fixture.plan.sglang_result_revision
@@ -221,7 +245,7 @@ def test_applies_followup_patch_after_integrated_gitlink(tmp_path: Path) -> None
 
     module_path = fixture.sglang_source / "module.py"
     module_path.write_text("WRAPPER_REGISTERED = True\nTP_QK_RMSNORM_SHARDED = True\n")
-    final_revision = commit_all(
+    tp_qk_revision = commit_all(
         fixture.sglang_source,
         "fix: shard QK RMSNorm",
         "2026-01-01T00:04:00+00:00",
@@ -229,8 +253,25 @@ def test_applies_followup_patch_after_integrated_gitlink(tmp_path: Path) -> None
     followup_patch_path = tmp_path / "0003-sglang-followup.patch"
     followup_patch_sha256 = write_mail_patch(
         fixture.sglang_source,
-        final_revision,
+        tp_qk_revision,
         followup_patch_path,
+    )
+
+    module_path.write_text(
+        "WRAPPER_REGISTERED = True\n"
+        "TP_QK_RMSNORM_SHARDED = True\n"
+        "LM_HEAD_ON_FINAL_PP_RANK = True\n"
+    )
+    final_revision = commit_all(
+        fixture.sglang_source,
+        "fix: allocate LM head on final PP rank",
+        "2026-01-01T00:05:00+00:00",
+    )
+    final_patch_path = tmp_path / "0004-sglang-followup.patch"
+    final_patch_sha256 = write_mail_patch(
+        fixture.sglang_source,
+        final_revision,
+        final_patch_path,
     )
     run_git(fixture.sglang_source, "checkout", "--detach", gitlink_revision)
     run_git(fixture.sglang_source, "reflog", "expire", "--expire=now", "--all")
@@ -246,6 +287,14 @@ def test_applies_followup_patch_after_integrated_gitlink(tmp_path: Path) -> None
                 committer_name=GIT_NAME,
                 committer_email=GIT_EMAIL,
                 base_revision=gitlink_revision,
+                result_revision=tp_qk_revision,
+            ),
+            MailPatch(
+                path=final_patch_path,
+                sha256=final_patch_sha256,
+                committer_name=GIT_NAME,
+                committer_email=GIT_EMAIL,
+                base_revision=tp_qk_revision,
                 result_revision=final_revision,
             ),
         ),
@@ -266,6 +315,7 @@ def test_applies_followup_patch_after_integrated_gitlink(tmp_path: Path) -> None
     assert tuple(Path(patch["path"]).name for patch in receipt.patches) == (
         fixture.plan.sglang_patch.path.name,
         followup_patch_path.name,
+        final_patch_path.name,
         fixture.plan.ktransformers_patch.path.name,
     )
 

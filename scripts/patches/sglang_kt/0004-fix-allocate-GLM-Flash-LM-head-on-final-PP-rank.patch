@@ -1,0 +1,122 @@
+From 7fea582043df06ebdde549ee3de602a3d11b96c6 Mon Sep 17 00:00:00 2001
+From: jimm <jimm@jimm.horse>
+Date: Mon, 20 Jul 2026 16:00:00 -0400
+Subject: [PATCH] fix: allocate GLM Flash LM head on final PP rank
+
+---
+ python/sglang/srt/models/glm4_moe_lite.py    | 17 +++---
+ test/unit/test_glm47_flash_kt_ep_coverage.py | 56 ++++++++++++++++++++
+ 2 files changed, 66 insertions(+), 7 deletions(-)
+
+diff --git a/python/sglang/srt/models/glm4_moe_lite.py b/python/sglang/srt/models/glm4_moe_lite.py
+index 55ff230d0..385ec556d 100644
+--- a/python/sglang/srt/models/glm4_moe_lite.py
++++ b/python/sglang/srt/models/glm4_moe_lite.py
+@@ -725,13 +725,16 @@ class Glm4MoeLiteForCausalLM(DeepseekV2ForCausalLM):
+             config, quant_config, prefix=add_prefix("model", prefix)
+         )
+         self.kt_ep_coverage_receipt = self.model.kt_ep_coverage_receipt
+-        self.lm_head = ParallelLMHead(
+-            config.vocab_size,
+-            config.hidden_size,
+-            quant_config=quant_config,
+-            prefix=add_prefix("lm_head", prefix),
+-            use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+-        )
++        if self.pp_group.is_last_rank:
++            self.lm_head = ParallelLMHead(
++                config.vocab_size,
++                config.hidden_size,
++                quant_config=quant_config,
++                prefix=add_prefix("lm_head", prefix),
++                use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
++            )
++        else:
++            self.lm_head = PPMissingLayer()
+         self.logits_processor = LogitsProcessor(config)
+ 
+         self._routed_experts_weights_of_layer = LazyValue(
+diff --git a/test/unit/test_glm47_flash_kt_ep_coverage.py b/test/unit/test_glm47_flash_kt_ep_coverage.py
+index a5ef06c20..bab6cfb87 100644
+--- a/test/unit/test_glm47_flash_kt_ep_coverage.py
++++ b/test/unit/test_glm47_flash_kt_ep_coverage.py
+@@ -75,6 +75,13 @@ class _FakeA2ABackend:
+         return False
+ 
+ 
++class _FakeGlm4MoeLiteModel(torch.nn.Module):
++    def __init__(self):
++        super().__init__()
++        self.kt_ep_coverage_receipt = None
++        self.layers = torch.nn.ModuleList()
++
++
+ class TestGlm47FlashKtEpCoverage(unittest.TestCase):
+     def _config(self):
+         return SimpleNamespace(
+@@ -122,6 +129,34 @@ class TestGlm47FlashKtEpCoverage(unittest.TestCase):
+             layers.append(SimpleNamespace(layer_id=layer_id, mlp=sparse_block))
+         return config, masks, layers
+ 
++    def _construct_causal_model(self, *, is_last_rank):
++        config = SimpleNamespace(vocab_size=154880, hidden_size=2048)
++        pp_group = SimpleNamespace(is_last_rank=is_last_rank)
++        model_body = _FakeGlm4MoeLiteModel()
++        expected_lm_head = torch.nn.Identity()
++        lm_head_constructor = Mock(return_value=expected_lm_head)
++        server_args = SimpleNamespace(enable_dp_lm_head=False)
++
++        with (
++            patch.object(glm, "get_pp_group", return_value=pp_group),
++            patch.object(glm, "get_tensor_model_parallel_world_size", return_value=1),
++            patch.object(
++                glm.Glm4MoeLiteForCausalLM,
++                "determine_num_fused_shared_experts",
++            ),
++            patch.object(glm, "Glm4MoeLiteModel", return_value=model_body),
++            patch.object(glm, "ParallelLMHead", lm_head_constructor),
++            patch.object(glm, "LogitsProcessor", return_value=torch.nn.Identity()),
++            patch.object(glm, "get_global_server_args", return_value=server_args),
++            patch(
++                "sglang.srt.layers.attention.nsa.utils.is_nsa_enable_prefill_cp",
++                return_value=False,
++            ),
++        ):
++            model = glm.Glm4MoeLiteForCausalLM(config)
++
++        return model, expected_lm_head, lm_head_constructor
++
+     def _build_receipt(
+         self,
+         config,
+@@ -183,6 +218,27 @@ class TestGlm47FlashKtEpCoverage(unittest.TestCase):
+         self.assertTrue(enabled)
+         require_registration.assert_called_once_with()
+ 
++    def test_non_last_pipeline_rank_does_not_allocate_lm_head(self):
++        model, _, lm_head_constructor = self._construct_causal_model(is_last_rank=False)
++
++        lm_head_constructor.assert_not_called()
++        self.assertIsInstance(model.lm_head, glm.PPMissingLayer)
++        self.assertNotIn("lm_head.weight", dict(model.named_parameters()))
++
++    def test_last_pipeline_rank_retains_lm_head(self):
++        model, expected_lm_head, lm_head_constructor = self._construct_causal_model(
++            is_last_rank=True
++        )
++
++        self.assertIs(model.lm_head, expected_lm_head)
++        lm_head_constructor.assert_called_once_with(
++            154880,
++            2048,
++            quant_config=None,
++            prefix="lm_head",
++            use_attn_tp_group=False,
++        )
++
+     def test_preconstruction_requirement_accepts_pipeline_parallelism(self):
+         fake_kt_module = SimpleNamespace(require_kt_ep_registration=lambda: None)
+         with (
+-- 
+2.54.0
+
