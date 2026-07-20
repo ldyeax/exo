@@ -1304,15 +1304,17 @@ def _validate_admission_cross_bindings(
 ) -> None:
     stage = process_spec.stage
     if (
-        calculate_sglang_kt_process_launch_spec_sha256(process_spec)
-        != config.admission.process_spec_sha256
-        or process_spec.target_profile != GLM_4_7_FLASH_SERVING_BASELINE_TARGET_PROFILE
+        process_spec.target_profile != GLM_4_7_FLASH_SERVING_BASELINE_TARGET_PROFILE
         or process_spec.executable != config.runtime_python.path
+        or process_spec.model_contract_sha256 != config.model_contract.sha256
         or process_spec.model_path != config.model_path
+        or process_spec.ktransformers_weight_path != config.model_path
         or process_spec.node_id != NodeId(config.host.node_id)
         or process_spec.gpu_uuid != config.host.gpu.uuid
         or process_spec.cpu_cores != config.host.cpu_cores
         or process_spec.memory_nodes != config.host.memory_nodes
+        or stage.cpu_infer_threads != config.host.cpu_infer_threads
+        or stage.threadpool_count != config.host.threadpool_count
         or stage.resident_gpu_experts != config.resident_gpu_experts
         or process_spec.service_endpoint.ip != config.service_endpoint.ip
         or process_spec.service_endpoint.port != config.service_endpoint.port
@@ -1323,8 +1325,10 @@ def _validate_admission_cross_bindings(
         or "--disable-cuda-graph" not in process_spec.arguments
     ):
         raise Glm47ServingHarnessError(
-            "fresh serving process spec differs from the admitted launch"
+            "generated serving process spec differs from the configured variant"
         )
+    # Admission proves the immutable runtime/model capability. CPU and NUMA placement
+    # belong to the generated benchmark spec, so the admitted receipts agree together.
     if (
         model.process_spec_sha256 != config.admission.process_spec_sha256
         or model.target_profile != GLM_4_7_FLASH_SERVING_BASELINE_TARGET_PROFILE
@@ -1333,8 +1337,6 @@ def _validate_admission_cross_bindings(
         or model.model_path != config.model_path
         or model.model_config_sha256 != GLM_4_7_FLASH_BF16_CONFIG_SHA256
         or model.gpu_uuid != config.host.gpu.uuid
-        or model.cpu_cores != config.host.cpu_cores
-        or model.memory_nodes != config.host.memory_nodes
         or model.resident_gpu_experts != config.resident_gpu_experts
         or model.executed_cpu_backend != "AMX_BF16"
         or model.sglang_revision != GLM_4_7_FLASH_SGLANG_REVISION
@@ -1347,18 +1349,20 @@ def _validate_admission_cross_bindings(
         or model.model_contract_receipt_sha256
         != config.admission.model_contract_receipt.sha256
         or model.model_contract_sha256 != GLM_4_7_FLASH_BF16_MODEL_CONTRACT_SHA256
+        or model.gpu_uuid != kernel.gpu_uuid
+        or model.gpu_compute_capability != kernel.gpu_compute_capability
+        or model.cpu_cores != kernel.cpu_cores
+        or model.memory_nodes != kernel.memory_nodes
     ):
         raise Glm47ServingHarnessError(
-            "model admission receipt differs from the serving process spec"
+            "model admission receipt is not reusable capability evidence"
         )
     if (
         kernel.receipt_path != config.admission.kernel_runtime_validation_receipt.path
         or kernel.receipt_sha256
         != config.admission.kernel_runtime_validation_receipt.sha256
         or kernel.executable != config.runtime_python.path
-        or kernel.gpu_uuid != config.host.gpu.uuid
-        or kernel.cpu_cores != config.host.cpu_cores
-        or kernel.memory_nodes != config.host.memory_nodes
+        or kernel.hostname != config.host.hostname
         or kernel.build_receipt_path != config.build_receipt.path
         or kernel.build_receipt_sha256 != config.build_receipt.sha256
         or kernel.sglang_revision != GLM_4_7_FLASH_SGLANG_REVISION
@@ -1370,7 +1374,7 @@ def _validate_admission_cross_bindings(
         or kernel.cuda_version != model.cuda_version
     ):
         raise Glm47ServingHarnessError(
-            "kernel admission receipt differs from the serving runtime"
+            "kernel admission receipt is not reusable capability evidence"
         )
 
 
@@ -1399,13 +1403,6 @@ def collect_admission_evidence(
     )
     validation.require_success(generator)
     process_spec, process_spec_file = _load_process_spec(results, generator)
-    if (
-        calculate_sglang_kt_process_launch_spec_sha256(process_spec)
-        != config.admission.process_spec_sha256
-    ):
-        raise Glm47ServingHarnessError(
-            "fresh process spec is not bound to the admitted canonical digest"
-        )
 
     kernel = load_sglang_kt_kernel_runtime_validation_receipt(
         Path(config.admission.kernel_runtime_validation_receipt.path),
@@ -1508,6 +1505,7 @@ def build_serving_environment(
             "CUDA_CACHE_PATH": str(cache_by_name["cuda"]),
             "HF_HOME": str(cache_by_name["huggingface"]),
             "HOME": str(scratch.path / "home"),
+            "SPT_NOENV": "1",
             "TEMP": str(scratch.path / "tmp"),
             "TMP": str(scratch.path / "tmp"),
             "TMPDIR": str(scratch.path / "tmp"),
@@ -1925,7 +1923,9 @@ def build_run_identity(
         ),
         process_spec=SglangKtServingProcessSpecIdentity(
             receipt=admission.process_spec_file,
-            process_spec_sha256=config.admission.process_spec_sha256,
+            process_spec_sha256=calculate_sglang_kt_process_launch_spec_sha256(
+                process_spec
+            ),
             launch_argv_sha256=server_identity.argv_sha256,
             launch_environment_sha256=_canonical_sha256(
                 sorted(server.environment.items())
@@ -2961,6 +2961,34 @@ def _validate_wrapper_manifest(
     return manifest
 
 
+def _validate_recorded_process_spec_identity(
+    config: ServingBenchmarkConfig,
+    identity: SglangKtWarmServingRunIdentity,
+    process_spec: SglangKtProcessLaunchSpec,
+) -> None:
+    recorded = identity.process_spec
+    stage = identity.topology.stages[0]
+    if (
+        recorded.process_spec_sha256
+        != calculate_sglang_kt_process_launch_spec_sha256(process_spec)
+        or recorded.target_profile != process_spec.target_profile
+        or recorded.resident_gpu_experts != process_spec.stage.resident_gpu_experts
+        or recorded.cpu_cores != process_spec.cpu_cores
+        or recorded.memory_nodes != process_spec.memory_nodes
+        or recorded.launch_argv_sha256
+        != _canonical_sha256(list(_server_command(config, process_spec)))
+        or stage.pipeline_rank != process_spec.pipeline_rank
+        or stage.node_id != process_spec.node_id
+        or stage.host != process_spec.service_endpoint.ip
+        or stage.port != process_spec.service_endpoint.port
+        or stage.gpu_uuid != process_spec.gpu_uuid
+        or stage.hca_devices != process_spec.stage.hca_devices
+    ):
+        raise Glm47ServingHarnessError(
+            "recorded serving identity differs from its generated process spec"
+        )
+
+
 def _validate_identity_files(
     config: ServingBenchmarkConfig,
     deployment: validation.DeploymentIdentity,
@@ -2999,6 +3027,7 @@ def _validate_identity_files(
         Path(identity.process_spec.receipt.path), maximum_bytes=1024 * 1024
     ).contents
     process_spec = SglangKtProcessLaunchSpec.model_validate_json(process_contents)
+    _validate_recorded_process_spec_identity(config, identity, process_spec)
     kernel = load_sglang_kt_kernel_runtime_validation_receipt(
         Path(config.admission.kernel_runtime_validation_receipt.path),
         expected_receipt_sha256=config.admission.kernel_runtime_validation_receipt.sha256,

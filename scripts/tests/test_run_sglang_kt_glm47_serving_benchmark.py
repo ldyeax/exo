@@ -24,6 +24,7 @@ from exo.worker.sglang_kt.launch_spec import (
     GLM_4_7_FLASH_SERVING_BASELINE_TARGET_PROFILE,
     GLM_4_7_FLASH_SGLANG_REVISION,
     SglangKtProcessLaunchSpec,
+    calculate_sglang_kt_process_launch_spec_sha256,
 )
 from exo.worker.sglang_kt.model_runtime_validation_receipt import (
     MODEL_RUNTIME_VALIDATOR_SOURCE_RELATIVE_PATHS,
@@ -31,6 +32,9 @@ from exo.worker.sglang_kt.model_runtime_validation_receipt import (
     calculate_sglang_kt_model_runtime_validator_bundle_sha256,
 )
 from exo.worker.sglang_kt.receipt_io import SglangKtBoundFile
+from exo.worker.sglang_kt.runtime_validation_receipt import (
+    SglangKtKernelRuntimeValidationReceiptObservation,
+)
 from exo.worker.sglang_kt.serving_benchmark_receipt import (
     SGLANG_KT_SERVING_CLIENT_RELATIVE_PATH,
     SGLANG_KT_SERVING_RECEIPT_RELATIVE_PATH,
@@ -77,6 +81,7 @@ from scripts.sglang_kt_glm47_serving_client import (
 )
 
 GPU_UUID = "GPU-a442b72e-6727-6322-ba5d-5a9512b79886"
+OTHER_GPU_UUID = "GPU-63a7760a-6164-0758-9228-03dbf35d721c"
 SHA = "a" * 64
 
 
@@ -443,22 +448,100 @@ def make_process_spec(
             "--gpu-uuid",
             config.host.gpu.uuid,
             "--cpu-cores",
-            "0-3",
+            ",".join(str(core) for core in config.host.cpu_cores),
             "--memory-nodes",
-            "0",
+            ",".join(str(node) for node in config.host.memory_nodes),
             "--cpu-infer-threads",
-            "4",
+            str(config.host.cpu_infer_threads),
             "--threadpool-count",
-            "1",
+            str(config.host.threadpool_count),
             "--distributed-coordinator",
             config.distributed_coordinator.argument,
             "--service-endpoint",
             config.service_endpoint.argument,
             "--resident-gpu-experts",
-            "4",
+            str(config.resident_gpu_experts),
         ]
     )
     return create_process_spec(arguments)
+
+
+def admitted_capability_receipts(
+    config: harness.ServingBenchmarkConfig,
+    *,
+    admitted_gpu_uuid: str | None = None,
+    kernel_gpu_uuid: str | None = None,
+    resident_gpu_experts: int | None = None,
+) -> tuple[
+    SglangKtModelRuntimeValidationReceiptObservation,
+    SglangKtKernelRuntimeValidationReceiptObservation,
+]:
+    observed_admitted_gpu_uuid = admitted_gpu_uuid or config.host.gpu.uuid
+    observed_kernel_gpu_uuid = kernel_gpu_uuid or observed_admitted_gpu_uuid
+    admitted_cpu_cores = (56, 57, 58, 59)
+    admitted_memory_nodes = (1,)
+    model = cast(
+        SglangKtModelRuntimeValidationReceiptObservation,
+        SimpleNamespace(
+            process_spec_sha256=config.admission.process_spec_sha256,
+            target_profile=GLM_4_7_FLASH_SERVING_BASELINE_TARGET_PROFILE,
+            model_id=harness.GLM_4_7_FLASH_BF16_MODEL_ID,
+            model_revision=GLM_4_7_FLASH_BF16_MODEL_REVISION,
+            model_path=config.model_path,
+            model_config_sha256=GLM_4_7_FLASH_BF16_CONFIG_SHA256,
+            gpu_uuid=observed_admitted_gpu_uuid,
+            gpu_compute_capability=(8, 6),
+            cpu_cores=admitted_cpu_cores,
+            memory_nodes=admitted_memory_nodes,
+            resident_gpu_experts=(
+                resident_gpu_experts
+                if resident_gpu_experts is not None
+                else config.resident_gpu_experts
+            ),
+            executed_cpu_backend="AMX_BF16",
+            sglang_revision=GLM_4_7_FLASH_SGLANG_REVISION,
+            ktransformers_revision=GLM_4_7_FLASH_KTRANSFORMERS_REVISION,
+            kernel_runtime_validation_receipt_path=(
+                config.admission.kernel_runtime_validation_receipt.path
+            ),
+            kernel_runtime_validation_receipt_sha256=(
+                config.admission.kernel_runtime_validation_receipt.sha256
+            ),
+            model_contract_path=config.admission.model_contract_receipt.path,
+            model_contract_receipt_sha256=(
+                config.admission.model_contract_receipt.sha256
+            ),
+            model_contract_sha256=harness.GLM_4_7_FLASH_BF16_MODEL_CONTRACT_SHA256,
+            sgl_kernel_build_id="4" * 64,
+            deep_gemm_build_id="5" * 64,
+            kt_kernel_build_id="6" * 64,
+            torch_version="2.9.1+cu128",
+            cuda_version="12.8",
+        ),
+    )
+    kernel = cast(
+        SglangKtKernelRuntimeValidationReceiptObservation,
+        SimpleNamespace(
+            receipt_path=config.admission.kernel_runtime_validation_receipt.path,
+            receipt_sha256=config.admission.kernel_runtime_validation_receipt.sha256,
+            executable=config.runtime_python.path,
+            hostname=config.host.hostname,
+            gpu_uuid=observed_kernel_gpu_uuid,
+            gpu_compute_capability=(8, 6),
+            cpu_cores=admitted_cpu_cores,
+            memory_nodes=admitted_memory_nodes,
+            build_receipt_path=config.build_receipt.path,
+            build_receipt_sha256=config.build_receipt.sha256,
+            sglang_revision=GLM_4_7_FLASH_SGLANG_REVISION,
+            ktransformers_revision=GLM_4_7_FLASH_KTRANSFORMERS_REVISION,
+            sgl_kernel_build_id="4" * 64,
+            deep_gemm_build_id="5" * 64,
+            kt_kernel_build_id="6" * 64,
+            torch_version="2.9.1+cu128",
+            cuda_version="12.8",
+        ),
+    )
+    return model, kernel
 
 
 def fake_scratch(tmp_path: Path) -> validation.OwnedScratchDirectory:
@@ -912,6 +995,189 @@ def test_serving_config_requires_exact_phase_and_distinct_admission_paths(
         harness.ServingBenchmarkConfig.model_validate_json(json.dumps(duplicate))
 
 
+def test_admitted_capabilities_allow_a_recorded_performance_variant(
+    tmp_path: Path,
+) -> None:
+    config = make_config(tmp_path)
+    process_spec = make_process_spec(config)
+    model, kernel = admitted_capability_receipts(config)
+
+    assert (
+        calculate_sglang_kt_process_launch_spec_sha256(process_spec)
+        != config.admission.process_spec_sha256
+    )
+    assert model.cpu_cores != process_spec.cpu_cores
+    assert model.memory_nodes != process_spec.memory_nodes
+
+    harness._validate_admission_cross_bindings(config, process_spec, model, kernel)
+
+
+def test_admitted_capabilities_allow_full_two_numa_cpu_variant(
+    tmp_path: Path,
+) -> None:
+    payload = config_payload(tmp_path)
+    host = cast(dict[str, object], payload["host"])
+    host.update(
+        {
+            "cpu_cores": list(range(112)),
+            "memory_nodes": [0, 1],
+            "threads_per_subpool": [56, 56],
+            "cpu_infer_threads": 112,
+            "threadpool_count": 2,
+        }
+    )
+    config = harness.ServingBenchmarkConfig.model_validate_json(json.dumps(payload))
+    process_spec = make_process_spec(config)
+    model, kernel = admitted_capability_receipts(config)
+
+    assert process_spec.cpu_cores == tuple(range(112))
+    assert process_spec.memory_nodes == (0, 1)
+    assert process_spec.stage.cpu_infer_threads == 112
+    assert process_spec.stage.threadpool_count == 2
+    harness._validate_admission_cross_bindings(config, process_spec, model, kernel)
+
+
+def test_performance_variant_process_spec_must_match_current_config(
+    tmp_path: Path,
+) -> None:
+    config = make_config(tmp_path)
+    process_spec = make_process_spec(config)
+    model, kernel = admitted_capability_receipts(config)
+    changed = config_payload(tmp_path)
+    changed["resident_gpu_experts"] = 3
+    changed_config = harness.ServingBenchmarkConfig.model_validate_json(
+        json.dumps(changed)
+    )
+
+    with pytest.raises(
+        harness.Glm47ServingHarnessError,
+        match="configured variant",
+    ):
+        harness._validate_admission_cross_bindings(
+            changed_config, process_spec, model, kernel
+        )
+
+
+def test_reused_model_and_kernel_admission_must_describe_one_baseline(
+    tmp_path: Path,
+) -> None:
+    config = make_config(tmp_path)
+    process_spec = make_process_spec(config)
+    model, kernel = admitted_capability_receipts(config, kernel_gpu_uuid=OTHER_GPU_UUID)
+
+    with pytest.raises(
+        harness.Glm47ServingHarnessError,
+        match="reusable capability evidence",
+    ):
+        harness._validate_admission_cross_bindings(config, process_spec, model, kernel)
+
+
+@pytest.mark.parametrize(
+    ("admitted_gpu_uuid", "resident_gpu_experts"),
+    (
+        (OTHER_GPU_UUID, None),
+        (None, 3),
+    ),
+)
+def test_reused_admission_remains_bound_to_gpu_and_expert_count(
+    tmp_path: Path,
+    admitted_gpu_uuid: str | None,
+    resident_gpu_experts: int | None,
+) -> None:
+    config = make_config(tmp_path)
+    process_spec = make_process_spec(config)
+    model, kernel = admitted_capability_receipts(
+        config,
+        admitted_gpu_uuid=admitted_gpu_uuid,
+        resident_gpu_experts=resident_gpu_experts,
+    )
+
+    with pytest.raises(
+        harness.Glm47ServingHarnessError,
+        match="reusable capability evidence",
+    ):
+        harness._validate_admission_cross_bindings(config, process_spec, model, kernel)
+
+
+def test_recorded_process_spec_identity_binds_variant_digest_and_placement(
+    tmp_path: Path,
+) -> None:
+    config = make_config(tmp_path)
+    process_spec = make_process_spec(config)
+    identity = serving_identity(config)
+    variant_sha256 = calculate_sglang_kt_process_launch_spec_sha256(process_spec)
+    recorded = identity.process_spec.model_copy(
+        update={
+            "process_spec_sha256": variant_sha256,
+            "launch_argv_sha256": harness._canonical_sha256(
+                list(harness._server_command(config, process_spec))
+            ),
+        }
+    )
+    variant_identity = identity.model_copy(update={"process_spec": recorded})
+
+    harness._validate_recorded_process_spec_identity(
+        config, variant_identity, process_spec
+    )
+
+    admitted_identity = identity.model_copy(
+        update={
+            "process_spec": recorded.model_copy(
+                update={"process_spec_sha256": config.admission.process_spec_sha256}
+            )
+        }
+    )
+    with pytest.raises(
+        harness.Glm47ServingHarnessError,
+        match="generated process spec",
+    ):
+        harness._validate_recorded_process_spec_identity(
+            config, admitted_identity, process_spec
+        )
+
+    wrong_placement = variant_identity.model_copy(
+        update={"process_spec": recorded.model_copy(update={"cpu_cores": (0, 1, 2)})}
+    )
+    with pytest.raises(
+        harness.Glm47ServingHarnessError,
+        match="generated process spec",
+    ):
+        harness._validate_recorded_process_spec_identity(
+            config, wrong_placement, process_spec
+        )
+
+    wrong_stage = variant_identity.topology.stages[0].model_copy(
+        update={"host": "127.0.0.2"}
+    )
+    wrong_topology = variant_identity.model_copy(
+        update={
+            "topology": variant_identity.topology.model_copy(
+                update={"stages": (wrong_stage,)}
+            )
+        }
+    )
+    with pytest.raises(
+        harness.Glm47ServingHarnessError,
+        match="generated process spec",
+    ):
+        harness._validate_recorded_process_spec_identity(
+            config, wrong_topology, process_spec
+        )
+
+    wrong_argv = variant_identity.model_copy(
+        update={
+            "process_spec": recorded.model_copy(update={"launch_argv_sha256": "0" * 64})
+        }
+    )
+    with pytest.raises(
+        harness.Glm47ServingHarnessError,
+        match="generated process spec",
+    ):
+        harness._validate_recorded_process_spec_identity(
+            config, wrong_argv, process_spec
+        )
+
+
 def test_measurement_timestamp_must_be_utc(tmp_path: Path) -> None:
     config = make_config(tmp_path)
     payload = serving_measurement(config, tmp_path / "cgroup").model_dump(mode="json")
@@ -1149,6 +1415,7 @@ def test_serving_environment_is_sanitized_and_owns_all_caches(tmp_path: Path) ->
             parent_environment={
                 "PATH": "/untrusted/bin",
                 "HOME": "/untrusted/home",
+                "SPT_NOENV": "",
                 "SGLANG_MOE_CONFIG_DIR": "/foreign",
                 "NCCL_DEBUG": "TRACE",
             },
@@ -1158,6 +1425,7 @@ def test_serving_environment_is_sanitized_and_owns_all_caches(tmp_path: Path) ->
         os.close(scratch.parent_descriptor)
     assert environment["PATH"] == harness.FIXED_CHILD_PATH
     assert environment["HOME"] == str(scratch.path / "home")
+    assert environment["SPT_NOENV"] == "1"
     assert environment["TMPDIR"] == str(scratch.path / "tmp")
     assert environment["TEMP"] == environment["TMPDIR"]
     assert environment["TMP"] == environment["TMPDIR"]
