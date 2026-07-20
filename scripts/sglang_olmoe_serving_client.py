@@ -24,6 +24,11 @@ SSE_EVENT_SLACK: Final = 8
 SSE_LINES_PER_TOKEN_LIMIT: Final = 8
 SSE_READ_CHUNK_BYTES: Final = 64 * 1024
 SANITY_RESPONSE_MAXIMUM_BYTES: Final = 4 * 1024 * 1024
+LOGIT_PARITY_RESPONSE_MAXIMUM_BYTES: Final = 256 * 1024
+LOGIT_PARITY_TOP_LOGPROBS_MAXIMUM: Final = 64
+LOGIT_PARITY_CANDIDATE_TOKEN_IDS_MAXIMUM: Final = 64
+LOGIT_PARITY_READ_CHUNK_BYTES: Final = 64 * 1024
+LOGIT_PARITY_IO_TIMEOUT_MAXIMUM_SECONDS: Final = 10.0
 
 
 class OlmoeServingClientError(RuntimeError):
@@ -87,6 +92,46 @@ class OlmoeNativeGenerateRequest:
             "stream": self.stream,
             "return_logprob": self.return_logprob,
             "log_metrics": self.log_metrics,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class OlmoeLogitParityRequest:
+    input_ids: tuple[int, ...]
+    sampling_params: OlmoeSamplingParameters
+    candidate_token_ids: tuple[int, ...]
+    top_logprobs_num: int
+
+    def __post_init__(self) -> None:
+        token_ids_sha256(self.input_ids)
+        token_ids_sha256(self.candidate_token_ids)
+        if (
+            self.sampling_params.max_new_tokens != 1
+            or not self.sampling_params.ignore_eos
+        ):
+            raise ValueError("logit parity requires exactly one greedy output token")
+        if len(set(self.candidate_token_ids)) != len(self.candidate_token_ids):
+            raise ValueError("logit parity candidate token IDs must be distinct")
+        if not 1 <= self.top_logprobs_num <= LOGIT_PARITY_TOP_LOGPROBS_MAXIMUM:
+            raise ValueError("logit parity top-k is outside its bound")
+        if (
+            not 1
+            <= len(self.candidate_token_ids)
+            <= (LOGIT_PARITY_CANDIDATE_TOKEN_IDS_MAXIMUM)
+        ):
+            raise ValueError("logit parity candidate count is outside its bound")
+
+    def json_object(self) -> JsonObject:
+        return {
+            "input_ids": list(self.input_ids),
+            "sampling_params": self.sampling_params.json_object(),
+            "stream": False,
+            "return_logprob": True,
+            "logprob_start_len": -1,
+            "top_logprobs_num": self.top_logprobs_num,
+            "token_ids_logprob": list(self.candidate_token_ids),
+            "return_text_in_logprobs": False,
+            "log_metrics": False,
         }
 
 
@@ -156,6 +201,61 @@ class _SanityResponse(_PermissiveModel):
         return self
 
 
+type _SerializedLogprob = tuple[float, int, None]
+
+
+@final
+class _LogitParityMetaInfo(_PermissiveModel):
+    prompt_tokens: int = Field(gt=0)
+    completion_tokens: Literal[1]
+    cached_tokens: Literal[0]
+    finish_reason: _LengthFinishReason
+    output_token_logprobs: tuple[_SerializedLogprob, ...]
+    output_top_logprobs: tuple[tuple[_SerializedLogprob, ...], ...]
+    output_token_ids_logprobs: tuple[tuple[_SerializedLogprob, ...], ...]
+
+    @model_validator(mode="after")
+    def validate_logprob_evidence(self) -> "_LogitParityMetaInfo":
+        if (
+            len(self.output_token_logprobs) != 1
+            or len(self.output_top_logprobs) != 1
+            or len(self.output_token_ids_logprobs) != 1
+            or self.finish_reason.length != 1
+        ):
+            raise ValueError("logit parity response does not describe one output token")
+        groups = (
+            self.output_token_logprobs,
+            self.output_top_logprobs[0],
+            self.output_token_ids_logprobs[0],
+        )
+        for entries in groups:
+            if any(
+                not math.isfinite(logprob)
+                or token_id < 0
+                or token_id >= OLMOE_VOCABULARY_SIZE
+                or text is not None
+                for logprob, token_id, text in entries
+            ):
+                raise ValueError("logit parity response contains an invalid logprob")
+        return self
+
+
+@final
+class _LogitParityResponse(_PermissiveModel):
+    text: str
+    output_ids: tuple[int, ...]
+    meta_info: _LogitParityMetaInfo
+
+    @model_validator(mode="after")
+    def validate_generated_token(self) -> "_LogitParityResponse":
+        if (
+            len(self.output_ids) != 1
+            or self.meta_info.output_token_logprobs[0][1] != self.output_ids[0]
+        ):
+            raise ValueError("logit parity generated-token evidence is inconsistent")
+        return self
+
+
 @dataclass(frozen=True, slots=True)
 class EndpointObservation:
     status_code: int
@@ -174,6 +274,27 @@ class ServerInfoObservation:
 class SanityResponseObservation:
     text: str
     output_ids: tuple[int, ...]
+    prompt_tokens: int
+    completion_tokens: int
+    cached_tokens: int
+    finish_reason: JsonObject
+    total_client_seconds: float
+
+
+@dataclass(frozen=True, slots=True)
+class LogprobObservation:
+    token_id: int
+    logprob: float
+
+
+@dataclass(frozen=True, slots=True)
+class LogitParityObservation:
+    input_ids_sha256: str
+    response_sha256: str
+    generated_token_id: int
+    generated_token_logprob: float
+    candidate_logprobs: tuple[LogprobObservation, ...]
+    top_logprobs: tuple[LogprobObservation, ...]
     prompt_tokens: int
     completion_tokens: int
     cached_tokens: int
@@ -345,6 +466,111 @@ class OlmoeNativeServingClient:
         return SanityResponseObservation(
             text=parsed.text,
             output_ids=parsed.output_ids,
+            prompt_tokens=parsed.meta_info.prompt_tokens,
+            completion_tokens=parsed.meta_info.completion_tokens,
+            cached_tokens=parsed.meta_info.cached_tokens,
+            finish_reason=cast(
+                JsonObject, parsed.meta_info.finish_reason.model_dump(mode="json")
+            ),
+            total_client_seconds=elapsed,
+        )
+
+    def generate_logit_parity(
+        self, request: OlmoeLogitParityRequest
+    ) -> LogitParityObservation:
+        started = self._clock_ns()
+        deadline = self._deadline_clock_ns() + self._timeout_ns
+
+        def require_within_deadline() -> None:
+            if self._deadline_clock_ns() > deadline:
+                raise OlmoeServingClientError(
+                    "logit parity response exceeded its deadline"
+                )
+
+        contents_buffer = bytearray()
+        io_timeout_seconds = min(
+            self._timeout_ns / 1_000_000_000,
+            LOGIT_PARITY_IO_TIMEOUT_MAXIMUM_SECONDS,
+        )
+        with self._client.stream(
+            "POST",
+            "/generate",
+            json=request.json_object(),
+            timeout=httpx.Timeout(io_timeout_seconds),
+        ) as response:
+            require_within_deadline()
+            if response.status_code != 200:
+                raise OlmoeServingClientError(
+                    f"POST /generate logit parity returned HTTP {response.status_code}"
+                )
+            if response.headers.get("content-encoding", "identity") != "identity":
+                raise OlmoeServingClientError(
+                    "logit parity response must not be compressed"
+                )
+            for chunk in response.iter_raw(chunk_size=LOGIT_PARITY_READ_CHUNK_BYTES):
+                require_within_deadline()
+                if len(chunk) > LOGIT_PARITY_RESPONSE_MAXIMUM_BYTES - len(
+                    contents_buffer
+                ):
+                    raise OlmoeServingClientError("logit parity response is oversized")
+                contents_buffer.extend(chunk)
+                require_within_deadline()
+            require_within_deadline()
+        completed = self._clock_ns()
+        contents = bytes(contents_buffer)
+        try:
+            parsed = _LogitParityResponse.model_validate_json(contents)
+        except ValidationError as error:
+            raise OlmoeServingClientError("logit parity response is invalid") from error
+
+        top_entries = parsed.meta_info.output_top_logprobs[0]
+        candidate_entries = parsed.meta_info.output_token_ids_logprobs[0]
+        top_token_ids = tuple(entry[1] for entry in top_entries)
+        top_logprobs_by_token_id = {
+            token_id: logprob for logprob, token_id, _text in top_entries
+        }
+        candidate_token_ids = tuple(entry[1] for entry in candidate_entries)
+        generated_entry = parsed.meta_info.output_token_logprobs[0]
+        if (
+            parsed.meta_info.prompt_tokens != len(request.input_ids)
+            or len(top_entries) != request.top_logprobs_num
+            or len(set(top_token_ids)) != len(top_token_ids)
+            or candidate_token_ids != request.candidate_token_ids
+            or any(
+                token_id in top_logprobs_by_token_id
+                and top_logprobs_by_token_id[token_id] != logprob
+                for logprob, token_id, _text in candidate_entries
+            )
+            or any(
+                current[0] < following[0]
+                for current, following in zip(
+                    top_entries, top_entries[1:], strict=False
+                )
+            )
+            or generated_entry not in top_entries
+            or generated_entry[0] != top_entries[0][0]
+        ):
+            raise OlmoeServingClientError(
+                "logit parity response does not match the exact request"
+            )
+        elapsed = (completed - started) / 1_000_000_000
+        if elapsed <= 0.0 or completed - started > self._timeout_ns:
+            raise OlmoeServingClientError(
+                "logit parity response exceeded its time bound"
+            )
+        return LogitParityObservation(
+            input_ids_sha256=token_ids_sha256(request.input_ids),
+            response_sha256=hashlib.sha256(contents).hexdigest(),
+            generated_token_id=parsed.output_ids[0],
+            generated_token_logprob=generated_entry[0],
+            candidate_logprobs=tuple(
+                LogprobObservation(token_id=token_id, logprob=logprob)
+                for logprob, token_id, _text in candidate_entries
+            ),
+            top_logprobs=tuple(
+                LogprobObservation(token_id=token_id, logprob=logprob)
+                for logprob, token_id, _text in top_entries
+            ),
             prompt_tokens=parsed.meta_info.prompt_tokens,
             completion_tokens=parsed.meta_info.completion_tokens,
             cached_tokens=parsed.meta_info.cached_tokens,

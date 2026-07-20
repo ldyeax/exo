@@ -83,6 +83,8 @@ from scripts.prepare_sglang_kt_source import (  # noqa: E402
 )
 from scripts.sglang_olmoe_serving_client import (  # noqa: E402
     GenerateObservation,
+    LogitParityObservation,
+    OlmoeLogitParityRequest,
     OlmoeNativeGenerateRequest,
     OlmoeNativeServingClient,
     OlmoeSamplingParameters,
@@ -129,6 +131,10 @@ CANONICAL_WORKLOADS: Final = (
     ("prefill", 1_024, 32),
     ("decode", 128, 128),
 )
+LOGIT_PARITY_CANONICAL_INPUT_TOKENS: Final = 128
+LOGIT_PARITY_COMMON_PREFIX: Final = (431, 3_056, 209)
+LOGIT_PARITY_CANDIDATE_TOKEN_IDS: Final = (139, 1_769)
+LOGIT_PARITY_TOP_LOGPROBS: Final = 8
 DEFAULT_PORT: Final = 62_610
 DEFAULT_STATIC_MEMORY_FRACTION: Final = 0.9
 _RECEIPT_MAXIMUM_BYTES: Final = 4 * 1024 * 1024
@@ -261,6 +267,7 @@ class OlmoeEpBenchmarkConfig:
     cleanup_timeout_seconds: float
     numactl_executable: str
     nvidia_smi_executable: str
+    logit_parity_probe: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -2628,6 +2635,78 @@ def build_deterministic_input_ids(kind: str, token_count: int) -> tuple[int, ...
     return tuple(token_ids)
 
 
+def _run_logit_parity_probe(client: OlmoeNativeServingClient) -> JsonObject:
+    canonical_input_ids = build_deterministic_input_ids(
+        "decode", LOGIT_PARITY_CANONICAL_INPUT_TOKENS
+    )
+    context_ids = canonical_input_ids + LOGIT_PARITY_COMMON_PREFIX
+    request = OlmoeLogitParityRequest(
+        input_ids=context_ids,
+        sampling_params=OlmoeSamplingParameters(
+            max_new_tokens=1,
+            temperature=0.0,
+            ignore_eos=True,
+            sampling_seed=CANONICAL_SAMPLING_SEED,
+        ),
+        candidate_token_ids=LOGIT_PARITY_CANDIDATE_TOKEN_IDS,
+        top_logprobs_num=LOGIT_PARITY_TOP_LOGPROBS,
+    )
+    observation: LogitParityObservation = client.generate_logit_parity(request)
+    flush = client.flush_cache()
+    return {
+        "schema_version": 1,
+        "status": "captured",
+        "context": {
+            "canonical_workload_kind": "decode",
+            "canonical_input_token_count": len(canonical_input_ids),
+            "canonical_input_ids_sha256": _canonical_sha256(list(canonical_input_ids)),
+            "common_generated_prefix_token_ids": list(LOGIT_PARITY_COMMON_PREFIX),
+            "common_generated_prefix_sha256": _canonical_sha256(
+                list(LOGIT_PARITY_COMMON_PREFIX)
+            ),
+            "context_token_count": len(context_ids),
+            "context_token_ids_sha256": observation.input_ids_sha256,
+        },
+        "request": {
+            "max_new_tokens": 1,
+            "temperature": 0.0,
+            "ignore_eos": True,
+            "sampling_seed": CANONICAL_SAMPLING_SEED,
+            "stream": False,
+            "return_logprob": True,
+            "logprob_start_len": -1,
+            "candidate_token_ids": list(LOGIT_PARITY_CANDIDATE_TOKEN_IDS),
+            "top_logprobs_num": LOGIT_PARITY_TOP_LOGPROBS,
+        },
+        "response": {
+            "raw_response_sha256": observation.response_sha256,
+            "generated_token_id": observation.generated_token_id,
+            "generated_token_logprob": observation.generated_token_logprob,
+            "candidate_logprobs": [
+                {
+                    "token_id": entry.token_id,
+                    "logprob": entry.logprob,
+                }
+                for entry in observation.candidate_logprobs
+            ],
+            "top_logprobs": [
+                {
+                    "token_id": entry.token_id,
+                    "logprob": entry.logprob,
+                }
+                for entry in observation.top_logprobs
+            ],
+            "prompt_tokens": observation.prompt_tokens,
+            "completion_tokens": observation.completion_tokens,
+            "cached_tokens": observation.cached_tokens,
+            "finish_reason": observation.finish_reason,
+            "client_seconds": observation.total_client_seconds,
+        },
+        "post_probe_flush_status_code": flush.status_code,
+        "post_probe_flush_response_sha256": flush.response_sha256,
+    }
+
+
 def _invocation_receipt(
     ordinal: int,
     flush_status_code: int,
@@ -2832,6 +2911,7 @@ def _configuration_receipt(config: OlmoeEpBenchmarkConfig) -> JsonObject:
         "expert_parallel_semantics": expert_parallel_semantics(
             config.expert_parallel_size
         ),
+        **({"logit_parity_probe_enabled": True} if config.logit_parity_probe else {}),
     }
 
 
@@ -3145,6 +3225,7 @@ def _run_stage_capture_under_cpu_policy(
     rank_local_numa: list[JsonValue] = []
     server_info: JsonObject | None = None
     capture: SanityCapture | None = None
+    logit_parity_probe: JsonObject | None = None
     capture_receipt_sha256: str | None = None
     cleanup: JsonObject = {
         "cleanup_complete": True,
@@ -3200,6 +3281,9 @@ def _run_stage_capture_under_cpu_policy(
                         f"managed sanity capture failed: {error}"
                     ) from error
                 assert_server_alive(running, "managed sanity capture")
+                if config.logit_parity_probe:
+                    logit_parity_probe = _run_logit_parity_probe(client)
+                    assert_server_alive(running, "logit parity probe")
                 listener_ownership.append(verify_listener_owned(running, config.port))
                 rank_local_numa.append(verify_rank_local_numa(running))
                 signal_state.checkpoint()
@@ -3265,6 +3349,7 @@ def _run_stage_capture_under_cpu_policy(
     passed = (
         failure is None
         and capture is not None
+        and (not config.logit_parity_probe or logit_parity_probe is not None)
         and cleanup.get("cleanup_complete") is True
     )
     payload = cast(
@@ -3272,7 +3357,11 @@ def _run_stage_capture_under_cpu_policy(
         {
             "schema_version": 1,
             "status": "policy_restore_pending" if passed else "failed",
-            "mode": "managed_stage_capture",
+            "mode": (
+                "managed_stage_capture_with_logit_parity_probe"
+                if config.logit_parity_probe
+                else "managed_stage_capture"
+            ),
             "run_id": config.run_id,
             "started_at_utc": started_at,
             "completed_at_utc": _utc_now(),
@@ -3300,6 +3389,11 @@ def _run_stage_capture_under_cpu_policy(
             "capture": None if capture is None else capture.model_dump(mode="json"),
             "capture_output": str(config.stage_capture_output),
             "capture_receipt_sha256": capture_receipt_sha256,
+            **(
+                {"logit_parity_probe": logit_parity_probe}
+                if config.logit_parity_probe
+                else {}
+            ),
             "cleanup": cleanup,
             "logs": logs,
             "failure": (
@@ -3495,6 +3589,8 @@ def run_benchmark(
     config: OlmoeEpBenchmarkConfig,
     policy_factory: CpuPerformancePolicyFactory = cpu_performance_policy,
 ) -> JsonObject:
+    if config.logit_parity_probe:
+        raise OlmoeEpBenchmarkError("logit parity probe requires managed stage capture")
     return _run_with_cpu_performance_policy(
         config,
         _run_benchmark_under_cpu_policy,
@@ -3575,6 +3671,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--cleanup-timeout-seconds", type=_positive_float, default=30.0)
     parser.add_argument("--numactl-executable", default="/usr/bin/numactl")
     parser.add_argument("--nvidia-smi-executable", default="/usr/bin/nvidia-smi")
+    parser.add_argument(
+        "--logit-parity-probe",
+        action="store_true",
+        help="capture one receipt-backed logit probe without timed workloads",
+    )
     return parser
 
 
@@ -3600,6 +3701,9 @@ def config_from_arguments(arguments: argparse.Namespace) -> OlmoeEpBenchmarkConf
         raise OlmoeEpBenchmarkError("local EP benchmark host must be loopback")
     stage_contract = cast(Path | None, arguments.stage_contract)
     stage_capture_output = cast(Path | None, arguments.stage_capture_output)
+    logit_parity_probe = cast(bool, arguments.logit_parity_probe)
+    if logit_parity_probe and stage_capture_output is None:
+        raise OlmoeEpBenchmarkError("logit parity probe requires managed stage capture")
     if stage_contract is not None and (
         not stage_contract.is_absolute() or ".." in stage_contract.parts
     ):
@@ -3652,6 +3756,7 @@ def config_from_arguments(arguments: argparse.Namespace) -> OlmoeEpBenchmarkConf
         nvidia_smi_executable=_absolute_lexical_path(
             cast(str, arguments.nvidia_smi_executable), "nvidia-smi executable"
         ),
+        logit_parity_probe=logit_parity_probe,
     )
 
 

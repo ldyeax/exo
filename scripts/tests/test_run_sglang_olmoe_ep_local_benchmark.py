@@ -18,6 +18,9 @@ from scripts import run_sglang_olmoe_ep_local_benchmark as olmoe
 from scripts.sglang_olmoe_serving_client import (
     EndpointObservation,
     GenerateObservation,
+    LogitParityObservation,
+    LogprobObservation,
+    OlmoeLogitParityRequest,
     OlmoeNativeGenerateRequest,
     OlmoeNativeServingClient,
     SanityResponseObservation,
@@ -896,6 +899,60 @@ def test_sanity_requires_exact_published_capture() -> None:
     assert evidence["expected_output_ids"] == [201]
 
 
+class _LogitParityClient:
+    request: OlmoeLogitParityRequest | None = None
+
+    def generate_logit_parity(
+        self, request: OlmoeLogitParityRequest
+    ) -> LogitParityObservation:
+        self.request = request
+        return LogitParityObservation(
+            input_ids_sha256=token_ids_sha256(request.input_ids),
+            response_sha256=SHA,
+            generated_token_id=139,
+            generated_token_logprob=-0.4,
+            candidate_logprobs=(
+                LogprobObservation(token_id=139, logprob=-0.4),
+                LogprobObservation(token_id=1_769, logprob=-0.5),
+            ),
+            top_logprobs=(
+                LogprobObservation(token_id=139, logprob=-0.4),
+                LogprobObservation(token_id=1_769, logprob=-0.5),
+            ),
+            prompt_tokens=len(request.input_ids),
+            completion_tokens=1,
+            cached_tokens=0,
+            finish_reason={"type": "length", "length": 1},
+            total_client_seconds=0.25,
+        )
+
+    def flush_cache(self) -> EndpointObservation:
+        return EndpointObservation(200, SHA, 0.01)
+
+
+def test_logit_parity_probe_binds_exact_divergence_context() -> None:
+    client = _LogitParityClient()
+
+    evidence = olmoe._run_logit_parity_probe(
+        cast(OlmoeNativeServingClient, cast(object, client))
+    )
+
+    expected_context = olmoe.build_deterministic_input_ids("decode", 128) + (
+        431,
+        3_056,
+        209,
+    )
+    assert client.request is not None
+    assert client.request.input_ids == expected_context
+    assert client.request.candidate_token_ids == (139, 1_769)
+    assert client.request.top_logprobs_num == 8
+    context = cast(dict[str, object], evidence["context"])
+    response = cast(dict[str, object], evidence["response"])
+    assert context["context_token_ids_sha256"] == token_ids_sha256(expected_context)
+    assert response["generated_token_id"] == 139
+    assert evidence["post_probe_flush_status_code"] == 200
+
+
 class _WorkloadClient:
     def __init__(self) -> None:
         self.generate_calls = 0
@@ -1251,6 +1308,59 @@ def test_argument_parser_uses_trusted_stage_contract(tmp_path: Path) -> None:
     assert olmoe.CANONICAL_SAMPLE_COUNT == 3
 
 
+def test_argument_parser_selects_logit_parity_probe(tmp_path: Path) -> None:
+    arguments = olmoe._parser().parse_args(
+        [
+            "--run-id",
+            "ep2-logit-parity",
+            "--result-directory",
+            str(tmp_path / "result"),
+            "--runtime-python",
+            "/runtime/python",
+            "--runtime-install-receipt",
+            "/runtime/install.json",
+            "--runtime-install-receipt-sha256",
+            SHA,
+            "--stage-capture-output",
+            str(tmp_path / "ep2-capture.json"),
+            "--ep-size",
+            "2",
+            "--logit-parity-probe",
+        ]
+    )
+
+    config = olmoe.config_from_arguments(arguments)
+
+    assert config.stage_contract is None
+    assert config.stage_capture_output == tmp_path / "ep2-capture.json"
+    assert config.logit_parity_probe is True
+
+
+def test_logit_parity_probe_rejects_stale_stage_contract(tmp_path: Path) -> None:
+    arguments = olmoe._parser().parse_args(
+        [
+            "--run-id",
+            "ep2-logit-parity",
+            "--result-directory",
+            str(tmp_path / "result"),
+            "--runtime-python",
+            "/runtime/python",
+            "--runtime-install-receipt",
+            "/runtime/install.json",
+            "--runtime-install-receipt-sha256",
+            SHA,
+            "--stage-contract",
+            "/stage/contract.json",
+            "--ep-size",
+            "2",
+            "--logit-parity-probe",
+        ]
+    )
+
+    with pytest.raises(olmoe.OlmoeEpBenchmarkError, match="managed stage capture"):
+        olmoe.config_from_arguments(arguments)
+
+
 def test_argument_parser_selects_managed_stage_capture(tmp_path: Path) -> None:
     arguments = olmoe._parser().parse_args(
         [
@@ -1275,6 +1385,7 @@ def test_argument_parser_selects_managed_stage_capture(tmp_path: Path) -> None:
 
     assert config.stage_contract is None
     assert config.stage_capture_output == Path("/stage/ep1.json")
+    assert config.logit_parity_probe is False
 
 
 @pytest.mark.parametrize(
