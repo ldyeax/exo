@@ -1365,7 +1365,8 @@ def test_server_placement_is_observed_from_proc_and_affinity(tmp_path: Path) -> 
         "00400000 bind:0-1 file=/runtime\n"
         "00600000 bind:0,1 heap anon=8 dirty=8 N0=4 N1=4\n"
         "7f000000 default file=/dev/nvidiactl\n"
-        "7f100000 default file=/dev/shm/torch_4242_0 shmem N0=1\n",
+        "7f100000 default file=/dev/shm/torch_4242_0 shmem N0=1\n"
+        "7f200000 local file=/dev/nvidia-uvm\n",
         encoding="ascii",
     )
 

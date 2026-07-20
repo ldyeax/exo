@@ -1638,7 +1638,7 @@ def _proc_status_resource_list(contents: str, field_name: str) -> tuple[int, ...
 
 
 def _parse_numa_maps_policy(value: str) -> tuple[int, ...] | None:
-    if value == "default":
+    if value in {"default", "local"}:
         return None
     policy, separator, resources = value.partition(":")
     if separator != ":" or policy != "bind":
