@@ -1765,17 +1765,17 @@ def collect_remote_snapshot(
         ssh_descriptor, _ = stack.enter_context(
             _pinned_bound_file(binding.ssh.executable)
         )
-        known_hosts_descriptor, _ = stack.enter_context(
+        _known_hosts_descriptor, known_hosts_observation = stack.enter_context(
             _pinned_bound_file(binding.ssh.known_hosts_file)
         )
-        identity_descriptor, _ = stack.enter_context(
+        _identity_descriptor, identity_observation = stack.enter_context(
             _pinned_bound_file(binding.ssh.identity_file)
         )
         command = binding.ssh.command(
             binding.remote_probe,
             executable_path=f"/proc/self/fd/{ssh_descriptor}",
-            known_hosts_path=f"/proc/self/fd/{known_hosts_descriptor}",
-            identity_path=f"/proc/self/fd/{identity_descriptor}",
+            known_hosts_path=known_hosts_observation.resolved_path,
+            identity_path=identity_observation.resolved_path,
         )
         result = runner(
             command,
@@ -1789,15 +1789,7 @@ def collect_remote_snapshot(
             maximum_stdout_bytes=MAXIMUM_WIRE_BYTES,
             maximum_stderr_bytes=MAXIMUM_COMMAND_STDERR_BYTES,
             environment=sanitized_command_environment(),
-            pass_fds=tuple(
-                sorted(
-                    (
-                        ssh_descriptor,
-                        known_hosts_descriptor,
-                        identity_descriptor,
-                    )
-                )
-            ),
+            pass_fds=(ssh_descriptor,),
         )
     if result.return_code != 0:
         stderr = result.stderr.decode("utf-8", errors="replace")[-2000:]

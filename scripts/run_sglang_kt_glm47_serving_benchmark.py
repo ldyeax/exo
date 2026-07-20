@@ -115,6 +115,7 @@ from exo.worker.sglang_kt.serving_benchmark_receipt import (  # noqa: E402
     canonicalize_sglang_kt_warm_serving_run_receipt,
 )
 from scripts import benchmark_host_guard as host_guard  # noqa: E402
+from scripts import benchmark_lease  # noqa: E402
 from scripts import run_sglang_kt_glm47_validation as validation  # noqa: E402
 from scripts.sglang_kt_glm47_serving_client import (  # noqa: E402
     EndpointCallObservation,
@@ -2621,9 +2622,16 @@ def _open_absolute_directory(path: Path) -> int:
 
 
 def _open_or_create_lock(path: Path) -> IO[bytes]:
-    if not path.is_absolute() or path == Path("/"):
+    if not path.is_absolute() or path == Path("/") or path.parent == Path("/"):
         raise Glm47ServingHarnessError("coordination lock path is not canonical")
-    parent_descriptor = _open_absolute_directory(path.parent)
+    try:
+        parent_descriptor = benchmark_lease.open_directory_without_symlinks(
+            path.parent, create=True
+        )
+    except benchmark_lease.LeaseError as error:
+        raise Glm47ServingHarnessError(
+            f"cannot safely create coordination lock parent {path.parent}: {error}"
+        ) from error
     try:
         descriptor = os.open(
             path.name,

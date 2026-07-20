@@ -1002,12 +1002,14 @@ def test_collect_remote_snapshot_uses_pinned_ssh_and_verifies_wire_receipt(
 ) -> None:
     local_files: list[guard.FileIdentityBinding] = []
     for name in ("ssh", "known_hosts", "identity"):
+        resolved_path = tmp_path / f"{name}-resolved"
+        resolved_path.write_bytes(name.encode())
         path = tmp_path / name
-        path.write_bytes(name.encode())
+        path.symlink_to(resolved_path)
         local_files.append(
             guard.FileIdentityBinding(
                 path=str(path),
-                resolved_path=str(path),
+                resolved_path=str(resolved_path),
                 sha256=hashlib.sha256(name.encode()).hexdigest(),
             )
         )
@@ -1056,22 +1058,26 @@ def test_collect_remote_snapshot_uses_pinned_ssh_and_verifies_wire_receipt(
     assert result.observation.hostname == "fwuff"
     assert len(calls) == 1
     assert calls[0][0].startswith("/proc/self/fd/")
-    assert len(inherited_descriptors[0]) == 3
+    assert len(inherited_descriptors[0]) == 1
     assert tuple(sorted(inherited_descriptors[0])) == inherited_descriptors[0]
     descriptor_paths = {
         f"/proc/self/fd/{descriptor}" for descriptor in inherited_descriptors[0]
     }
     assert calls[0][0] in descriptor_paths
-    assert any(
-        argument.startswith("UserKnownHostsFile=")
-        and argument.partition("=")[2] in descriptor_paths
-        for argument in calls[0]
+    known_hosts_option = next(
+        argument for argument in calls[0] if argument.startswith("UserKnownHostsFile=")
     )
-    assert any(
-        argument.startswith("IdentityFile=")
-        and argument.partition("=")[2] in descriptor_paths
-        for argument in calls[0]
+    identity_option = next(
+        argument for argument in calls[0] if argument.startswith("IdentityFile=")
     )
+    assert known_hosts_option == (
+        f"UserKnownHostsFile={binding.ssh.known_hosts_file.resolved_path}"
+    )
+    assert identity_option == (
+        f"IdentityFile={binding.ssh.identity_file.resolved_path}"
+    )
+    assert known_hosts_option.partition("=")[2] not in descriptor_paths
+    assert identity_option.partition("=")[2] not in descriptor_paths
     assert "ClearAllForwardings=yes" in calls[0]
     assert calls[0][-1] == "remote-probe"
     assert calls[0][-3:-1] == (
@@ -1229,8 +1235,10 @@ def test_run_bound_executable_checks_replacement_even_when_runner_fails(
         guard.run_bound_executable(binding, (), runner=failing_replacing_runner)
 
 
-def test_collect_remote_snapshot_rejects_ssh_identity_replacement(
+@pytest.mark.parametrize("replaced_file_index", (1, 2))
+def test_collect_remote_snapshot_rejects_ssh_transport_file_replacement(
     tmp_path: Path,
+    replaced_file_index: int,
 ) -> None:
     local_files: list[guard.FileIdentityBinding] = []
     paths: list[Path] = []
@@ -1253,9 +1261,9 @@ def test_collect_remote_snapshot_rejects_ssh_identity_replacement(
     ) -> guard.CommandResult:
         del command, input_bytes, timeout_seconds, maximum_stdout_bytes
         del maximum_stderr_bytes, environment, pass_fds
-        replacement = tmp_path / "new-identity"
-        replacement.write_bytes(b"new identity")
-        replacement.replace(paths[2])
+        replacement = tmp_path / "replacement-transport-file"
+        replacement.write_bytes(b"replacement transport file")
+        replacement.replace(paths[replaced_file_index])
         return guard.CommandResult(return_code=1, stdout=b"", stderr=b"failed")
 
     with pytest.raises(guard.HostGuardError, match="path was replaced"):

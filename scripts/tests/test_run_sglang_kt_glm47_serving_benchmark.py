@@ -1090,6 +1090,50 @@ def test_outer_entry_points_reject_relative_paths(subcommand: str) -> None:
         entry_point(arguments)
 
 
+def test_open_or_create_lock_bootstraps_missing_runtime_parent(
+    tmp_path: Path,
+) -> None:
+    runtime_parent = tmp_path / "run" / "exo"
+    lock_path = runtime_parent / "benchmark.lock"
+
+    with harness._open_or_create_lock(lock_path) as first_lock:
+        first_identity = os.fstat(first_lock.fileno())
+
+    assert runtime_parent.is_dir()
+    assert lock_path.is_file()
+    with harness._open_or_create_lock(lock_path) as reopened_lock:
+        reopened_identity = os.fstat(reopened_lock.fileno())
+
+    assert (reopened_identity.st_dev, reopened_identity.st_ino) == (
+        first_identity.st_dev,
+        first_identity.st_ino,
+    )
+
+
+@pytest.mark.parametrize("unsafe_kind", ["file", "symlink"])
+def test_open_or_create_lock_rejects_unsafe_existing_runtime_parent(
+    tmp_path: Path, unsafe_kind: str
+) -> None:
+    runtime_root = tmp_path / "run"
+    runtime_root.mkdir()
+    runtime_parent = runtime_root / "exo"
+    if unsafe_kind == "file":
+        runtime_parent.write_text("not a directory", encoding="ascii")
+    else:
+        target = tmp_path / "untrusted"
+        target.mkdir()
+        runtime_parent.symlink_to(target, target_is_directory=True)
+
+    with pytest.raises(
+        harness.Glm47ServingHarnessError,
+        match="cannot safely create coordination lock parent",
+    ):
+        harness._open_or_create_lock(runtime_parent / "benchmark.lock")
+
+    if unsafe_kind == "symlink":
+        assert not (tmp_path / "untrusted" / "benchmark.lock").exists()
+
+
 def test_serving_environment_is_sanitized_and_owns_all_caches(tmp_path: Path) -> None:
     config = make_config(tmp_path)
     process_spec = make_process_spec(config)
