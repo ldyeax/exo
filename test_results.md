@@ -1020,6 +1020,19 @@ canonical process-spec/config SHA-256 values are
 - KTransformers `kt_ep` routes experts between CPU and GPU inside one process;
   it is not true cross-rank expert sharding. Its current global/local expert-ID
   assumptions also prevent safely combining it with native distributed EP.
+- The pinned wrapper is deterministically incompatible with GLM EP3 as written,
+  rather than merely untested. GLM's 64 routed experts plus two redundant slots
+  become 22 local physical slots per EP rank, but `kt_ep` passes the unchanged
+  64-entry global placement mask to a `KTMoEWrapper` constructed for 22 experts.
+  The native KT kernel therefore encounters a mask-size mismatch during startup.
+  Beyond that first failure, the standard dispatcher has already remapped routed
+  IDs to local `0..21`/`-1` values while KT still interprets them through the
+  global mask, and KT creates/submits CPU work only on global TP rank 0. Rank 1
+  and rank 2 AMX experts would consequently be omitted. A correct hybrid needs
+  one local 22-entry physical mask and AMX worker per EP rank, rank-local
+  physical-to-logical weight mapping including the two redundant slots, and a
+  guarded `-1` path before mask indexing. Until that is implemented and tested,
+  KT hybrid execution is admitted only with distributed EP1.
 - The pinned SGLang runtime has native `--ep-size`. Its standard `none`
   dispatcher masks non-local experts and NCCL-reduces partial expert results,
   making it the shortest correct proof path on SM86. DeepEP/DeepGEMM are not an
