@@ -631,7 +631,7 @@ def serving_measurement(
     config: harness.ServingBenchmarkConfig,
     cgroup_path: Path,
     handoff: harness.ServingHandoffIdentity | None = None,
-) -> harness.WarmServingMeasurementV1:
+) -> harness.WarmServingMeasurementV2:
     identity = serving_identity(config)
     prefill = harness.prepare_glm47_serving_workload("prefill").receipt_request
     decode = harness.prepare_glm47_serving_workload("decode").receipt_request
@@ -682,8 +682,8 @@ def serving_measurement(
         post_sanity_cache_flush_response_sha256="7" * 64,
     )
     coordination_guard = coordination_evidence(config)
-    return harness.WarmServingMeasurementV1(
-        schema_version=1,
+    return harness.WarmServingMeasurementV2(
+        schema_version=2,
         status="passed",
         generated_at_utc="2026-07-19T20:00:00+00:00",
         profiler="none",
@@ -852,13 +852,13 @@ def mock_successful_finalization_proofs(monkeypatch: pytest.MonkeyPatch) -> None
     def identity_files(
         _config: harness.ServingBenchmarkConfig,
         _deployment: validation.DeploymentIdentity,
-        _measurement: harness.WarmServingMeasurementV1,
+        _measurement: harness.WarmServingMeasurementV2,
     ) -> None:
         return None
 
     def processes_absent(
         _manifest: harness.JsonObject,
-        _measurement: harness.WarmServingMeasurementV1,
+        _measurement: harness.WarmServingMeasurementV2,
     ) -> None:
         return None
 
@@ -901,7 +901,23 @@ def test_measurement_timestamp_must_be_utc(tmp_path: Path) -> None:
     payload = serving_measurement(config, tmp_path / "cgroup").model_dump(mode="json")
     payload["generated_at_utc"] = "2026-07-19T16:00:00-04:00"
     with pytest.raises(ValidationError, match="must be UTC"):
-        harness.WarmServingMeasurementV1.model_validate_json(json.dumps(payload))
+        harness.WarmServingMeasurementV2.model_validate_json(json.dumps(payload))
+
+
+def test_measurement_v2_rejects_v1_payload_with_sanity(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    payload = serving_measurement(config, tmp_path / "cgroup").model_dump(mode="json")
+    payload["schema_version"] = 1
+    with pytest.raises(ValidationError):
+        harness.WarmServingMeasurementV2.model_validate_json(json.dumps(payload))
+
+
+def test_measurement_v2_requires_sanity(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    payload = serving_measurement(config, tmp_path / "cgroup").model_dump(mode="json")
+    del payload["sanity"]
+    with pytest.raises(ValidationError):
+        harness.WarmServingMeasurementV2.model_validate_json(json.dumps(payload))
 
 
 def test_fresh_deployment_must_match_admitted_validator(tmp_path: Path) -> None:

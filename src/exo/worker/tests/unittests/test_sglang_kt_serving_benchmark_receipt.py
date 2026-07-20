@@ -43,7 +43,7 @@ from exo.worker.sglang_kt.serving_benchmark_receipt import (
     SglangKtServingWorkloadRequest,
     SglangKtWarmServingRunIdentity,
     SglangKtWarmServingRunReceiptError,
-    WarmServingRunReceiptV1,
+    WarmServingRunReceiptV2,
     calculate_sglang_kt_length_finish_reason_sha256,
     calculate_sglang_kt_serving_coordination_guard_evidence_sha256,
     calculate_sglang_kt_serving_source_bundle_sha256,
@@ -341,10 +341,10 @@ def _coordination_guard() -> SglangKtServingCoordinationGuardEvidence:
     )
 
 
-def _receipt() -> WarmServingRunReceiptV1:
+def _receipt() -> WarmServingRunReceiptV2:
     identity = _identity()
-    return WarmServingRunReceiptV1(
-        schema_version=1,
+    return WarmServingRunReceiptV2(
+        schema_version=2,
         status="passed",
         generated_at_utc="2026-07-19T20:31:00+00:00",
         evidence_class="performance",
@@ -434,6 +434,38 @@ def test_canonical_receipt_round_trips_and_loads(tmp_path: Path) -> None:
     )
     assert observation.receipt.performance_comparable
     assert observation.receipt_sha256 == receipt_sha256
+
+
+def test_canonical_receipt_rejects_v1_payload_with_sanity() -> None:
+    payload = _payload()
+    payload["schema_version"] = 1
+    with pytest.raises(SglangKtWarmServingRunReceiptError):
+        canonicalize_sglang_kt_warm_serving_run_receipt(payload)
+
+
+def test_canonical_receipt_rejects_v2_payload_without_sanity() -> None:
+    payload = _payload()
+    del payload["sanity"]
+    with pytest.raises(SglangKtWarmServingRunReceiptError):
+        canonicalize_sglang_kt_warm_serving_run_receipt(payload)
+
+
+@pytest.mark.parametrize("invalid_shape", ["v1_with_sanity", "v2_without_sanity"])
+def test_receipt_loader_rejects_non_v2_shape(
+    tmp_path: Path, invalid_shape: str
+) -> None:
+    payload = _payload()
+    if invalid_shape == "v1_with_sanity":
+        payload["schema_version"] = 1
+    else:
+        del payload["sanity"]
+    path = tmp_path / "invalid-serving.json"
+    path.write_bytes(canonical_sglang_kt_json(payload))
+    with pytest.raises(SglangKtWarmServingRunReceiptError):
+        load_sglang_kt_warm_serving_run_receipt(
+            path,
+            expected_identity_sha256=_receipt().identity_sha256,
+        )
 
 
 def test_receipt_rejects_debug_instrumentation_as_performance() -> None:

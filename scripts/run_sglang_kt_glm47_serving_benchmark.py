@@ -104,7 +104,7 @@ from exo.worker.sglang_kt.serving_benchmark_receipt import (  # noqa: E402
     SglangKtServingTuningIdentity,
     SglangKtServingWorkloadEvidence,
     SglangKtWarmServingRunIdentity,
-    WarmServingRunReceiptV1,
+    WarmServingRunReceiptV2,
     calculate_sglang_kt_serving_coordination_guard_evidence_sha256,
     calculate_sglang_kt_serving_source_bundle_sha256,
     calculate_sglang_kt_warm_serving_run_identity_sha256,
@@ -375,8 +375,8 @@ class ServingHandoffIdentity(validation.StrictModel):
 
 
 @final
-class WarmServingMeasurementV1(validation.StrictModel):
-    schema_version: Literal[1]
+class WarmServingMeasurementV2(validation.StrictModel):
+    schema_version: Literal[2]
     status: Literal["passed"]
     generated_at_utc: str
     profiler: Literal["none"]
@@ -416,7 +416,7 @@ class WarmServingMeasurementV1(validation.StrictModel):
         return value
 
     @model_validator(mode="after")
-    def validate_measurement(self) -> "WarmServingMeasurementV1":
+    def validate_measurement(self) -> "WarmServingMeasurementV2":
         if self.identity_sha256 != calculate_sglang_kt_warm_serving_run_identity_sha256(
             self.identity
         ):
@@ -517,7 +517,7 @@ class RetainedExecutable:
 
 @dataclass(frozen=True)
 class BoundMeasurementSnapshot:
-    measurement: WarmServingMeasurementV1
+    measurement: WarmServingMeasurementV2
     contents: bytes
     sha256: str
     device: int
@@ -2251,9 +2251,9 @@ def _publish_measurement(
     handoff: ServingHandoffIdentity,
     coordination_guard: SglangKtServingCoordinationGuardEvidence,
     lease_id: str,
-) -> WarmServingMeasurementV1:
-    measurement = WarmServingMeasurementV1(
-        schema_version=1,
+) -> WarmServingMeasurementV2:
+    measurement = WarmServingMeasurementV2(
+        schema_version=2,
         status="passed",
         generated_at_utc=_utc_now().isoformat(timespec="microseconds"),
         profiler="none",
@@ -2289,7 +2289,7 @@ def _publish_measurement(
         ),
         replace=False,
     )
-    persisted = WarmServingMeasurementV1.model_validate_json(
+    persisted = WarmServingMeasurementV2.model_validate_json(
         results.read_bytes(MEASUREMENT_FILENAME, MAXIMUM_MEASUREMENT_BYTES)
     )
     if persisted != measurement:
@@ -2415,7 +2415,7 @@ def run_serving_benchmark(
                     f"{type(guard_error).__name__}: {guard_error}"
                 )
 
-    measurement: WarmServingMeasurementV1 | None = None
+    measurement: WarmServingMeasurementV2 | None = None
     if (
         caught_error is None
         and cleanup_succeeded
@@ -2720,7 +2720,7 @@ def _load_measurement(
                 "serving measurement changed while it was read"
             )
         parse_sglang_kt_strict_json(contents)
-        measurement = WarmServingMeasurementV1.model_validate_json(contents)
+        measurement = WarmServingMeasurementV2.model_validate_json(contents)
         final = os.fstat(descriptor)
         current = os.stat(
             MEASUREMENT_FILENAME,
@@ -2843,7 +2843,7 @@ def _validate_wrapper_manifest(
 def _validate_identity_files(
     config: ServingBenchmarkConfig,
     deployment: validation.DeploymentIdentity,
-    measurement: WarmServingMeasurementV1,
+    measurement: WarmServingMeasurementV2,
 ) -> None:
     identity = measurement.identity
     if validation.load_deployment_identity(Path(deployment.root)) != deployment:
@@ -2900,7 +2900,7 @@ def _validate_identity_files(
 
 
 def _require_processes_absent(
-    manifest: JsonObject, measurement: WarmServingMeasurementV1
+    manifest: JsonObject, measurement: WarmServingMeasurementV2
 ) -> None:
     runtime_metadata = validation.json_object(
         manifest.get("runtime_metadata"), "wrapper runtime metadata"
@@ -3034,7 +3034,7 @@ def _build_performance_receipt(
     *,
     lease_path: Path,
     handoff: PreservedServingHandoff,
-) -> WarmServingRunReceiptV1:
+) -> WarmServingRunReceiptV2:
     results = handoff.results
     try:
         os.lstat(lease_path)
@@ -3105,8 +3105,8 @@ def _build_performance_receipt(
     generated_at = _utc_now()
     if generated_at <= cleanup_completed_at:
         generated_at = cleanup_completed_at + timedelta(microseconds=1)
-    return WarmServingRunReceiptV1(
-        schema_version=1,
+    return WarmServingRunReceiptV2(
+        schema_version=2,
         status="passed",
         generated_at_utc=generated_at.isoformat(timespec="microseconds"),
         evidence_class="performance",
@@ -3134,7 +3134,7 @@ def finalize_serving_benchmark(
     handoff: PreservedServingHandoff,
     lease_path: Path,
     wrapper_return_code: int,
-) -> WarmServingRunReceiptV1:
+) -> WarmServingRunReceiptV2:
     validation.require_no_profiler_state(os.environ, sys.argv, "")
     acquire_finalization_lock(handoff)
     try:
