@@ -605,6 +605,12 @@ def _run_remote_json(
         ) from error
 
 
+def _strict_model_json(payload: JsonObject) -> str:
+    """Preserve JSON container semantics for strict tuple-backed receipt models."""
+
+    return json.dumps(payload, allow_nan=False, separators=(",", ":"), sort_keys=True)
+
+
 def inspect_remote_host(config: NativeTpEpConfig) -> NativeHostInspection:
     payload = _run_remote_json(
         config,
@@ -624,7 +630,7 @@ def inspect_remote_host(config: NativeTpEpConfig) -> NativeHostInspection:
             config.fwuff_model_contract,
         ),
     )
-    return NativeHostInspection.model_validate(payload)
+    return NativeHostInspection.model_validate_json(_strict_model_json(payload))
 
 
 def _check_ports_clear(
@@ -693,7 +699,7 @@ def check_remote_ports(
         ),
         timeout_seconds=30.0,
     )
-    return PortCheckEvidence.model_validate(payload)
+    return PortCheckEvidence.model_validate_json(_strict_model_json(payload))
 
 
 def _lifecycle_spec(
@@ -750,7 +756,7 @@ def _probe_remote_owner(
         ("probe-owner", "--receipt-json", json.dumps(receipt, sort_keys=True)),
         timeout_seconds=30.0,
     )
-    return OwnershipProbe.model_validate(payload)
+    return OwnershipProbe.model_validate_json(_strict_model_json(payload))
 
 
 def require_stages_owned(

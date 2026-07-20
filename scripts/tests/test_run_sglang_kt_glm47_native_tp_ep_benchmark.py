@@ -568,6 +568,27 @@ def test_remote_controller_command_is_clean_and_binds_deployed_source(
     )
 
 
+def test_remote_receipt_json_arrays_preserve_strict_tuple_fields(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = make_config(tmp_path)
+    monkeypatch.setattr(
+        native,
+        "_run_remote_json",
+        lambda *_args, **_kwargs: {
+            "host_name": "fwuff",
+            "bind_ip": "0.0.0.0",
+            "ports": [30_000, 30_102],
+            "checked_at_utc": "2026-07-20T00:00:00.000000+00:00",
+            "all_clear": True,
+        },
+    )
+
+    evidence = native.check_remote_ports(config, (30_000, 30_102))
+
+    assert evidence.ports == (30_000, 30_102)
+
+
 def test_owned_receipt_parser_is_exact_and_strict() -> None:
     receipt = {
         "rank": 2,

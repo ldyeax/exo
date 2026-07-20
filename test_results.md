@@ -1090,15 +1090,25 @@ canonical process-spec/config SHA-256 values are
   NCCL, not DeepEP, on SM86. OSCAR remains a later KV-cache compression and
   placement candidate, not an expert dispatcher.
 
+### GLM native TP3/EP iterations
+
+- Native TP3/EP1 v1 failed closed during remote host admission before any model
+  process or weight load. The strict Python-mode Pydantic boundary rejected JSON
+  arrays for tuple-backed source-support fields returned by fwuff. The receipt
+  has `status=failed`, no owned processes, and complete empty cleanup at
+  `/var/lib/exo/benchmarks/glm47-native-tp3-ep1-dwagon-fwuff-20260720-v1`.
+  The controller now validates remote receipts in JSON mode, preserving strict
+  scalar types while mapping JSON arrays to the declared tuples; the regression
+  suite covers that exact boundary.
+
 ## Pending tests
 
 1. Repeat the matched OLMoE matrix with one GPU per host over InfiniBand,
    retaining host-staged NCCL, exact sanity, strict response coherence, HCA
    counters, sequence-variation evidence, and a local NVLink control.
-2. Finish the heterogeneous SGLang 2-local+1-remote process controller, then run
-   a native GLM TP3/EP1 control followed by TP3/EP3 with DP attention, dense
-   TP1, two padded experts, small token pools, and CUDA graphs initially
-   disabled.
+2. Run the completed heterogeneous SGLang 2-local+1-remote controller with a
+   native GLM TP3/EP1 control followed by TP3/EP3 with DP attention, dense TP1,
+   two padded experts, small token pools, and CUDA graphs initially disabled.
 3. Add feasible mixed TP/PP trials after the local controls, and implement the
    operational collective stage-local receipt producer before claiming
    production Exo PP3 admission. The current engineering harness directly
