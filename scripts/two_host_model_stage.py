@@ -56,6 +56,23 @@ from pydantic import (
 JsonScalar: TypeAlias = str | int | float | bool | None
 JsonValue: TypeAlias = JsonScalar | list["JsonValue"] | dict[str, "JsonValue"]
 JsonObject: TypeAlias = dict[str, JsonValue]
+AcquisitionMode: TypeAlias = Literal[
+    "huggingface_cli",
+    "preverified_snapshot_copy",
+    "local_copy_from_existing_remote_source",
+]
+KTransformersMethod: TypeAlias = Literal[
+    "AMXINT4",
+    "AMXINT8",
+    "BF16",
+    "FP8",
+    "FP8_PERCHANNEL",
+    "LLAMAFILE",
+    "MOE_INT4",
+    "MOE_INT8",
+    "MXFP4",
+    "RAWINT4",
+]
 
 _HEX_REVISION = re.compile(r"[0-9a-f]{40}")
 _HEX_SHA256 = re.compile(r"[0-9a-f]{64}")
@@ -76,6 +93,50 @@ _LEASE_HEARTBEAT_MAX_AGE = timedelta(minutes=2)
 _LEASE_METADATA_MAX_AGE = timedelta(minutes=15)
 _MAX_REMOTE_IDENTITY_BYTES = 64 * 1024
 _MAX_REMOTE_RESPONSE_BYTES = 64 * 1024 * 1024
+_MAX_MODEL_CONTRACT_BYTES = 1024 * 1024
+_MAX_REMOTE_REQUEST_BYTES = 2 * 1024 * 1024
+_SINGLETON_MODEL_CONTRACT_FILES: tuple[
+    tuple[
+        str,
+        Literal[
+            "chat_template",
+            "config",
+            "generation_config",
+            "safetensors_index",
+            "tokenizer",
+            "tokenizer_config",
+        ],
+    ],
+    ...,
+] = (
+    ("chat_template.jinja", "chat_template"),
+    ("config.json", "config"),
+    ("generation_config.json", "generation_config"),
+    (_INDEX_FILENAME, "safetensors_index"),
+    ("tokenizer.json", "tokenizer"),
+    ("tokenizer_config.json", "tokenizer_config"),
+)
+_MODEL_CONTRACT_ROLES = (
+    "chat_template",
+    "config",
+    "generation_config",
+    "safetensors_index",
+    "tokenizer",
+    "tokenizer_config",
+    "weight_shard",
+)
+_UNCONTRACTED_EXECUTABLE_SUFFIXES = (
+    ".dll",
+    ".dylib",
+    ".egg",
+    ".pth",
+    ".py",
+    ".pyc",
+    ".pyd",
+    ".pyo",
+    ".so",
+)
+_WRITE_MODE_BITS = stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH
 _REMOTE_LOADER = (
     "import base64,sys,types;"
     "encoded=sys.stdin.buffer.readline().rstrip(b'\\n');"
@@ -100,11 +161,18 @@ class StageError(RuntimeError):
 
 
 class OperationError(StageError):
-    """A process operation that also reports whether cleanup was confirmed."""
+    """A process operation with authoritative cleanup and publication outcomes."""
 
-    def __init__(self, message: str, *, cleanup_confirmed: bool) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        cleanup_confirmed: bool,
+        installed: bool = False,
+    ) -> None:
         super().__init__(message)
         self.cleanup_confirmed = cleanup_confirmed
+        self.installed = installed
 
 
 class ManagedSignalError(StageError):
@@ -255,16 +323,184 @@ class SshConfig(StrictModel):
         return self
 
 
+class ModelContractBinding(StrictModel):
+    path: str
+    sha256: str
+
+    @model_validator(mode="after")
+    def validate_binding(self) -> "ModelContractBinding":
+        _validate_lexical_absolute_path(self.path, "model contract")
+        if _HEX_SHA256.fullmatch(self.sha256) is None:
+            raise ValueError("model contract SHA-256 must be lowercase SHA-256")
+        return self
+
+
+class TransportedModelContract(StrictModel):
+    canonical_bytes_base64: str
+    sha256: str
+
+    @model_validator(mode="after")
+    def validate_payload(self) -> "TransportedModelContract":
+        if _HEX_SHA256.fullmatch(self.sha256) is None:
+            raise ValueError("transported model contract SHA-256 is invalid")
+        maximum_encoded_bytes = ((_MAX_MODEL_CONTRACT_BYTES + 2) // 3) * 4
+        if len(self.canonical_bytes_base64) > maximum_encoded_bytes:
+            raise ValueError("transported model contract exceeds the size limit")
+        try:
+            raw_contract = base64.b64decode(
+                self.canonical_bytes_base64.encode("ascii"), validate=True
+            )
+        except (UnicodeEncodeError, ValueError) as error:
+            raise ValueError(
+                "transported model contract is not strict base64"
+            ) from error
+        if len(raw_contract) > _MAX_MODEL_CONTRACT_BYTES:
+            raise ValueError("transported model contract exceeds the size limit")
+        if hashlib.sha256(raw_contract).hexdigest() != self.sha256:
+            raise ValueError(
+                "transported model contract SHA-256 differs from its bytes"
+            )
+        return self
+
+    def canonical_bytes(self) -> bytes:
+        return base64.b64decode(
+            self.canonical_bytes_base64.encode("ascii"), validate=True
+        )
+
+
+class ModelContractFile(StrictModel):
+    path: str
+    role: Literal[
+        "chat_template",
+        "config",
+        "generation_config",
+        "safetensors_index",
+        "tokenizer",
+        "tokenizer_config",
+        "weight_shard",
+    ]
+    size_bytes: int = Field(gt=0)
+    sha256: str
+    huggingface_etag_algorithm: Literal["git_blob_sha1", "sha256"]
+    huggingface_etag_digest: str
+
+    @model_validator(mode="after")
+    def validate_file(self) -> "ModelContractFile":
+        try:
+            path = _validate_relative_file_name(self.path)
+        except StageError as error:
+            raise ValueError(str(error)) from error
+        if len(path.parts) != 1:
+            raise ValueError("model contract files must be snapshot-root files")
+        if len(self.path) > 255:
+            raise ValueError("model contract file path exceeds 255 characters")
+        if _HEX_SHA256.fullmatch(self.sha256) is None:
+            raise ValueError("model contract file SHA-256 must be lowercase SHA-256")
+        expected_etag_length = (
+            40 if self.huggingface_etag_algorithm == "git_blob_sha1" else 64
+        )
+        if (
+            re.fullmatch(r"[0-9a-f]+", self.huggingface_etag_digest) is None
+            or len(self.huggingface_etag_digest) != expected_etag_length
+        ):
+            raise ValueError("model contract Hugging Face ETag is invalid")
+        if self.role == "weight_shard" and self.huggingface_etag_algorithm != "sha256":
+            raise ValueError("model contract weight shards require SHA-256 ETags")
+        return self
+
+
+class SnapshotModelContract(StrictModel):
+    schema_version: Literal[1]
+    canonicalization: Literal["exo-sglang-kt-model-contract-v1"]
+    model_id: str
+    revision: str
+    weight_format: Literal["safetensors"]
+    ktransformers_method: KTransformersMethod
+    full_indexer_layer_starts: tuple[int, ...]
+    weight_map_entries: int = Field(gt=0)
+    index_metadata_total_size: int = Field(gt=0)
+    physical_weight_bytes: int = Field(gt=0)
+    files: tuple[ModelContractFile, ...]
+
+    @model_validator(mode="after")
+    def validate_contract(self) -> "SnapshotModelContract":
+        if not self.full_indexer_layer_starts or any(
+            value < 0 for value in self.full_indexer_layer_starts
+        ):
+            raise ValueError("model contract indexer starts must be nonnegative")
+        if (
+            tuple(sorted(set(self.full_indexer_layer_starts)))
+            != (self.full_indexer_layer_starts)
+            or self.full_indexer_layer_starts[0] != 0
+        ):
+            raise ValueError("model contract indexer starts must begin at zero")
+        paths = tuple(file.path for file in self.files)
+        if not paths or paths != tuple(sorted(set(paths))):
+            raise ValueError("model contract files must be sorted and unique")
+        files_by_role = {
+            role: tuple(file for file in self.files if file.role == role)
+            for role in _MODEL_CONTRACT_ROLES
+        }
+        for expected_path, role in _SINGLETON_MODEL_CONTRACT_FILES:
+            role_files = files_by_role[role]
+            if len(role_files) != 1 or role_files[0].path != expected_path:
+                raise ValueError(
+                    f"model contract requires exactly {expected_path} as {role}"
+                )
+        weight_files = tuple(file for file in self.files if file.role == "weight_shard")
+        if not weight_files:
+            raise ValueError("model contract requires weight shards")
+        if any(not file.path.endswith(".safetensors") for file in weight_files):
+            raise ValueError("model contract weight shards must be safetensors files")
+        if sum(file.size_bytes for file in weight_files) != self.physical_weight_bytes:
+            raise ValueError("model contract physical weight bytes disagree")
+        return self
+
+
 class AcquisitionConfig(StrictModel):
+    mode: AcquisitionMode
     hf_executable: str
     source_snapshot: str | None = None
+    source_model_contract: ModelContractBinding | None = None
     environment: dict[str, str]
+
+    @model_validator(mode="before")
+    @classmethod
+    def infer_legacy_mode(cls, value: object) -> object:
+        if not isinstance(value, Mapping) or "mode" in value:
+            return value
+        copied = dict(cast(Mapping[object, object], value))
+        if copied.get("source_model_contract") is not None:
+            raise ValueError(
+                "acquisition mode is required when source_model_contract is present"
+            )
+        copied["mode"] = (
+            "huggingface_cli"
+            if copied.get("source_snapshot") is None
+            else "preverified_snapshot_copy"
+        )
+        return copied
 
     @model_validator(mode="after")
     def validate_acquisition(self) -> "AcquisitionConfig":
         _validate_lexical_absolute_path(self.hf_executable, "hf executable")
         if self.source_snapshot is not None:
             _validate_lexical_absolute_path(self.source_snapshot, "source snapshot")
+        if self.mode == "huggingface_cli" and self.source_snapshot is not None:
+            raise ValueError(
+                "huggingface_cli acquisition must not name a source snapshot"
+            )
+        if self.mode != "huggingface_cli" and self.source_snapshot is None:
+            raise ValueError(f"{self.mode} acquisition requires a source snapshot")
+        if self.mode == "local_copy_from_existing_remote_source":
+            if self.source_model_contract is None:
+                raise ValueError(
+                    "existing remote source acquisition requires a model contract"
+                )
+        elif self.source_model_contract is not None:
+            raise ValueError(
+                "source model contract is only valid for an existing remote source"
+            )
         for name, value in self.environment.items():
             if _ENVIRONMENT_NAME.fullmatch(name) is None:
                 raise ValueError(f"invalid environment variable name {name!r}")
@@ -467,7 +703,12 @@ class StageConfig(StrictModel):
                     f"{description} must end in the exact revision-pinned Exo name "
                     f"{self.model.directory_name}"
                 )
-        if self.acquisition.source_snapshot in {
+        if self.acquisition.mode == "local_copy_from_existing_remote_source":
+            if self.acquisition.source_snapshot != self.remote_destination:
+                raise ValueError(
+                    "existing remote source must exactly equal remote_destination"
+                )
+        elif self.acquisition.source_snapshot in {
             self.local_destination,
             self.remote_destination,
         }:
@@ -546,6 +787,7 @@ class SnapshotVerification(StrictModel):
     revision: str
     indexed_bytes: int = Field(gt=0)
     shard_count: int = Field(gt=0)
+    model_contract_sha256: str | None = None
     manifest: dict[str, str]
 
     @field_validator("manifest")
@@ -557,6 +799,13 @@ class SnapshotVerification(StrictModel):
             _validate_relative_file_name(relative_path)
             if _HEX_SHA256.fullmatch(digest) is None:
                 raise ValueError("manifest values must be lowercase SHA-256")
+        return value
+
+    @field_validator("model_contract_sha256")
+    @classmethod
+    def validate_model_contract_sha256(cls, value: str | None) -> str | None:
+        if value is not None and _HEX_SHA256.fullmatch(value) is None:
+            raise ValueError("verification model contract must be lowercase SHA-256")
         return value
 
 
@@ -585,7 +834,7 @@ class ProcessOperationResult(StrictModel):
 
 class RemoteRequest(StrictModel):
     schema_version: Literal[1]
-    operation: Literal["probe", "receive"]
+    operation: Literal["probe", "reverify", "receive"]
     run_id: str
     namespace: str
     owner_token: str
@@ -593,6 +842,7 @@ class RemoteRequest(StrictModel):
     destination: str
     temporary_path: str
     model: ModelSpec
+    source_model_contract: TransportedModelContract | None = None
 
     @model_validator(mode="after")
     def validate_request(self) -> "RemoteRequest":
@@ -611,6 +861,10 @@ class RemoteRequest(StrictModel):
             expected_prefix
         ) or not temporary.name.endswith(".stage"):
             raise ValueError("remote temporary path is not owned by this run")
+        if self.operation == "receive" and self.source_model_contract is not None:
+            raise ValueError("remote receive must not use a source model contract")
+        if self.operation == "reverify" and self.source_model_contract is None:
+            raise ValueError("remote reverification requires a source model contract")
         return self
 
 
@@ -670,6 +924,20 @@ class OwnedDirectory:
             self.parent_descriptor = -1
 
 
+ImmutableStat: TypeAlias = tuple[int, int, int, int, int, int, int, int, int, int]
+
+
+@dataclass
+class RetainedImmutableTree:
+    directory: OwnedDirectory
+    description: str
+    root_state: ImmutableStat
+    entry_states: dict[str, ImmutableStat]
+
+    def close(self) -> None:
+        self.directory.close()
+
+
 def reconcile_remote_cleanup(
     local_transport_cleanup_succeeded: bool,
     response: RemoteResponse | None,
@@ -683,6 +951,10 @@ def reconcile_remote_cleanup(
 
 
 class StagingEffects(Protocol):
+    def verify_source_snapshot(
+        self, path: Path, model: ModelSpec, latch: SignalLatch
+    ) -> SnapshotVerification: ...
+
     def inspect_local_destination(
         self, path: Path, model: ModelSpec, latch: SignalLatch
     ) -> SnapshotVerification | None: ...
@@ -713,12 +985,23 @@ class StagingEffects(Protocol):
     ) -> SnapshotVerification: ...
 
     def install_local_snapshot(
-        self, temporary_path: Path, destination: Path
+        self,
+        temporary_path: Path,
+        destination: Path,
+        record_publication: Callable[[], None],
     ) -> None: ...
 
     def cleanup_local_temporary(self, path: Path) -> bool: ...
 
     def probe_remote_destination(
+        self,
+        config: StageConfig,
+        owner_token: str,
+        register_process: Callable[[OwnedProcess], None],
+        latch: SignalLatch,
+    ) -> ProcessOperationResult: ...
+
+    def reverify_remote_destination(
         self,
         config: StageConfig,
         owner_token: str,
@@ -1034,8 +1317,15 @@ def _atomic_create_json(path: Path, value: Mapping[str, object]) -> None:
         os.close(directory_descriptor)
 
 
-def _read_regular_file_path(path: Path, description: str) -> bytes:
+def _read_regular_file_path(
+    path: Path,
+    description: str,
+    *,
+    maximum_bytes: int | None = None,
+) -> bytes:
     """Read one regular file through a symlink-free retained parent."""
+    if maximum_bytes is not None and maximum_bytes < 0:
+        raise ValueError("maximum_bytes must be nonnegative")
     parent_descriptor = _open_directory_without_symlinks(path.parent)
     try:
         descriptor = os.open(
@@ -1047,8 +1337,17 @@ def _read_regular_file_path(path: Path, description: str) -> bytes:
             file_status = os.fstat(descriptor)
             if not stat.S_ISREG(file_status.st_mode):
                 raise StageError(f"{description} is not a regular file")
+            if maximum_bytes is not None and file_status.st_size > maximum_bytes:
+                raise StageError(f"{description} exceeds the size limit")
             with os.fdopen(descriptor, "rb", closefd=False) as input_file:
-                return input_file.read()
+                contents = input_file.read(
+                    -1 if maximum_bytes is None else maximum_bytes + 1
+                )
+            if maximum_bytes is not None and len(contents) > maximum_bytes:
+                raise StageError(f"{description} exceeds the size limit")
+            if os.fstat(descriptor).st_size != file_status.st_size:
+                raise StageError(f"{description} changed while it was read")
+            return contents
         finally:
             os.close(descriptor)
     except OSError as error:
@@ -1128,6 +1427,38 @@ def _read_relative_file(root_descriptor: int, relative_path: str) -> bytes:
         os.close(descriptor)
 
 
+def _retained_regular_entry(
+    tree: RetainedImmutableTree, relative_path: str
+) -> OwnedTreeEntry:
+    entry = tree.directory.entries.get(relative_path)
+    if entry is None or entry.kind != "regular":
+        raise StageError(
+            f"{tree.description} retained regular file is missing: {relative_path}"
+        )
+    try:
+        retained_state = _immutable_stat(os.fstat(entry.descriptor))
+    except OSError as error:
+        raise StageError(
+            f"cannot inspect retained file {relative_path}: {error}"
+        ) from error
+    if retained_state != tree.entry_states.get(relative_path):
+        raise StageError(f"{tree.description} retained file changed: {relative_path}")
+    return entry
+
+
+def _read_retained_relative_file(
+    tree: RetainedImmutableTree, relative_path: str
+) -> bytes:
+    entry = _retained_regular_entry(tree, relative_path)
+    chunks: list[bytes] = []
+    offset = 0
+    while chunk := os.pread(entry.descriptor, 1024 * 1024, offset):
+        chunks.append(chunk)
+        offset += len(chunk)
+    _retained_regular_entry(tree, relative_path)
+    return b"".join(chunks)
+
+
 def _sha256_file_at(
     root_descriptor: int,
     relative_path: str,
@@ -1142,6 +1473,22 @@ def _sha256_file_at(
                 digest.update(chunk)
     finally:
         os.close(descriptor)
+    return digest.hexdigest()
+
+
+def _sha256_retained_file(
+    tree: RetainedImmutableTree,
+    relative_path: str,
+    checkpoint: Callable[[], None] = lambda: None,
+) -> str:
+    entry = _retained_regular_entry(tree, relative_path)
+    digest = hashlib.sha256()
+    offset = 0
+    while chunk := os.pread(entry.descriptor, 1024 * 1024, offset):
+        checkpoint()
+        digest.update(chunk)
+        offset += len(chunk)
+    _retained_regular_entry(tree, relative_path)
     return digest.hexdigest()
 
 
@@ -1308,6 +1655,185 @@ def _validate_owned_tree(directory: OwnedDirectory) -> bool:
     return walk(directory.descriptor, None) and observed_paths == set(directory.entries)
 
 
+def _frozen_mode(kind: Literal["directory", "regular"]) -> int:
+    return 0o555 if kind == "directory" else 0o444
+
+
+def _validate_frozen_owned_tree(directory: OwnedDirectory) -> bool:
+    if not _owned_directory_path_matches(directory) or not _validate_owned_tree(
+        directory
+    ):
+        return False
+    try:
+        retained_root = os.fstat(directory.descriptor)
+        live_root = os.stat(
+            directory.path.name,
+            dir_fd=directory.parent_descriptor,
+            follow_symlinks=False,
+        )
+    except OSError:
+        return False
+    if (
+        (retained_root.st_dev, retained_root.st_ino)
+        != (directory.device, directory.inode)
+        or (live_root.st_dev, live_root.st_ino) != (directory.device, directory.inode)
+        or retained_root.st_uid != 0
+        or retained_root.st_gid != 0
+        or stat.S_IMODE(retained_root.st_mode) != _frozen_mode("directory")
+        or stat.S_IMODE(live_root.st_mode) != _frozen_mode("directory")
+    ):
+        return False
+    for entry in directory.entries.values():
+        try:
+            retained = os.fstat(entry.descriptor)
+        except OSError:
+            return False
+        if (
+            (retained.st_dev, retained.st_ino) != (entry.device, entry.inode)
+            or retained.st_uid != 0
+            or retained.st_gid != 0
+            or stat.S_IMODE(retained.st_mode) != _frozen_mode(entry.kind)
+        ):
+            return False
+    return True
+
+
+def _freeze_owned_tree(directory: OwnedDirectory) -> None:
+    """Durably freeze every retained entry before publishing the snapshot name."""
+    if not _owned_directory_path_matches(directory) or not _validate_owned_tree(
+        directory
+    ):
+        raise StageError("cannot freeze a model tree outside its retained journal")
+    entries = sorted(
+        directory.entries.values(),
+        key=lambda entry: (
+            entry.kind == "directory",
+            -len(PurePosixPath(entry.relative_path).parts),
+        ),
+    )
+    try:
+        for entry in entries:
+            os.fchown(entry.descriptor, 0, 0)
+            os.fchmod(entry.descriptor, _frozen_mode(entry.kind))
+            os.fsync(entry.descriptor)
+        os.fchown(directory.descriptor, 0, 0)
+        os.fchmod(directory.descriptor, _frozen_mode("directory"))
+        os.fsync(directory.descriptor)
+    except OSError as error:
+        raise StageError(
+            f"cannot freeze model tree as root-owned read-only: {error}"
+        ) from error
+    if not _validate_frozen_owned_tree(directory):
+        raise StageError("frozen model tree identity or mode validation failed")
+
+
+def _immutable_stat(value: os.stat_result) -> ImmutableStat:
+    # Access time is deliberately excluded because reading the retained file can
+    # update it. Every field that can evidence content, mode, owner, link, or
+    # directory membership mutation remains bound.
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_mode,
+        value.st_nlink,
+        value.st_uid,
+        value.st_gid,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+        value.st_blocks,
+    )
+
+
+def _validate_immutable_status(
+    value: os.stat_result,
+    kind: Literal["directory", "regular"],
+    description: str,
+    relative_path: str,
+) -> None:
+    expected_kind = stat.S_ISDIR if kind == "directory" else stat.S_ISREG
+    if not expected_kind(value.st_mode):
+        raise StageError(f"{description} has the wrong type: {relative_path}")
+    if value.st_uid != 0 or value.st_gid != 0:
+        raise StageError(f"{description} is not root-owned: {relative_path}")
+    if value.st_mode & _WRITE_MODE_BITS:
+        raise StageError(f"{description} is writable: {relative_path}")
+    compatible_mode = 0o555 if kind == "directory" else 0o444
+    if stat.S_IMODE(value.st_mode) & ~compatible_mode:
+        raise StageError(
+            f"{description} has permissions incompatible with "
+            f"{compatible_mode:04o}: {relative_path}"
+        )
+    if value.st_nlink <= 0:
+        raise StageError(f"{description} is unlinked: {relative_path}")
+
+
+def _retained_immutable_tree_state(
+    directory: OwnedDirectory, description: str
+) -> tuple[ImmutableStat, dict[str, ImmutableStat]]:
+    if not _owned_directory_path_matches(directory) or not _validate_owned_tree(
+        directory
+    ):
+        raise StageError(f"{description} path or entry identity changed")
+    retained_root = os.fstat(directory.descriptor)
+    live_root = os.stat(
+        directory.path.name,
+        dir_fd=directory.parent_descriptor,
+        follow_symlinks=False,
+    )
+    _validate_immutable_status(retained_root, "directory", description, ".")
+    _validate_immutable_status(live_root, "directory", description, ".")
+    root_state = _immutable_stat(retained_root)
+    if _immutable_stat(live_root) != root_state:
+        raise StageError(f"{description} root changed during retained validation")
+    entry_states: dict[str, ImmutableStat] = {}
+    for relative_path, entry in sorted(directory.entries.items()):
+        retained = os.fstat(entry.descriptor)
+        _validate_immutable_status(retained, entry.kind, description, relative_path)
+        if (retained.st_dev, retained.st_ino) != (entry.device, entry.inode):
+            raise StageError(
+                f"{description} retained entry identity changed: {relative_path}"
+            )
+        entry_states[relative_path] = _immutable_stat(retained)
+    return root_state, entry_states
+
+
+def _open_retained_immutable_tree(
+    path: Path,
+    description: str,
+    checkpoint: Callable[[], None] = lambda: None,
+) -> RetainedImmutableTree:
+    directory = _open_owned_directory(path)
+    try:
+        if not _owned_directory_path_matches(directory):
+            raise StageError(f"{description} root identity changed while opening")
+        _journal_existing_owned_tree(directory, checkpoint)
+        root_state, entry_states = _retained_immutable_tree_state(
+            directory, description
+        )
+        return RetainedImmutableTree(
+            directory=directory,
+            description=description,
+            root_state=root_state,
+            entry_states=entry_states,
+        )
+    except BaseException:
+        directory.close()
+        raise
+
+
+def _require_retained_immutable_tree_unchanged(
+    tree: RetainedImmutableTree,
+) -> None:
+    root_state, entry_states = _retained_immutable_tree_state(
+        tree.directory, tree.description
+    )
+    if root_state != tree.root_state or entry_states != tree.entry_states:
+        raise StageError(
+            f"{tree.description} identity, mode, or content metadata changed"
+        )
+
+
 def _ensure_owned_relative_parent(
     directory: OwnedDirectory, relative_path: str
 ) -> tuple[int, str]:
@@ -1431,23 +1957,141 @@ def _validate_receipt_bytes(raw_value: bytes, model: ModelSpec) -> None:
         raise StageError("Exo revision receipt does not match the configured model")
 
 
+def _canonical_json_bytes(value: object) -> bytes:
+    try:
+        return (
+            json.dumps(
+                value,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+                allow_nan=False,
+            )
+            + "\n"
+        ).encode("ascii")
+    except (TypeError, ValueError, UnicodeEncodeError) as error:
+        raise StageError("model contract cannot be canonically serialized") from error
+
+
+def _validate_model_contract_bytes(
+    raw_contract: bytes,
+    expected_sha256: str,
+    model: ModelSpec,
+) -> SnapshotModelContract:
+    if len(raw_contract) > _MAX_MODEL_CONTRACT_BYTES:
+        raise StageError("source model contract exceeds the size limit")
+    if hashlib.sha256(raw_contract).hexdigest() != expected_sha256:
+        raise StageError("source model contract does not match its configured SHA-256")
+    try:
+        contract = SnapshotModelContract.model_validate_json(raw_contract)
+    except ValidationError as error:
+        raise StageError("source model contract has an invalid schema") from error
+    if (
+        contract.model_id != model.model_id
+        or contract.revision != model.revision
+        or contract.index_metadata_total_size != model.expected_indexed_bytes
+    ):
+        raise StageError("source model contract identity differs from the model spec")
+    if raw_contract != _canonical_json_bytes(contract.model_dump(mode="json")):
+        raise StageError("source model contract bytes are not canonical JSON")
+    return contract
+
+
+def _load_bound_model_contract(
+    binding: ModelContractBinding | TransportedModelContract,
+    model: ModelSpec,
+) -> SnapshotModelContract:
+    if isinstance(binding, ModelContractBinding):
+        raw_contract = _read_regular_file_path(
+            Path(binding.path),
+            "source model contract",
+            maximum_bytes=_MAX_MODEL_CONTRACT_BYTES,
+        )
+    else:
+        raw_contract = binding.canonical_bytes()
+    return _validate_model_contract_bytes(raw_contract, binding.sha256, model)
+
+
+def _transport_model_contract(
+    binding: ModelContractBinding,
+    model: ModelSpec,
+) -> TransportedModelContract:
+    contract = _load_bound_model_contract(binding, model)
+    canonical_bytes = _canonical_json_bytes(contract.model_dump(mode="json"))
+    return TransportedModelContract(
+        canonical_bytes_base64=base64.b64encode(canonical_bytes).decode("ascii"),
+        sha256=binding.sha256,
+    )
+
+
 def _verify_snapshot_descriptor(
     descriptor: int,
     model: ModelSpec,
     checkpoint: Callable[[], None] = lambda: None,
+    *,
+    source_model_contract: ModelContractBinding
+    | TransportedModelContract
+    | None = None,
+    retained_immutable_tree: RetainedImmutableTree | None = None,
 ) -> SnapshotVerification:
-    files = _snapshot_regular_files(descriptor, checkpoint)
+    if retained_immutable_tree is None:
+        files = _snapshot_regular_files(descriptor, checkpoint)
+
+        def read_file(relative_path: str) -> bytes:
+            return _read_relative_file(descriptor, relative_path)
+
+        def hash_file(relative_path: str) -> str:
+            return _sha256_file_at(descriptor, relative_path, checkpoint)
+
+        def file_status(relative_path: str) -> os.stat_result:
+            file_descriptor = _open_relative_regular_file(descriptor, relative_path)
+            try:
+                return os.fstat(file_descriptor)
+            finally:
+                os.close(file_descriptor)
+
+    else:
+        if descriptor != retained_immutable_tree.directory.descriptor:
+            raise StageError("retained immutable tree descriptor differs")
+        _require_retained_immutable_tree_unchanged(retained_immutable_tree)
+        files = tuple(
+            sorted(
+                relative_path
+                for relative_path, entry in retained_immutable_tree.directory.entries.items()
+                if entry.kind == "regular"
+            )
+        )
+
+        def read_file(relative_path: str) -> bytes:
+            return _read_retained_relative_file(retained_immutable_tree, relative_path)
+
+        def hash_file(relative_path: str) -> str:
+            return _sha256_retained_file(
+                retained_immutable_tree, relative_path, checkpoint
+            )
+
+        def file_status(relative_path: str) -> os.stat_result:
+            return os.fstat(
+                _retained_regular_entry(
+                    retained_immutable_tree, relative_path
+                ).descriptor
+            )
+
     file_set = set(files)
+    contract = (
+        None
+        if source_model_contract is None
+        else _load_bound_model_contract(source_model_contract, model)
+    )
     if "config.json" not in file_set:
         raise StageError("snapshot is missing config.json")
-    if _MODEL_RECEIPT not in file_set:
+    if contract is None and _MODEL_RECEIPT not in file_set:
         raise StageError("snapshot is missing the exact Exo revision receipt")
-    _validate_receipt_bytes(_read_relative_file(descriptor, _MODEL_RECEIPT), model)
+    if _MODEL_RECEIPT in file_set:
+        _validate_receipt_bytes(read_file(_MODEL_RECEIPT), model)
     if _INDEX_FILENAME not in file_set:
         raise StageError(f"snapshot is missing {_INDEX_FILENAME}")
-    index = _parse_json_object(
-        _read_relative_file(descriptor, _INDEX_FILENAME), "safetensors index"
-    )
+    index = _parse_json_object(read_file(_INDEX_FILENAME), "safetensors index")
     metadata = index.get("metadata")
     weight_map = index.get("weight_map")
     if not isinstance(metadata, dict) or not isinstance(weight_map, dict):
@@ -1467,7 +2111,9 @@ def _verify_snapshot_descriptor(
         raise StageError("safetensors weight_map must contain string entries")
     shard_names = sorted({cast(str, value) for value in raw_weight_map.values()})
     for shard_name in shard_names:
-        _validate_relative_file_name(shard_name)
+        shard_path = _validate_relative_file_name(shard_name)
+        if len(shard_path.parts) != 1:
+            raise StageError(f"safetensors index contains a nested shard: {shard_name}")
         if shard_name not in file_set or not shard_name.endswith(".safetensors"):
             raise StageError(f"referenced safetensors shard is missing: {shard_name}")
     indexed_shards = set(shard_names)
@@ -1478,17 +2124,68 @@ def _verify_snapshot_descriptor(
     )
     if extra_shards:
         raise StageError(f"unindexed safetensors files are present: {extra_shards}")
-    manifest = {
-        relative: _sha256_file_at(descriptor, relative, checkpoint)
-        for relative in sorted(files)
-    }
-    return SnapshotVerification(
+    if contract is not None:
+        contract_files_by_role = {
+            role: tuple(file for file in contract.files if file.role == role)
+            for role in ("config", "safetensors_index", "weight_shard")
+        }
+        config_contract = contract_files_by_role["config"]
+        index_contract = contract_files_by_role["safetensors_index"]
+        weight_contracts = contract_files_by_role["weight_shard"]
+        if (
+            len(config_contract) != 1
+            or config_contract[0].path != "config.json"
+            or len(index_contract) != 1
+            or index_contract[0].path != _INDEX_FILENAME
+        ):
+            raise StageError("source model contract has invalid config or index paths")
+        if contract.weight_map_entries != len(raw_weight_map):
+            raise StageError("source model contract weight-map entry count differs")
+        if tuple(file.path for file in weight_contracts) != tuple(shard_names):
+            raise StageError("source model contract shard set differs from the index")
+        contracted_paths = {file.path for file in contract.files}
+        for relative_path in files:
+            if (
+                relative_path in contracted_paths
+                or relative_path == _MODEL_RECEIPT
+                or relative_path.startswith(".cache/huggingface/")
+            ):
+                continue
+            relative = PurePosixPath(relative_path)
+            observed_mode = file_status(relative_path).st_mode
+            if relative.name.endswith(_UNCONTRACTED_EXECUTABLE_SUFFIXES) or (
+                observed_mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+            ):
+                raise StageError(
+                    f"snapshot contains uncontracted executable code: {relative_path}"
+                )
+    manifest = {relative: hash_file(relative) for relative in sorted(files)}
+    if contract is not None:
+        for contracted_file in contract.files:
+            checkpoint()
+            if manifest.get(contracted_file.path) != contracted_file.sha256:
+                raise StageError(
+                    "snapshot file differs from source model contract: "
+                    f"{contracted_file.path}"
+                )
+            if file_status(contracted_file.path).st_size != contracted_file.size_bytes:
+                raise StageError(
+                    "snapshot file size differs from source model contract: "
+                    f"{contracted_file.path}"
+                )
+    verification = SnapshotVerification(
         model_id=model.model_id,
         revision=model.revision,
         indexed_bytes=indexed_bytes,
         shard_count=len(shard_names),
+        model_contract_sha256=(
+            None if source_model_contract is None else source_model_contract.sha256
+        ),
         manifest=manifest,
     )
+    if retained_immutable_tree is not None:
+        _require_retained_immutable_tree_unchanged(retained_immutable_tree)
+    return verification
 
 
 def _validate_hugging_face_download_metadata(
@@ -1534,6 +2231,8 @@ def verify_snapshot(
     path: Path,
     model: ModelSpec,
     checkpoint: Callable[[], None] = lambda: None,
+    *,
+    source_model_contract: ModelContractBinding | None = None,
 ) -> SnapshotVerification:
     """Verify one canonical, symlink-free, revision-bound model snapshot."""
     _validate_lexical_absolute_path(str(path), "snapshot path")
@@ -1544,7 +2243,12 @@ def verify_snapshot(
     try:
         if not _owned_directory_path_matches(directory):
             raise StageError("snapshot root identity changed while opening")
-        return _verify_snapshot_descriptor(directory.descriptor, model, checkpoint)
+        return _verify_snapshot_descriptor(
+            directory.descriptor,
+            model,
+            checkpoint,
+            source_model_contract=source_model_contract,
+        )
     finally:
         directory.close()
 
@@ -1671,7 +2375,10 @@ def _wait_for_process(
 
 
 def _rename_entry_noreplace_at(
-    parent_descriptor: int, source_name: str, destination_name: str
+    parent_descriptor: int,
+    source_name: str,
+    destination_name: str,
+    record_publication: Callable[[], None] | None = None,
 ) -> None:
     validated_source = _validate_directory_entry_name(source_name)
     validated_destination = _validate_directory_entry_name(destination_name)
@@ -1680,30 +2387,51 @@ def _rename_entry_noreplace_at(
     if symbol is None:
         raise StageError("Linux renameat2 is required for no-replace model install")
     renameat2 = cast(Callable[[int, bytes, int, bytes, int], int], symbol)
-    result = renameat2(
-        parent_descriptor,
-        os.fsencode(validated_source),
-        parent_descriptor,
-        os.fsencode(validated_destination),
-        1,
-    )
-    if result != 0:
-        error_number = ctypes.get_errno()
-        if error_number in {errno.EEXIST, errno.ENOTEMPTY}:
-            raise StageError(
-                f"destination appeared during atomic install: {validated_destination}"
-            )
-        raise StageError(
-            f"cannot atomically install {validated_destination}: "
-            f"{os.strerror(error_number)}"
+    previous_signal_mask: set[signal.Signals] | None = None
+    if record_publication is not None:
+        previous_signal_mask = signal.pthread_sigmask(
+            signal.SIG_BLOCK,
+            (signal.SIGINT, signal.SIGTERM, signal.SIGHUP),
         )
+    try:
+        result = renameat2(
+            parent_descriptor,
+            os.fsencode(validated_source),
+            parent_descriptor,
+            os.fsencode(validated_destination),
+            1,
+        )
+        if result != 0:
+            error_number = ctypes.get_errno()
+            if error_number in {errno.EEXIST, errno.ENOTEMPTY}:
+                raise StageError(
+                    "destination appeared during atomic install: "
+                    f"{validated_destination}"
+                )
+            raise StageError(
+                f"cannot atomically install {validated_destination}: "
+                f"{os.strerror(error_number)}"
+            )
+        if record_publication is not None:
+            record_publication()
+    finally:
+        if previous_signal_mask is not None:
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous_signal_mask)
     os.fsync(parent_descriptor)
 
 
 def _rename_directory_noreplace_at(
-    parent_descriptor: int, source_name: str, destination_name: str
+    parent_descriptor: int,
+    source_name: str,
+    destination_name: str,
+    record_publication: Callable[[], None] | None = None,
 ) -> None:
-    _rename_entry_noreplace_at(parent_descriptor, source_name, destination_name)
+    _rename_entry_noreplace_at(
+        parent_descriptor,
+        source_name,
+        destination_name,
+        record_publication,
+    )
 
 
 def owned_temporary_name(config: StageConfig, owner_token: str) -> str:
@@ -2374,23 +3102,51 @@ class SystemEffects:
                 path_status.st_mode
             ):
                 raise StageError("local destination exists but is not a real directory")
-            directory_descriptor = os.open(
-                path.name,
-                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
-                dir_fd=parent_descriptor,
-            )
-            try:
-                if not _snapshot_regular_files(directory_descriptor, latch.checkpoint):
-                    raise StageError(
-                        "refusing to replace a pre-existing empty destination"
-                    )
-                return _verify_snapshot_descriptor(
-                    directory_descriptor, model, latch.checkpoint
-                )
-            finally:
-                os.close(directory_descriptor)
         finally:
             os.close(parent_descriptor)
+        tree = _open_retained_immutable_tree(
+            path, "existing local destination", latch.checkpoint
+        )
+        try:
+            if not tree.entry_states:
+                raise StageError("refusing to replace a pre-existing empty destination")
+            return _verify_snapshot_descriptor(
+                tree.directory.descriptor,
+                model,
+                latch.checkpoint,
+                source_model_contract=self._config.acquisition.source_model_contract,
+                retained_immutable_tree=tree,
+            )
+        finally:
+            tree.close()
+
+    def verify_source_snapshot(
+        self, path: Path, model: ModelSpec, latch: SignalLatch
+    ) -> SnapshotVerification:
+        if path != Path(self._config.acquisition.source_snapshot or ""):
+            raise StageError("source verification path differs from the staging config")
+        if self._config.acquisition.mode == "local_copy_from_existing_remote_source":
+            tree = _open_retained_immutable_tree(
+                path, "shared source snapshot", latch.checkpoint
+            )
+            try:
+                return _verify_snapshot_descriptor(
+                    tree.directory.descriptor,
+                    model,
+                    latch.checkpoint,
+                    source_model_contract=(
+                        self._config.acquisition.source_model_contract
+                    ),
+                    retained_immutable_tree=tree,
+                )
+            finally:
+                tree.close()
+        return verify_snapshot(
+            path,
+            model,
+            latch.checkpoint,
+            source_model_contract=self._config.acquisition.source_model_contract,
+        )
 
     def create_local_temporary(self, destination: Path, owned_name: str) -> Path:
         temporary = destination.parent / owned_name
@@ -2418,7 +3174,14 @@ class SystemEffects:
         model: ModelSpec,
         latch: SignalLatch,
     ) -> None:
-        source_directory = _open_owned_directory(source)
+        retained_source: RetainedImmutableTree | None = None
+        if self._config.acquisition.mode == "local_copy_from_existing_remote_source":
+            retained_source = _open_retained_immutable_tree(
+                source, "shared source snapshot", latch.checkpoint
+            )
+            source_directory = retained_source.directory
+        else:
+            source_directory = _open_owned_directory(source)
         try:
             destination_directory = self._owned_local_temporaries.get(destination)
             if destination_directory is None or not _owned_directory_path_matches(
@@ -2426,14 +3189,30 @@ class SystemEffects:
             ):
                 raise StageError("copy destination is not the retained owned temporary")
             source_verification = _verify_snapshot_descriptor(
-                source_directory.descriptor, model, latch.checkpoint
+                source_directory.descriptor,
+                model,
+                latch.checkpoint,
+                source_model_contract=self._config.acquisition.source_model_contract,
+                retained_immutable_tree=retained_source,
             )
             for relative_path in sorted(source_verification.manifest):
-                if relative_path == _MODEL_RECEIPT:
+                if (
+                    relative_path == _MODEL_RECEIPT
+                    and self._config.acquisition.mode
+                    != "local_copy_from_existing_remote_source"
+                ):
                     continue
                 latch.checkpoint()
-                source_descriptor = _open_relative_regular_file(
-                    source_directory.descriptor, relative_path
+                source_descriptor = (
+                    _open_relative_regular_file(
+                        source_directory.descriptor, relative_path
+                    )
+                    if retained_source is None
+                    else os.dup(
+                        _retained_regular_entry(
+                            retained_source, relative_path
+                        ).descriptor
+                    )
                 )
                 parent_descriptor, filename = _ensure_owned_relative_parent(
                     destination_directory, relative_path
@@ -2457,13 +3236,22 @@ class SystemEffects:
                         descriptor,
                         "regular",
                     )
-                    with (
-                        os.fdopen(source_descriptor, "rb", closefd=False) as input_file,
-                        os.fdopen(descriptor, "wb", closefd=False) as output_file,
-                    ):
-                        while chunk := input_file.read(1024 * 1024):
-                            latch.checkpoint()
-                            output_file.write(chunk)
+                    with os.fdopen(descriptor, "wb", closefd=False) as output_file:
+                        if retained_source is None:
+                            with os.fdopen(
+                                source_descriptor, "rb", closefd=False
+                            ) as input_file:
+                                while chunk := input_file.read(1024 * 1024):
+                                    latch.checkpoint()
+                                    output_file.write(chunk)
+                        else:
+                            offset = 0
+                            while chunk := os.pread(
+                                source_descriptor, 1024 * 1024, offset
+                            ):
+                                latch.checkpoint()
+                                output_file.write(chunk)
+                                offset += len(chunk)
                         output_file.flush()
                         os.fsync(output_file.fileno())
                 finally:
@@ -2473,13 +3261,22 @@ class SystemEffects:
                     os.close(parent_descriptor)
             if (
                 _verify_snapshot_descriptor(
-                    source_directory.descriptor, model, latch.checkpoint
+                    source_directory.descriptor,
+                    model,
+                    latch.checkpoint,
+                    source_model_contract=(
+                        self._config.acquisition.source_model_contract
+                    ),
+                    retained_immutable_tree=retained_source,
                 )
                 != source_verification
             ):
                 raise StageError("source snapshot changed while it was copied")
         finally:
-            source_directory.close()
+            if retained_source is None:
+                source_directory.close()
+            else:
+                retained_source.close()
 
     def _local_owned_process(
         self,
@@ -2613,7 +3410,12 @@ class SystemEffects:
                         "owned model tree differs from its creation journal"
                     )
                 verification = _verify_snapshot_descriptor(
-                    directory.descriptor, model, latch.checkpoint
+                    directory.descriptor,
+                    model,
+                    latch.checkpoint,
+                    source_model_contract=(
+                        self._config.acquisition.source_model_contract
+                    ),
                 )
                 if not _validate_owned_tree(directory):
                     raise StageError("owned model tree changed during verification")
@@ -2622,20 +3424,44 @@ class SystemEffects:
                 if installed:
                     self._installed_local_directories.pop(path, None)
                     directory.close()
-        return verify_snapshot(path, model, latch.checkpoint)
+        return verify_snapshot(
+            path,
+            model,
+            latch.checkpoint,
+            source_model_contract=self._config.acquisition.source_model_contract,
+        )
 
-    def install_local_snapshot(self, temporary_path: Path, destination: Path) -> None:
+    def install_local_snapshot(
+        self,
+        temporary_path: Path,
+        destination: Path,
+        record_publication: Callable[[], None],
+    ) -> None:
         directory = self._owned_local_temporaries.get(temporary_path)
         if directory is None or not _owned_directory_path_matches(directory):
             raise StageError("refusing to install an unowned local temporary path")
         if not _validate_owned_tree(directory):
             raise StageError("refusing to install a model tree outside its journal")
-        _rename_directory_noreplace_at(
-            directory.parent_descriptor, temporary_path.name, destination.name
-        )
-        del self._owned_local_temporaries[temporary_path]
-        directory.path = destination
+        _freeze_owned_tree(directory)
+        published = False
+
+        def mark_published() -> None:
+            nonlocal published
+            # The successful rename is the irreversible publication boundary.
+            # Record it before directory fsync or any later validation can fail.
+            record_publication()
+            published = True
+            del self._owned_local_temporaries[temporary_path]
+            directory.path = destination
+            self._installed_local_directories[destination] = directory
+
         try:
+            _rename_directory_noreplace_at(
+                directory.parent_descriptor,
+                temporary_path.name,
+                destination.name,
+                mark_published,
+            )
             observed = os.stat(
                 destination.name,
                 dir_fd=directory.parent_descriptor,
@@ -2650,9 +3476,12 @@ class SystemEffects:
                 )
             if not _validate_owned_tree(directory):
                 raise StageError("installed local model tree changed during rename")
-            self._installed_local_directories[destination] = directory
+            if not _validate_frozen_owned_tree(directory):
+                raise StageError("installed local model tree is not durably frozen")
         except BaseException:
-            directory.close()
+            if published:
+                self._installed_local_directories.pop(destination, None)
+                directory.close()
             raise
 
     def cleanup_local_temporary(self, path: Path) -> bool:
@@ -2776,8 +3605,6 @@ class SystemEffects:
                 raise StageError("local transfer snapshot changed before streaming")
             with tarfile.open(fileobj=output, mode="w|") as archive:
                 for relative_path in sorted(verification.manifest):
-                    if relative_path == _MODEL_RECEIPT:
-                        continue
                     latch.checkpoint()
                     source_descriptor = _open_relative_regular_file(
                         directory.descriptor, relative_path
@@ -2853,7 +3680,7 @@ class SystemEffects:
         header_payload = (
             self._script_payload() + request.model_dump_json().encode("utf-8") + b"\n"
         )
-        log_suffix = "probe" if request.operation == "probe" else "transfer"
+        log_suffix = "transfer" if request.operation == "receive" else request.operation
         log_path = self._result_directory / f"model-stage-remote-{log_suffix}.log"
         log_descriptor = os.open(
             log_path.name,
@@ -2986,6 +3813,9 @@ class SystemEffects:
                 with contextlib.suppress(OSError, ValueError):
                     if process.stdin is not None:
                         process.stdin.close()
+                if reader is not None and reader.is_alive():
+                    with contextlib.suppress(subprocess.TimeoutExpired):
+                        process.wait(timeout=config.timeouts.cleanup_seconds)
             cleanup_confirmed = _terminate_process_group(
                 process, config.timeouts.cleanup_seconds, request.owner_token
             )
@@ -3016,12 +3846,14 @@ class SystemEffects:
             raise OperationError(
                 f"remote {request.operation} failed: {type(caught_error).__name__}: {caught_error}",
                 cleanup_confirmed=cleanup_confirmed,
+                installed=response.installed if response is not None else False,
             ) from caught_error
         assert response is not None
         if not cleanup_confirmed:
             raise OperationError(
                 f"remote {request.operation} cleanup was not confirmed",
                 cleanup_confirmed=False,
+                installed=response.installed,
             )
         return ProcessOperationResult(
             verification=response.verification,
@@ -3033,7 +3865,7 @@ class SystemEffects:
         self,
         config: StageConfig,
         owner_token: str,
-        operation: Literal["probe", "receive"],
+        operation: Literal["probe", "reverify", "receive"],
     ) -> RemoteRequest:
         temporary = Path(config.remote_destination).parent / owned_temporary_name(
             config, owner_token
@@ -3048,6 +3880,18 @@ class SystemEffects:
             destination=config.remote_destination,
             temporary_path=str(temporary),
             model=config.model,
+            source_model_contract=(
+                None
+                if operation == "receive"
+                else (
+                    None
+                    if config.acquisition.source_model_contract is None
+                    else _transport_model_contract(
+                        config.acquisition.source_model_contract,
+                        config.model,
+                    )
+                )
+            ),
         )
 
     def probe_remote_destination(
@@ -3060,6 +3904,21 @@ class SystemEffects:
         return self._run_remote(
             config,
             self._remote_request(config, owner_token, "probe"),
+            config.timeouts.remote_probe_seconds,
+            register_process,
+            latch,
+        )
+
+    def reverify_remote_destination(
+        self,
+        config: StageConfig,
+        owner_token: str,
+        register_process: Callable[[OwnedProcess], None],
+        latch: SignalLatch,
+    ) -> ProcessOperationResult:
+        return self._run_remote(
+            config,
+            self._remote_request(config, owner_token, "reverify"),
             config.timeouts.remote_probe_seconds,
             register_process,
             latch,
@@ -3110,10 +3969,12 @@ def run_staging(
     process_identities: set[tuple[str, int, int]] = set()
     cleanup_confirmations: list[bool] = []
     local_temporary: Path | None = None
+    source_verification: SnapshotVerification | None = None
     local_verification: SnapshotVerification | None = None
     remote_verification: SnapshotVerification | None = None
     local_installed = False
     remote_installed = False
+    remote_preexisting: bool | None = None
     acquisition = "existing"
     caught_error: BaseException | None = None
 
@@ -3138,9 +3999,37 @@ def run_staging(
         processes.append(process)
         publish_runtime()
 
+    def record_local_publication() -> None:
+        nonlocal local_installed, local_temporary
+        local_installed = True
+        local_temporary = None
+
     publish_runtime()
     try:
         signal_latch.checkpoint()
+        source_snapshot = config.acquisition.source_snapshot
+        shared_remote_source = (
+            config.acquisition.mode == "local_copy_from_existing_remote_source"
+        )
+        if source_snapshot is not None:
+            source_verification = effects.verify_source_snapshot(
+                Path(source_snapshot), config.model, signal_latch
+            )
+        if shared_remote_source:
+            assert source_verification is not None
+            initial_remote_probe = effects.probe_remote_destination(
+                config, owner_token, register_process, signal_latch
+            )
+            cleanup_confirmations.append(initial_remote_probe.cleanup_confirmed)
+            if initial_remote_probe.installed:
+                raise StageError("remote source probe claimed to install a snapshot")
+            remote_preexisting = initial_remote_probe.verification is not None
+            if initial_remote_probe.verification is None:
+                raise StageError("configured existing remote source is missing")
+            if initial_remote_probe.verification != source_verification:
+                raise StageError(
+                    "local view and remote view of the source manifest differ"
+                )
         local_destination = Path(config.local_destination)
         local_verification = effects.inspect_local_destination(
             local_destination, config.model, signal_latch
@@ -3149,10 +4038,10 @@ def run_staging(
             local_temporary = effects.create_local_temporary(
                 local_destination, owned_temporary_name(config, owner_token)
             )
-            if config.acquisition.source_snapshot is not None:
-                acquisition = "preverified_snapshot_copy"
+            if source_snapshot is not None:
+                acquisition = config.acquisition.mode
                 effects.copy_preverified_snapshot(
-                    Path(config.acquisition.source_snapshot),
+                    Path(source_snapshot),
                     local_temporary,
                     config.model,
                     signal_latch,
@@ -3168,14 +4057,26 @@ def run_staging(
                         signal_latch,
                     )
                 )
-            effects.write_revision_receipt(local_temporary, config.model)
+            if config.acquisition.mode != "local_copy_from_existing_remote_source":
+                effects.write_revision_receipt(local_temporary, config.model)
             local_verification = effects.verify_local_snapshot(
                 local_temporary, config.model, signal_latch
             )
+            if (
+                source_verification is not None
+                and local_verification != source_verification
+            ):
+                raise StageError(
+                    "copied local snapshot differs from its source manifest"
+                )
             signal_latch.checkpoint()
-            effects.install_local_snapshot(local_temporary, local_destination)
-            local_temporary = None
-            local_installed = True
+            effects.install_local_snapshot(
+                local_temporary, local_destination, record_local_publication
+            )
+            if not local_installed:
+                raise StageError(
+                    "local installer returned without recording snapshot publication"
+                )
             if (
                 effects.verify_local_snapshot(
                     local_destination, config.model, signal_latch
@@ -3185,23 +4086,44 @@ def run_staging(
                 raise StageError("local snapshot changed during atomic installation")
 
         assert local_verification is not None
-        remote_probe = effects.probe_remote_destination(
-            config, owner_token, register_process, signal_latch
-        )
-        cleanup_confirmations.append(remote_probe.cleanup_confirmed)
-        remote_verification = remote_probe.verification
-        if remote_verification is None:
-            remote_result = effects.transfer_remote_snapshot(
-                config,
-                local_destination,
-                local_verification,
-                owner_token,
-                register_process,
-                signal_latch,
+        if (
+            source_verification is not None
+            and local_verification != source_verification
+        ):
+            raise StageError("existing local snapshot differs from the source manifest")
+        if shared_remote_source:
+            remote_reverification = effects.reverify_remote_destination(
+                config, owner_token, register_process, signal_latch
             )
-            cleanup_confirmations.append(remote_result.cleanup_confirmed)
-            remote_verification = remote_result.verification
-            remote_installed = remote_result.installed
+            cleanup_confirmations.append(remote_reverification.cleanup_confirmed)
+            if remote_reverification.installed:
+                raise StageError("remote source reverification claimed an installation")
+            remote_verification = remote_reverification.verification
+            if remote_verification is None:
+                raise StageError("existing remote source disappeared during local copy")
+            if remote_verification != source_verification:
+                raise StageError("remote source manifest changed during local copy")
+        else:
+            remote_probe = effects.probe_remote_destination(
+                config, owner_token, register_process, signal_latch
+            )
+            cleanup_confirmations.append(remote_probe.cleanup_confirmed)
+            if remote_probe.installed:
+                raise StageError("remote destination probe claimed an installation")
+            remote_verification = remote_probe.verification
+            remote_preexisting = remote_verification is not None
+            if remote_verification is None:
+                remote_result = effects.transfer_remote_snapshot(
+                    config,
+                    local_destination,
+                    local_verification,
+                    owner_token,
+                    register_process,
+                    signal_latch,
+                )
+                cleanup_confirmations.append(remote_result.cleanup_confirmed)
+                remote_verification = remote_result.verification
+                remote_installed = remote_result.installed
         if remote_verification is None:
             raise StageError("both hosts must return verified snapshot manifests")
         if local_verification != remote_verification:
@@ -3210,6 +4132,7 @@ def run_staging(
         caught_error = error
         if isinstance(error, OperationError):
             cleanup_confirmations.append(error.cleanup_confirmed)
+            remote_installed = remote_installed or error.installed
     finally:
         signal_latch.begin_cleanup()
         if local_temporary is not None:
@@ -3250,7 +4173,13 @@ def run_staging(
         },
         "acquisition": acquisition,
         "local_installed": local_installed,
+        "remote_preexisting": remote_preexisting,
         "remote_installed": remote_installed,
+        "source_verification": (
+            None
+            if source_verification is None
+            else source_verification.model_dump(mode="json")
+        ),
         "local_verification": (
             None
             if local_verification is None
@@ -3343,7 +4272,10 @@ def _remote_process_identity() -> tuple[int, int, int]:
 
 
 def _remote_destination_probe(
-    destination: Path, model: ModelSpec
+    destination: Path,
+    model: ModelSpec,
+    *,
+    source_model_contract: TransportedModelContract | None,
 ) -> SnapshotVerification | None:
     parent_descriptor = _open_directory_without_symlinks(destination.parent)
     try:
@@ -3357,21 +4289,22 @@ def _remote_destination_probe(
             destination_status.st_mode
         ):
             raise StageError("remote destination exists but is not a real directory")
-        descriptor = os.open(
-            destination.name,
-            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
-            dir_fd=parent_descriptor,
-        )
-        try:
-            if not _snapshot_regular_files(descriptor):
-                raise StageError(
-                    "refusing to replace a pre-existing empty remote destination"
-                )
-            return _verify_snapshot_descriptor(descriptor, model)
-        finally:
-            os.close(descriptor)
     finally:
         os.close(parent_descriptor)
+    tree = _open_retained_immutable_tree(destination, "existing remote destination")
+    try:
+        if not tree.entry_states:
+            raise StageError(
+                "refusing to replace a pre-existing empty remote destination"
+            )
+        return _verify_snapshot_descriptor(
+            tree.directory.descriptor,
+            model,
+            source_model_contract=source_model_contract,
+            retained_immutable_tree=tree,
+        )
+    finally:
+        tree.close()
 
 
 def remote_helper_main(
@@ -3394,7 +4327,12 @@ def remote_helper_main(
         raise ManagedSignalError(signal_number)
 
     try:
-        request = RemoteRequest.model_validate_json(sys.stdin.buffer.readline())
+        raw_request = sys.stdin.buffer.readline(_MAX_REMOTE_REQUEST_BYTES + 1)
+        if len(raw_request) > _MAX_REMOTE_REQUEST_BYTES or not raw_request.endswith(
+            b"\n"
+        ):
+            raise StageError("remote request is missing a bounded newline frame")
+        request = RemoteRequest.model_validate_json(raw_request)
         os.environ[_OWNER_TOKEN_ENVIRONMENT] = request.owner_token
         os.environ[_NAMESPACE_ENVIRONMENT] = request.namespace
         observed_host_name = socket.gethostname()
@@ -3425,8 +4363,12 @@ def remote_helper_main(
             for signal_number in previous_handlers:
                 signal.signal(signal_number, handle_signal)
             destination = Path(request.destination)
-            existing = _remote_destination_probe(destination, request.model)
-            if request.operation == "probe":
+            existing = _remote_destination_probe(
+                destination,
+                request.model,
+                source_model_contract=request.source_model_contract,
+            )
+            if request.operation in {"probe", "reverify"}:
                 verification = existing
             else:
                 if existing is not None:
@@ -3443,14 +4385,6 @@ def remote_helper_main(
                         else (_raise_managed_signal(managed_signal))
                     ),
                 )
-                _create_owned_json_at(
-                    temporary_directory,
-                    _MODEL_RECEIPT,
-                    {
-                        "repo_id": request.model.model_id,
-                        "revision": request.model.revision,
-                    },
-                )
                 verification = _verify_snapshot_descriptor(
                     temporary_directory.descriptor, request.model
                 )
@@ -3460,14 +4394,21 @@ def remote_helper_main(
                     raise StageError(
                         "remote model tree differs from its creation journal"
                     )
+                _freeze_owned_tree(temporary_directory)
+
+                def mark_published() -> None:
+                    nonlocal temporary_owned, installed
+                    installed = True
+                    temporary_owned = False
+                    assert temporary_directory is not None
+                    temporary_directory.path = destination
+
                 _rename_directory_noreplace_at(
                     temporary_directory.parent_descriptor,
                     temporary.name,
                     destination.name,
+                    mark_published,
                 )
-                temporary_owned = False
-                installed = True
-                temporary_directory.path = destination
                 observed_destination = os.stat(
                     destination.name,
                     dir_fd=temporary_directory.parent_descriptor,
@@ -3490,6 +4431,10 @@ def remote_helper_main(
                 if not _validate_owned_tree(temporary_directory):
                     raise StageError(
                         "installed remote model tree changed during rename"
+                    )
+                if not _validate_frozen_owned_tree(temporary_directory):
+                    raise StageError(
+                        "installed remote model tree is not durably frozen"
                     )
                 temporary_directory.close()
                 temporary_directory = None
@@ -3515,7 +4460,6 @@ def remote_helper_main(
         elif installed and temporary_directory is not None:
             temporary_directory.close()
             temporary_directory = None
-            cleanup_succeeded = False
         response = RemoteResponse(
             schema_version=1,
             kind="result",

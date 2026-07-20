@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import copy
+import errno
 import hashlib
 import io
 import json
 import os
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import tarfile
@@ -23,10 +25,12 @@ import scripts.two_host_model_stage as model_stage
 from scripts.benchmark_lease import BenchmarkLease, atomic_write_json
 from scripts.two_host_model_stage import (
     AcquisitionConfig,
+    AcquisitionMode,
     CpuBinding,
     GitIdentity,
     HcaBinding,
     LeaseMetadataInputs,
+    ModelContractBinding,
     ModelSpec,
     OperationError,
     OwnedProcess,
@@ -105,6 +109,9 @@ def make_config(
     tmp_path: Path,
     *,
     source_snapshot: Path | None = None,
+    acquisition_mode: AcquisitionMode | None = None,
+    source_model_contract: ModelContractBinding | None = None,
+    remote_destination: Path | None = None,
     result_directory: Path | None = None,
 ) -> StageConfig:
     model = make_model()
@@ -119,7 +126,9 @@ def make_config(
         remote_host_name="fwuff",
         model=model,
         local_destination=str(tmp_path / "local" / model.directory_name),
-        remote_destination=f"/mnt/models/{model.directory_name}",
+        remote_destination=str(
+            remote_destination or Path("/mnt/models") / model.directory_name
+        ),
         ssh=SshConfig(
             target="fwuff",
             executable="/usr/bin/ssh",
@@ -127,8 +136,18 @@ def make_config(
             options=ssh_options(tmp_path / "known_hosts"),
         ),
         acquisition=AcquisitionConfig(
+            mode=(
+                acquisition_mode
+                if acquisition_mode is not None
+                else (
+                    "preverified_snapshot_copy"
+                    if source_snapshot is not None
+                    else "huggingface_cli"
+                )
+            ),
             hf_executable="/usr/local/bin/hf",
             source_snapshot=None if source_snapshot is None else str(source_snapshot),
+            source_model_contract=source_model_contract,
             environment={"HOME": "/root", "HF_HUB_DISABLE_TELEMETRY": "1"},
         ),
         timeouts=TimeoutConfig(
@@ -199,6 +218,8 @@ def remap_runtime_config(
     ssh["executable"] = str(ssh_executable)
     ssh["remote_python_executable"] = str(remote_python_executable)
     acquisition = cast(dict[str, object], payload["acquisition"])
+    if config.acquisition.mode == "local_copy_from_existing_remote_source":
+        acquisition["source_snapshot"] = str(remote_destination)
     if hf_executable is not None:
         acquisition["hf_executable"] = str(hf_executable)
     lease = cast(dict[str, object], payload["lease_metadata"])
@@ -277,7 +298,7 @@ time.sleep(0.1)
 
 
 def write_fake_transport(
-    directory: Path, *, remote_host_name: str
+    directory: Path, *, remote_host_name: str, remote_hook: str | None = None
 ) -> tuple[Path, Path]:
     remote_python = write_executable(
         directory / "remote-python",
@@ -287,7 +308,17 @@ import sys
 socket.gethostname = lambda: {remote_host_name!r}
 if len(sys.argv) != 3 or sys.argv[1] != '-c':
     raise SystemExit(64)
-exec(sys.argv[2], {{'__name__': '__main__', '__file__': __file__}})
+loader = sys.argv[2]
+hook = {remote_hook!r}
+if hook is not None:
+    needle = 'raise SystemExit(module.remote_helper_main())'
+    if needle not in loader:
+        raise SystemExit(65)
+    loader = loader.replace(
+        needle,
+        'exec(' + repr(hook) + ',module.__dict__);' + needle,
+    )
+exec(loader, {{'__name__': '__main__', '__file__': __file__}})
 """,
     )
     ssh = write_executable(
@@ -306,10 +337,13 @@ os.execv(command[0], command)
 def write_snapshot(root: Path, *, model: ModelSpec | None = None) -> Path:
     selected_model = model or make_model()
     root.mkdir(parents=True)
+    (root / "chat_template.jinja").write_text("{{ messages }}\n", encoding="utf-8")
     (root / "config.json").write_text("{}\n", encoding="utf-8")
+    (root / "generation_config.json").write_text("{}\n", encoding="utf-8")
     (root / "model-00001-of-00002.safetensors").write_bytes(b"first")
     (root / "model-00002-of-00002.safetensors").write_bytes(b"second")
     (root / "tokenizer.json").write_text('{"tokenizer":true}\n', encoding="utf-8")
+    (root / "tokenizer_config.json").write_text("{}\n", encoding="utf-8")
     cache = root / ".cache" / "huggingface"
     cache.mkdir(parents=True)
     (cache / "metadata").write_text("cached\n", encoding="utf-8")
@@ -337,6 +371,81 @@ def write_snapshot(root: Path, *, model: ModelSpec | None = None) -> Path:
     return root
 
 
+def freeze_test_tree(root: Path) -> None:
+    for path in sorted(
+        root.rglob("*"), key=lambda value: len(value.parts), reverse=True
+    ):
+        os.chown(path, 0, 0, follow_symlinks=False)
+        path.chmod(0o555 if path.is_dir() else 0o444)
+    os.chown(root, 0, 0, follow_symlinks=False)
+    root.chmod(0o555)
+
+
+def assert_test_tree_is_frozen(root: Path) -> None:
+    for path in (root, *root.rglob("*")):
+        observed = path.lstat()
+        assert observed.st_uid == 0
+        assert observed.st_gid == 0
+        assert observed.st_mode & (stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH) == 0
+
+
+def write_model_contract(
+    path: Path, snapshot: Path, *, model: ModelSpec | None = None
+) -> ModelContractBinding:
+    selected_model = model or make_model()
+    roles = {
+        "chat_template.jinja": "chat_template",
+        "config.json": "config",
+        "generation_config.json": "generation_config",
+        "model.safetensors.index.json": "safetensors_index",
+        "tokenizer.json": "tokenizer",
+        "tokenizer_config.json": "tokenizer_config",
+        "model-00001-of-00002.safetensors": "weight_shard",
+        "model-00002-of-00002.safetensors": "weight_shard",
+    }
+    files: list[dict[str, object]] = []
+    for relative_path in sorted(roles):
+        contents = (snapshot / relative_path).read_bytes()
+        digest = hashlib.sha256(contents).hexdigest()
+        is_weight = roles[relative_path] == "weight_shard"
+        files.append(
+            {
+                "path": relative_path,
+                "role": roles[relative_path],
+                "size_bytes": len(contents),
+                "sha256": digest,
+                "huggingface_etag_algorithm": (
+                    "sha256" if is_weight else "git_blob_sha1"
+                ),
+                "huggingface_etag_digest": digest if is_weight else "1" * 40,
+            }
+        )
+    contract = {
+        "schema_version": 1,
+        "canonicalization": "exo-sglang-kt-model-contract-v1",
+        "model_id": selected_model.model_id,
+        "revision": selected_model.revision,
+        "weight_format": "safetensors",
+        "ktransformers_method": "BF16",
+        "full_indexer_layer_starts": [0],
+        "weight_map_entries": 2,
+        "index_metadata_total_size": selected_model.expected_indexed_bytes,
+        "physical_weight_bytes": sum(
+            cast(int, file["size_bytes"])
+            for file in files
+            if file["role"] == "weight_shard"
+        ),
+        "files": files,
+    }
+    raw_contract = (
+        json.dumps(contract, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode("ascii")
+    path.write_bytes(raw_contract)
+    return ModelContractBinding(
+        path=str(path), sha256=hashlib.sha256(raw_contract).hexdigest()
+    )
+
+
 def make_verification(marker: str = "same") -> SnapshotVerification:
     return SnapshotVerification(
         model_id=MODEL_ID,
@@ -359,7 +468,9 @@ class FakeEffects:
         self.local_existing = local_existing
         self.remote_existing = remote_existing
         self.verification = make_verification("a")
+        self.source_verification = self.verification
         self.remote_transfer_verification = self.verification
+        self.remote_reverification = remote_existing
         self.fragments: list[tuple[str, dict[str, object]]] = []
         self.calls: list[str] = []
         self.local_temporary: Path | None = None
@@ -391,6 +502,13 @@ class FakeEffects:
         del path, model, latch
         self.calls.append("inspect-local")
         return self.local_existing
+
+    def verify_source_snapshot(
+        self, path: Path, model: ModelSpec, latch: SignalLatch
+    ) -> SnapshotVerification:
+        del path, model, latch
+        self.calls.append("verify-source")
+        return self.source_verification
 
     def create_local_temporary(self, destination: Path, owned_name: str) -> Path:
         self.calls.append("create-local-temporary")
@@ -433,10 +551,16 @@ class FakeEffects:
         self.calls.append("verify-local")
         return self.verification
 
-    def install_local_snapshot(self, temporary_path: Path, destination: Path) -> None:
+    def install_local_snapshot(
+        self,
+        temporary_path: Path,
+        destination: Path,
+        record_publication: Callable[[], None],
+    ) -> None:
         del temporary_path, destination
         self.calls.append("install-local")
         self.local_temporary = None
+        record_publication()
 
     def cleanup_local_temporary(self, path: Path) -> bool:
         del path
@@ -458,6 +582,22 @@ class FakeEffects:
             raise self.remote_probe_error
         return ProcessOperationResult(
             verification=self.remote_existing,
+            cleanup_confirmed=self.remote_probe_cleanup,
+            installed=False,
+        )
+
+    def reverify_remote_destination(
+        self,
+        config: StageConfig,
+        owner_token: str,
+        register_process: Callable[[OwnedProcess], None],
+        latch: SignalLatch,
+    ) -> ProcessOperationResult:
+        del config, latch
+        self.calls.append("reverify-remote")
+        register_process(self._process(self.config.remote_host_name, owner_token))
+        return ProcessOperationResult(
+            verification=self.remote_reverification,
             cleanup_confirmed=self.remote_probe_cleanup,
             installed=False,
         )
@@ -520,6 +660,50 @@ def test_config_forbids_extra_fields(tmp_path: Path) -> None:
     payload = make_config(tmp_path).model_dump(mode="json")
     payload["surprise"] = True
     with pytest.raises(ValidationError, match="Extra inputs"):
+        StageConfig.model_validate_json(json.dumps(payload))
+
+
+@pytest.mark.parametrize(
+    ("source_snapshot", "expected_mode"),
+    [(None, "huggingface_cli"), ("source", "preverified_snapshot_copy")],
+)
+def test_schema_v1_legacy_acquisition_mode_is_deterministically_inferred(
+    tmp_path: Path,
+    source_snapshot: str | None,
+    expected_mode: AcquisitionMode,
+) -> None:
+    payload = make_config(
+        tmp_path,
+        source_snapshot=(
+            None if source_snapshot is None else tmp_path / source_snapshot
+        ),
+    ).model_dump(mode="json")
+    acquisition = cast(dict[str, object], payload["acquisition"])
+    del acquisition["mode"]
+
+    parsed = StageConfig.model_validate_json(json.dumps(payload))
+
+    assert parsed.schema_version == 1
+    assert parsed.acquisition.mode == expected_mode
+
+
+def test_schema_v1_rejects_ambiguous_contract_binding_without_mode(
+    tmp_path: Path,
+) -> None:
+    remote_source = tmp_path / "remote" / make_model().directory_name
+    payload = make_config(
+        tmp_path,
+        source_snapshot=remote_source,
+        acquisition_mode="local_copy_from_existing_remote_source",
+        source_model_contract=ModelContractBinding(
+            path=str(tmp_path / "contract.json"), sha256="a" * 64
+        ),
+        remote_destination=remote_source,
+    ).model_dump(mode="json")
+    acquisition = cast(dict[str, object], payload["acquisition"])
+    del acquisition["mode"]
+
+    with pytest.raises(ValidationError, match="mode is required"):
         StageConfig.model_validate_json(json.dumps(payload))
 
 
@@ -625,9 +809,9 @@ def test_destination_requires_exact_exo_revision_suffix(tmp_path: Path) -> None:
 def test_config_rejects_source_and_result_path_overlap(tmp_path: Path) -> None:
     config = make_config(tmp_path)
     payload = config.model_dump(mode="json")
-    cast(dict[str, object], payload["acquisition"])["source_snapshot"] = str(
-        Path(config.local_destination).parent
-    )
+    acquisition = cast(dict[str, object], payload["acquisition"])
+    acquisition["mode"] = "preverified_snapshot_copy"
+    acquisition["source_snapshot"] = str(Path(config.local_destination).parent)
     with pytest.raises(ValidationError, match="must not overlap"):
         StageConfig.model_validate_json(json.dumps(payload))
 
@@ -637,10 +821,47 @@ def test_config_rejects_source_and_result_path_overlap(tmp_path: Path) -> None:
         StageConfig.model_validate_json(json.dumps(payload))
 
     payload = config.model_dump(mode="json")
-    cast(dict[str, object], payload["acquisition"])["source_snapshot"] = str(
-        Path(config.result_directory)
-    )
+    acquisition = cast(dict[str, object], payload["acquisition"])
+    acquisition["mode"] = "preverified_snapshot_copy"
+    acquisition["source_snapshot"] = str(Path(config.result_directory))
     with pytest.raises(ValidationError, match="source snapshot must not overlap"):
+        StageConfig.model_validate_json(json.dumps(payload))
+
+
+def test_config_explicitly_admits_only_contract_bound_existing_remote_source(
+    tmp_path: Path,
+) -> None:
+    remote_source = tmp_path / "remote" / make_model().directory_name
+    binding = ModelContractBinding(
+        path=str(tmp_path / "contract.json"), sha256="a" * 64
+    )
+    config = make_config(
+        tmp_path,
+        source_snapshot=remote_source,
+        acquisition_mode="local_copy_from_existing_remote_source",
+        source_model_contract=binding,
+        remote_destination=remote_source,
+    )
+    assert config.acquisition.source_snapshot == config.remote_destination
+    assert config.acquisition.source_model_contract == binding
+
+    payload = config.model_dump(mode="json")
+    cast(dict[str, object], payload["acquisition"])["source_model_contract"] = None
+    with pytest.raises(ValidationError, match="requires a model contract"):
+        StageConfig.model_validate_json(json.dumps(payload))
+
+    payload = config.model_dump(mode="json")
+    payload["remote_destination"] = str(
+        tmp_path / "other" / make_model().directory_name
+    )
+    with pytest.raises(ValidationError, match="exactly equal remote_destination"):
+        StageConfig.model_validate_json(json.dumps(payload))
+
+    payload = config.model_dump(mode="json")
+    cast(dict[str, object], payload["acquisition"])["mode"] = (
+        "preverified_snapshot_copy"
+    )
+    with pytest.raises(ValidationError, match="only valid for an existing remote"):
         StageConfig.model_validate_json(json.dumps(payload))
 
 
@@ -723,11 +944,14 @@ def test_snapshot_verifier_hashes_every_regular_file(tmp_path: Path) -> None:
     assert set(result.manifest) == {
         ".cache/huggingface/metadata",
         ".exo-huggingface-revision.json",
+        "chat_template.jinja",
         "config.json",
+        "generation_config.json",
         "model-00001-of-00002.safetensors",
         "model-00002-of-00002.safetensors",
         "model.safetensors.index.json",
         "tokenizer.json",
+        "tokenizer_config.json",
     }
     assert all(len(digest) == 64 for digest in result.manifest.values())
 
@@ -808,6 +1032,157 @@ def test_snapshot_requires_exact_exo_receipt(
     )
     with pytest.raises(StageError, match="receipt"):
         verify_snapshot(snapshot, make_model())
+
+
+def test_contract_bound_snapshot_allows_no_receipt_and_rejects_contract_tampering(
+    tmp_path: Path,
+) -> None:
+    snapshot = write_snapshot(tmp_path / "snapshot")
+    (snapshot / ".exo-huggingface-revision.json").unlink()
+    contract_path = tmp_path / "contract.json"
+    binding = write_model_contract(contract_path, snapshot)
+    verified = verify_snapshot(snapshot, make_model(), source_model_contract=binding)
+    assert verified.model_contract_sha256 == binding.sha256
+    with pytest.raises(StageError, match="revision receipt"):
+        verify_snapshot(snapshot, make_model())
+
+    with pytest.raises(StageError, match="configured SHA-256"):
+        verify_snapshot(
+            snapshot,
+            make_model(),
+            source_model_contract=binding.model_copy(update={"sha256": "0" * 64}),
+        )
+
+    original_contract = cast(dict[str, object], json.loads(contract_path.read_bytes()))
+    wrong_revision = copy.deepcopy(original_contract)
+    wrong_revision["revision"] = "c" * 40
+    wrong_revision_bytes = (
+        json.dumps(wrong_revision, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode("ascii")
+    contract_path.write_bytes(wrong_revision_bytes)
+    wrong_revision_binding = ModelContractBinding(
+        path=str(contract_path),
+        sha256=hashlib.sha256(wrong_revision_bytes).hexdigest(),
+    )
+    with pytest.raises(StageError, match="identity differs"):
+        verify_snapshot(
+            snapshot,
+            make_model(),
+            source_model_contract=wrong_revision_binding,
+        )
+
+    wrong_file = copy.deepcopy(original_contract)
+    contract_files = cast(list[dict[str, object]], wrong_file["files"])
+    contract_files[0]["sha256"] = "f" * 64
+    wrong_file_bytes = (
+        json.dumps(wrong_file, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode("ascii")
+    contract_path.write_bytes(wrong_file_bytes)
+    wrong_file_binding = ModelContractBinding(
+        path=str(contract_path), sha256=hashlib.sha256(wrong_file_bytes).hexdigest()
+    )
+    with pytest.raises(StageError, match="differs from source model contract"):
+        verify_snapshot(
+            snapshot, make_model(), source_model_contract=wrong_file_binding
+        )
+
+
+@pytest.mark.parametrize("omitted_role", ["chat_template", "tokenizer"])
+def test_contract_requires_every_authoritative_singleton_runtime_file(
+    tmp_path: Path, omitted_role: str
+) -> None:
+    snapshot = write_snapshot(tmp_path / "snapshot")
+    (snapshot / ".exo-huggingface-revision.json").unlink()
+    contract_path = tmp_path / "contract.json"
+    write_model_contract(contract_path, snapshot)
+    contract = cast(dict[str, object], json.loads(contract_path.read_bytes()))
+    files = cast(list[dict[str, object]], contract["files"])
+    contract["files"] = [file for file in files if file["role"] != omitted_role]
+    raw_contract = (
+        json.dumps(contract, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode("ascii")
+    contract_path.write_bytes(raw_contract)
+    binding = ModelContractBinding(
+        path=str(contract_path), sha256=hashlib.sha256(raw_contract).hexdigest()
+    )
+
+    with pytest.raises(StageError, match="invalid schema"):
+        verify_snapshot(snapshot, make_model(), source_model_contract=binding)
+
+
+@pytest.mark.parametrize("filename", ["remote_model.py", "native_kernel.so"])
+def test_contract_bound_snapshot_rejects_uncontracted_executable_code(
+    tmp_path: Path, filename: str
+) -> None:
+    snapshot = write_snapshot(tmp_path / "snapshot")
+    (snapshot / ".exo-huggingface-revision.json").unlink()
+    binding = write_model_contract(tmp_path / "contract.json", snapshot)
+    (snapshot / filename).write_bytes(b"uncontracted")
+
+    with pytest.raises(StageError, match="uncontracted executable code"):
+        verify_snapshot(snapshot, make_model(), source_model_contract=binding)
+
+
+def test_contract_bound_snapshot_rejects_uncontracted_execute_mode(
+    tmp_path: Path,
+) -> None:
+    snapshot = write_snapshot(tmp_path / "snapshot")
+    (snapshot / ".exo-huggingface-revision.json").unlink()
+    binding = write_model_contract(tmp_path / "contract.json", snapshot)
+    uncontracted = snapshot / "launcher"
+    uncontracted.write_bytes(b"uncontracted")
+    uncontracted.chmod(0o755)
+
+    with pytest.raises(StageError, match="uncontracted executable code"):
+        verify_snapshot(snapshot, make_model(), source_model_contract=binding)
+
+
+def test_snapshot_rejects_nested_safetensors_shards(tmp_path: Path) -> None:
+    snapshot = write_snapshot(tmp_path / "snapshot")
+    nested = snapshot / "nested"
+    nested.mkdir()
+    (snapshot / "model-00001-of-00002.safetensors").rename(
+        nested / "model-00001-of-00002.safetensors"
+    )
+    index_path = snapshot / "model.safetensors.index.json"
+    index = read_json_object(index_path)
+    cast(dict[str, object], index["weight_map"])["a"] = (
+        "nested/model-00001-of-00002.safetensors"
+    )
+    index_path.write_text(json.dumps(index), encoding="utf-8")
+
+    with pytest.raises(StageError, match="nested shard"):
+        verify_snapshot(snapshot, make_model())
+
+
+def test_model_contract_read_is_bounded_by_descriptor_size_before_parsing(
+    tmp_path: Path,
+) -> None:
+    snapshot = write_snapshot(tmp_path / "snapshot")
+    contract_path = tmp_path / "oversized-contract.json"
+    with contract_path.open("wb") as output:
+        output.truncate(model_stage._MAX_MODEL_CONTRACT_BYTES + 1)
+    binding = ModelContractBinding(path=str(contract_path), sha256="a" * 64)
+
+    with pytest.raises(StageError, match="exceeds the size limit"):
+        verify_snapshot(snapshot, make_model(), source_model_contract=binding)
+
+
+def test_model_contract_requires_canonical_bytes_even_with_matching_digest(
+    tmp_path: Path,
+) -> None:
+    snapshot = write_snapshot(tmp_path / "snapshot")
+    contract_path = tmp_path / "contract.json"
+    write_model_contract(contract_path, snapshot)
+    parsed = cast(dict[str, object], json.loads(contract_path.read_bytes()))
+    noncanonical = json.dumps(parsed, indent=2, sort_keys=True).encode("ascii")
+    contract_path.write_bytes(noncanonical)
+    binding = ModelContractBinding(
+        path=str(contract_path), sha256=hashlib.sha256(noncanonical).hexdigest()
+    )
+
+    with pytest.raises(StageError, match="not canonical JSON"):
+        verify_snapshot(snapshot, make_model(), source_model_contract=binding)
 
 
 def test_system_effects_copy_only_accepts_preverified_source(tmp_path: Path) -> None:
@@ -981,7 +1356,231 @@ def test_real_fake_ssh_transfer_drains_large_remote_receipt_concurrently(
     assert transfer.installed
     assert transfer.verification == local_verification
     assert verify_snapshot(remote_destination, config.model) == local_verification
+    assert_test_tree_is_frozen(remote_destination)
     assert [process.host_name for process in processes] == ["fwuff", "fwuff"]
+
+
+def test_real_fake_ssh_shared_remote_source_copies_only_to_local_destination(
+    tmp_path: Path,
+) -> None:
+    ssh, remote_python = write_fake_transport(tmp_path, remote_host_name="fwuff")
+    model = make_model()
+    remote_source = write_snapshot(tmp_path / "remote" / model.directory_name)
+    (remote_source / ".exo-huggingface-revision.json").unlink()
+    binding = write_model_contract(tmp_path / "model-contract.json", remote_source)
+    freeze_test_tree(remote_source)
+    result_directory = tmp_path / "results"
+    result_directory.mkdir()
+    config = make_config(
+        tmp_path,
+        source_snapshot=remote_source,
+        acquisition_mode="local_copy_from_existing_remote_source",
+        source_model_contract=binding,
+        remote_destination=remote_source,
+        result_directory=result_directory,
+    )
+    config = remap_runtime_config(
+        config,
+        local_host_name="dwagon",
+        remote_host_name="fwuff",
+        remote_destination=remote_source,
+        ssh_executable=ssh,
+        remote_python_executable=remote_python,
+    )
+    Path(config.local_destination).parent.mkdir(parents=True)
+    effects = make_system_effects(config)
+
+    result = run_staging(config, effects, owner_token_factory=lambda: "token")
+
+    assert result["status"] == "completed", result["error"]
+    assert result["local_installed"] is True
+    assert result["remote_preexisting"] is True
+    assert result["remote_installed"] is False
+    assert_test_tree_is_frozen(Path(config.local_destination))
+    source_verification = verify_snapshot(
+        remote_source, model, source_model_contract=binding
+    )
+    assert (
+        verify_snapshot(
+            Path(config.local_destination), model, source_model_contract=binding
+        )
+        == source_verification
+    )
+    assert (result_directory / "model-stage-remote-probe.log").is_file()
+    assert (result_directory / "model-stage-remote-reverify.log").is_file()
+    assert not (result_directory / "model-stage-remote-transfer.log").exists()
+
+
+@pytest.mark.parametrize("mutable_entry", ["root", "directory", "file"])
+@pytest.mark.parametrize("remote_operation", ["probe", "reverify"])
+def test_fake_ssh_shared_source_and_remote_reject_writable_tree(
+    tmp_path: Path, mutable_entry: str, remote_operation: str
+) -> None:
+    ssh, remote_python = write_fake_transport(tmp_path, remote_host_name="fwuff")
+    model = make_model()
+    remote_source = write_snapshot(tmp_path / "remote" / model.directory_name)
+    (remote_source / ".exo-huggingface-revision.json").unlink()
+    binding = write_model_contract(tmp_path / "model-contract.json", remote_source)
+    freeze_test_tree(remote_source)
+    mutable_path = {
+        "root": remote_source,
+        "directory": remote_source / ".cache",
+        "file": remote_source / "config.json",
+    }[mutable_entry]
+    mutable_path.chmod(0o755 if mutable_path.is_dir() else 0o644)
+    result_directory = tmp_path / "results"
+    result_directory.mkdir()
+    config = make_config(
+        tmp_path,
+        source_snapshot=remote_source,
+        acquisition_mode="local_copy_from_existing_remote_source",
+        source_model_contract=binding,
+        remote_destination=remote_source,
+        result_directory=result_directory,
+    )
+    config = remap_runtime_config(
+        config,
+        local_host_name="dwagon",
+        remote_host_name="fwuff",
+        remote_destination=remote_source,
+        ssh_executable=ssh,
+        remote_python_executable=remote_python,
+    )
+    effects = make_system_effects(config)
+
+    with pytest.raises(StageError, match="shared source snapshot is writable"):
+        effects.verify_source_snapshot(remote_source, model, SignalLatch())
+    remote_verifier = (
+        effects.probe_remote_destination
+        if remote_operation == "probe"
+        else effects.reverify_remote_destination
+    )
+    with pytest.raises(OperationError, match="existing remote destination is writable"):
+        remote_verifier(config, "owner-token", lambda _process: None, SignalLatch())
+
+
+@pytest.mark.parametrize("mutation", ["mode", "path_replacement"])
+@pytest.mark.parametrize("remote_operation", ["probe", "reverify"])
+def test_fake_ssh_remote_verification_rejects_mutation_after_retained_scan(
+    tmp_path: Path, mutation: str, remote_operation: str
+) -> None:
+    if mutation == "mode":
+        remote_hook = """
+_original_read_retained_relative_file = _read_retained_relative_file
+_injected_once = False
+def _injected_read_retained_relative_file(tree, relative_path):
+    global _injected_once
+    contents = _original_read_retained_relative_file(tree, relative_path)
+    if not _injected_once:
+        _injected_once = True
+        os.chmod(tree.directory.path, 0o755)
+    return contents
+_read_retained_relative_file = _injected_read_retained_relative_file
+"""
+    else:
+        remote_hook = """
+_original_read_retained_relative_file = _read_retained_relative_file
+_injected_once = False
+def _injected_read_retained_relative_file(tree, relative_path):
+    global _injected_once
+    contents = _original_read_retained_relative_file(tree, relative_path)
+    if not _injected_once:
+        _injected_once = True
+        target = tree.directory.path / 'config.json'
+        replacement_contents = target.read_bytes()
+        target.rename(tree.directory.path / 'config.original')
+        target.write_bytes(replacement_contents)
+        target.chmod(0o444)
+    return contents
+_read_retained_relative_file = _injected_read_retained_relative_file
+"""
+    ssh, remote_python = write_fake_transport(
+        tmp_path, remote_host_name="fwuff", remote_hook=remote_hook
+    )
+    model = make_model()
+    remote_source = write_snapshot(tmp_path / "remote" / model.directory_name)
+    (remote_source / ".exo-huggingface-revision.json").unlink()
+    binding = write_model_contract(tmp_path / "model-contract.json", remote_source)
+    freeze_test_tree(remote_source)
+    result_directory = tmp_path / "results"
+    result_directory.mkdir()
+    config = make_config(
+        tmp_path,
+        source_snapshot=remote_source,
+        acquisition_mode="local_copy_from_existing_remote_source",
+        source_model_contract=binding,
+        remote_destination=remote_source,
+        result_directory=result_directory,
+    )
+    config = remap_runtime_config(
+        config,
+        local_host_name="dwagon",
+        remote_host_name="fwuff",
+        remote_destination=remote_source,
+        ssh_executable=ssh,
+        remote_python_executable=remote_python,
+    )
+
+    effects = make_system_effects(config)
+    remote_verifier = (
+        effects.probe_remote_destination
+        if remote_operation == "probe"
+        else effects.reverify_remote_destination
+    )
+    with pytest.raises(OperationError, match="existing remote destination"):
+        remote_verifier(config, "owner-token", lambda _process: None, SignalLatch())
+
+
+def test_remote_probe_uses_embedded_contract_bytes_not_a_local_contract_path(
+    tmp_path: Path,
+) -> None:
+    ssh, remote_python = write_fake_transport(tmp_path, remote_host_name="fwuff")
+    model = make_model()
+    remote_source = write_snapshot(
+        tmp_path / "simulated-fwuff-filesystem" / model.directory_name
+    )
+    (remote_source / ".exo-huggingface-revision.json").unlink()
+    local_contract_directory = tmp_path / "dwagon-only-contract-filesystem"
+    local_contract_directory.mkdir()
+    contract_path = local_contract_directory / "model-contract.json"
+    binding = write_model_contract(contract_path, remote_source)
+    freeze_test_tree(remote_source)
+    result_directory = tmp_path / "results"
+    result_directory.mkdir()
+    config = make_config(
+        tmp_path,
+        source_snapshot=remote_source,
+        acquisition_mode="local_copy_from_existing_remote_source",
+        source_model_contract=binding,
+        remote_destination=remote_source,
+        result_directory=result_directory,
+    )
+    config = remap_runtime_config(
+        config,
+        local_host_name="dwagon",
+        remote_host_name="fwuff",
+        remote_destination=remote_source,
+        ssh_executable=ssh,
+        remote_python_executable=remote_python,
+    )
+    effects = make_system_effects(config)
+    request = effects._remote_request(config, "owner-token", "probe")
+    serialized_request = request.model_dump_json()
+    assert str(contract_path) not in serialized_request
+    assert request.source_model_contract is not None
+    contract_path.unlink()
+
+    result = effects._run_remote(
+        config,
+        request,
+        config.timeouts.remote_probe_seconds,
+        lambda _process: None,
+        SignalLatch(),
+    )
+
+    assert result.cleanup_confirmed is True
+    assert result.verification is not None
+    assert result.verification.model_contract_sha256 == binding.sha256
 
 
 def test_remote_identity_partial_line_obeys_timeout(tmp_path: Path) -> None:
@@ -1042,6 +1641,7 @@ def test_existing_nonempty_destination_is_verified_without_overwrite(
     result_directory.mkdir()
     config = make_config(tmp_path, result_directory=result_directory)
     snapshot = write_snapshot(Path(config.local_destination))
+    freeze_test_tree(snapshot)
     effects = make_system_effects(config)
     assert effects.inspect_local_destination(
         snapshot, config.model, SignalLatch()
@@ -1054,9 +1654,24 @@ def test_existing_empty_destination_is_never_replaced(tmp_path: Path) -> None:
     config = make_config(tmp_path, result_directory=result_directory)
     destination = Path(config.local_destination)
     destination.mkdir(parents=True)
+    freeze_test_tree(destination)
     effects = make_system_effects(config)
     with pytest.raises(StageError, match="pre-existing empty"):
         effects.inspect_local_destination(destination, config.model, SignalLatch())
+
+
+def test_existing_writable_local_destination_is_rejected(tmp_path: Path) -> None:
+    result_directory = tmp_path / "results"
+    result_directory.mkdir()
+    config = make_config(tmp_path, result_directory=result_directory)
+    destination = write_snapshot(Path(config.local_destination))
+    freeze_test_tree(destination)
+    (destination / "config.json").chmod(0o644)
+
+    with pytest.raises(StageError, match="existing local destination is writable"):
+        make_system_effects(config).inspect_local_destination(
+            destination, config.model, SignalLatch()
+        )
 
 
 def test_owned_temp_creation_refuses_collision_and_cleanup_refuses_foreign_path(
@@ -1122,6 +1737,78 @@ def test_owned_temp_open_failure_never_claims_failed_cleanup(
     assert raised.value.cleanup_confirmed is False
     assert (destination.parent / name).is_dir()
     (destination.parent / name).rmdir()
+
+
+def test_atomic_rename_records_publication_before_pending_signal_is_delivered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    source.mkdir()
+    parent_descriptor = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    publication_recorded = False
+    handler_observed_publication = False
+    previous_handler = signal.getsignal(signal.SIGTERM)
+    previous_mask = signal.pthread_sigmask(signal.SIG_UNBLOCK, (signal.SIGTERM,))
+
+    def record_publication() -> None:
+        nonlocal publication_recorded
+        publication_recorded = True
+
+    def handle_signal(signal_number: int, _frame: object) -> None:
+        nonlocal handler_observed_publication
+        handler_observed_publication = publication_recorded
+        raise model_stage.ManagedSignalError(signal_number)
+
+    def rename_and_signal(
+        source_descriptor: int,
+        source_name: bytes,
+        destination_descriptor: int,
+        destination_name: bytes,
+        flags: int,
+    ) -> int:
+        assert flags == 1
+        os.rename(
+            source_name,
+            destination_name,
+            src_dir_fd=source_descriptor,
+            dst_dir_fd=destination_descriptor,
+        )
+        os.kill(os.getpid(), signal.SIGTERM)
+        return 0
+
+    class FakeLibrary:
+        def __init__(self) -> None:
+            self.renameat2 = rename_and_signal
+
+    try:
+        signal.signal(signal.SIGTERM, handle_signal)
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                model_stage.ctypes,
+                "CDLL",
+                lambda *_arguments, **_keywords: FakeLibrary(),
+            )
+            with pytest.raises(model_stage.ManagedSignalError, match="managed signal"):
+                model_stage._rename_entry_noreplace_at(
+                    parent_descriptor,
+                    source.name,
+                    destination.name,
+                    record_publication,
+                )
+    finally:
+        try:
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+        except model_stage.ManagedSignalError:
+            pass
+        finally:
+            signal.signal(signal.SIGTERM, previous_handler)
+            os.close(parent_descriptor)
+
+    assert publication_recorded is True
+    assert handler_observed_publication is True
+    assert not source.exists()
+    assert destination.is_dir()
 
 
 def test_cleanup_quarantine_preserves_a_foreign_root_replacement(
@@ -1402,9 +2089,46 @@ def test_no_replace_install_refuses_destination_that_appears(tmp_path: Path) -> 
     destination.mkdir()
     (destination / "foreign").write_text("foreign", encoding="utf-8")
     with pytest.raises(StageError, match="destination appeared"):
-        effects.install_local_snapshot(temporary, destination)
+        effects.install_local_snapshot(temporary, destination, lambda: None)
     assert (destination / "foreign").read_text(encoding="utf-8") == "foreign"
     assert (temporary / "config.json").read_text(encoding="utf-8") == "{}\n"
+
+
+def test_install_validates_modes_through_retained_descriptors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result_directory = tmp_path / "results"
+    result_directory.mkdir()
+    config = make_config(tmp_path, result_directory=result_directory)
+    destination = Path(config.local_destination)
+    destination.parent.mkdir()
+    effects = make_system_effects(config)
+    temporary = effects.create_local_temporary(destination, "owned.stage")
+    source = write_snapshot(tmp_path / "source")
+    effects.copy_preverified_snapshot(source, temporary, config.model, SignalLatch())
+    effects.write_revision_receipt(temporary, config.model)
+    real_fchmod = os.fchmod
+    skipped_regular = False
+
+    def skip_one_regular_mode(descriptor: int, mode: int) -> None:
+        nonlocal skipped_regular
+        if mode == 0o444 and not skipped_regular:
+            skipped_regular = True
+            return
+        real_fchmod(descriptor, mode)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(model_stage.os, "fchmod", skip_one_regular_mode)
+        with pytest.raises(StageError, match="identity or mode validation failed"):
+            effects.install_local_snapshot(temporary, destination, lambda: None)
+
+    assert skipped_regular is True
+    assert destination.exists() is False
+    assert any(
+        path.stat().st_mode & (stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH)
+        for path in temporary.rglob("*")
+        if path.is_file()
+    )
 
 
 def test_install_retains_nested_journal_until_post_rename_verification(
@@ -1420,7 +2144,8 @@ def test_install_retains_nested_journal_until_post_rename_verification(
     source = write_snapshot(tmp_path / "source")
     effects.copy_preverified_snapshot(source, temporary, config.model, SignalLatch())
     effects.write_revision_receipt(temporary, config.model)
-    effects.install_local_snapshot(temporary, destination)
+    effects.install_local_snapshot(temporary, destination, lambda: None)
+    assert_test_tree_is_frozen(destination)
     moved = destination.parent / "moved-installed-cache"
     (destination / ".cache").rename(moved)
     (destination / ".cache").mkdir()
@@ -1434,6 +2159,285 @@ def test_install_retains_nested_journal_until_post_rename_verification(
     )
     assert (moved / "huggingface" / "metadata").read_text(encoding="utf-8") == (
         "cached\n"
+    )
+
+
+def test_run_staging_records_local_install_after_post_rename_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = write_snapshot(tmp_path / "source")
+    result_directory = tmp_path / "results"
+    config = make_config(
+        tmp_path,
+        source_snapshot=source,
+        result_directory=result_directory,
+    )
+    destination = Path(config.local_destination)
+    destination.parent.mkdir()
+    effects = make_system_effects(config)
+    validate_frozen_owned_tree = model_stage._validate_frozen_owned_tree
+
+    def fail_only_after_publication(directory: model_stage.OwnedDirectory) -> bool:
+        if directory.path == destination:
+            return False
+        return validate_frozen_owned_tree(directory)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            model_stage,
+            "_validate_frozen_owned_tree",
+            fail_only_after_publication,
+        )
+        result = run_staging(
+            config, effects, owner_token_factory=lambda: "post-rename-local"
+        )
+
+    assert result["status"] == "staging_failed"
+    assert result["cleanup_succeeded"] is True
+    assert result["reportable"] is False
+    assert result["local_installed"] is True
+    assert result["remote_installed"] is False
+    assert "durably frozen" in cast(str, result["error"])
+    assert destination.is_dir()
+    assert_test_tree_is_frozen(destination)
+    assert not any(
+        path.name.endswith(".stage") for path in destination.parent.iterdir()
+    )
+
+
+def test_run_staging_records_local_install_when_parent_fsync_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = write_snapshot(tmp_path / "source")
+    result_directory = tmp_path / "results"
+    config = make_config(
+        tmp_path,
+        source_snapshot=source,
+        result_directory=result_directory,
+    )
+    destination = Path(config.local_destination)
+    destination.parent.mkdir()
+    effects = make_system_effects(config)
+    parent_status = destination.parent.stat()
+    real_fsync = os.fsync
+    failed_parent_fsync = False
+
+    def fail_first_post_publication_parent_fsync(descriptor: int) -> None:
+        nonlocal failed_parent_fsync
+        observed = os.fstat(descriptor)
+        if (
+            not failed_parent_fsync
+            and destination.is_dir()
+            and (observed.st_dev, observed.st_ino)
+            == (parent_status.st_dev, parent_status.st_ino)
+        ):
+            failed_parent_fsync = True
+            raise OSError(errno.EIO, "injected parent fsync failure")
+        real_fsync(descriptor)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(model_stage.os, "fsync", fail_first_post_publication_parent_fsync)
+        result = run_staging(
+            config, effects, owner_token_factory=lambda: "parent-fsync-local"
+        )
+
+    assert failed_parent_fsync is True
+    assert result["status"] == "staging_failed"
+    assert result["cleanup_succeeded"] is True
+    assert result["reportable"] is False
+    assert result["local_installed"] is True
+    assert result["remote_installed"] is False
+    assert "injected parent fsync failure" in cast(str, result["error"])
+    assert destination.is_dir()
+    assert_test_tree_is_frozen(destination)
+    assert not any(
+        path.name.endswith(".stage") for path in destination.parent.iterdir()
+    )
+
+
+def test_run_staging_records_remote_install_from_failed_post_rename_receipt(
+    tmp_path: Path,
+) -> None:
+    remote_hook = """
+_original_validate_frozen_owned_tree = _validate_frozen_owned_tree
+def _fail_only_after_publication(directory):
+    if not directory.path.name.endswith('.stage'):
+        return False
+    return _original_validate_frozen_owned_tree(directory)
+_validate_frozen_owned_tree = _fail_only_after_publication
+"""
+    ssh, remote_python = write_fake_transport(
+        tmp_path, remote_host_name="fwuff", remote_hook=remote_hook
+    )
+    source = write_snapshot(tmp_path / "source")
+    remote_destination = tmp_path / "remote" / make_model().directory_name
+    remote_destination.parent.mkdir()
+    result_directory = tmp_path / "results"
+    config = make_config(
+        tmp_path,
+        source_snapshot=source,
+        remote_destination=remote_destination,
+        result_directory=result_directory,
+    )
+    config = remap_runtime_config(
+        config,
+        local_host_name="dwagon",
+        remote_host_name="fwuff",
+        remote_destination=remote_destination,
+        ssh_executable=ssh,
+        remote_python_executable=remote_python,
+    )
+    local_destination = Path(config.local_destination)
+    local_destination.parent.mkdir()
+    effects = make_system_effects(config)
+
+    result = run_staging(
+        config, effects, owner_token_factory=lambda: "post-rename-remote"
+    )
+
+    assert result["status"] == "staging_failed"
+    assert result["cleanup_succeeded"] is True
+    assert result["reportable"] is False
+    assert result["local_installed"] is True
+    assert result["remote_installed"] is True
+    assert "installed remote model tree is not durably frozen" in cast(
+        str, result["error"]
+    )
+    assert remote_destination.is_dir()
+    assert_test_tree_is_frozen(remote_destination)
+    assert verify_snapshot(remote_destination, config.model) == verify_snapshot(
+        local_destination, config.model
+    )
+    assert not any(
+        path.name.endswith(".stage") for path in remote_destination.parent.iterdir()
+    )
+
+
+def test_run_staging_records_remote_install_when_parent_fsync_fails(
+    tmp_path: Path,
+) -> None:
+    source = write_snapshot(tmp_path / "source")
+    remote_destination = tmp_path / "remote" / make_model().directory_name
+    remote_destination.parent.mkdir()
+    remote_hook = f"""
+_original_fsync = os.fsync
+_destination = Path({str(remote_destination)!r})
+_parent_fsync_failed = False
+def _fail_first_post_publication_parent_fsync(descriptor):
+    global _parent_fsync_failed
+    observed = os.fstat(descriptor)
+    parent = os.stat(_destination.parent)
+    if (
+        not _parent_fsync_failed
+        and _destination.is_dir()
+        and (observed.st_dev, observed.st_ino) == (parent.st_dev, parent.st_ino)
+    ):
+        _parent_fsync_failed = True
+        raise OSError(errno.EIO, 'injected remote parent fsync failure')
+    _original_fsync(descriptor)
+os.fsync = _fail_first_post_publication_parent_fsync
+"""
+    ssh, remote_python = write_fake_transport(
+        tmp_path, remote_host_name="fwuff", remote_hook=remote_hook
+    )
+    result_directory = tmp_path / "results"
+    config = make_config(
+        tmp_path,
+        source_snapshot=source,
+        remote_destination=remote_destination,
+        result_directory=result_directory,
+    )
+    config = remap_runtime_config(
+        config,
+        local_host_name="dwagon",
+        remote_host_name="fwuff",
+        remote_destination=remote_destination,
+        ssh_executable=ssh,
+        remote_python_executable=remote_python,
+    )
+    local_destination = Path(config.local_destination)
+    local_destination.parent.mkdir()
+    effects = make_system_effects(config)
+
+    result = run_staging(
+        config, effects, owner_token_factory=lambda: "parent-fsync-remote"
+    )
+
+    assert result["status"] == "staging_failed"
+    assert result["cleanup_succeeded"] is True
+    assert result["reportable"] is False
+    assert result["local_installed"] is True
+    assert result["remote_installed"] is True
+    assert "injected remote parent fsync failure" in cast(str, result["error"])
+    assert remote_destination.is_dir()
+    assert_test_tree_is_frozen(remote_destination)
+    assert verify_snapshot(remote_destination, config.model) == verify_snapshot(
+        local_destination, config.model
+    )
+    assert not any(
+        path.name.endswith(".stage") for path in remote_destination.parent.iterdir()
+    )
+
+
+def test_run_staging_records_remote_install_when_signal_follows_rename(
+    tmp_path: Path,
+) -> None:
+    source = write_snapshot(tmp_path / "source")
+    remote_destination = tmp_path / "remote" / make_model().directory_name
+    remote_destination.parent.mkdir()
+    remote_hook = """
+_original_cdll = ctypes.CDLL
+class _SignalAfterRenameLibrary:
+    def __init__(self, *arguments, **keywords):
+        self._library = _original_cdll(*arguments, **keywords)
+    def __getattr__(self, name):
+        return getattr(self._library, name)
+    def renameat2(self, *arguments):
+        result = self._library.renameat2(*arguments)
+        if result == 0:
+            os.kill(os.getpid(), signal.SIGTERM)
+        return result
+ctypes.CDLL = _SignalAfterRenameLibrary
+"""
+    ssh, remote_python = write_fake_transport(
+        tmp_path, remote_host_name="fwuff", remote_hook=remote_hook
+    )
+    result_directory = tmp_path / "results"
+    config = make_config(
+        tmp_path,
+        source_snapshot=source,
+        remote_destination=remote_destination,
+        result_directory=result_directory,
+    )
+    config = remap_runtime_config(
+        config,
+        local_host_name="dwagon",
+        remote_host_name="fwuff",
+        remote_destination=remote_destination,
+        ssh_executable=ssh,
+        remote_python_executable=remote_python,
+    )
+    local_destination = Path(config.local_destination)
+    local_destination.parent.mkdir()
+    effects = make_system_effects(config)
+
+    result = run_staging(
+        config, effects, owner_token_factory=lambda: "rename-signal-remote"
+    )
+
+    assert result["status"] == "staging_failed"
+    assert result["cleanup_succeeded"] is True
+    assert result["reportable"] is False
+    assert result["local_installed"] is True
+    assert result["remote_installed"] is True
+    assert "received managed signal" in cast(str, result["error"])
+    assert remote_destination.is_dir()
+    assert_test_tree_is_frozen(remote_destination)
+    assert verify_snapshot(remote_destination, config.model) == verify_snapshot(
+        local_destination, config.model
+    )
+    assert not any(
+        path.name.endswith(".stage") for path in remote_destination.parent.iterdir()
     )
 
 
@@ -1489,6 +2493,88 @@ def test_run_staging_uses_preverified_source_instead_of_hf(tmp_path: Path) -> No
     assert result["acquisition"] == "preverified_snapshot_copy"
     assert "copy-source" in effects.calls
     assert "download" not in effects.calls
+
+
+def make_shared_remote_source_config(tmp_path: Path) -> StageConfig:
+    remote_source = tmp_path / "remote" / make_model().directory_name
+    return make_config(
+        tmp_path,
+        source_snapshot=remote_source,
+        acquisition_mode="local_copy_from_existing_remote_source",
+        source_model_contract=ModelContractBinding(
+            path=str(tmp_path / "model-contract.json"), sha256="a" * 64
+        ),
+        remote_destination=remote_source,
+    )
+
+
+def test_shared_remote_source_is_probed_copied_and_reverified_without_transfer(
+    tmp_path: Path,
+) -> None:
+    config = make_shared_remote_source_config(tmp_path)
+    verification = make_verification("a")
+    effects = FakeEffects(config, remote_existing=verification)
+    effects.remote_reverification = verification
+    result = run_staging(config, effects, owner_token_factory=lambda: "token")
+
+    assert result["status"] == "completed"
+    assert result["acquisition"] == "local_copy_from_existing_remote_source"
+    assert result["local_installed"] is True
+    assert result["remote_preexisting"] is True
+    assert result["remote_installed"] is False
+    assert result["source_verification"] == verification.model_dump(mode="json")
+    assert effects.calls == [
+        "verify-source",
+        "probe-remote",
+        "inspect-local",
+        "create-local-temporary",
+        "copy-source",
+        "verify-local",
+        "install-local",
+        "verify-local",
+        "reverify-remote",
+    ]
+    assert "transfer-remote" not in effects.calls
+
+
+@pytest.mark.parametrize("failure", ["missing", "initial_mismatch", "changed"])
+def test_shared_remote_source_fails_closed_without_remote_transfer(
+    tmp_path: Path, failure: str
+) -> None:
+    config = make_shared_remote_source_config(tmp_path)
+    initial = None if failure == "missing" else make_verification("a")
+    if failure == "initial_mismatch":
+        initial = make_verification("b")
+    effects = FakeEffects(config, remote_existing=initial)
+    effects.remote_reverification = (
+        make_verification("c") if failure == "changed" else make_verification("a")
+    )
+    result = run_staging(config, effects)
+
+    assert result["status"] == "staging_failed"
+    assert result["cleanup_succeeded"] is True
+    assert result["reportable"] is False
+    assert result["remote_installed"] is False
+    assert result["remote_preexisting"] is (failure != "missing")
+    assert "transfer-remote" not in effects.calls
+    if failure != "changed":
+        assert "create-local-temporary" not in effects.calls
+
+
+def test_remote_preexisting_is_unknown_when_failure_precedes_remote_observation(
+    tmp_path: Path,
+) -> None:
+    config = make_config(tmp_path)
+    effects = FakeEffects(config)
+    effects.download_error = OperationError(
+        "injected acquisition failure", cleanup_confirmed=True
+    )
+
+    result = run_staging(config, effects)
+
+    assert result["status"] == "staging_failed"
+    assert result["remote_preexisting"] is None
+    assert "probe-remote" not in effects.calls
 
 
 def test_run_staging_preserves_matching_existing_destinations(tmp_path: Path) -> None:
@@ -1911,6 +2997,14 @@ def test_remote_request_requires_owned_sibling_temporary(tmp_path: Path) -> None
         model=config.model,
     )
     assert valid.operation == "receive"
+
+
+def test_transported_model_contract_is_hash_bound() -> None:
+    with pytest.raises(ValidationError, match="differs from its bytes"):
+        model_stage.TransportedModelContract(
+            canonical_bytes_base64="e30K",
+            sha256="a" * 64,
+        )
 
 
 def test_remote_helper_reports_unconfirmed_early_temp_cleanup(
