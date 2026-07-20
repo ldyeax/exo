@@ -78,6 +78,11 @@ def _identity() -> SglangKtWarmServingRunIdentity:
             sha256="e" * 64,
         ),
         SglangKtServingSourceFileIdentity(
+            relative_path="src/exo/__init__.py",
+            size_bytes=0,
+            sha256="0" * 64,
+        ),
+        SglangKtServingSourceFileIdentity(
             relative_path=SGLANG_KT_SERVING_RECEIPT_RELATIVE_PATH,
             size_bytes=222,
             sha256="f" * 64,

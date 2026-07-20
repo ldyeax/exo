@@ -10,6 +10,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    NonNegativeInt,
     PositiveInt,
     StringConstraints,
     ValidationError,
@@ -360,7 +361,7 @@ class SglangKtServingClientIdentity(_StrictModel):
 @final
 class SglangKtServingSourceFileIdentity(_StrictModel):
     relative_path: NonemptyText
-    size_bytes: PositiveInt
+    size_bytes: NonNegativeInt
     sha256: Sha256Digest
 
     @field_validator("relative_path")
