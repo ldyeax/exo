@@ -80,7 +80,8 @@ DWAGON_PHYSICAL_CPUS: Final = tuple(range(112))
 DWAGON_NUMA_NODES: Final = (0, 1)
 DWAGON_CPU_INFER_THREADS: Final = 112
 DWAGON_THREADPOOL_COUNT: Final = 2
-GLOBAL_RESIDENT_GPU_EXPERTS: Final = 40
+DEFAULT_RESIDENT_GPU_EXPERTS: Final = 40
+MAXIMUM_RESIDENT_GPU_EXPERTS: Final = 44
 DEFAULT_DWAGON_IP: Final = "192.168.40.24"
 DEFAULT_DISTRIBUTED_PORT: Final = 62600
 DEFAULT_SERVICE_PORT: Final = 62610
@@ -163,6 +164,7 @@ class Tp2LocalDiagnosticConfig:
     distributed_port: int
     service_port: int
     static_memory_fraction: float
+    resident_gpu_experts: int
     readiness_timeout_seconds: float
     request_timeout_seconds: float
     cleanup_timeout_seconds: float
@@ -190,7 +192,7 @@ class Tp2LocalProcessSpec:
     memory_nodes: tuple[int, int] = DWAGON_NUMA_NODES
     cpu_infer_threads: int = DWAGON_CPU_INFER_THREADS
     threadpool_count: int = DWAGON_THREADPOOL_COUNT
-    resident_gpu_experts: int = GLOBAL_RESIDENT_GPU_EXPERTS
+    resident_gpu_experts: int = DEFAULT_RESIDENT_GPU_EXPERTS
 
     def __post_init__(self) -> None:
         exact_topology = (
@@ -205,7 +207,6 @@ class Tp2LocalProcessSpec:
             and self.memory_nodes == DWAGON_NUMA_NODES
             and self.cpu_infer_threads == DWAGON_CPU_INFER_THREADS
             and self.threadpool_count == DWAGON_THREADPOOL_COUNT
-            and self.resident_gpu_experts == GLOBAL_RESIDENT_GPU_EXPERTS
         )
         if not exact_topology:
             raise ValueError("TP2 process spec differs from the pinned dwagon topology")
@@ -215,6 +216,11 @@ class Tp2LocalProcessSpec:
             raise ValueError("TP2 runtime executable must be an absolute path")
         if not 0.8 <= self.static_memory_fraction <= 0.95:
             raise ValueError("TP2 static memory fraction must be between 0.8 and 0.95")
+        if not 1 <= self.resident_gpu_experts <= MAXIMUM_RESIDENT_GPU_EXPERTS:
+            raise ValueError(
+                "TP2 resident GPU experts must be between 1 and "
+                f"{MAXIMUM_RESIDENT_GPU_EXPERTS}"
+            )
         if self.service_endpoint == self.distributed_coordinator:
             raise ValueError("TP2 service and distributed endpoints must be distinct")
 
@@ -405,6 +411,7 @@ def build_tp2_local_process_spec(
             port=config.distributed_port,
         ),
         static_memory_fraction=config.static_memory_fraction,
+        resident_gpu_experts=config.resident_gpu_experts,
     )
 
 
@@ -427,7 +434,7 @@ def validate_tp2_server_info(
         "kt_cpuinfer": 112,
         "kt_threadpool_count": 2,
         "kt_numa_nodes": [0, 1],
-        "kt_num_gpu_experts": 40,
+        "kt_num_gpu_experts": spec.resident_gpu_experts,
         "kt_max_deferred_experts_per_token": 0,
         "kt_expert_placement_strategy": "uniform",
         "mem_fraction_static": spec.static_memory_fraction,
@@ -1661,6 +1668,15 @@ def _memory_fraction(raw: str) -> float:
     return value
 
 
+def _resident_gpu_experts(raw: str) -> int:
+    value = int(raw)
+    if not 1 <= value <= MAXIMUM_RESIDENT_GPU_EXPERTS:
+        raise argparse.ArgumentTypeError(
+            f"value must be between 1 and {MAXIMUM_RESIDENT_GPU_EXPERTS}"
+        )
+    return value
+
+
 def _sha256_argument(raw: str) -> str:
     if validation.SHA256_PATTERN.fullmatch(raw) is None:
         raise argparse.ArgumentTypeError("value must be a lowercase SHA-256 digest")
@@ -1709,6 +1725,11 @@ def _parser() -> argparse.ArgumentParser:
         "--static-memory-fraction",
         type=_memory_fraction,
         default=DEFAULT_STATIC_MEMORY_FRACTION,
+    )
+    parser.add_argument(
+        "--resident-gpu-experts",
+        type=_resident_gpu_experts,
+        default=DEFAULT_RESIDENT_GPU_EXPERTS,
     )
     parser.add_argument(
         "--readiness-timeout-seconds",
@@ -1784,6 +1805,7 @@ def _config_from_arguments(
         distributed_port=distributed_port,
         service_port=service_port,
         static_memory_fraction=cast(float, arguments.static_memory_fraction),
+        resident_gpu_experts=cast(int, arguments.resident_gpu_experts),
         readiness_timeout_seconds=cast(float, arguments.readiness_timeout_seconds),
         request_timeout_seconds=cast(float, arguments.request_timeout_seconds),
         cleanup_timeout_seconds=cast(float, arguments.cleanup_timeout_seconds),

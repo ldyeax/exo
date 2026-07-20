@@ -35,6 +35,7 @@ def make_config(tmp_path: Path) -> tp2.Tp2LocalDiagnosticConfig:
         distributed_port=62600,
         service_port=62610,
         static_memory_fraction=0.9,
+        resident_gpu_experts=40,
         readiness_timeout_seconds=60.0,
         request_timeout_seconds=900.0,
         cleanup_timeout_seconds=30.0,
@@ -148,7 +149,6 @@ def test_builds_exact_single_parent_tp2_command_and_receipt(tmp_path: Path) -> N
         ("memory_nodes", (1, 0)),
         ("cpu_infer_threads", 111),
         ("threadpool_count", 1),
-        ("resident_gpu_experts", 39),
         ("pipeline_parallel_size", 2),
         ("tensor_parallel_size", 1),
     ),
@@ -171,11 +171,27 @@ def test_process_spec_rejects_model_path_substitution(tmp_path: Path) -> None:
         tp2.build_tp2_local_process_spec(config)
 
 
+@pytest.mark.parametrize("resident_gpu_experts", (0, 45))
+def test_process_spec_rejects_out_of_range_resident_gpu_experts(
+    tmp_path: Path,
+    resident_gpu_experts: int,
+) -> None:
+    config = replace(
+        make_config(tmp_path),
+        resident_gpu_experts=resident_gpu_experts,
+    )
+
+    with pytest.raises(ValueError, match="resident GPU experts"):
+        tp2.build_tp2_local_process_spec(config)
+
+
 def make_server_info_observation(
     *,
     tp_size: int = 2,
     kt_cpuinfer: int = 112,
+    kt_num_gpu_experts: int = 40,
     dist_init_addr: str = "192.168.40.24:62600",
+    mem_fraction_static: float = 0.9,
     status_code: int = 200,
 ) -> ServerInfoObservation:
     response: tp2.JsonObject = {
@@ -191,10 +207,10 @@ def make_server_info_observation(
         "kt_cpuinfer": kt_cpuinfer,
         "kt_threadpool_count": 2,
         "kt_numa_nodes": [0, 1],
-        "kt_num_gpu_experts": 40,
+        "kt_num_gpu_experts": kt_num_gpu_experts,
         "kt_max_deferred_experts_per_token": 0,
         "kt_expert_placement_strategy": "uniform",
-        "mem_fraction_static": 0.9,
+        "mem_fraction_static": mem_fraction_static,
         "attention_backend": "flashinfer",
         "kv_cache_dtype": "bfloat16",
         "disable_cuda_graph": True,
@@ -238,6 +254,42 @@ def test_server_info_gate_accepts_and_preserves_exact_raw_tp2_response(
     assert identity["pp_size"] == 1
     assert identity["version"] == tp2.GLM_4_7_FLASH_PINNED_SGLANG_SERVER_VERSION
     assert response["scheduler_detail"] == "raw-field-is-preserved"
+
+
+def test_e44_is_bound_through_command_receipts_and_server_info(
+    tmp_path: Path,
+) -> None:
+    config = replace(
+        make_config(tmp_path),
+        resident_gpu_experts=44,
+        static_memory_fraction=0.95,
+    )
+    spec = tp2.build_tp2_local_process_spec(config)
+
+    assert spec.resident_gpu_experts == 44
+    assert argument_value(spec.command, "--kt-num-gpu-experts") == "44"
+    assert argument_value(spec.command, "--mem-fraction-static") == "0.95"
+    process_receipt = spec.receipt()
+    experts = cast(dict[str, object], process_receipt["experts"])
+    assert experts["resident_gpu_experts"] == 44
+    assert process_receipt["static_memory_fraction"] == 0.95
+
+    server_info = tp2.validate_tp2_server_info(
+        make_server_info_observation(
+            kt_num_gpu_experts=44,
+            mem_fraction_static=0.95,
+        ),
+        spec,
+    )
+
+    validated = cast(dict[str, object], server_info["validated_identity"])
+    assert validated["kt_num_gpu_experts"] == 44
+    assert validated["mem_fraction_static"] == 0.95
+    configuration = tp2._configuration_receipt(config, spec)
+    assert configuration["resident_gpu_experts"] == 44
+    assert configuration["static_memory_fraction"] == 0.95
+    with pytest.raises(tp2.Tp2LocalDiagnosticError, match="kt_num_gpu_experts"):
+        tp2.validate_tp2_server_info(make_server_info_observation(), spec)
 
 
 def test_server_info_gate_rejects_tp1_response(tmp_path: Path) -> None:
@@ -503,6 +555,16 @@ def test_parser_rejects_duplicate_ports_and_relative_runtime_paths(
     )
     default_config = tp2._config_from_arguments(tp2._parser().parse_args(common))
     assert default_config.static_memory_fraction == 0.9
+    assert default_config.resident_gpu_experts == 40
+    e44_config = tp2._config_from_arguments(
+        tp2._parser().parse_args((*common, "--resident-gpu-experts", "44"))
+    )
+    assert e44_config.resident_gpu_experts == 44
+    for invalid_resident_count in ("0", "45"):
+        with pytest.raises(SystemExit):
+            tp2._parser().parse_args(
+                (*common, "--resident-gpu-experts", invalid_resident_count)
+            )
     duplicate_ports = tp2._parser().parse_args(
         (*common, "--distributed-port", "62600", "--service-port", "62600")
     )
@@ -680,6 +742,7 @@ def test_run_publishes_truthful_tp2_receipt_and_cleans_owned_parent(
     assert configuration["memory_nodes"] == [0, 1]
     assert configuration["cpu_infer_threads"] == 112
     assert configuration["threadpool_count"] == 2
+    assert configuration["resident_gpu_experts"] == 40
     assert configuration["resident_gpu_expert_count_semantics"] == (
         "per_layer_global_logical_expert_count"
     )
@@ -722,6 +785,7 @@ def test_run_publishes_truthful_tp2_receipt_and_cleans_owned_parent(
     server_info = cast(dict[str, object], payload["server_info"])
     validated_server = cast(dict[str, object], server_info["validated_identity"])
     assert validated_server["tp_size"] == 2
+    assert validated_server["kt_num_gpu_experts"] == 40
     host_telemetry = cast(dict[str, object], payload["host_telemetry"])
     telemetry_semantics = cast(
         dict[str, object], host_telemetry["cpu_binding_label_semantics"]
