@@ -596,6 +596,13 @@ def test_live_mode_requires_all_provenance_bindings_before_cuda(
     assert raised.value.code == 2
 
 
+def test_default_numeric_tolerances_cover_one_bfloat16_step() -> None:
+    spec = tuner.TuningSpec()
+
+    assert spec.relative_l1_tolerance == 0.02
+    assert spec.max_absolute_tolerance == 0.04
+
+
 @pytest.mark.parametrize(
     ("overrides", "message"),
     [
