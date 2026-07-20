@@ -96,6 +96,13 @@ type JsonScalar = str | int | float | bool | None
 type JsonValue = JsonScalar | list[JsonValue] | dict[str, JsonValue]
 type JsonObject = dict[str, JsonValue]
 type ExpertParallelSize = Literal[1, 2]
+type NumaMappingClass = Literal[
+    "model_weight",
+    "private_anonymous",
+    "regular_file",
+    "regular_file_private",
+    "special_or_shared",
+]
 
 OLMOE_MODEL_ID: Final = "allenai/OLMoE-1B-7B-0924"
 OLMOE_MODEL_REVISION: Final = "6d84c48581ece794365f2b8e9cfb043c68ade9c5"
@@ -127,6 +134,8 @@ DEFAULT_STATIC_MEMORY_FRACTION: Final = 0.9
 _RECEIPT_MAXIMUM_BYTES: Final = 4 * 1024 * 1024
 _IDENTITY_FILE_MAXIMUM_BYTES: Final = 64 * 1024 * 1024
 _LOG_MAXIMUM_BYTES: Final = 256 * 1024 * 1024
+_PROC_MAPS_MAXIMUM_BYTES: Final = 16 * 1024 * 1024
+_PROC_SMAPS_MAXIMUM_BYTES: Final = 64 * 1024 * 1024
 _OWNERSHIP_JOURNAL_FILENAME: Final = "olmoe-ep-ownership-journal.json"
 _RESULT_FILENAME: Final = "olmoe-ep-local-benchmark-result.json"
 _SERVER_LOG_FILENAME: Final = "native-sglang-server.log"
@@ -143,6 +152,28 @@ _MAX_TOTAL_TOKENS_SERVER_ARGS_PATTERN: Final = re.compile(
 )
 _DISABLED_CUSTOM_ALL_REDUCE_SERVER_ARGS_PATTERN: Final = re.compile(
     r"\bdisable_custom_all_reduce=True\b", re.ASCII
+)
+_NUMA_MAP_ADDRESS_PATTERN: Final = re.compile(r"[0-9a-f]+", re.ASCII)
+_NUMA_MAP_NODE_PAGES_PATTERN: Final = re.compile(
+    r"N(?P<node>[0-9]+)=(?P<pages>[0-9]+)", re.ASCII
+)
+_MAPS_HEADER_PATTERN: Final = re.compile(
+    r"(?P<start>[0-9a-f]+)-(?P<end>[0-9a-f]+) "
+    r"(?P<permissions>[rwxps-]{4}) (?P<offset>[0-9a-f]+) "
+    r"(?P<device>[0-9a-f]+:[0-9a-f]+) (?P<inode>[0-9]+)"
+    r"(?: +(?P<path>.*))?",
+    re.ASCII,
+)
+_MODEL_WEIGHT_SUFFIXES: Final = (".safetensors", ".bin", ".gguf", ".pt", ".pth")
+_SPECIAL_NUMA_FILE_PREFIXES: Final = (
+    "/dev/",
+    "/SYSV",
+    "SYSV",
+    "/memfd:",
+    "memfd:",
+)
+_CUDA_VMM_RESERVATION_VM_FLAGS: Final = frozenset(
+    {"rd", "wr", "mr", "mw", "me", "ac", "sd"}
 )
 _SCHEDULER_TITLE_PATTERN: Final = re.compile(
     r"sglang::scheduler_TP(?P<tp_rank>[01])(?:_EP(?P<ep_rank>[01]))?", re.ASCII
@@ -1313,27 +1344,688 @@ def _scheduler_process_title(pid: int, proc_root: Path) -> str:
     return title
 
 
-def _numa_policy_counts(pid: int, proc_root: Path) -> tuple[dict[str, int], int]:
-    contents = _read_bounded_proc_file(
-        proc_root / str(pid) / "numa_maps", 16 * 1024 * 1024
+@dataclass(frozen=True, slots=True)
+class _VmaIdentity:
+    start_address: str
+    end_address: str
+    permissions: str
+    offset: str
+    device: str
+    inode: int
+    path: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _SmapsVmaObservation:
+    identity: _VmaIdentity
+    rss_kibibytes: int
+    pss_kibibytes: int
+    anonymous_kibibytes: int
+    swap_kibibytes: int
+    vm_flags: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _StableVmaSnapshot:
+    maps: Mapping[str, _VmaIdentity]
+    smaps: Mapping[str, _SmapsVmaObservation]
+    numa_map_addresses: frozenset[str]
+    maps_contents: bytes
+    smaps_contents: bytes
+    numa_maps_contents: bytes
+    vsyscall_omissions: tuple[str, ...]
+    stable_observation_attempt: int
+
+
+def _vma_identity(line: str, description: str) -> _VmaIdentity:
+    match = _MAPS_HEADER_PATTERN.fullmatch(line)
+    if match is None:
+        raise OlmoeEpBenchmarkError(f"{description} VMA header is malformed")
+    start_address = match.group("start")
+    end_address = match.group("end")
+    if int(end_address, 16) <= int(start_address, 16):
+        raise OlmoeEpBenchmarkError(f"{description} VMA range is invalid")
+    raw_path = match.group("path")
+    return _VmaIdentity(
+        start_address=start_address,
+        end_address=end_address,
+        permissions=match.group("permissions"),
+        offset=match.group("offset"),
+        device=match.group("device"),
+        inode=int(match.group("inode")),
+        path=None if raw_path is None or not raw_path else raw_path,
     )
+
+
+def _parse_maps(contents: bytes) -> dict[str, _VmaIdentity]:
+    try:
+        lines = contents.decode("ascii").splitlines()
+    except UnicodeDecodeError as error:
+        raise OlmoeEpBenchmarkError("scheduler maps is not ASCII") from error
+    identities: dict[str, _VmaIdentity] = {}
+    for line in lines:
+        if not line:
+            continue
+        identity = _vma_identity(line, "scheduler maps")
+        if identity.start_address in identities:
+            raise OlmoeEpBenchmarkError("scheduler maps repeats a VMA start")
+        identities[identity.start_address] = identity
+    if not identities:
+        raise OlmoeEpBenchmarkError("scheduler maps is empty")
+    return identities
+
+
+def _smaps_kibibytes(value: str, field_name: str) -> int:
+    fields = value.strip().split()
+    if len(fields) != 2 or fields[1] != "kB":
+        raise OlmoeEpBenchmarkError(f"scheduler smaps {field_name} is malformed")
+    try:
+        amount = int(fields[0])
+    except ValueError as error:
+        raise OlmoeEpBenchmarkError(
+            f"scheduler smaps {field_name} is malformed"
+        ) from error
+    if amount < 0:
+        raise OlmoeEpBenchmarkError(f"scheduler smaps {field_name} is negative")
+    return amount
+
+
+def _parse_smaps(contents: bytes) -> dict[str, _SmapsVmaObservation]:
+    try:
+        lines = contents.decode("ascii").splitlines()
+    except UnicodeDecodeError as error:
+        raise OlmoeEpBenchmarkError("scheduler smaps is not ASCII") from error
+    observations: dict[str, _SmapsVmaObservation] = {}
+    current: _VmaIdentity | None = None
+    metrics: dict[str, int] = {}
+    vm_flags: tuple[str, ...] | None = None
+    required_metrics = frozenset({"Rss", "Pss", "Anonymous", "Swap"})
+
+    def finish_current() -> None:
+        if current is None:
+            return
+        if frozenset(metrics) != required_metrics or vm_flags is None:
+            raise OlmoeEpBenchmarkError(
+                f"scheduler smaps VMA {current.start_address} lacks required evidence"
+            )
+        if current.start_address in observations:
+            raise OlmoeEpBenchmarkError("scheduler smaps repeats a VMA start")
+        observations[current.start_address] = _SmapsVmaObservation(
+            identity=current,
+            rss_kibibytes=metrics["Rss"],
+            pss_kibibytes=metrics["Pss"],
+            anonymous_kibibytes=metrics["Anonymous"],
+            swap_kibibytes=metrics["Swap"],
+            vm_flags=vm_flags,
+        )
+
+    for line in lines:
+        if _MAPS_HEADER_PATTERN.fullmatch(line) is not None:
+            finish_current()
+            current = _vma_identity(line, "scheduler smaps")
+            metrics = {}
+            vm_flags = None
+            continue
+        if not line:
+            continue
+        if current is None:
+            raise OlmoeEpBenchmarkError("scheduler smaps data precedes its VMA header")
+        name, separator, value = line.partition(":")
+        if not separator:
+            raise OlmoeEpBenchmarkError("scheduler smaps row is malformed")
+        if name in required_metrics:
+            if name in metrics:
+                raise OlmoeEpBenchmarkError(
+                    f"scheduler smaps VMA {current.start_address} repeats {name}"
+                )
+            metrics[name] = _smaps_kibibytes(value, name)
+        elif name == "VmFlags":
+            if vm_flags is not None:
+                raise OlmoeEpBenchmarkError(
+                    f"scheduler smaps VMA {current.start_address} repeats VmFlags"
+                )
+            raw_flags = tuple(value.strip().split())
+            if not raw_flags or len(set(raw_flags)) != len(raw_flags):
+                raise OlmoeEpBenchmarkError(
+                    f"scheduler smaps VMA {current.start_address} has invalid VmFlags"
+                )
+            vm_flags = raw_flags
+    finish_current()
+    if not observations:
+        raise OlmoeEpBenchmarkError("scheduler smaps is empty")
+    return observations
+
+
+def _numa_map_addresses(contents: bytes) -> frozenset[str]:
     try:
         lines = contents.decode("ascii").splitlines()
     except UnicodeDecodeError as error:
         raise OlmoeEpBenchmarkError("scheduler numa_maps is not ASCII") from error
-    counts: dict[str, int] = {}
+    addresses: set[str] = set()
     for line in lines:
         if not line:
             continue
-        fields = line.split()
+        fields = line.split(maxsplit=1)
+        if len(fields) != 2 or _NUMA_MAP_ADDRESS_PATTERN.fullmatch(fields[0]) is None:
+            raise OlmoeEpBenchmarkError("scheduler numa_maps row is malformed")
+        if fields[0] in addresses:
+            raise OlmoeEpBenchmarkError("scheduler numa_maps repeats a VMA start")
+        addresses.add(fields[0])
+    if not addresses:
+        raise OlmoeEpBenchmarkError("scheduler numa_maps is empty")
+    return frozenset(addresses)
+
+
+def _read_stable_vma_snapshot(
+    *,
+    pid: int,
+    expected_start_time_ticks: int,
+    proc_root: Path,
+) -> _StableVmaSnapshot:
+    last_instability = "not observed"
+    process_root = proc_root / str(pid)
+    for attempt in range(3):
+        before_group, before_start, before_state = _read_process_stat_at(pid, proc_root)
+        if before_start != expected_start_time_ticks or before_state == "Z":
+            raise OlmoeEpBenchmarkError("scheduler identity changed before VMA capture")
+        maps_contents = _read_bounded_proc_file(
+            process_root / "maps", _PROC_MAPS_MAXIMUM_BYTES
+        )
+        smaps_contents = _read_bounded_proc_file(
+            process_root / "smaps", _PROC_SMAPS_MAXIMUM_BYTES
+        )
+        numa_maps_contents = _read_bounded_proc_file(
+            process_root / "numa_maps", _PROC_MAPS_MAXIMUM_BYTES
+        )
+        final_maps_contents = _read_bounded_proc_file(
+            process_root / "maps", _PROC_MAPS_MAXIMUM_BYTES
+        )
+        after_group, after_start, after_state = _read_process_stat_at(pid, proc_root)
+        if (
+            after_group != before_group
+            or after_start != expected_start_time_ticks
+            or after_state == "Z"
+        ):
+            raise OlmoeEpBenchmarkError("scheduler identity changed during VMA capture")
+        if maps_contents != final_maps_contents:
+            last_instability = "maps changed during capture"
+            time.sleep(0.05)
+            continue
+        try:
+            maps = _parse_maps(maps_contents)
+            smaps = _parse_smaps(smaps_contents)
+            numa_map_addresses = _numa_map_addresses(numa_maps_contents)
+        except OlmoeEpBenchmarkError as error:
+            last_instability = str(error)
+            time.sleep(0.05)
+            continue
+        if maps != {address: item.identity for address, item in smaps.items()}:
+            last_instability = "maps and smaps VMA headers differ"
+            time.sleep(0.05)
+            continue
+        map_addresses = frozenset(maps)
+        extra_numa_addresses = numa_map_addresses - map_addresses
+        missing_numa_addresses = map_addresses - numa_map_addresses
+        if extra_numa_addresses or any(
+            maps[address].path != "[vsyscall]"
+            or maps[address].permissions != "--xp"
+            or int(maps[address].offset, 16) != 0
+            or maps[address].device != "00:00"
+            or maps[address].inode != 0
+            for address in missing_numa_addresses
+        ):
+            last_instability = "maps, smaps, and numa_maps VMA starts differ"
+            time.sleep(0.05)
+            continue
+        return _StableVmaSnapshot(
+            maps=maps,
+            smaps=smaps,
+            numa_map_addresses=numa_map_addresses,
+            maps_contents=maps_contents,
+            smaps_contents=smaps_contents,
+            numa_maps_contents=numa_maps_contents,
+            vsyscall_omissions=tuple(sorted(missing_numa_addresses)),
+            stable_observation_attempt=attempt + 1,
+        )
+    raise OlmoeEpBenchmarkError(
+        f"scheduler VMA evidence did not stabilize: {last_instability}"
+    )
+
+
+def _numa_map_numeric_field(fields: tuple[str, ...], name: str, address: str) -> int:
+    prefix = f"{name}="
+    values = [
+        field.removeprefix(prefix) for field in fields if field.startswith(prefix)
+    ]
+    if len(values) > 1:
+        raise OlmoeEpBenchmarkError(f"scheduler numa_maps row {address} repeats {name}")
+    if not values:
+        return 0
+    try:
+        value = int(values[0])
+    except ValueError as error:
+        raise OlmoeEpBenchmarkError(
+            f"scheduler numa_maps row {address} has invalid {name}"
+        ) from error
+    if value < 0:
+        raise OlmoeEpBenchmarkError(
+            f"scheduler numa_maps row {address} has negative {name}"
+        )
+    return value
+
+
+def _numa_mapping_class(
+    *,
+    file_path: str | None,
+    permissions: str,
+    flags: frozenset[str],
+    anonymous_pages: int,
+) -> NumaMappingClass:
+    special_file = file_path is not None and file_path.startswith(
+        _SPECIAL_NUMA_FILE_PREFIXES
+    )
+    named_shared_anonymous = file_path is not None and file_path.startswith(
+        "[anon_shmem:"
+    )
+    if (
+        "shmem" in flags
+        or special_file
+        or named_shared_anonymous
+        or permissions.endswith("s")
+    ):
+        return "special_or_shared"
+    if file_path is not None and (
+        file_path.startswith(f"{OLMOE_MODEL_PATH.rstrip('/')}/")
+        and file_path.endswith(_MODEL_WEIGHT_SUFFIXES)
+    ):
+        return "model_weight"
+    private_anonymous_path = file_path is None or file_path in {"[heap]", "[stack]"}
+    if file_path is not None and file_path.startswith("[anon:"):
+        private_anonymous_path = True
+    if private_anonymous_path:
+        return "private_anonymous"
+    if file_path is not None:
+        return "regular_file_private" if anonymous_pages else "regular_file"
+    return "private_anonymous"
+
+
+def _observe_numa_memory_placement(
+    pid: int,
+    expected_node: int,
+    expected_start_time_ticks: int,
+    proc_root: Path,
+) -> JsonObject:
+    snapshot = _read_stable_vma_snapshot(
+        pid=pid,
+        expected_start_time_ticks=expected_start_time_ticks,
+        proc_root=proc_root,
+    )
+    raw_contents = snapshot.numa_maps_contents
+    try:
+        lines = raw_contents.decode("ascii").splitlines()
+    except UnicodeDecodeError as error:
+        raise OlmoeEpBenchmarkError("scheduler numa_maps is not ASCII") from error
+    expected_policy = f"bind:{expected_node}"
+    policy_counts: dict[str, int] = {}
+    classification_counts: dict[NumaMappingClass, int] = {}
+    classification_resident_kibibytes: dict[NumaMappingClass, int] = {}
+    classification_policy_counts: dict[tuple[NumaMappingClass, str], int] = {}
+    classification_node_kibibytes: dict[tuple[NumaMappingClass, int], int] = {}
+    resident_kibibytes_by_node: dict[int, int] = {}
+    placement_sensitive_vma_kibibytes_by_node: dict[int, int] = {}
+    classified_rows: list[JsonValue] = []
+    violation_counts: dict[str, int] = {}
+    violation_examples: list[JsonValue] = []
+    local_reservation_exceptions: list[JsonValue] = []
+    placement_sensitive_mapping_count = 0
+    placement_sensitive_resident_kibibytes = 0
+    provable_sensitive_off_node_kibibytes = 0
+
+    def record_violation(
+        kind: str,
+        *,
+        address: str,
+        policy: str,
+        classification: NumaMappingClass,
+        file_path: str | None,
+        identity: _VmaIdentity | None = None,
+        smaps: _SmapsVmaObservation | None = None,
+        off_node_kibibytes: int = 0,
+    ) -> None:
+        violation_counts[kind] = violation_counts.get(kind, 0) + 1
+        if len(violation_examples) < 8:
+            violation_examples.append(
+                {
+                    "kind": kind,
+                    "address": address,
+                    "policy": policy,
+                    "classification": classification,
+                    "file_path": file_path,
+                    "off_node_kibibytes": off_node_kibibytes,
+                    "permissions": None if identity is None else identity.permissions,
+                    "device": None if identity is None else identity.device,
+                    "inode": None if identity is None else identity.inode,
+                    "rss_kibibytes": None if smaps is None else smaps.rss_kibibytes,
+                    "pss_kibibytes": None if smaps is None else smaps.pss_kibibytes,
+                    "anonymous_kibibytes": (
+                        None if smaps is None else smaps.anonymous_kibibytes
+                    ),
+                    "swap_kibibytes": None if smaps is None else smaps.swap_kibibytes,
+                    "vm_flags": None if smaps is None else list(smaps.vm_flags),
+                }
+            )
+
+    for line in lines:
+        if not line:
+            continue
+        fields = tuple(line.split())
         if len(fields) < 2:
             raise OlmoeEpBenchmarkError("scheduler numa_maps row is malformed")
-        policy = fields[1]
-        counts[policy] = counts.get(policy, 0) + 1
-    line_count = sum(counts.values())
+        address, policy, *details = fields
+        if _NUMA_MAP_ADDRESS_PATTERN.fullmatch(address) is None:
+            raise OlmoeEpBenchmarkError("scheduler numa_maps address is malformed")
+        identity = snapshot.maps[address]
+        smaps = snapshot.smaps[address]
+        numa_file_paths = [
+            field.removeprefix("file=")
+            for field in details
+            if field.startswith("file=")
+        ]
+        if len(numa_file_paths) > 1 or (numa_file_paths and not numa_file_paths[0]):
+            raise OlmoeEpBenchmarkError(
+                f"scheduler numa_maps row {address} has invalid file identity"
+            )
+        numa_file_path = numa_file_paths[0] if numa_file_paths else None
+        file_path = identity.path
+        flags = frozenset(field for field in details if "=" not in field)
+        anonymous_pages = _numa_map_numeric_field(fields, "anon", address)
+        mapped_pages = _numa_map_numeric_field(fields, "mapped", address)
+        kernel_page_size_kibibytes = _numa_map_numeric_field(
+            fields, "kernelpagesize_kB", address
+        )
+        node_pages: dict[int, int] = {}
+        for field in details:
+            match = _NUMA_MAP_NODE_PAGES_PATTERN.fullmatch(field)
+            if match is None:
+                continue
+            node = int(match.group("node"))
+            if node in node_pages:
+                raise OlmoeEpBenchmarkError(
+                    f"scheduler numa_maps row {address} repeats node {node}"
+                )
+            node_pages[node] = int(match.group("pages"))
+        resident_page_count = sum(node_pages.values())
+        if resident_page_count and kernel_page_size_kibibytes == 0:
+            raise OlmoeEpBenchmarkError(
+                f"scheduler numa_maps row {address} lacks kernel page size"
+            )
+        node_kibibytes = {
+            node: pages * kernel_page_size_kibibytes
+            for node, pages in node_pages.items()
+        }
+        resident_kibibytes = sum(node_kibibytes.values())
+        classification = _numa_mapping_class(
+            file_path=file_path,
+            permissions=identity.permissions,
+            flags=flags,
+            anonymous_pages=anonymous_pages,
+        )
+
+        policy_counts[policy] = policy_counts.get(policy, 0) + 1
+        classification_counts[classification] = (
+            classification_counts.get(classification, 0) + 1
+        )
+        classification_resident_kibibytes[classification] = (
+            classification_resident_kibibytes.get(classification, 0)
+            + resident_kibibytes
+        )
+        policy_key = (classification, policy)
+        classification_policy_counts[policy_key] = (
+            classification_policy_counts.get(policy_key, 0) + 1
+        )
+        for node, kibibytes in node_kibibytes.items():
+            resident_kibibytes_by_node[node] = (
+                resident_kibibytes_by_node.get(node, 0) + kibibytes
+            )
+            class_node_key = (classification, node)
+            classification_node_kibibytes[class_node_key] = (
+                classification_node_kibibytes.get(class_node_key, 0) + kibibytes
+            )
+
+        local_reservation_exception = (
+            policy == "local"
+            and resident_page_count == 0
+            and not details
+            and identity.permissions == "rw-p"
+            and int(identity.offset, 16) == 0
+            and identity.device == "00:00"
+            and identity.inode == 0
+            and identity.path is None
+            and smaps.rss_kibibytes == 0
+            and smaps.pss_kibibytes == 0
+            and smaps.anonymous_kibibytes == 0
+            and smaps.swap_kibibytes == 0
+            and frozenset(smaps.vm_flags) == _CUDA_VMM_RESERVATION_VM_FLAGS
+        )
+        if policy == expected_policy:
+            pass
+        elif local_reservation_exception:
+            local_reservation_exceptions.append(
+                {
+                    "address": address,
+                    "virtual_size_kibibytes": (
+                        int(identity.end_address, 16) - int(identity.start_address, 16)
+                    )
+                    // 1024,
+                    "permissions": identity.permissions,
+                    "offset": identity.offset,
+                    "device": identity.device,
+                    "inode": identity.inode,
+                    "path": identity.path,
+                    "rss_kibibytes": smaps.rss_kibibytes,
+                    "pss_kibibytes": smaps.pss_kibibytes,
+                    "anonymous_kibibytes": smaps.anonymous_kibibytes,
+                    "swap_kibibytes": smaps.swap_kibibytes,
+                    "vm_flags": list(smaps.vm_flags),
+                }
+            )
+        else:
+            if policy.startswith("bind:"):
+                violation_kind = "wrong_bind_policy"
+            elif policy == "local":
+                violation_kind = "invalid_local_reservation_exception"
+            else:
+                violation_kind = "unsupported_memory_policy"
+            record_violation(
+                violation_kind,
+                address=address,
+                policy=policy,
+                classification=classification,
+                file_path=file_path,
+                identity=identity,
+                smaps=smaps,
+            )
+
+        off_node_kibibytes = sum(
+            kibibytes
+            for node, kibibytes in node_kibibytes.items()
+            if node != expected_node
+        )
+        provable_off_node_kibibytes = 0
+        if classification in {"model_weight", "private_anonymous"}:
+            placement_sensitive_mapping_count += 1
+            placement_sensitive_resident_kibibytes += resident_kibibytes
+            provable_off_node_kibibytes = off_node_kibibytes
+        elif classification == "regular_file_private":
+            placement_sensitive_mapping_count += 1
+            resident_anonymous_pages = min(anonymous_pages, resident_page_count)
+            placement_sensitive_resident_kibibytes += (
+                resident_anonymous_pages * kernel_page_size_kibibytes
+            )
+            # numa_maps does not assign each node page to the file or COW subset.
+            # Subtract every possible resident file page to retain a proven floor.
+            resident_file_pages = resident_page_count - resident_anonymous_pages
+            off_node_pages = sum(
+                pages for node, pages in node_pages.items() if node != expected_node
+            )
+            provable_off_node_kibibytes = (
+                max(0, off_node_pages - resident_file_pages)
+                * kernel_page_size_kibibytes
+            )
+        if classification in {
+            "model_weight",
+            "private_anonymous",
+            "regular_file_private",
+        }:
+            for node, kibibytes in node_kibibytes.items():
+                placement_sensitive_vma_kibibytes_by_node[node] = (
+                    placement_sensitive_vma_kibibytes_by_node.get(node, 0) + kibibytes
+                )
+        if provable_off_node_kibibytes:
+            provable_sensitive_off_node_kibibytes += provable_off_node_kibibytes
+            record_violation(
+                "placement_sensitive_memory_off_node",
+                address=address,
+                policy=policy,
+                classification=classification,
+                file_path=file_path,
+                identity=identity,
+                smaps=smaps,
+                off_node_kibibytes=provable_off_node_kibibytes,
+            )
+
+        classified_rows.append(
+            cast(
+                JsonValue,
+                {
+                    "address": address,
+                    "policy": policy,
+                    "classification": classification,
+                    "maps_identity": {
+                        "end_address": identity.end_address,
+                        "permissions": identity.permissions,
+                        "offset": identity.offset,
+                        "device": identity.device,
+                        "inode": identity.inode,
+                        "path": identity.path,
+                    },
+                    "numa_file_path": numa_file_path,
+                    "numa_flags": sorted(flags),
+                    "anonymous_pages": anonymous_pages,
+                    "mapped_pages": mapped_pages,
+                    "kernel_page_size_kibibytes": kernel_page_size_kibibytes,
+                    "resident_page_counts_by_node": {
+                        str(node): pages for node, pages in sorted(node_pages.items())
+                    },
+                    "resident_kibibytes_by_node": {
+                        str(node): kibibytes
+                        for node, kibibytes in sorted(node_kibibytes.items())
+                    },
+                    "smaps": {
+                        "rss_kibibytes": smaps.rss_kibibytes,
+                        "pss_kibibytes": smaps.pss_kibibytes,
+                        "anonymous_kibibytes": smaps.anonymous_kibibytes,
+                        "swap_kibibytes": smaps.swap_kibibytes,
+                        "vm_flags": list(smaps.vm_flags),
+                    },
+                },
+            ),
+        )
+
+    line_count = len(classified_rows)
     if line_count == 0:
         raise OlmoeEpBenchmarkError("scheduler numa_maps is empty")
-    return counts, line_count
+    if (
+        placement_sensitive_mapping_count == 0
+        or placement_sensitive_resident_kibibytes == 0
+    ):
+        record_violation(
+            "no_resident_placement_sensitive_memory",
+            address="none",
+            policy="none",
+            classification="private_anonymous",
+            file_path=None,
+        )
+
+    classifications: list[JsonValue] = []
+    for classification in sorted(classification_counts):
+        classifications.append(
+            {
+                "classification": classification,
+                "mapping_count": classification_counts[classification],
+                "resident_kibibytes": classification_resident_kibibytes[classification],
+                "policy_counts": {
+                    policy: count
+                    for (observed_class, policy), count in sorted(
+                        classification_policy_counts.items()
+                    )
+                    if observed_class == classification
+                },
+                "resident_kibibytes_by_node": {
+                    str(node): kibibytes
+                    for (observed_class, node), kibibytes in sorted(
+                        classification_node_kibibytes.items()
+                    )
+                    if observed_class == classification
+                },
+            }
+        )
+    evidence = cast(
+        JsonObject,
+        {
+            "status": "verified" if not violation_counts else "rejected",
+            "expected_policy": expected_policy,
+            "policy_contract": (
+                "all_vmas_exact_bind_except_proven_zero_resident_"
+                "private_cuda_local_reservation"
+            ),
+            "mapping_count": line_count,
+            "policy_counts": policy_counts,
+            "classifications": classifications,
+            "resident_kibibytes": sum(resident_kibibytes_by_node.values()),
+            "resident_kibibytes_by_node": {
+                str(node): kibibytes
+                for node, kibibytes in sorted(resident_kibibytes_by_node.items())
+            },
+            "placement_sensitive_mapping_count": placement_sensitive_mapping_count,
+            "placement_sensitive_resident_kibibytes": (
+                placement_sensitive_resident_kibibytes
+            ),
+            "placement_sensitive_vma_kibibytes_by_node": {
+                str(node): kibibytes
+                for node, kibibytes in sorted(
+                    placement_sensitive_vma_kibibytes_by_node.items()
+                )
+            },
+            "provable_sensitive_off_node_kibibytes": (
+                provable_sensitive_off_node_kibibytes
+            ),
+            "local_reservation_exception_count": len(local_reservation_exceptions),
+            "local_reservation_exceptions": local_reservation_exceptions,
+            "violation_counts": violation_counts,
+            "violation_examples": violation_examples,
+            "vma_join": {
+                "maps_vma_count": len(snapshot.maps),
+                "smaps_vma_count": len(snapshot.smaps),
+                "numa_maps_vma_count": len(snapshot.numa_map_addresses),
+                "vsyscall_omissions": list(snapshot.vsyscall_omissions),
+                "stable_observation_attempt": snapshot.stable_observation_attempt,
+            },
+            "maps_sha256": hashlib.sha256(snapshot.maps_contents).hexdigest(),
+            "smaps_sha256": hashlib.sha256(snapshot.smaps_contents).hexdigest(),
+            "numa_maps_sha256": hashlib.sha256(raw_contents).hexdigest(),
+            "classified_rows_sha256": _canonical_sha256(classified_rows),
+        },
+    )
+    if violation_counts:
+        counts = ",".join(
+            f"{kind}={count}" for kind, count in sorted(violation_counts.items())
+        )
+        examples = _canonical_json(violation_examples).decode("ascii")
+        raise OlmoeEpBenchmarkError(
+            f"scheduler NUMA memory placement failed ({counts}); examples={examples}"
+        )
+    return evidence
 
 
 def _observe_scheduler_numa(
@@ -1394,12 +2086,14 @@ def _observe_scheduler_numa(
                 raise OlmoeEpBenchmarkError("scheduler process identity changed")
             time.sleep(0.05)
             continue
-        policies, map_line_count = _numa_policy_counts(pid, proc_root)
-        expected_policy = f"bind:{expected_node}"
-        if set(policies) != {expected_policy}:
-            raise OlmoeEpBenchmarkError(
-                f"TP rank {tp_rank} memory policy is not {expected_policy}"
+        try:
+            memory_placement = _observe_numa_memory_placement(
+                pid, expected_node, before_start, proc_root
             )
+        except OlmoeEpBenchmarkError as error:
+            raise OlmoeEpBenchmarkError(
+                f"TP rank {tp_rank} memory placement is invalid: {error}"
+            ) from error
         try:
             second_tasks = tuple(
                 sorted(
@@ -1451,8 +2145,7 @@ def _observe_scheduler_numa(
                         {"cpus": list(cpus), "thread_count": count}
                         for cpus, count in sorted(affinity_counts.items())
                     ],
-                    "numa_policy_counts": policies,
-                    "numa_map_line_count": map_line_count,
+                    "numa_memory_placement": memory_placement,
                     "stable_observation_attempt": attempt + 1,
                 },
             )

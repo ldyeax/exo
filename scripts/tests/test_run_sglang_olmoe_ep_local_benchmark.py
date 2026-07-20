@@ -368,6 +368,45 @@ def _synthetic_process_stat(pid: int, process_group: int, start_ticks: int) -> s
     return f"{pid} (scheduler) {' '.join(fields)}\n"
 
 
+def _append_synthetic_vma(
+    proc_root: Path,
+    *,
+    pid: int,
+    address: str,
+    policy: str | None,
+    numa_details: str = "",
+    permissions: str = "rw-p",
+    offset: str = "00000000",
+    device: str = "00:00",
+    inode: int = 0,
+    path: str | None = None,
+    rss_kibibytes: int = 0,
+    pss_kibibytes: int = 0,
+    anonymous_kibibytes: int = 0,
+    swap_kibibytes: int = 0,
+    vm_flags: tuple[str, ...] = ("rd", "wr", "mr", "mw", "me", "ac", "sd"),
+) -> None:
+    process_root = proc_root / str(pid)
+    end_address = f"{int(address, 16) + 0x1000:x}"
+    path_field = "" if path is None else f" {path}"
+    header = (
+        f"{address}-{end_address} {permissions} {offset} {device} {inode}{path_field}\n"
+    )
+    with (process_root / "maps").open("a") as destination:
+        destination.write(header)
+    with (process_root / "smaps").open("a") as destination:
+        destination.write(header)
+        destination.write(f"Rss: {rss_kibibytes} kB\n")
+        destination.write(f"Pss: {pss_kibibytes} kB\n")
+        destination.write(f"Anonymous: {anonymous_kibibytes} kB\n")
+        destination.write(f"Swap: {swap_kibibytes} kB\n")
+        destination.write(f"VmFlags: {' '.join(vm_flags)}\n")
+    if policy is not None:
+        details_field = "" if not numa_details else f" {numa_details}"
+        with (process_root / "numa_maps").open("a") as destination:
+            destination.write(f"{address} {policy}{details_field}\n")
+
+
 def _write_synthetic_scheduler(
     proc_root: Path,
     *,
@@ -387,9 +426,51 @@ def _write_synthetic_scheduler(
     (process_root / "status").write_text(status)
     _write_synthetic_task_affinity(proc_root, pid=pid, task_id=pid, cpus=cpus)
     remote_node = 1 if memory_policy == "bind:0" else 0
-    (process_root / "numa_maps").write_text(
-        f"1000 {memory_policy} file=/mapped N{remote_node}=4\n"
-        f"2000 {memory_policy} heap anon=4 dirty=4 N{memory_policy[-1]}=4\n"
+    expected_node = int(memory_policy.removeprefix("bind:"))
+    for name in ("maps", "smaps", "numa_maps"):
+        (process_root / name).write_bytes(b"")
+    _append_synthetic_vma(
+        proc_root,
+        pid=pid,
+        address="1000",
+        policy=memory_policy,
+        numa_details=(f"file=/mapped mapped=4 N{remote_node}=4 kernelpagesize_kB=4"),
+        permissions="r--p",
+        device="08:01",
+        inode=1,
+        path="/mapped",
+        rss_kibibytes=16,
+        pss_kibibytes=16,
+        vm_flags=("rd", "mr", "mw", "me", "sd"),
+    )
+    _append_synthetic_vma(
+        proc_root,
+        pid=pid,
+        address="2000",
+        policy=memory_policy,
+        numa_details=(f"heap anon=4 dirty=4 N{expected_node}=4 kernelpagesize_kB=4"),
+        path="[heap]",
+        rss_kibibytes=16,
+        pss_kibibytes=16,
+        anonymous_kibibytes=16,
+    )
+    _append_synthetic_vma(
+        proc_root,
+        pid=pid,
+        address="3000",
+        policy="local",
+    )
+    _append_synthetic_vma(
+        proc_root,
+        pid=pid,
+        address="4000",
+        policy=memory_policy,
+        numa_details="file=/dev/nvidiactl",
+        permissions="rw-s",
+        device="00:05",
+        inode=2,
+        path="/dev/nvidiactl",
+        vm_flags=("rd", "wr", "sh", "mr", "mw", "me", "ms", "sd"),
     )
 
 
@@ -449,7 +530,22 @@ def test_observed_rank_local_numa_binds_both_scheduler_ranks(tmp_path: Path) -> 
     ]
     assert ranks[0]["task_affinity_union"] == [0, 1, 112, 113]
     assert isinstance(ranks[0]["task_affinity_sha256"], str)
-    assert ranks[0]["numa_policy_counts"] == {"bind:0": 2}
+    memory = cast(dict[str, object], ranks[0]["numa_memory_placement"])
+    assert memory["status"] == "verified"
+    assert memory["policy_counts"] == {"bind:0": 3, "local": 1}
+    assert memory["local_reservation_exception_count"] == 1
+    assert memory["provable_sensitive_off_node_kibibytes"] == 0
+    assert isinstance(memory["maps_sha256"], str)
+    assert isinstance(memory["smaps_sha256"], str)
+    assert isinstance(memory["numa_maps_sha256"], str)
+    assert isinstance(memory["classified_rows_sha256"], str)
+    classifications = cast(list[dict[str, object]], memory["classifications"])
+    by_name = {item["classification"]: item for item in classifications}
+    assert by_name["private_anonymous"]["policy_counts"] == {
+        "bind:0": 1,
+        "local": 1,
+    }
+    assert by_name["special_or_shared"]["policy_counts"] == {"bind:0": 1}
 
 
 def test_observed_rank_local_numa_rejects_cross_node_task_affinity(
@@ -514,10 +610,18 @@ def test_observed_rank_local_numa_rejects_mixed_memory_policy(
     tmp_path: Path,
 ) -> None:
     proc_root, sysfs_root = _synthetic_numa_tree(tmp_path)
-    with (proc_root / "101/numa_maps").open("a") as destination:
-        destination.write("3000 default anon=1 dirty=1 N1=1\n")
+    _append_synthetic_vma(
+        proc_root,
+        pid=101,
+        address="5000",
+        policy="default",
+        numa_details="anon=1 dirty=1 N1=1 kernelpagesize_kB=4",
+        rss_kibibytes=4,
+        pss_kibibytes=4,
+        anonymous_kibibytes=4,
+    )
 
-    with pytest.raises(olmoe.OlmoeEpBenchmarkError, match="memory policy"):
+    with pytest.raises(olmoe.OlmoeEpBenchmarkError, match="memory placement"):
         olmoe.observe_rank_local_numa(
             process_ids=(100, 101),
             process_group_id=100,
@@ -525,6 +629,244 @@ def test_observed_rank_local_numa_rejects_mixed_memory_policy(
             proc_root=proc_root,
             sysfs_root=sysfs_root,
         )
+
+
+@pytest.mark.parametrize(
+    ("policy", "numa_details", "permissions", "device", "inode", "path"),
+    (
+        ("default", "anon=1 N0=1 kernelpagesize_kB=4", "rw-p", "00:00", 0, None),
+        (
+            "local",
+            "file=/dev/nvidiactl",
+            "rw-s",
+            "00:05",
+            2,
+            "/dev/nvidiactl",
+        ),
+        ("bind:1", "anon=1 N0=1 kernelpagesize_kB=4", "rw-p", "00:00", 0, None),
+        (
+            "interleave:0-1",
+            "anon=1 N0=1 kernelpagesize_kB=4",
+            "rw-p",
+            "00:00",
+            0,
+            None,
+        ),
+        (
+            "preferred:1",
+            "anon=1 N0=1 kernelpagesize_kB=4",
+            "rw-p",
+            "00:00",
+            0,
+            None,
+        ),
+        ("default", "file=/runtime/lib.so", "r--p", "08:01", 3, "/runtime/lib.so"),
+    ),
+)
+def test_numa_memory_placement_rejects_resident_or_unsupported_non_bind_policy(
+    tmp_path: Path,
+    policy: str,
+    numa_details: str,
+    permissions: str,
+    device: str,
+    inode: int,
+    path: str | None,
+) -> None:
+    proc_root, _sysfs_root = _synthetic_numa_tree(tmp_path)
+    is_resident = "N0=1" in numa_details
+    _append_synthetic_vma(
+        proc_root,
+        pid=100,
+        address="5000",
+        policy=policy,
+        numa_details=numa_details,
+        permissions=permissions,
+        device=device,
+        inode=inode,
+        path=path,
+        rss_kibibytes=4 if is_resident else 0,
+        pss_kibibytes=4 if is_resident else 0,
+        anonymous_kibibytes=(4 if is_resident and path != "/dev/nvidiactl" else 0),
+    )
+
+    with pytest.raises(olmoe.OlmoeEpBenchmarkError, match="NUMA memory placement"):
+        olmoe._observe_numa_memory_placement(100, 0, 1000, proc_root)
+
+
+@pytest.mark.parametrize(
+    ("path", "numa_details", "anonymous_kibibytes"),
+    (
+        (None, "anon=4 dirty=4 N1=4 kernelpagesize_kB=4", 16),
+        ("[heap]", "heap anon=4 dirty=4 N1=4 kernelpagesize_kB=4", 16),
+        (
+            f"{olmoe.OLMOE_MODEL_PATH}/model-00001-of-00003.safetensors",
+            (
+                f"file={olmoe.OLMOE_MODEL_PATH}/model-00001-of-00003.safetensors "
+                "mapped=4 N1=4 kernelpagesize_kB=4"
+            ),
+            0,
+        ),
+    ),
+)
+def test_numa_memory_placement_rejects_sensitive_memory_off_node(
+    tmp_path: Path,
+    path: str | None,
+    numa_details: str,
+    anonymous_kibibytes: int,
+) -> None:
+    proc_root, _sysfs_root = _synthetic_numa_tree(tmp_path)
+    model_weight = path is not None and path.startswith(olmoe.OLMOE_MODEL_PATH)
+    _append_synthetic_vma(
+        proc_root,
+        pid=100,
+        address="5000",
+        policy="bind:0",
+        numa_details=numa_details,
+        permissions="r--p" if model_weight else "rw-p",
+        device="08:01" if model_weight else "00:00",
+        inode=4 if model_weight else 0,
+        path=path,
+        rss_kibibytes=16,
+        pss_kibibytes=16,
+        anonymous_kibibytes=anonymous_kibibytes,
+    )
+
+    with pytest.raises(
+        olmoe.OlmoeEpBenchmarkError, match="placement_sensitive_memory_off_node"
+    ):
+        olmoe._observe_numa_memory_placement(100, 0, 1000, proc_root)
+
+
+def test_numa_memory_placement_bounds_mixed_file_private_residency(
+    tmp_path: Path,
+) -> None:
+    proc_root, _sysfs_root = _synthetic_numa_tree(tmp_path)
+    _append_synthetic_vma(
+        proc_root,
+        pid=100,
+        address="5000",
+        policy="bind:0",
+        numa_details=(
+            "file=/runtime/lib.so anon=4 mapped=8 N0=4 N1=4 kernelpagesize_kB=4"
+        ),
+        device="08:01",
+        inode=5,
+        path="/runtime/lib.so",
+        rss_kibibytes=32,
+        pss_kibibytes=32,
+        anonymous_kibibytes=16,
+    )
+
+    evidence = olmoe._observe_numa_memory_placement(100, 0, 1000, proc_root)
+
+    assert evidence["provable_sensitive_off_node_kibibytes"] == 0
+    _append_synthetic_vma(
+        proc_root,
+        pid=100,
+        address="6000",
+        policy="bind:0",
+        numa_details=(
+            "file=/runtime/other.so anon=4 mapped=8 N0=3 N1=5 kernelpagesize_kB=4"
+        ),
+        device="08:01",
+        inode=6,
+        path="/runtime/other.so",
+        rss_kibibytes=32,
+        pss_kibibytes=32,
+        anonymous_kibibytes=16,
+    )
+    with pytest.raises(
+        olmoe.OlmoeEpBenchmarkError, match="placement_sensitive_memory_off_node"
+    ):
+        olmoe._observe_numa_memory_placement(100, 0, 1000, proc_root)
+
+
+@pytest.mark.parametrize(
+    ("rss_kibibytes", "pss_kibibytes", "anonymous_kibibytes", "swap_kibibytes"),
+    (
+        (0, 0, 0, 4),
+        (4, 4, 4, 0),
+    ),
+)
+def test_numa_memory_placement_rejects_populated_local_reservation(
+    tmp_path: Path,
+    rss_kibibytes: int,
+    pss_kibibytes: int,
+    anonymous_kibibytes: int,
+    swap_kibibytes: int,
+) -> None:
+    proc_root, _sysfs_root = _synthetic_numa_tree(tmp_path)
+    _append_synthetic_vma(
+        proc_root,
+        pid=100,
+        address="5000",
+        policy="local",
+        rss_kibibytes=rss_kibibytes,
+        pss_kibibytes=pss_kibibytes,
+        anonymous_kibibytes=anonymous_kibibytes,
+        swap_kibibytes=swap_kibibytes,
+    )
+
+    with pytest.raises(
+        olmoe.OlmoeEpBenchmarkError,
+        match="invalid_local_reservation_exception",
+    ):
+        olmoe._observe_numa_memory_placement(100, 0, 1000, proc_root)
+
+
+def test_numa_memory_placement_rejects_mismatched_vma_join(tmp_path: Path) -> None:
+    proc_root, _sysfs_root = _synthetic_numa_tree(tmp_path)
+    with (proc_root / "100/numa_maps").open("a") as destination:
+        destination.write("5000 bind:0 anon=1 N0=1 kernelpagesize_kB=4\n")
+
+    with pytest.raises(
+        olmoe.OlmoeEpBenchmarkError, match="VMA evidence did not stabilize"
+    ):
+        olmoe._observe_numa_memory_placement(100, 0, 1000, proc_root)
+
+
+def test_numa_memory_placement_accepts_structural_vsyscall_omission(
+    tmp_path: Path,
+) -> None:
+    proc_root, _sysfs_root = _synthetic_numa_tree(tmp_path)
+    _append_synthetic_vma(
+        proc_root,
+        pid=100,
+        address="ffff0000",
+        policy=None,
+        permissions="--xp",
+        path="[vsyscall]",
+        vm_flags=("ex",),
+    )
+
+    evidence = olmoe._observe_numa_memory_placement(100, 0, 1000, proc_root)
+
+    vma_join = cast(dict[str, object], evidence["vma_join"])
+    assert vma_join["vsyscall_omissions"] == ["ffff0000"]
+
+
+def test_numa_memory_placement_retries_vma_churn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    proc_root, _sysfs_root = _synthetic_numa_tree(tmp_path)
+    real_reader = olmoe._read_bounded_proc_file
+    maps_read_count = 0
+
+    def changing_maps_reader(path: Path, maximum_bytes: int) -> bytes:
+        nonlocal maps_read_count
+        contents = real_reader(path, maximum_bytes)
+        if path == proc_root / "100/maps":
+            maps_read_count += 1
+            if maps_read_count == 2:
+                return contents + b"5000-6000 rw-p 00000000 00:00 0\n"
+        return contents
+
+    monkeypatch.setattr(olmoe, "_read_bounded_proc_file", changing_maps_reader)
+
+    evidence = olmoe._observe_numa_memory_placement(100, 0, 1000, proc_root)
+
+    vma_join = cast(dict[str, object], evidence["vma_join"])
+    assert vma_join["stable_observation_attempt"] == 2
 
 
 class _SanityClient:
