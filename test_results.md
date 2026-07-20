@@ -1077,18 +1077,21 @@ canonical process-spec/config SHA-256 values are
   narrows from 9.600% to 6.716%. C8 reaches 1,205.310 aggregate decode tok/s
   under EP1 and 1,129.455 under EP2. This makes concurrency a major throughput
   control for later PP/EP comparisons rather than an optional serving detail.
-- GLM-4.7 has 64 routed experts and 20 attention heads. The model layout is
+- GLM-4.7 has 64 routed experts and 20 attention heads. The native layout is
   feasible with `TP3`, `DP3`, DP attention, dense-MLP TP1, and two padded
-  experts, producing 22 physical expert slots per rank. Checkpoint-header
-  accounting estimates about 20.34 GiB static parameters/rank for TP3/EP1 and
-  20.88 GiB/rank for TP3/EP3 before buffers, activations, and KV. The pinned
-  GLM-Lite class inherits the required expert-location metadata. The committed
-  contract models the 2+1 physical layout as three logical one-GPU SGLang nodes,
-  satisfying `(tp_size * pp_size) % nnodes == 0`; the remaining step is the
-  ownership-safe controller and live launch. Both hosts now carry clean,
-  matching final-pin runtimes that admit EP1 and EP3. Use standard host-staged
-  NCCL, not DeepEP, on SM86. OSCAR remains a later KV-cache compression and
-  placement candidate, not an expert dispatcher.
+  experts, producing 22 physical expert slots per rank. Exact checkpoint-header
+  accounting excludes the unused MTP layer and gives 55.774 GiB of target
+  weights. Attention DP replicates a 2.625-GiB floor per rank: the complete
+  attention stack, embedding, layer-zero dense MLP, routers, and norms. With a
+  TP-sharded head, TP3/EP1 therefore stores 20.341 GiB/rank and 61.023 GiB
+  cluster-wide; TP3/EP3 stores 20.880 GiB/rank and 62.640 GiB cluster-wide.
+  Byte-balanced PP3 stores one logical copy at 18.499/18.934/18.341 GiB for
+  `[0,16)`, `[16,32)`, and `[32,47)`. Native attention-DP/EP remains a possible
+  throughput experiment for expert-heavy MoEs, but it is not the capacity path
+  on these same three devices. Use PP3/TP1 plus KTransformers CPU/AMX offload
+  for models that exceed dwagon's capacity. Use standard host-staged NCCL, not
+  DeepEP, on SM86. OSCAR remains a later KV-cache compression and placement
+  candidate, not an expert dispatcher.
 
 ### GLM native TP3/EP iterations
 
@@ -1100,29 +1103,46 @@ canonical process-spec/config SHA-256 values are
   The controller now validates remote receipts in JSON mode, preserving strict
   scalar types while mapping JSON arrays to the declared tuples; the regression
   suite covers that exact boundary.
+- Native TP3/EP1 v2 passed source and model admission, launched all three ranks,
+  and initialized the intended dual-rail NCCL topology. All ranks then failed
+  before weight loading in `ParallelLMHead` because vocabulary size 154,880 is
+  not divisible by TP3. Ownership-verified cleanup terminated all three ranks
+  without force and no model process survived. Receipt:
+  `/var/lib/exo/benchmarks/glm47-native-tp3-ep1-dwagon-fwuff-20260720-v2`, SHA-256
+  `f145bcc58fcb8a0bd79dcd33e5033d90f623debbb5d69e49fc52de540179e5b1`.
+- SGLang's `--enable-dp-lm-head` would avoid the divisibility failure but
+  replicate the full 605-MiB BF16 output head on every rank. That raises the
+  TP3/EP1 cluster static-weight footprint from 61.023 to 62.205 GiB and TP3/EP3
+  from 62.640 to 63.822 GiB. The retry is intentionally paused because it moves
+  away from the primary goal of fitting models larger than dwagon can hold.
 
 ## Pending tests
 
 1. Repeat the matched OLMoE matrix with one GPU per host over InfiniBand,
    retaining host-staged NCCL, exact sanity, strict response coherence, HCA
    counters, sequence-variation evidence, and a local NVLink control.
-2. Run the completed heterogeneous SGLang 2-local+1-remote controller with a
-   native GLM TP3/EP1 control followed by TP3/EP3 with DP attention, dense TP1,
-   two padded experts, small token pools, and CUDA graphs initially disabled.
-3. Add feasible mixed TP/PP trials after the local controls, and implement the
+2. Run synchronized C1/C3/C6 request curves on the capacity-efficient GLM
+   PP3/TP1 E48 topology. Start each run with semantic sanity, use full assigned
+   56/56/60-core domains, and retain dual-rail counters and ownership-safe
+   cleanup. Use the curve to tune stage balance and token-pool limits.
+3. Keep native GLM TP3/DP3/EP as a secondary throughput experiment. Before a
+   future retry, preserve head sharding by padding vocabulary 154,880 to 154,944
+   rather than enabling the replicated DP LM head. Do not treat that topology
+   as a capacity result.
+4. Add feasible mixed TP/PP trials after the local controls, and implement the
    operational collective stage-local receipt producer before claiming
    production Exo PP3 admission. The current engineering harness directly
    launches the audited three-stage runtime and does not pretend that gap is
    closed.
-4. Convert the verified GLM BF16 source to AMXINT8 only after BF16 placement and
+5. Convert the verified GLM BF16 source to AMXINT8 only after BF16 placement and
    hybrid execution comparisons; keep packed-GPU mode disabled initially.
-5. Resume exact staging, deterministic TP1, and strict TP=2 for Qwen3-Coder 30B
+6. Resume exact staging, deterministic TP1, and strict TP=2 for Qwen3-Coder 30B
    A3B, followed by Qwen3.5 35B A3B.
-6. After the first larger-model correctness proof, complete at least five
+7. After the first larger-model correctness proof, complete at least five
    distinct dwagon-only optimization runs and five distinct dwagon-plus-fwuff
    InfiniBand optimization runs. Each run needs repeated samples and a recorded
    hypothesis/lesson. Keep a matched-artifact comparison workload; when a
    different exact-revision HF quantization or format wins one track, add a
    quality-gated matched-format control so topology and format effects remain
    separable.
-7. Re-run the preserved QDR receipts after the ConnectX-5 EDR hardware swap.
+8. Re-run the preserved QDR receipts after the ConnectX-5 EDR hardware swap.
