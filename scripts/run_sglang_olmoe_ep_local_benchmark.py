@@ -15,6 +15,10 @@ Admission is fail closed. The caller must provide:
   matching TP2/EP1 and TP2/EP2 servers. Admission full-rehashes every snapshot
   file, revalidates Hugging Face revision metadata and local tokenization, and
   requires the exact deterministic EP1/EP2 output equivalence.
+
+An optional external Triton MoE configuration root is admitted as two exact,
+hashed RTX 3090 JSON files for the selected EP shape. No caller-provided MoE
+configuration environment variable is inherited.
 """
 
 from __future__ import annotations
@@ -30,6 +34,7 @@ import os
 import re
 import signal
 import socket
+import stat
 import statistics
 import subprocess
 import sys
@@ -112,6 +117,7 @@ OLMOE_SGLANG_REVISION: Final = GLM_4_7_FLASH_SGLANG_REVISION
 OLMOE_VOCABULARY_SIZE: Final = 50_304
 OLMOE_EXPERT_COUNT: Final = 64
 OLMOE_EXPERTS_PER_TOKEN: Final = 8
+OLMOE_HIDDEN_SIZE: Final = 2_048
 OLMOE_CONTEXT_LENGTH: Final = 4_096
 OLMOE_MAX_TOTAL_TOKENS: Final = 4_096
 DWAGON_GPU_UUIDS: Final = (
@@ -138,6 +144,8 @@ LOGIT_PARITY_TOP_LOGPROBS: Final = 8
 DEFAULT_PORT: Final = 62_610
 DEFAULT_STATIC_MEMORY_FRACTION: Final = 0.9
 _RECEIPT_MAXIMUM_BYTES: Final = 4 * 1024 * 1024
+_MOE_CONFIG_MAXIMUM_BYTES: Final = 64 * 1024
+_MOE_CONFIG_MAXIMUM_ENTRIES: Final = 256
 _IDENTITY_FILE_MAXIMUM_BYTES: Final = 64 * 1024 * 1024
 _LOG_MAXIMUM_BYTES: Final = 256 * 1024 * 1024
 _PROC_MAPS_MAXIMUM_BYTES: Final = 16 * 1024 * 1024
@@ -145,8 +153,33 @@ _PROC_SMAPS_MAXIMUM_BYTES: Final = 64 * 1024 * 1024
 _OWNERSHIP_JOURNAL_FILENAME: Final = "olmoe-ep-ownership-journal.json"
 _RESULT_FILENAME: Final = "olmoe-ep-local-benchmark-result.json"
 _SERVER_LOG_FILENAME: Final = "native-sglang-server.log"
+_MOE_CONFIG_SNAPSHOT_DIRECTORY_NAME: Final = "effective-moe-config"
+_MOE_CONFIG_SNAPSHOT_DIRECTORY_MODE: Final = 0o500
+_MOE_CONFIG_SNAPSHOT_FILE_MODE: Final = 0o400
 _SHA256_PATTERN: Final = re.compile(r"[0-9a-f]{64}", re.ASCII)
 _SAFE_RUN_ID_PATTERN: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
+_MOE_CONFIG_BATCH_SIZE_PATTERN: Final = re.compile(r"[1-9][0-9]{0,4}", re.ASCII)
+_MOE_CONFIG_TRITON_VERSION: Final = "3.5.1"
+_MOE_CONFIG_VERSION_DIRECTORY: Final = "triton_3_5_1"
+_MOE_CONFIG_DEVICE_NAME: Final = "NVIDIA_GeForce_RTX_3090"
+_MOE_CONFIG_KEYS: Final = frozenset(
+    {
+        "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N",
+        "BLOCK_SIZE_K",
+        "GROUP_SIZE_M",
+        "num_warps",
+        "num_stages",
+    }
+)
+_MOE_CONFIG_ALLOWED_VALUES: Final[dict[str, frozenset[int]]] = {
+    "BLOCK_SIZE_M": frozenset({16, 32, 64, 128, 256}),
+    "BLOCK_SIZE_N": frozenset({16, 32, 64, 128, 256}),
+    "BLOCK_SIZE_K": frozenset({32, 64, 128, 256}),
+    "GROUP_SIZE_M": frozenset({1, 2, 4, 8, 16, 32, 64, 128}),
+    "num_warps": frozenset({1, 2, 4, 8}),
+    "num_stages": frozenset({1, 2, 3, 4, 5}),
+}
 _KV_CACHE_ALLOCATION_PATTERN: Final = re.compile(
     r"\[(?:[^\]\r\n]* )?TP(?P<tp_rank>[01])"
     r"(?: EP(?P<ep_rank>[01]))?\] KV Cache is allocated\. "
@@ -249,6 +282,40 @@ class RuntimeAdmission:
 
 
 @dataclass(frozen=True, slots=True)
+class MoeConfigFileAdmission:
+    relative_path: str
+    size_bytes: int
+    sha256: str
+    canonical_sha256: str
+    entry_count: int
+    batch_sizes: tuple[int, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class MoeConfigAdmission:
+    root: str
+    triton_version: str
+    version_directory: str
+    device_name: str
+    expert_parallel_size: ExpertParallelSize
+    local_expert_count: int
+    moe_intermediate_size: int
+    files: tuple[MoeConfigFileAdmission, ...]
+    file_set_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class MoeConfigSnapshotAdmission:
+    source: MoeConfigAdmission
+    effective: MoeConfigAdmission
+    directory_paths: tuple[str, ...]
+    directory_mode: int
+    file_mode: int
+    exact_tree_verified: bool
+    byte_for_byte_copy_verified: bool
+
+
+@dataclass(frozen=True, slots=True)
 class OlmoeEpBenchmarkConfig:
     run_id: str
     result_directory: Path
@@ -268,6 +335,7 @@ class OlmoeEpBenchmarkConfig:
     numactl_executable: str
     nvidia_smi_executable: str
     logit_parity_probe: bool = False
+    moe_config_root: Path | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -370,6 +438,387 @@ def _required_sha256(value: object, description: str) -> str:
     if not isinstance(value, str) or _SHA256_PATTERN.fullmatch(value) is None:
         raise OlmoeEpBenchmarkError(f"{description} must be lowercase SHA-256")
     return value
+
+
+def _moe_config_shape(
+    expert_parallel_size: ExpertParallelSize,
+) -> tuple[int, int]:
+    if expert_parallel_size == 1:
+        return 64, 512
+    return 32, 1_024
+
+
+def _moe_config_relative_paths(
+    expert_parallel_size: ExpertParallelSize,
+) -> tuple[Path, Path]:
+    local_expert_count, moe_intermediate_size = _moe_config_shape(expert_parallel_size)
+    stem = (
+        f"E={local_expert_count},N={moe_intermediate_size},"
+        f"device_name={_MOE_CONFIG_DEVICE_NAME}"
+    )
+    directory = Path("configs") / _MOE_CONFIG_VERSION_DIRECTORY
+    return directory / f"{stem}.json", directory / f"{stem}_down.json"
+
+
+def _read_moe_config_file(
+    root: Path,
+    relative_path: Path,
+    moe_intermediate_size: int,
+) -> tuple[MoeConfigFileAdmission, dict[int, dict[str, int]]]:
+    path = root / relative_path
+    description = f"Triton MoE config {relative_path}"
+    try:
+        bound = read_sglang_kt_bound_file(path, maximum_bytes=_MOE_CONFIG_MAXIMUM_BYTES)
+        parsed = parse_sglang_kt_strict_json(bound.contents)
+    except SglangKtReceiptFileError as error:
+        raise OlmoeEpBenchmarkError(f"cannot admit {description}: {error}") from error
+    document = _json_object(parsed, description)
+    if not 1 <= len(document) <= _MOE_CONFIG_MAXIMUM_ENTRIES:
+        raise OlmoeEpBenchmarkError(
+            f"{description} must contain 1-{_MOE_CONFIG_MAXIMUM_ENTRIES} entries"
+        )
+
+    configurations: dict[int, dict[str, int]] = {}
+    for raw_batch_size, raw_configuration in document.items():
+        if _MOE_CONFIG_BATCH_SIZE_PATTERN.fullmatch(raw_batch_size) is None:
+            raise OlmoeEpBenchmarkError(
+                f"{description} batch-size key is not canonical"
+            )
+        batch_size = int(raw_batch_size)
+        if batch_size > OLMOE_MAX_TOTAL_TOKENS:
+            raise OlmoeEpBenchmarkError(
+                f"{description} batch-size key exceeds the token pool"
+            )
+        configuration = _json_object(
+            raw_configuration, f"{description}[{raw_batch_size}]"
+        )
+        _strict_keys(
+            configuration,
+            _MOE_CONFIG_KEYS,
+            f"{description}[{raw_batch_size}]",
+        )
+        admitted: dict[str, int] = {}
+        for name, allowed_values in _MOE_CONFIG_ALLOWED_VALUES.items():
+            value = configuration.get(name)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise OlmoeEpBenchmarkError(
+                    f"{description}[{raw_batch_size}].{name} must be an integer"
+                )
+            if value not in allowed_values:
+                raise OlmoeEpBenchmarkError(
+                    f"{description}[{raw_batch_size}].{name} is not admitted"
+                )
+            admitted[name] = value
+        if moe_intermediate_size % admitted["BLOCK_SIZE_N"] != 0:
+            raise OlmoeEpBenchmarkError(
+                f"{description}[{raw_batch_size}].BLOCK_SIZE_N does not tile N"
+            )
+        if OLMOE_HIDDEN_SIZE % admitted["BLOCK_SIZE_K"] != 0:
+            raise OlmoeEpBenchmarkError(
+                f"{description}[{raw_batch_size}].BLOCK_SIZE_K does not tile K"
+            )
+        configurations[batch_size] = admitted
+
+    batch_sizes = tuple(sorted(configurations))
+    return (
+        MoeConfigFileAdmission(
+            relative_path=relative_path.as_posix(),
+            size_bytes=len(bound.contents),
+            sha256=bound.sha256,
+            canonical_sha256=_canonical_sha256(cast(JsonValue, document)),
+            entry_count=len(configurations),
+            batch_sizes=batch_sizes,
+        ),
+        configurations,
+    )
+
+
+def _verify_moe_config_root(
+    root: Path, expert_parallel_size: ExpertParallelSize
+) -> MoeConfigAdmission:
+    if (
+        not root.is_absolute()
+        or ".." in root.parts
+        or "\0" in str(root)
+        or root != Path(os.path.normpath(root))
+    ):
+        raise OlmoeEpBenchmarkError(
+            "MoE config root must be an absolute lexical directory"
+        )
+
+    local_expert_count, moe_intermediate_size = _moe_config_shape(expert_parallel_size)
+    relative_paths = _moe_config_relative_paths(expert_parallel_size)
+    files: list[MoeConfigFileAdmission] = []
+    maps: list[dict[int, dict[str, int]]] = []
+    for relative_path in relative_paths:
+        file_admission, configurations = _read_moe_config_file(
+            root, relative_path, moe_intermediate_size
+        )
+        files.append(file_admission)
+        maps.append(configurations)
+
+    normal_configurations, down_configurations = maps
+    if normal_configurations.keys() != down_configurations.keys():
+        raise OlmoeEpBenchmarkError(
+            "normal and down Triton MoE configs must have the same batch-size grid"
+        )
+    for batch_size in normal_configurations:
+        if (
+            normal_configurations[batch_size]["BLOCK_SIZE_M"]
+            != down_configurations[batch_size]["BLOCK_SIZE_M"]
+        ):
+            raise OlmoeEpBenchmarkError(
+                "normal and down Triton MoE configs must match BLOCK_SIZE_M"
+            )
+
+    file_set_payload = cast(
+        JsonObject,
+        {
+            "expert_parallel_size": expert_parallel_size,
+            "local_expert_count": local_expert_count,
+            "moe_intermediate_size": moe_intermediate_size,
+            "files": [
+                {
+                    "relative_path": item.relative_path,
+                    "size_bytes": item.size_bytes,
+                    "sha256": item.sha256,
+                    "canonical_sha256": item.canonical_sha256,
+                    "entry_count": item.entry_count,
+                    "batch_sizes": list(item.batch_sizes),
+                }
+                for item in files
+            ],
+        },
+    )
+    return MoeConfigAdmission(
+        root=str(root),
+        triton_version=_MOE_CONFIG_TRITON_VERSION,
+        version_directory=_MOE_CONFIG_VERSION_DIRECTORY,
+        device_name=_MOE_CONFIG_DEVICE_NAME,
+        expert_parallel_size=expert_parallel_size,
+        local_expert_count=local_expert_count,
+        moe_intermediate_size=moe_intermediate_size,
+        files=tuple(files),
+        file_set_sha256=_canonical_sha256(file_set_payload),
+    )
+
+
+def verify_moe_config(config: OlmoeEpBenchmarkConfig) -> MoeConfigAdmission | None:
+    """Admit the exact external RTX 3090 config pair selected for this run."""
+
+    if config.moe_config_root is None:
+        return None
+    return _verify_moe_config_root(config.moe_config_root, config.expert_parallel_size)
+
+
+def _write_moe_config_snapshot_file(path: Path, contents: bytes) -> None:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags, 0o600)
+    except OSError as error:
+        raise OlmoeEpBenchmarkError(
+            f"cannot create private MoE config snapshot file: {error}"
+        ) from error
+    try:
+        view = memoryview(contents)
+        written = 0
+        while written < len(contents):
+            count = os.write(descriptor, view[written:])
+            if count <= 0:
+                raise OlmoeEpBenchmarkError(
+                    "private MoE config snapshot write made no progress"
+                )
+            written += count
+        os.fsync(descriptor)
+        observed = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(observed.st_mode)
+            or observed.st_nlink != 1
+            or observed.st_uid != os.geteuid()
+            or observed.st_size != len(contents)
+        ):
+            raise OlmoeEpBenchmarkError(
+                "private MoE config snapshot file identity is invalid"
+            )
+        os.fchmod(descriptor, _MOE_CONFIG_SNAPSHOT_FILE_MODE)
+        os.fsync(descriptor)
+    except OSError as error:
+        raise OlmoeEpBenchmarkError(
+            f"cannot publish private MoE config snapshot file: {error}"
+        ) from error
+    finally:
+        os.close(descriptor)
+
+
+def _moe_config_snapshot_directories(root: Path) -> tuple[Path, Path, Path]:
+    configs = root / "configs"
+    version = configs / _MOE_CONFIG_VERSION_DIRECTORY
+    return root, configs, version
+
+
+def _verify_moe_config_snapshot_tree(
+    root: Path, expert_parallel_size: ExpertParallelSize
+) -> tuple[str, ...]:
+    directories = _moe_config_snapshot_directories(root)
+    expected_entries = (
+        frozenset({"configs"}),
+        frozenset({_MOE_CONFIG_VERSION_DIRECTORY}),
+        frozenset(
+            path.name for path in _moe_config_relative_paths(expert_parallel_size)
+        ),
+    )
+    for directory, expected_names in zip(directories, expected_entries, strict=True):
+        try:
+            observed = directory.lstat()
+            names = frozenset(entry.name for entry in os.scandir(directory))
+        except OSError as error:
+            raise OlmoeEpBenchmarkError(
+                f"cannot verify private MoE config snapshot tree: {error}"
+            ) from error
+        if (
+            not stat.S_ISDIR(observed.st_mode)
+            or stat.S_IMODE(observed.st_mode) != _MOE_CONFIG_SNAPSHOT_DIRECTORY_MODE
+            or observed.st_uid != os.geteuid()
+            or names != expected_names
+        ):
+            raise OlmoeEpBenchmarkError(
+                "private MoE config snapshot directory is not exact and read-only"
+            )
+
+    for relative_path in _moe_config_relative_paths(expert_parallel_size):
+        path = root / relative_path
+        try:
+            observed = path.lstat()
+        except OSError as error:
+            raise OlmoeEpBenchmarkError(
+                f"cannot verify private MoE config snapshot file: {error}"
+            ) from error
+        if (
+            not stat.S_ISREG(observed.st_mode)
+            or observed.st_nlink != 1
+            or stat.S_IMODE(observed.st_mode) != _MOE_CONFIG_SNAPSHOT_FILE_MODE
+            or observed.st_uid != os.geteuid()
+        ):
+            raise OlmoeEpBenchmarkError(
+                "private MoE config snapshot file is not exact and read-only"
+            )
+    return tuple(str(path) for path in directories)
+
+
+def create_moe_config_snapshot(
+    config: OlmoeEpBenchmarkConfig,
+    source_admission: MoeConfigAdmission | None,
+) -> MoeConfigSnapshotAdmission | None:
+    """Copy the admitted pair into one immutable, harness-owned launch root."""
+
+    if source_admission is None:
+        if config.moe_config_root is not None:
+            raise OlmoeEpBenchmarkError("external MoE config was not admitted")
+        return None
+    if config.moe_config_root is None:
+        raise OlmoeEpBenchmarkError("MoE config admission has no source root")
+    freshly_admitted = verify_moe_config(config)
+    if freshly_admitted != source_admission:
+        raise OlmoeEpBenchmarkError("external MoE config changed before snapshot")
+
+    source_contents: dict[str, bytes] = {}
+    for file_admission in source_admission.files:
+        source_path = Path(source_admission.root) / file_admission.relative_path
+        try:
+            bound = read_sglang_kt_bound_file(
+                source_path, maximum_bytes=_MOE_CONFIG_MAXIMUM_BYTES
+            )
+        except SglangKtReceiptFileError as error:
+            raise OlmoeEpBenchmarkError(
+                f"cannot reread admitted MoE config source: {error}"
+            ) from error
+        if (
+            len(bound.contents) != file_admission.size_bytes
+            or bound.sha256 != file_admission.sha256
+        ):
+            raise OlmoeEpBenchmarkError("external MoE config changed before snapshot")
+        source_contents[file_admission.relative_path] = bound.contents
+    if verify_moe_config(config) != source_admission:
+        raise OlmoeEpBenchmarkError("external MoE config changed during snapshot read")
+
+    snapshot_root = config.result_directory / _MOE_CONFIG_SNAPSHOT_DIRECTORY_NAME
+    root, configs_directory, version_directory = _moe_config_snapshot_directories(
+        snapshot_root
+    )
+    try:
+        root.mkdir(mode=0o700, parents=False, exist_ok=False)
+        configs_directory.mkdir(mode=0o700, parents=False, exist_ok=False)
+        version_directory.mkdir(mode=0o700, parents=False, exist_ok=False)
+    except OSError as error:
+        raise OlmoeEpBenchmarkError(
+            f"cannot create private MoE config snapshot tree: {error}"
+        ) from error
+
+    for file_admission in source_admission.files:
+        _write_moe_config_snapshot_file(
+            snapshot_root / file_admission.relative_path,
+            source_contents[file_admission.relative_path],
+        )
+    for directory in reversed((root, configs_directory, version_directory)):
+        _fsync_directory(directory)
+    try:
+        for directory in (version_directory, configs_directory, root):
+            os.chmod(
+                directory,
+                _MOE_CONFIG_SNAPSHOT_DIRECTORY_MODE,
+                follow_symlinks=False,
+            )
+    except OSError as error:
+        raise OlmoeEpBenchmarkError(
+            f"cannot make private MoE config snapshot read-only: {error}"
+        ) from error
+    for directory in (version_directory, configs_directory, root):
+        _fsync_directory(directory)
+    _fsync_directory(config.result_directory)
+
+    effective_admission = _verify_moe_config_root(
+        snapshot_root, config.expert_parallel_size
+    )
+    if effective_admission.file_set_sha256 != source_admission.file_set_sha256:
+        raise OlmoeEpBenchmarkError(
+            "private MoE config snapshot differs from admitted source"
+        )
+    directory_paths = _verify_moe_config_snapshot_tree(
+        snapshot_root, config.expert_parallel_size
+    )
+    return MoeConfigSnapshotAdmission(
+        source=source_admission,
+        effective=effective_admission,
+        directory_paths=directory_paths,
+        directory_mode=_MOE_CONFIG_SNAPSHOT_DIRECTORY_MODE,
+        file_mode=_MOE_CONFIG_SNAPSHOT_FILE_MODE,
+        exact_tree_verified=True,
+        byte_for_byte_copy_verified=True,
+    )
+
+
+def verify_moe_config_snapshot(
+    snapshot: MoeConfigSnapshotAdmission,
+) -> MoeConfigSnapshotAdmission:
+    root = Path(snapshot.effective.root)
+    effective = _verify_moe_config_root(root, snapshot.effective.expert_parallel_size)
+    directory_paths = _verify_moe_config_snapshot_tree(
+        root, snapshot.effective.expert_parallel_size
+    )
+    observed = MoeConfigSnapshotAdmission(
+        source=snapshot.source,
+        effective=effective,
+        directory_paths=directory_paths,
+        directory_mode=_MOE_CONFIG_SNAPSHOT_DIRECTORY_MODE,
+        file_mode=_MOE_CONFIG_SNAPSHOT_FILE_MODE,
+        exact_tree_verified=True,
+        byte_for_byte_copy_verified=(
+            effective.file_set_sha256 == snapshot.source.file_set_sha256
+        ),
+    )
+    if observed != snapshot or not observed.byte_for_byte_copy_verified:
+        raise OlmoeEpBenchmarkError("private MoE config snapshot changed")
+    return observed
 
 
 def _load_bound_json(
@@ -851,6 +1300,7 @@ def build_server_environment(
     owner_token: str,
     ownership_namespace: str,
     parent_environment: Mapping[str, str] | None = None,
+    moe_config_snapshot: MoeConfigSnapshotAdmission | None = None,
 ) -> dict[str, str]:
     parent = os.environ if parent_environment is None else parent_environment
     environment = {
@@ -882,6 +1332,22 @@ def build_server_environment(
             _OWNERSHIP_NAMESPACE_ENVIRONMENT: ownership_namespace,
         }
     )
+    if config.moe_config_root is None:
+        if moe_config_snapshot is not None:
+            raise OlmoeEpBenchmarkError(
+                "MoE config snapshot is invalid without an external source"
+            )
+    else:
+        if (
+            moe_config_snapshot is None
+            or moe_config_snapshot.source.root != str(config.moe_config_root)
+            or moe_config_snapshot.source.expert_parallel_size
+            != config.expert_parallel_size
+        ):
+            raise OlmoeEpBenchmarkError(
+                "external MoE config requires its private per-run snapshot"
+            )
+        environment["SGLANG_MOE_CONFIG_DIR"] = moe_config_snapshot.effective.root
     return environment
 
 
@@ -2297,10 +2763,29 @@ def start_server(
     config: OlmoeEpBenchmarkConfig,
     owner_token: str,
     ownership_namespace: str,
+    moe_config_snapshot: MoeConfigSnapshotAdmission | None = None,
 ) -> RunningServerProcess:
+    source_admission = verify_moe_config(config)
+    if source_admission is None:
+        if moe_config_snapshot is not None:
+            raise OlmoeEpBenchmarkError("unexpected MoE config snapshot")
+    else:
+        if (
+            moe_config_snapshot is None
+            or source_admission != moe_config_snapshot.source
+        ):
+            raise OlmoeEpBenchmarkError(
+                "external MoE config changed before server launch"
+            )
+        verify_moe_config_snapshot(moe_config_snapshot)
     verify_port_vacant(config.host, config.port)
     command = build_server_command(config)
-    environment = build_server_environment(config, owner_token, ownership_namespace)
+    environment = build_server_environment(
+        config,
+        owner_token,
+        ownership_namespace,
+        moe_config_snapshot=moe_config_snapshot,
+    )
     log_path = config.result_directory / _SERVER_LOG_FILENAME
     log_file = log_path.open("xb", buffering=0)
     try:
@@ -2439,7 +2924,9 @@ def _wait_for_readiness(
 
 
 def verify_server_log_contract(
-    log_path: Path, expert_parallel_size: ExpertParallelSize
+    log_path: Path,
+    expert_parallel_size: ExpertParallelSize,
+    moe_config_snapshot: MoeConfigSnapshotAdmission | None = None,
 ) -> JsonObject:
     """Bind the effective KV-pool and collective policy from startup logs."""
 
@@ -2502,7 +2989,67 @@ def verify_server_log_contract(
         raise OlmoeEpBenchmarkError(
             "native SGLang log reports a custom all-reduce setup failure"
         )
-    return {
+    moe_config_loads: list[JsonValue] = []
+    if moe_config_snapshot is not None:
+        effective_admission = moe_config_snapshot.effective
+        all_config_load_lines = [
+            line for line in lines if "Using MoE kernel config from " in line
+        ]
+        rejected_config_warning_lines = [
+            line
+            for line in lines
+            if any(
+                marker in line
+                for marker in (
+                    "Using default MoE kernel config",
+                    "Using MoE kernel config with down_moe=False",
+                    "Config file not found at ",
+                    "Fallback to triton version",
+                )
+            )
+        ]
+        if len(all_config_load_lines) != 4 or rejected_config_warning_lines:
+            raise OlmoeEpBenchmarkError(
+                "native SGLang log contains an extra MoE config load, default, "
+                "or fallback warning"
+            )
+        for file_admission in effective_admission.files:
+            absolute_path = (
+                Path(effective_admission.root) / file_admission.relative_path
+            )
+            marker = f"Using MoE kernel config from {absolute_path}."
+            matches_by_rank = [
+                [
+                    line
+                    for line in lines
+                    if marker in line
+                    and (
+                        f"TP{rank}] {marker}" in line
+                        if expert_parallel_size == 1
+                        else f"TP{rank} EP{rank}] {marker}" in line
+                    )
+                ]
+                for rank in range(2)
+            ]
+            if any(len(rank_matches) != 1 for rank_matches in matches_by_rank):
+                raise OlmoeEpBenchmarkError(
+                    "native SGLang log does not verify both TP ranks loaded every "
+                    "admitted MoE config"
+                )
+            matches = [rank_matches[0] for rank_matches in matches_by_rank]
+            moe_config_loads.append(
+                {
+                    "relative_path": file_admission.relative_path,
+                    "sha256": file_admission.sha256,
+                    "rank_load_count": len(matches),
+                    "load_line_sha256": [
+                        hashlib.sha256(line.encode("utf-8")).hexdigest()
+                        for line in matches
+                    ],
+                }
+            )
+
+    receipt: JsonObject = {
         "status": "verified",
         "observed_bytes": len(contents),
         "observed_sha256": hashlib.sha256(contents).hexdigest(),
@@ -2526,6 +3073,16 @@ def verify_server_log_contract(
         "custom_all_reduce_disabled": True,
         "custom_all_reduce_failure_line_count": len(custom_all_reduce_failures),
     }
+    if moe_config_snapshot is not None:
+        receipt["moe_kernel_config"] = {
+            "source_file_set_sha256": moe_config_snapshot.source.file_set_sha256,
+            "effective_file_set_sha256": (
+                moe_config_snapshot.effective.file_set_sha256
+            ),
+            "effective_root": moe_config_snapshot.effective.root,
+            "loads": moe_config_loads,
+        }
+    return receipt
 
 
 def _verify_server_info(
@@ -2874,8 +3431,53 @@ def expert_parallel_semantics(expert_parallel_size: ExpertParallelSize) -> JsonO
     }
 
 
-def _configuration_receipt(config: OlmoeEpBenchmarkConfig) -> JsonObject:
+def _moe_config_receipt(admission: MoeConfigAdmission) -> JsonObject:
     return {
+        "status": "admitted",
+        "root": admission.root,
+        "triton_version": admission.triton_version,
+        "version_directory": admission.version_directory,
+        "device_name": admission.device_name,
+        "expert_parallel_size": admission.expert_parallel_size,
+        "local_expert_count": admission.local_expert_count,
+        "moe_intermediate_size": admission.moe_intermediate_size,
+        "files": [
+            {
+                "relative_path": item.relative_path,
+                "size_bytes": item.size_bytes,
+                "sha256": item.sha256,
+                "canonical_sha256": item.canonical_sha256,
+                "entry_count": item.entry_count,
+                "batch_sizes": list(item.batch_sizes),
+            }
+            for item in admission.files
+        ],
+        "file_set_sha256": admission.file_set_sha256,
+    }
+
+
+def _moe_config_snapshot_receipt(
+    snapshot: MoeConfigSnapshotAdmission,
+) -> JsonObject:
+    return {
+        "status": "snapshotted",
+        "source": _moe_config_receipt(snapshot.source),
+        "effective_snapshot": {
+            **_moe_config_receipt(snapshot.effective),
+            "directory_paths": list(snapshot.directory_paths),
+            "directory_mode_octal": format(snapshot.directory_mode, "04o"),
+            "file_mode_octal": format(snapshot.file_mode, "04o"),
+            "exact_tree_verified": snapshot.exact_tree_verified,
+            "byte_for_byte_copy_verified": snapshot.byte_for_byte_copy_verified,
+        },
+    }
+
+
+def _configuration_receipt(
+    config: OlmoeEpBenchmarkConfig,
+    moe_config_snapshot: MoeConfigSnapshotAdmission | None = None,
+) -> JsonObject:
+    receipt: JsonObject = {
         "host_name": "dwagon",
         "scope": "single_host",
         "pipeline_parallel_size": 1,
@@ -2913,6 +3515,16 @@ def _configuration_receipt(config: OlmoeEpBenchmarkConfig) -> JsonObject:
         ),
         **({"logit_parity_probe_enabled": True} if config.logit_parity_probe else {}),
     }
+    if config.moe_config_root is not None:
+        receipt["moe_kernel_config"] = (
+            {
+                "status": "not_snapshotted",
+                "source_root": str(config.moe_config_root),
+            }
+            if moe_config_snapshot is None
+            else _moe_config_snapshot_receipt(moe_config_snapshot)
+        )
+    return receipt
 
 
 def _source_identity() -> tuple[JsonObject, ...]:
@@ -3002,6 +3614,7 @@ def _run_benchmark_under_cpu_policy(config: OlmoeEpBenchmarkConfig) -> JsonObjec
     port_preflight = verify_port_vacant(config.host, config.port)
     runtime = verify_runtime_install(config)
     model = verify_stage_contract(config)
+    moe_config_source = verify_moe_config(config)
     source_identity = _source_identity()
     topology = {
         "gpu_nv4": verify_dwagon_nv4_topology(config),
@@ -3009,6 +3622,7 @@ def _run_benchmark_under_cpu_policy(config: OlmoeEpBenchmarkConfig) -> JsonObjec
         "port_preflight": port_preflight,
     }
     config.result_directory.mkdir(mode=0o700, parents=False, exist_ok=False)
+    moe_config_snapshot = create_moe_config_snapshot(config, moe_config_source)
     started_at = _utc_now()
     started_monotonic = time.monotonic()
     owner_token = uuid.uuid4().hex
@@ -3034,7 +3648,7 @@ def _run_benchmark_under_cpu_policy(config: OlmoeEpBenchmarkConfig) -> JsonObjec
             previous_handlers[managed_signal] = signal.getsignal(managed_signal)
             signal.signal(managed_signal, signal_state.handle)
         try:
-            running = start_server(config, owner_token, namespace)
+            running = start_server(config, owner_token, namespace, moe_config_snapshot)
             signal_state.checkpoint()
             with OlmoeNativeServingClient(
                 f"http://{config.host}:{config.port}",
@@ -3044,7 +3658,9 @@ def _run_benchmark_under_cpu_policy(config: OlmoeEpBenchmarkConfig) -> JsonObjec
                     running, client, config.readiness_timeout_seconds
                 )
                 server_log_contract = verify_server_log_contract(
-                    Path(running.owned.log_path), config.expert_parallel_size
+                    Path(running.owned.log_path),
+                    config.expert_parallel_size,
+                    moe_config_snapshot,
                 )
                 listener_ownership.append(verify_listener_owned(running, config.port))
                 signal_state.checkpoint()
@@ -3074,6 +3690,12 @@ def _run_benchmark_under_cpu_policy(config: OlmoeEpBenchmarkConfig) -> JsonObjec
                     )
                     signal_state.checkpoint()
                 rank_local_numa.append(verify_rank_local_numa(running))
+                if moe_config_snapshot is not None:
+                    server_log_contract = verify_server_log_contract(
+                        Path(running.owned.log_path),
+                        config.expert_parallel_size,
+                        moe_config_snapshot,
+                    )
         except BaseException as error:
             failure = error
         finally:
@@ -3099,10 +3721,18 @@ def _run_benchmark_under_cpu_policy(config: OlmoeEpBenchmarkConfig) -> JsonObjec
     try:
         final_runtime = verify_runtime_install(config)
         final_model = verify_stage_contract(config)
+        final_moe_config_source = verify_moe_config(config)
+        final_moe_config_snapshot = (
+            None
+            if moe_config_snapshot is None
+            else verify_moe_config_snapshot(moe_config_snapshot)
+        )
         final_source_identity = _source_identity()
         if (
             final_runtime != runtime
             or final_model != model
+            or final_moe_config_source != moe_config_source
+            or final_moe_config_snapshot != moe_config_snapshot
             or final_source_identity != source_identity
         ):
             raise OlmoeEpBenchmarkError("admitted artifacts changed during benchmark")
@@ -3148,7 +3778,7 @@ def _run_benchmark_under_cpu_policy(config: OlmoeEpBenchmarkConfig) -> JsonObjec
             "started_at_utc": started_at,
             "completed_at_utc": completed_at,
             "elapsed_seconds": time.monotonic() - started_monotonic,
-            "configuration": _configuration_receipt(config),
+            "configuration": _configuration_receipt(config, moe_config_snapshot),
             "source_identity": list(source_identity),
             "admission": {
                 "runtime": cast(JsonObject, asdict(runtime)),
@@ -3157,6 +3787,15 @@ def _run_benchmark_under_cpu_policy(config: OlmoeEpBenchmarkConfig) -> JsonObjec
                     "receipt_sha256": model.receipt_sha256,
                     "contract": model.contract.model_dump(mode="json"),
                 },
+                **(
+                    {
+                        "moe_kernel_config": _moe_config_snapshot_receipt(
+                            moe_config_snapshot
+                        )
+                    }
+                    if moe_config_snapshot is not None
+                    else {}
+                ),
                 "topology": topology,
                 "post_run_reverification": admission_reverification,
             },
@@ -3165,7 +3804,11 @@ def _run_benchmark_under_cpu_policy(config: OlmoeEpBenchmarkConfig) -> JsonObjec
                 "environment": {
                     key: value
                     for key, value in build_server_environment(
-                        config, "redacted", namespace, {}
+                        config,
+                        "redacted",
+                        namespace,
+                        {},
+                        moe_config_snapshot,
                     ).items()
                     if key not in {_OWNER_TOKEN_ENVIRONMENT}
                 },
@@ -3176,6 +3819,15 @@ def _run_benchmark_under_cpu_policy(config: OlmoeEpBenchmarkConfig) -> JsonObjec
                         **asdict(running.owned),
                         "owner_token": hashlib.sha256(owner_token.encode()).hexdigest(),
                     }
+                ),
+                **(
+                    {
+                        "moe_kernel_config": _moe_config_snapshot_receipt(
+                            moe_config_snapshot
+                        )
+                    }
+                    if moe_config_snapshot is not None
+                    else {}
                 ),
             },
             "readiness": readiness,
@@ -3207,6 +3859,7 @@ def _run_stage_capture_under_cpu_policy(
         raise OlmoeEpBenchmarkError("stage capture mode is not configured exactly")
     port_preflight = verify_port_vacant(config.host, config.port)
     runtime = verify_runtime_install(config)
+    moe_config_source = verify_moe_config(config)
     source_identity = _source_identity()
     topology = {
         "gpu_nv4": verify_dwagon_nv4_topology(config),
@@ -3214,6 +3867,7 @@ def _run_stage_capture_under_cpu_policy(
         "port_preflight": port_preflight,
     }
     config.result_directory.mkdir(mode=0o700, parents=False, exist_ok=False)
+    moe_config_snapshot = create_moe_config_snapshot(config, moe_config_source)
     started_at = _utc_now()
     started_monotonic = time.monotonic()
     owner_token = uuid.uuid4().hex
@@ -3240,7 +3894,7 @@ def _run_stage_capture_under_cpu_policy(
             previous_handlers[managed_signal] = signal.getsignal(managed_signal)
             signal.signal(managed_signal, signal_state.handle)
         try:
-            running = start_server(config, owner_token, namespace)
+            running = start_server(config, owner_token, namespace, moe_config_snapshot)
             signal_state.checkpoint()
             with OlmoeNativeServingClient(
                 f"http://{config.host}:{config.port}",
@@ -3250,7 +3904,9 @@ def _run_stage_capture_under_cpu_policy(
                     running, client, config.readiness_timeout_seconds
                 )
                 server_log_contract = verify_server_log_contract(
-                    Path(running.owned.log_path), config.expert_parallel_size
+                    Path(running.owned.log_path),
+                    config.expert_parallel_size,
+                    moe_config_snapshot,
                 )
                 first_listener = verify_listener_owned(running, config.port)
                 listener_ownership.append(first_listener)
@@ -3286,6 +3942,12 @@ def _run_stage_capture_under_cpu_policy(
                     assert_server_alive(running, "logit parity probe")
                 listener_ownership.append(verify_listener_owned(running, config.port))
                 rank_local_numa.append(verify_rank_local_numa(running))
+                if moe_config_snapshot is not None:
+                    server_log_contract = verify_server_log_contract(
+                        Path(running.owned.log_path),
+                        config.expert_parallel_size,
+                        moe_config_snapshot,
+                    )
                 signal_state.checkpoint()
         except BaseException as error:
             failure = error
@@ -3311,10 +3973,18 @@ def _run_stage_capture_under_cpu_policy(
     admission_reverification: JsonObject
     try:
         final_runtime = verify_runtime_install(config)
+        final_moe_config_source = verify_moe_config(config)
+        final_moe_config_snapshot = (
+            None
+            if moe_config_snapshot is None
+            else verify_moe_config_snapshot(moe_config_snapshot)
+        )
         final_snapshot = verify_pinned_snapshot(Path(config.model_path))
         final_source_identity = _source_identity()
         if (
             final_runtime != runtime
+            or final_moe_config_source != moe_config_source
+            or final_moe_config_snapshot != moe_config_snapshot
             or final_source_identity != source_identity
             or capture is None
             or final_snapshot.canonical_sha256 != capture.snapshot_canonical_sha256
@@ -3366,10 +4036,19 @@ def _run_stage_capture_under_cpu_policy(
             "started_at_utc": started_at,
             "completed_at_utc": _utc_now(),
             "elapsed_seconds": time.monotonic() - started_monotonic,
-            "configuration": _configuration_receipt(config),
+            "configuration": _configuration_receipt(config, moe_config_snapshot),
             "source_identity": list(source_identity),
             "admission": {
                 "runtime": cast(JsonObject, asdict(runtime)),
+                **(
+                    {
+                        "moe_kernel_config": _moe_config_snapshot_receipt(
+                            moe_config_snapshot
+                        )
+                    }
+                    if moe_config_snapshot is not None
+                    else {}
+                ),
                 "topology": topology,
                 "post_run_reverification": admission_reverification,
             },
@@ -3379,6 +4058,15 @@ def _run_stage_capture_under_cpu_policy(
                 else {
                     **asdict(running.owned),
                     "owner_token": hashlib.sha256(owner_token.encode()).hexdigest(),
+                    **(
+                        {
+                            "moe_kernel_config": _moe_config_snapshot_receipt(
+                                moe_config_snapshot
+                            )
+                        }
+                        if moe_config_snapshot is not None
+                        else {}
+                    ),
                 }
             ),
             "readiness": readiness,
@@ -3552,9 +4240,7 @@ def _run_with_cpu_performance_policy(
     ):
         try:
             raw_capture = payload.get("capture")
-            capture = SanityCapture.model_validate_json(
-                _canonical_json(cast(JsonValue, raw_capture))
-            )
+            capture = SanityCapture.model_validate_json(_canonical_json(raw_capture))
             if config.stage_capture_output is None:
                 raise OlmoeEpBenchmarkError("stage capture output is unavailable")
             payload["capture_receipt_sha256"] = publish_sanity_capture(
@@ -3672,6 +4358,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--numactl-executable", default="/usr/bin/numactl")
     parser.add_argument("--nvidia-smi-executable", default="/usr/bin/nvidia-smi")
     parser.add_argument(
+        "--moe-config-root",
+        type=Path,
+        help="absolute root containing the exact admitted Triton config pair",
+    )
+    parser.add_argument(
         "--logit-parity-probe",
         action="store_true",
         help="capture one receipt-backed logit probe without timed workloads",
@@ -3701,6 +4392,7 @@ def config_from_arguments(arguments: argparse.Namespace) -> OlmoeEpBenchmarkConf
         raise OlmoeEpBenchmarkError("local EP benchmark host must be loopback")
     stage_contract = cast(Path | None, arguments.stage_contract)
     stage_capture_output = cast(Path | None, arguments.stage_capture_output)
+    moe_config_root = cast(Path | None, arguments.moe_config_root)
     logit_parity_probe = cast(bool, arguments.logit_parity_probe)
     if logit_parity_probe and stage_capture_output is None:
         raise OlmoeEpBenchmarkError("logit parity probe requires managed stage capture")
@@ -3713,6 +4405,15 @@ def config_from_arguments(arguments: argparse.Namespace) -> OlmoeEpBenchmarkConf
     ):
         raise OlmoeEpBenchmarkError(
             "stage capture output must be an absolute lexical path"
+        )
+    if moe_config_root is not None and (
+        not moe_config_root.is_absolute()
+        or ".." in moe_config_root.parts
+        or "\0" in str(moe_config_root)
+        or moe_config_root != Path(os.path.normpath(moe_config_root))
+    ):
+        raise OlmoeEpBenchmarkError(
+            "MoE config root must be an absolute lexical directory"
         )
     if stage_capture_output is not None:
         try:
@@ -3757,6 +4458,7 @@ def config_from_arguments(arguments: argparse.Namespace) -> OlmoeEpBenchmarkConf
             cast(str, arguments.nvidia_smi_executable), "nvidia-smi executable"
         ),
         logit_parity_probe=logit_parity_probe,
+        moe_config_root=moe_config_root,
     )
 
 

@@ -52,6 +52,46 @@ def _base_config(tmp_path: Path) -> olmoe.OlmoeEpBenchmarkConfig:
     )
 
 
+def _moe_kernel_configuration(*, block_size_m: int = 16) -> dict[str, int]:
+    return {
+        "BLOCK_SIZE_M": block_size_m,
+        "BLOCK_SIZE_N": 64,
+        "BLOCK_SIZE_K": 64,
+        "GROUP_SIZE_M": 1,
+        "num_warps": 4,
+        "num_stages": 2,
+    }
+
+
+def _write_moe_config_pair(
+    root: Path,
+    expert_parallel_size: olmoe.ExpertParallelSize,
+    *,
+    normal: object | None = None,
+    down: object | None = None,
+) -> None:
+    paths = olmoe._moe_config_relative_paths(expert_parallel_size)
+    payloads = (
+        {"1": _moe_kernel_configuration()} if normal is None else normal,
+        {"1": _moe_kernel_configuration()} if down is None else down,
+    )
+    for relative_path, payload in zip(paths, payloads, strict=True):
+        path = root / relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def _create_moe_config_snapshot(
+    config: olmoe.OlmoeEpBenchmarkConfig,
+) -> olmoe.MoeConfigSnapshotAdmission:
+    source = olmoe.verify_moe_config(config)
+    assert source is not None
+    config.result_directory.mkdir(mode=0o700)
+    snapshot = olmoe.create_moe_config_snapshot(config, source)
+    assert snapshot is not None
+    return snapshot
+
+
 def _capture(ep_size: olmoe.ExpertParallelSize) -> olmoe.SanityCapture:
     input_ids = (101, 102, 103)
     output_ids = (201,)
@@ -133,6 +173,243 @@ def test_tiny_self_attested_runtime_receipt_is_rejected(tmp_path: Path) -> None:
         olmoe.verify_runtime_install(config)
 
 
+@pytest.mark.parametrize(
+    ("expert_parallel_size", "expected_stem", "local_experts", "intermediate_size"),
+    (
+        (1, "E=64,N=512", 64, 512),
+        (2, "E=32,N=1024", 32, 1_024),
+    ),
+)
+def test_external_moe_config_admits_exact_rtx3090_pair(
+    tmp_path: Path,
+    expert_parallel_size: olmoe.ExpertParallelSize,
+    expected_stem: str,
+    local_experts: int,
+    intermediate_size: int,
+) -> None:
+    root = tmp_path / "moe-config"
+    _write_moe_config_pair(root, expert_parallel_size)
+    (root / "unrelated-source-file.txt").write_text("not copied")
+    config = replace(
+        _base_config(tmp_path),
+        expert_parallel_size=expert_parallel_size,
+        moe_config_root=root,
+    )
+
+    snapshot = _create_moe_config_snapshot(config)
+    source = snapshot.source
+    effective = snapshot.effective
+
+    assert source.local_expert_count == local_experts
+    assert source.moe_intermediate_size == intermediate_size
+    assert len(source.files) == 2
+    assert all(expected_stem in item.relative_path for item in source.files)
+    assert source.files[1].relative_path.endswith("_down.json")
+    assert all(len(item.sha256) == 64 for item in source.files)
+    assert effective.root != source.root
+    assert Path(effective.root).parent == config.result_directory
+    assert effective.file_set_sha256 == source.file_set_sha256
+    assert [item.sha256 for item in effective.files] == [
+        item.sha256 for item in source.files
+    ]
+    assert all(
+        (Path(source.root) / source_file.relative_path).read_bytes()
+        == (Path(effective.root) / effective_file.relative_path).read_bytes()
+        for source_file, effective_file in zip(
+            source.files, effective.files, strict=True
+        )
+    )
+    assert sorted(
+        path.relative_to(Path(effective.root)).as_posix()
+        for path in Path(effective.root).rglob("*")
+        if path.is_file()
+    ) == sorted(item.relative_path for item in source.files)
+    assert all(
+        path.stat().st_mode & 0o777 == 0o400
+        for path in Path(effective.root).rglob("*")
+        if path.is_file()
+    )
+    assert all(
+        Path(path).stat().st_mode & 0o777 == 0o500 for path in snapshot.directory_paths
+    )
+    with pytest.raises(olmoe.OlmoeEpBenchmarkError, match="private per-run snapshot"):
+        olmoe.build_server_environment(config, "owner", "namespace", {})
+    environment = olmoe.build_server_environment(
+        config, "owner", "namespace", {}, snapshot
+    )
+    assert environment["SGLANG_MOE_CONFIG_DIR"] == effective.root
+    assert environment["SGLANG_MOE_CONFIG_DIR"] != str(root)
+    receipt = olmoe._configuration_receipt(config, snapshot)
+    config_receipt = cast(dict[str, object], receipt["moe_kernel_config"])
+    source_receipt = cast(dict[str, object], config_receipt["source"])
+    effective_receipt = cast(dict[str, object], config_receipt["effective_snapshot"])
+    assert source_receipt["file_set_sha256"] == source.file_set_sha256
+    assert effective_receipt["file_set_sha256"] == effective.file_set_sha256
+    assert olmoe.build_server_command(config) == olmoe.build_server_command(
+        replace(config, moe_config_root=None)
+    )
+
+
+def test_external_moe_config_mutation_before_snapshot_is_rejected(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "moe-config"
+    _write_moe_config_pair(root, 2)
+    config = replace(_base_config(tmp_path), moe_config_root=root)
+    source = olmoe.verify_moe_config(config)
+    assert source is not None
+    config.result_directory.mkdir(mode=0o700)
+    normal_path, _down_path = olmoe._moe_config_relative_paths(2)
+    (root / normal_path).write_text(
+        json.dumps(
+            {
+                "1": {
+                    **_moe_kernel_configuration(),
+                    "num_stages": 3,
+                }
+            }
+        )
+    )
+
+    with pytest.raises(olmoe.OlmoeEpBenchmarkError, match="changed before snapshot"):
+        olmoe.create_moe_config_snapshot(config, source)
+
+
+def test_effective_moe_config_snapshot_mutation_is_rejected(tmp_path: Path) -> None:
+    root = tmp_path / "moe-config"
+    _write_moe_config_pair(root, 2)
+    config = replace(_base_config(tmp_path), moe_config_root=root)
+    snapshot = _create_moe_config_snapshot(config)
+    target = Path(snapshot.effective.root) / snapshot.effective.files[0].relative_path
+    target.chmod(0o600)
+    target.write_text(
+        json.dumps(
+            {
+                "1": {
+                    **_moe_kernel_configuration(),
+                    "num_stages": 3,
+                }
+            }
+        )
+    )
+    target.chmod(0o400)
+
+    with pytest.raises(olmoe.OlmoeEpBenchmarkError, match="snapshot changed"):
+        olmoe.verify_moe_config_snapshot(snapshot)
+
+
+def test_external_moe_config_requires_both_exact_files(tmp_path: Path) -> None:
+    root = tmp_path / "moe-config"
+    normal_path, _down_path = olmoe._moe_config_relative_paths(2)
+    path = root / normal_path
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({"1": _moe_kernel_configuration()}))
+    config = replace(_base_config(tmp_path), moe_config_root=root)
+
+    with pytest.raises(olmoe.OlmoeEpBenchmarkError, match="cannot admit"):
+        olmoe.verify_moe_config(config)
+
+
+@pytest.mark.parametrize(
+    "artifact_kind", ["symlink", "hardlink", "directory", "oversized"]
+)
+def test_external_moe_config_rejects_unsafe_file_artifacts(
+    tmp_path: Path, artifact_kind: str
+) -> None:
+    root = tmp_path / "moe-config"
+    _write_moe_config_pair(root, 2)
+    normal_path, down_path = olmoe._moe_config_relative_paths(2)
+    target = root / down_path
+    target.unlink()
+    if artifact_kind == "symlink":
+        target.symlink_to(root / normal_path)
+    elif artifact_kind == "hardlink":
+        os.link(root / normal_path, target)
+    elif artifact_kind == "directory":
+        target.mkdir()
+    else:
+        target.write_bytes(b" " * (olmoe._MOE_CONFIG_MAXIMUM_BYTES + 1))
+    config = replace(_base_config(tmp_path), moe_config_root=root)
+
+    with pytest.raises(olmoe.OlmoeEpBenchmarkError, match="cannot admit"):
+        olmoe.verify_moe_config(config)
+
+
+@pytest.mark.parametrize("symlink_position", ["root", "ancestor"])
+def test_external_moe_config_rejects_symlinked_root_or_ancestor(
+    tmp_path: Path, symlink_position: str
+) -> None:
+    backing = tmp_path / "backing" / "moe-config"
+    _write_moe_config_pair(backing, 2)
+    if symlink_position == "root":
+        selected_root = tmp_path / "selected-root"
+        selected_root.symlink_to(backing, target_is_directory=True)
+    else:
+        selected_ancestor = tmp_path / "selected-ancestor"
+        selected_ancestor.symlink_to(backing.parent, target_is_directory=True)
+        selected_root = selected_ancestor / backing.name
+    config = replace(_base_config(tmp_path), moe_config_root=selected_root)
+
+    with pytest.raises(olmoe.OlmoeEpBenchmarkError, match="cannot admit"):
+        olmoe.verify_moe_config(config)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    (
+        b"not-json",
+        b'{"1":{"BLOCK_SIZE_M":16},"1":{"BLOCK_SIZE_M":32}}',
+        json.dumps({"01": _moe_kernel_configuration()}).encode(),
+        json.dumps({"1": {**_moe_kernel_configuration(), "unknown_field": 1}}).encode(),
+        json.dumps(
+            {
+                "1": {
+                    **_moe_kernel_configuration(),
+                    "num_warps": True,
+                }
+            }
+        ).encode(),
+        json.dumps(
+            {
+                "1": {
+                    **_moe_kernel_configuration(),
+                    "BLOCK_SIZE_K": 512,
+                }
+            }
+        ).encode(),
+    ),
+)
+def test_external_moe_config_rejects_invalid_json_schema_and_values(
+    tmp_path: Path, payload: bytes
+) -> None:
+    root = tmp_path / "moe-config"
+    _write_moe_config_pair(root, 2)
+    normal_path, _down_path = olmoe._moe_config_relative_paths(2)
+    (root / normal_path).write_bytes(payload)
+    config = replace(_base_config(tmp_path), moe_config_root=root)
+
+    with pytest.raises(olmoe.OlmoeEpBenchmarkError):
+        olmoe.verify_moe_config(config)
+
+
+@pytest.mark.parametrize(
+    ("down", "match"),
+    (
+        ({"2": _moe_kernel_configuration(block_size_m=32)}, "batch-size grid"),
+        ({"1": _moe_kernel_configuration(block_size_m=32)}, "BLOCK_SIZE_M"),
+    ),
+)
+def test_external_moe_config_requires_matched_normal_and_down_contract(
+    tmp_path: Path, down: object, match: str
+) -> None:
+    root = tmp_path / "moe-config"
+    _write_moe_config_pair(root, 2, down=down)
+    config = replace(_base_config(tmp_path), moe_config_root=root)
+
+    with pytest.raises(olmoe.OlmoeEpBenchmarkError, match=match):
+        olmoe.verify_moe_config(config)
+
+
 @pytest.mark.parametrize("ep_size", [1, 2])
 def test_server_command_is_native_tp2_with_rank_local_numa(
     tmp_path: Path, ep_size: olmoe.ExpertParallelSize
@@ -174,6 +451,7 @@ def test_server_environment_uses_all_cores_as_two_rank_local_pools(
             "LD_PRELOAD": "/profiler.so",
             "TORCH_LOGS": "all",
             "NCCL_ALGO": "Tree",
+            "SGLANG_MOE_CONFIG_DIR": "/untrusted",
         },
     )
 
@@ -186,6 +464,7 @@ def test_server_environment_uses_all_cores_as_two_rank_local_pools(
     assert "LD_PRELOAD" not in environment
     assert "TORCH_LOGS" not in environment
     assert "NCCL_ALGO" not in environment
+    assert "SGLANG_MOE_CONFIG_DIR" not in environment
 
 
 def test_server_info_pins_observable_launch_fields(tmp_path: Path) -> None:
@@ -236,6 +515,7 @@ def test_configuration_receipt_names_token_pool_and_nccl_fallback(
         "fallback": "NCCL",
         "cuda_visible_devices_format": "GPU_UUID",
     }
+    assert "moe_kernel_config" not in receipt
 
 
 def _valid_server_startup_log(ep_size: olmoe.ExpertParallelSize = 1) -> str:
@@ -272,6 +552,75 @@ def test_server_log_contract_verifies_exact_rank_allocations(
     assert receipt["expert_parallel_size"] == ep_size
     assert receipt["max_total_tokens"] == 4096
     assert receipt["custom_all_reduce_disabled"] is True
+
+
+def test_server_log_contract_verifies_each_rank_loaded_both_moe_configs(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "moe-config"
+    _write_moe_config_pair(root, 2)
+    config = replace(_base_config(tmp_path), moe_config_root=root)
+    snapshot = _create_moe_config_snapshot(config)
+    load_lines = [
+        f"[2026-07-20 07:15:27 TP{rank} EP{rank}] "
+        f"Using MoE kernel config from "
+        f"{Path(snapshot.effective.root) / item.relative_path}."
+        for item in snapshot.effective.files
+        for rank in range(2)
+    ]
+    contents = "\n".join((*load_lines, _valid_server_startup_log(2))).encode()
+    log_path = tmp_path / "native-sglang-server.log"
+    log_path.write_bytes(contents)
+
+    receipt = olmoe.verify_server_log_contract(log_path, 2, snapshot)
+
+    config_loads = cast(dict[str, object], receipt["moe_kernel_config"])
+    assert config_loads["source_file_set_sha256"] == snapshot.source.file_set_sha256
+    assert (
+        config_loads["effective_file_set_sha256"] == snapshot.effective.file_set_sha256
+    )
+    assert [
+        cast(dict[str, object], item)["rank_load_count"]
+        for item in cast(list[object], config_loads["loads"])
+    ] == [2, 2]
+
+    log_path.write_text("\n".join((*load_lines[:-1], _valid_server_startup_log(2))))
+    with pytest.raises(olmoe.OlmoeEpBenchmarkError, match="MoE config"):
+        olmoe.verify_server_log_contract(log_path, 2, snapshot)
+
+
+@pytest.mark.parametrize(
+    "extra_line",
+    (
+        "[2026-07-20 TP0 EP0] Using MoE kernel config from /tmp/extra.json.",
+        "[2026-07-20 TP0 EP0] Using default MoE kernel config.",
+        "[2026-07-20 TP0 EP0] Using MoE kernel config with "
+        "down_moe=False. Performance might be sub-optimal!",
+        "[2026-07-20 TP0 EP0] Config file not found at /tmp/missing.json",
+        "[2026-07-20 TP0 EP0] Fallback to triton version 3.4.0 and use MoE",
+    ),
+)
+def test_server_log_contract_rejects_extra_moe_loads_and_fallbacks(
+    tmp_path: Path, extra_line: str
+) -> None:
+    root = tmp_path / "moe-config"
+    _write_moe_config_pair(root, 2)
+    config = replace(_base_config(tmp_path), moe_config_root=root)
+    snapshot = _create_moe_config_snapshot(config)
+    load_lines = [
+        f"[2026-07-20 07:15:27 TP{rank} EP{rank}] "
+        f"Using MoE kernel config from "
+        f"{Path(snapshot.effective.root) / item.relative_path}."
+        for item in snapshot.effective.files
+        for rank in range(2)
+    ]
+    log_path = tmp_path / "native-sglang-server.log"
+    log_path.write_text(
+        "\n".join((*load_lines, extra_line, _valid_server_startup_log(2)))
+    )
+
+    with pytest.raises(olmoe.OlmoeEpBenchmarkError, match="extra MoE config"):
+        olmoe.verify_server_log_contract(log_path, 2, snapshot)
 
 
 @pytest.mark.parametrize(
@@ -1304,8 +1653,37 @@ def test_argument_parser_uses_trusted_stage_contract(tmp_path: Path) -> None:
     assert config.model_path == olmoe.OLMOE_MODEL_PATH
     assert config.stage_contract == Path("/stage/contract.json")
     assert config.stage_capture_output is None
+    assert config.moe_config_root is None
     assert olmoe.CANONICAL_WARMUP_COUNT == 2
     assert olmoe.CANONICAL_SAMPLE_COUNT == 3
+
+
+def test_argument_parser_requires_absolute_lexical_moe_config_root(
+    tmp_path: Path,
+) -> None:
+    arguments = olmoe._parser().parse_args(
+        [
+            "--run-id",
+            "ep2",
+            "--result-directory",
+            str(tmp_path / "result"),
+            "--runtime-python",
+            "/runtime/python",
+            "--runtime-install-receipt",
+            "/runtime/install.json",
+            "--runtime-install-receipt-sha256",
+            SHA,
+            "--stage-contract",
+            "/stage/contract.json",
+            "--ep-size",
+            "2",
+            "--moe-config-root",
+            "relative/config",
+        ]
+    )
+
+    with pytest.raises(olmoe.OlmoeEpBenchmarkError, match="absolute lexical"):
+        olmoe.config_from_arguments(arguments)
 
 
 def test_argument_parser_selects_logit_parity_probe(tmp_path: Path) -> None:
