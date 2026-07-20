@@ -149,6 +149,8 @@ def test_server_command_is_native_tp2_with_rank_local_numa(
     )
     assert command[command.index("--tp-size") + 1] == "2"
     assert command[command.index("--ep-size") + 1] == str(ep_size)
+    assert command[command.index("--max-total-tokens") + 1] == "4096"
+    assert "--disable-custom-all-reduce" in command
     numa_index = command.index("--numa-node")
     assert command[numa_index + 1 : numa_index + 3] == ("0", "1")
     assert not any("kt-" in value or "ktransformers" in value for value in command)
@@ -197,12 +199,14 @@ def test_server_info_pins_observable_launch_fields(tmp_path: Path) -> None:
         "node_rank": 0,
         "dtype": "bfloat16",
         "context_length": 4096,
+        "max_total_tokens": 4096,
         "mem_fraction_static": 0.9,
         "max_running_requests": 1,
         "random_seed": olmoe.CANONICAL_SAMPLING_SEED,
         "moe_a2a_backend": "none",
         "moe_runner_backend": "triton",
         "disable_radix_cache": True,
+        "disable_custom_all_reduce": True,
         "numa_node": [0, 1],
     }
 
@@ -212,6 +216,110 @@ def test_server_info_pins_observable_launch_fields(tmp_path: Path) -> None:
     mutated = {**response, "max_running_requests": 2}
     with pytest.raises(olmoe.OlmoeEpBenchmarkError, match="server_info"):
         olmoe._verify_server_info(mutated, config)
+
+
+def test_configuration_receipt_names_token_pool_and_nccl_fallback(
+    tmp_path: Path,
+) -> None:
+    receipt = olmoe._configuration_receipt(_base_config(tmp_path))
+
+    assert receipt["token_pool"] == {
+        "context_length": 4096,
+        "max_total_tokens": 4096,
+        "max_running_requests": 1,
+    }
+    assert receipt["tensor_parallel_collective"] == {
+        "custom_all_reduce": False,
+        "fallback": "NCCL",
+        "cuda_visible_devices_format": "GPU_UUID",
+    }
+
+
+def _valid_server_startup_log(ep_size: olmoe.ExpertParallelSize = 1) -> str:
+    rank_labels = ("TP0", "TP1") if ep_size == 1 else ("TP0 EP0", "TP1 EP1")
+    return "\n".join(
+        (
+            "server_args=ServerArgs(max_total_tokens=4096, "
+            "disable_custom_all_reduce=True)",
+            f"[2026-07-20 07:15:28 {rank_labels[0]}] KV Cache is allocated. "
+            "#tokens: 4096, K size: 1 GB",
+            f"[2026-07-20 07:15:28 {rank_labels[1]}] KV Cache is allocated. "
+            "#tokens: 4096, K size: 1 GB",
+        )
+    )
+
+
+@pytest.mark.parametrize("ep_size", [1, 2])
+def test_server_log_contract_verifies_exact_rank_allocations(
+    tmp_path: Path, ep_size: olmoe.ExpertParallelSize
+) -> None:
+    log_path = tmp_path / "native-sglang-server.log"
+    contents = _valid_server_startup_log(ep_size).encode()
+    log_path.write_bytes(contents)
+
+    receipt = olmoe.verify_server_log_contract(log_path, ep_size)
+
+    assert receipt["observed_sha256"] == hashlib.sha256(contents).hexdigest()
+    assert receipt["kv_cache_allocation_line_count"] == 2
+    expected_ep_ranks = [None, None] if ep_size == 1 else [0, 1]
+    assert receipt["kv_cache_allocation_rank_bindings"] == [
+        {"tp_rank": 0, "ep_rank": expected_ep_ranks[0]},
+        {"tp_rank": 1, "ep_rank": expected_ep_ranks[1]},
+    ]
+    assert receipt["expert_parallel_size"] == ep_size
+    assert receipt["max_total_tokens"] == 4096
+    assert receipt["custom_all_reduce_disabled"] is True
+
+
+@pytest.mark.parametrize(
+    ("contents", "ep_size", "match"),
+    (
+        (
+            _valid_server_startup_log().replace(
+                "max_total_tokens=4096", "max_total_tokens=None"
+            ),
+            1,
+            "server argument contract",
+        ),
+        (
+            _valid_server_startup_log().replace("#tokens: 4096", "#tokens: 234355"),
+            1,
+            "rank-bound 4096-token KV allocations",
+        ),
+        (
+            _valid_server_startup_log()
+            + "\n[TP0] Setup Custom allreduce failed with invalid device ordinal",
+            1,
+            "custom all-reduce setup failure",
+        ),
+        (
+            _valid_server_startup_log(2).replace(" EP0", "").replace(" EP1", ""),
+            2,
+            "rank-bound 4096-token KV allocations",
+        ),
+        (
+            _valid_server_startup_log(2).replace("TP0 EP0", "TP0 EP1"),
+            2,
+            "rank-bound 4096-token KV allocations",
+        ),
+        (
+            _valid_server_startup_log(2),
+            1,
+            "rank-bound 4096-token KV allocations",
+        ),
+    ),
+)
+def test_server_log_contract_rejects_ineffective_launch(
+    tmp_path: Path,
+    contents: str,
+    ep_size: olmoe.ExpertParallelSize,
+    match: str,
+) -> None:
+    log_path = tmp_path / "native-sglang-server.log"
+    log_path.write_text(contents)
+
+    with pytest.raises(olmoe.OlmoeEpBenchmarkError, match=match):
+        olmoe.verify_server_log_contract(log_path, ep_size)
 
 
 def test_nv4_admission_binds_uuid_order(tmp_path: Path) -> None:

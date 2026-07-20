@@ -410,6 +410,7 @@ def _verify_managed_launch_binding(
         or _command_option(command, "--ep-size") != str(capture.expert_parallel_size)
         or _command_option(command, "--dtype") != "bfloat16"
         or _command_option(command, "--context-length") != "4096"
+        or _command_option(command, "--max-total-tokens") != "4096"
         or _command_option(command, "--max-running-requests") != "1"
         or _command_option(command, "--random-seed") != "20260720"
         or _command_option(command, "--moe-a2a-backend") != "none"
@@ -421,6 +422,7 @@ def _verify_managed_launch_binding(
             abs_tol=0.0,
         )
         or "--disable-radix-cache" not in command
+        or "--disable-custom-all-reduce" not in command
         or tuple(command[command.index("--numa-node") + 1 :][:2]) != ("0", "1")
         or frozenset(environment) != allowed_environment
         or any(
@@ -754,10 +756,12 @@ def _verify_capture_server_info(
         "node_rank": 0,
         "dtype": "bfloat16",
         "context_length": 4_096,
+        "max_total_tokens": 4_096,
         "max_running_requests": 1,
         "random_seed": OLMOE_SANITY_SAMPLING_SEED,
         "mem_fraction_static": static_memory_fraction,
         "disable_radix_cache": True,
+        "disable_custom_all_reduce": True,
         "moe_a2a_backend": "none",
         "moe_runner_backend": "triton",
         "numa_node": [0, 1],

@@ -104,6 +104,7 @@ OLMOE_VOCABULARY_SIZE: Final = 50_304
 OLMOE_EXPERT_COUNT: Final = 64
 OLMOE_EXPERTS_PER_TOKEN: Final = 8
 OLMOE_CONTEXT_LENGTH: Final = 4_096
+OLMOE_MAX_TOTAL_TOKENS: Final = 4_096
 DWAGON_GPU_UUIDS: Final = (
     "GPU-63a7760a-6164-0758-9228-03dbf35d721c",
     "GPU-a442b72e-6727-6322-ba5d-5a9512b79886",
@@ -131,6 +132,18 @@ _RESULT_FILENAME: Final = "olmoe-ep-local-benchmark-result.json"
 _SERVER_LOG_FILENAME: Final = "native-sglang-server.log"
 _SHA256_PATTERN: Final = re.compile(r"[0-9a-f]{64}", re.ASCII)
 _SAFE_RUN_ID_PATTERN: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
+_KV_CACHE_ALLOCATION_PATTERN: Final = re.compile(
+    r"\[(?:[^\]\r\n]* )?TP(?P<tp_rank>[01])"
+    r"(?: EP(?P<ep_rank>[01]))?\] KV Cache is allocated\. "
+    r"#tokens: 4096(?:,|$)",
+    re.ASCII,
+)
+_MAX_TOTAL_TOKENS_SERVER_ARGS_PATTERN: Final = re.compile(
+    r"\bmax_total_tokens=4096\b", re.ASCII
+)
+_DISABLED_CUSTOM_ALL_REDUCE_SERVER_ARGS_PATTERN: Final = re.compile(
+    r"\bdisable_custom_all_reduce=True\b", re.ASCII
+)
 _SCHEDULER_TITLE_PATTERN: Final = re.compile(
     r"sglang::scheduler_TP(?P<tp_rank>[01])(?:_EP(?P<ep_rank>[01]))?", re.ASCII
 )
@@ -782,6 +795,8 @@ def build_server_command(config: OlmoeEpBenchmarkConfig) -> tuple[str, ...]:
         "bfloat16",
         "--context-length",
         str(OLMOE_CONTEXT_LENGTH),
+        "--max-total-tokens",
+        str(OLMOE_MAX_TOTAL_TOKENS),
         "--mem-fraction-static",
         format(config.static_memory_fraction, ".17g"),
         "--max-running-requests",
@@ -789,6 +804,7 @@ def build_server_command(config: OlmoeEpBenchmarkConfig) -> tuple[str, ...]:
         "--random-seed",
         str(CANONICAL_SAMPLING_SEED),
         "--disable-radix-cache",
+        "--disable-custom-all-reduce",
     )
 
 
@@ -1678,6 +1694,96 @@ def _wait_for_readiness(
     )
 
 
+def verify_server_log_contract(
+    log_path: Path, expert_parallel_size: ExpertParallelSize
+) -> JsonObject:
+    """Bind the effective KV-pool and collective policy from startup logs."""
+
+    try:
+        with log_path.open("rb") as source:
+            contents = source.read(_LOG_MAXIMUM_BYTES + 1)
+    except OSError as error:
+        raise OlmoeEpBenchmarkError(
+            f"cannot read native SGLang startup log: {error}"
+        ) from error
+    if len(contents) > _LOG_MAXIMUM_BYTES:
+        raise OlmoeEpBenchmarkError("native SGLang startup log exceeds size bound")
+    try:
+        lines = contents.decode("utf-8", errors="strict").splitlines()
+    except UnicodeDecodeError as error:
+        raise OlmoeEpBenchmarkError(
+            "native SGLang startup log is not valid UTF-8"
+        ) from error
+
+    server_args_lines = [line for line in lines if "server_args=ServerArgs(" in line]
+    matching_server_args_lines = [
+        line
+        for line in server_args_lines
+        if _MAX_TOTAL_TOKENS_SERVER_ARGS_PATTERN.search(line) is not None
+        and _DISABLED_CUSTOM_ALL_REDUCE_SERVER_ARGS_PATTERN.search(line) is not None
+    ]
+    kv_cache_allocation_lines = [
+        line for line in lines if "KV Cache is allocated." in line
+    ]
+    matching_kv_cache_lines: list[tuple[str, re.Match[str]]] = []
+    for line in kv_cache_allocation_lines:
+        if match := _KV_CACHE_ALLOCATION_PATTERN.search(line):
+            matching_kv_cache_lines.append((line, match))
+    matching_rank_bindings = {
+        (match.group("tp_rank"), match.group("ep_rank"))
+        for _, match in matching_kv_cache_lines
+    }
+    expected_rank_bindings = (
+        {("0", None), ("1", None)}
+        if expert_parallel_size == 1
+        else {("0", "0"), ("1", "1")}
+    )
+    custom_all_reduce_failures = [
+        line for line in lines if "Setup Custom allreduce failed" in line
+    ]
+    if len(server_args_lines) != 1 or len(matching_server_args_lines) != 1:
+        raise OlmoeEpBenchmarkError(
+            "native SGLang log does not verify the exact server argument contract"
+        )
+    if (
+        len(kv_cache_allocation_lines) != 2
+        or len(matching_kv_cache_lines) != 2
+        or matching_rank_bindings != expected_rank_bindings
+    ):
+        raise OlmoeEpBenchmarkError(
+            "native SGLang log does not verify the expected TP/EP rank-bound "
+            "4096-token KV allocations"
+        )
+    if custom_all_reduce_failures:
+        raise OlmoeEpBenchmarkError(
+            "native SGLang log reports a custom all-reduce setup failure"
+        )
+    return {
+        "status": "verified",
+        "observed_bytes": len(contents),
+        "observed_sha256": hashlib.sha256(contents).hexdigest(),
+        "server_args_line_sha256": hashlib.sha256(
+            matching_server_args_lines[0].encode("utf-8")
+        ).hexdigest(),
+        "server_args_line_count": len(server_args_lines),
+        "kv_cache_allocation_line_count": len(matching_kv_cache_lines),
+        "kv_cache_allocation_rank_bindings": [
+            {
+                "tp_rank": int(tp_rank),
+                "ep_rank": None if ep_rank is None else int(ep_rank),
+            }
+            for tp_rank, ep_rank in sorted(
+                matching_rank_bindings,
+                key=lambda binding: binding[0],
+            )
+        ],
+        "expert_parallel_size": expert_parallel_size,
+        "max_total_tokens": OLMOE_MAX_TOTAL_TOKENS,
+        "custom_all_reduce_disabled": True,
+        "custom_all_reduce_failure_line_count": len(custom_all_reduce_failures),
+    }
+
+
 def _verify_server_info(
     response: Mapping[str, object], config: OlmoeEpBenchmarkConfig
 ) -> JsonObject:
@@ -1693,12 +1799,14 @@ def _verify_server_info(
         "node_rank": 0,
         "dtype": "bfloat16",
         "context_length": OLMOE_CONTEXT_LENGTH,
+        "max_total_tokens": OLMOE_MAX_TOTAL_TOKENS,
         "mem_fraction_static": config.static_memory_fraction,
         "max_running_requests": 1,
         "random_seed": CANONICAL_SAMPLING_SEED,
         "moe_a2a_backend": "none",
         "moe_runner_backend": "triton",
         "disable_radix_cache": True,
+        "disable_custom_all_reduce": True,
         "numa_node": [0, 1],
     }
     mismatches = {
@@ -1972,6 +2080,16 @@ def _configuration_receipt(config: OlmoeEpBenchmarkConfig) -> JsonObject:
             "openmp_places": "cores",
         },
         "static_memory_fraction": config.static_memory_fraction,
+        "token_pool": {
+            "context_length": OLMOE_CONTEXT_LENGTH,
+            "max_total_tokens": OLMOE_MAX_TOTAL_TOKENS,
+            "max_running_requests": 1,
+        },
+        "tensor_parallel_collective": {
+            "custom_all_reduce": False,
+            "fallback": "NCCL",
+            "cuda_visible_devices_format": "GPU_UUID",
+        },
         "warmup_count": CANONICAL_WARMUP_COUNT,
         "sample_count": CANONICAL_SAMPLE_COUNT,
         "expert_parallel_semantics": expert_parallel_semantics(
@@ -2080,6 +2198,7 @@ def _run_benchmark_under_cpu_policy(config: OlmoeEpBenchmarkConfig) -> JsonObjec
     namespace = f"exo-olmoe-ep-{config.run_id}-{uuid.uuid4().hex}"
     running: RunningServerProcess | None = None
     readiness: JsonObject | None = None
+    server_log_contract: JsonObject | None = None
     listener_ownership: list[JsonValue] = []
     rank_local_numa: list[JsonValue] = []
     server_info: JsonObject | None = None
@@ -2106,6 +2225,9 @@ def _run_benchmark_under_cpu_policy(config: OlmoeEpBenchmarkConfig) -> JsonObjec
             ) as client:
                 readiness = _wait_for_readiness(
                     running, client, config.readiness_timeout_seconds
+                )
+                server_log_contract = verify_server_log_contract(
+                    Path(running.owned.log_path), config.expert_parallel_size
                 )
                 listener_ownership.append(verify_listener_owned(running, config.port))
                 signal_state.checkpoint()
@@ -2240,6 +2362,7 @@ def _run_benchmark_under_cpu_policy(config: OlmoeEpBenchmarkConfig) -> JsonObjec
                 ),
             },
             "readiness": readiness,
+            "server_log_contract": server_log_contract,
             "listener_ownership": listener_ownership,
             "rank_local_numa": rank_local_numa,
             "server_info": server_info,
@@ -2280,6 +2403,7 @@ def _run_stage_capture_under_cpu_policy(
     namespace = f"exo-olmoe-ep-{config.run_id}-{uuid.uuid4().hex}"
     running: RunningServerProcess | None = None
     readiness: JsonObject | None = None
+    server_log_contract: JsonObject | None = None
     listener_ownership: list[JsonValue] = []
     rank_local_numa: list[JsonValue] = []
     server_info: JsonObject | None = None
@@ -2306,6 +2430,9 @@ def _run_stage_capture_under_cpu_policy(
             ) as client:
                 readiness = _wait_for_readiness(
                     running, client, config.readiness_timeout_seconds
+                )
+                server_log_contract = verify_server_log_contract(
+                    Path(running.owned.log_path), config.expert_parallel_size
                 )
                 first_listener = verify_listener_owned(running, config.port)
                 listener_ownership.append(first_listener)
@@ -2429,6 +2556,7 @@ def _run_stage_capture_under_cpu_policy(
                 }
             ),
             "readiness": readiness,
+            "server_log_contract": server_log_contract,
             "listener_ownership": listener_ownership,
             "rank_local_numa": rank_local_numa,
             "server_info": server_info,

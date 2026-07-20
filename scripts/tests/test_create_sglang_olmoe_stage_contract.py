@@ -83,6 +83,8 @@ def _managed_launch(ep_size: stage.ExpertParallelSize) -> stage.ManagedLaunchEvi
         "bfloat16",
         "--context-length",
         "4096",
+        "--max-total-tokens",
+        "4096",
         "--mem-fraction-static",
         "0.9",
         "--max-running-requests",
@@ -90,6 +92,7 @@ def _managed_launch(ep_size: stage.ExpertParallelSize) -> stage.ManagedLaunchEvi
         "--random-seed",
         "20260720",
         "--disable-radix-cache",
+        "--disable-custom-all-reduce",
     )
     environment = {
         "PATH": "/usr/bin",
@@ -250,6 +253,22 @@ def test_contract_rejects_capture_with_unmatched_managed_command() -> None:
         )
 
 
+@pytest.mark.parametrize("invalid_binding", ("token_pool", "custom_all_reduce"))
+def test_capture_rejects_unpinned_memory_or_collective_policy(
+    invalid_binding: str,
+) -> None:
+    capture = _capture(2)
+    command = list(capture.managed_launch.command)
+    if invalid_binding == "token_pool":
+        command[command.index("--max-total-tokens") + 1] = "8192"
+    else:
+        command.remove("--disable-custom-all-reduce")
+    evidence = capture.managed_launch.model_copy(update={"command": tuple(command)})
+
+    with pytest.raises(ValueError, match="managed launch"):
+        stage._verify_managed_launch_binding(capture, evidence)
+
+
 def test_atomic_capture_publish_and_contract_load(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -291,10 +310,12 @@ def test_capture_server_info_binds_memory_fraction() -> None:
         "node_rank": 0,
         "dtype": "bfloat16",
         "context_length": 4096,
+        "max_total_tokens": 4096,
         "max_running_requests": 1,
         "random_seed": stage.OLMOE_SANITY_SAMPLING_SEED,
         "mem_fraction_static": 0.9,
         "disable_radix_cache": True,
+        "disable_custom_all_reduce": True,
         "moe_a2a_backend": "none",
         "moe_runner_backend": "triton",
         "numa_node": [0, 1],
