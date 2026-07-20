@@ -72,11 +72,9 @@ OLMOE_MODEL_PATH: Final = (
 OLMOE_PHYSICAL_WEIGHT_BYTES: Final = 13_838_721_960
 OLMOE_INDEXED_WEIGHT_BYTES: Final = 13_838_323_712
 OLMOE_WEIGHT_MAP_ENTRIES: Final = 3_219
-OLMOE_SANITY_PROMPT: Final = (
-    "Answer with the number in digits only: What is 17 plus 25?"
-)
+OLMOE_SANITY_PROMPT: Final = "17 + 25 ="
 OLMOE_SANITY_MARKER: Final = "42"
-OLMOE_SANITY_MAX_NEW_TOKENS: Final = 32
+OLMOE_SANITY_MAX_NEW_TOKENS: Final = 1
 OLMOE_SANITY_SAMPLING_SEED: Final = 20_260_720
 PINNED_SERVER_VERSION: Final = "0.0.0.dev0"
 _SHA256_PATTERN: Final = re.compile(r"[0-9a-f]{64}", re.ASCII)
@@ -281,7 +279,7 @@ class SanityCapture(_StrictModel):
     sglang_revision: str = Field(pattern=r"^[0-9a-f]{40}$")
     runtime_install_receipt_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     snapshot_canonical_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    prompt_text: Literal["Answer with the number in digits only: What is 17 plus 25?"]
+    prompt_text: Literal["17 + 25 ="]
     tokenizer_class: str = Field(min_length=1, max_length=256)
     input_ids: tuple[int, ...]
     input_ids_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -289,7 +287,7 @@ class SanityCapture(_StrictModel):
     output_ids_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     output_text: str = Field(min_length=1, max_length=4_096)
     output_text_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    max_new_tokens: Literal[32]
+    max_new_tokens: Literal[1]
     sampling_seed: Literal[20_260_720]
     static_memory_fraction: float = Field(ge=0.5, le=0.95)
     server_host: Literal["127.0.0.1", "localhost"]
@@ -305,7 +303,7 @@ class SanityCapture(_StrictModel):
             self.sglang_revision != OLMOE_SGLANG_REVISION
             or token_ids_sha256(self.input_ids) != self.input_ids_sha256
             or token_ids_sha256(self.output_ids) != self.output_ids_sha256
-            or len(self.output_ids) > self.max_new_tokens
+            or len(self.output_ids) != self.max_new_tokens
             or hashlib.sha256(self.output_text.encode()).hexdigest()
             != self.output_text_sha256
             or self.output_text.strip() != OLMOE_SANITY_MARKER

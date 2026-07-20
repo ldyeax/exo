@@ -144,7 +144,7 @@ def _managed_launch(ep_size: stage.ExpertParallelSize) -> stage.ManagedLaunchEvi
 def _capture(
     ep_size: stage.ExpertParallelSize,
     *,
-    output_ids: tuple[int, ...] = (201, 202),
+    output_ids: tuple[int, ...] = (201,),
 ) -> stage.SanityCapture:
     output_text = "42"
     input_ids = (101, 102, 103)
@@ -187,10 +187,22 @@ def test_public_snapshot_admission_rejects_tiny_fake_path(tmp_path: Path) -> Non
         stage.verify_pinned_snapshot(tmp_path)
 
 
+def test_sanity_contract_binds_one_token_base_model_completion() -> None:
+    assert stage.OLMOE_SANITY_PROMPT == "17 + 25 ="
+    assert stage.OLMOE_SANITY_MAX_NEW_TOKENS == 1
+
+    with pytest.raises(ValidationError, match="bound or coherent"):
+        _capture(1, output_ids=(201, 202))
+    changed_prompt = _capture(1).model_dump(mode="json")
+    changed_prompt["prompt_text"] = "17 + 25 = "
+    with pytest.raises(ValidationError):
+        stage.SanityCapture.model_validate(changed_prompt)
+
+
 def test_contract_requires_exact_ep1_ep2_output_equivalence() -> None:
     first = stage.SanityCaptureBinding(receipt_sha256="3" * 64, capture=_capture(1))
     second = stage.SanityCaptureBinding(
-        receipt_sha256="4" * 64, capture=_capture(2, output_ids=(201, 203))
+        receipt_sha256="4" * 64, capture=_capture(2, output_ids=(203,))
     )
 
     with pytest.raises(ValidationError, match="not exactly equivalent"):

@@ -51,7 +51,7 @@ def _base_config(tmp_path: Path) -> olmoe.OlmoeEpBenchmarkConfig:
 
 def _capture(ep_size: olmoe.ExpertParallelSize) -> olmoe.SanityCapture:
     input_ids = (101, 102, 103)
-    output_ids = (201, 202)
+    output_ids = (201,)
     output_text = "42"
     config = replace(
         _base_config(Path("/tmp/olmoe-test-fixture")),
@@ -92,7 +92,7 @@ def _capture(ep_size: olmoe.ExpertParallelSize) -> olmoe.SanityCapture:
         sglang_revision=olmoe.OLMOE_SGLANG_REVISION,
         runtime_install_receipt_sha256="0" * 64,
         snapshot_canonical_sha256="1" * 64,
-        prompt_text="Answer with the number in digits only: What is 17 plus 25?",
+        prompt_text="17 + 25 =",
         tokenizer_class="OlmoeTokenizerFast",
         input_ids=input_ids,
         input_ids_sha256=token_ids_sha256(input_ids),
@@ -100,7 +100,7 @@ def _capture(ep_size: olmoe.ExpertParallelSize) -> olmoe.SanityCapture:
         output_ids_sha256=token_ids_sha256(output_ids),
         output_text=output_text,
         output_text_sha256=hashlib.sha256(output_text.encode()).hexdigest(),
-        max_new_tokens=32,
+        max_new_tokens=1,
         sampling_seed=20_260_720,
         static_memory_fraction=0.9,
         server_host="127.0.0.1",
@@ -875,9 +875,9 @@ class _SanityClient:
     ) -> SanityResponseObservation:
         return SanityResponseObservation(
             text="42",
-            output_ids=(201, 202),
+            output_ids=(201,),
             prompt_tokens=3,
-            completion_tokens=2,
+            completion_tokens=1,
             cached_tokens=0,
             finish_reason={"type": "stop"},
             total_client_seconds=0.5,
@@ -893,7 +893,7 @@ def test_sanity_requires_exact_published_capture() -> None:
     )
 
     assert evidence["status"] == "exact_match"
-    assert evidence["expected_output_ids"] == [201, 202]
+    assert evidence["expected_output_ids"] == [201]
 
 
 class _WorkloadClient:
