@@ -54,6 +54,19 @@ GLM_4_7_FLASH_PREFILL_OUTPUT_TOKENS = 32
 GLM_4_7_FLASH_DECODE_INPUT_TOKENS = 128
 GLM_4_7_FLASH_DECODE_OUTPUT_TOKENS = 128
 GLM_4_7_FLASH_SERVING_SAMPLING_SEED = 20_260_719
+GLM_4_7_FLASH_SANITY_PROMPT = "Reply with exactly EXO_SANITY_OK and nothing else."
+GLM_4_7_FLASH_SANITY_MARKER = "EXO_SANITY_OK"
+GLM_4_7_FLASH_SANITY_MAX_NEW_TOKENS = 16
+GLM_4_7_FLASH_SANITY_INPUT_TOKENS = 17
+GLM_4_7_FLASH_SANITY_CHAT_TEMPLATE_SHA256 = (
+    "d63ad536c3c81880043e22ec7fd08db42b4d8fb7c89c7138bc562bfa25281375"
+)
+GLM_4_7_FLASH_SANITY_RENDERED_PROMPT_SHA256 = (
+    "62acda2056933064acbc3211ff3474871d746256bc57e3cd195032e9507b7604"
+)
+GLM_4_7_FLASH_SANITY_INPUT_IDS_SHA256 = (
+    "0506b57087c67f3f4a3c92b488e60484f2fc6ffa5d32609df1d8e07ed438f876"
+)
 GLM_4_7_FLASH_PREFILL_INPUT_IDS_SHA256 = (
     "ebd3e87b9680a8b3e4bb594b8c2cda63eaead72fd478187bbaa3e2d3f3fadcac"
 )
@@ -83,6 +96,7 @@ _GIT_COMMIT_PATTERN = re.compile(r"[0-9a-f]{40}")
 
 NonemptyText = Annotated[str, StringConstraints(min_length=1)]
 Sha256Digest = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
+SanityText = Annotated[str, StringConstraints(min_length=1, max_length=256)]
 LeaseId = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{32}$")]
 NonnegativeFiniteFloat = Annotated[float, Field(ge=0.0)]
 PositiveFiniteFloat = Annotated[float, Field(gt=0.0)]
@@ -550,6 +564,64 @@ class SglangKtServingSetupEvidence(_StrictModel):
 
 
 @final
+class SglangKtServingSanityEvidence(_StrictModel):
+    prompt: Literal["Reply with exactly EXO_SANITY_OK and nothing else."]
+    marker: Literal["EXO_SANITY_OK"]
+    chat_template_sha256: Sha256Digest
+    rendered_prompt_sha256: Sha256Digest
+    tokenizer_class: NonemptyText
+    input_token_count: PositiveInt
+    input_ids_sha256: Sha256Digest
+    max_new_tokens: Literal[16]
+    sampling_seed: Literal[20_260_719]
+    temperature: float
+    ignore_eos: Literal[False]
+    stream: Literal[False]
+    return_logprob: Literal[False]
+    log_metrics: Literal[False]
+    prompt_tokens: PositiveInt
+    completion_tokens: PositiveInt
+    output_ids: tuple[TokenId, ...]
+    output_ids_sha256: Sha256Digest
+    server_output_text: SanityText
+    locally_decoded_output_text: SanityText
+    finish_reason_type: Literal["stop", "length"]
+    finish_reason_sha256: Sha256Digest
+    total_client_seconds: PositiveFiniteFloat
+    post_sanity_cache_flush_status_code: Literal[200]
+    post_sanity_cache_flush_response_sha256: Sha256Digest
+
+    @field_validator("temperature", "total_client_seconds")
+    @classmethod
+    def validate_finite_value(cls, value: float) -> float:
+        return _validate_finite(value)
+
+    @model_validator(mode="after")
+    def validate_coherent_marker(self) -> "SglangKtServingSanityEvidence":
+        if (
+            self.prompt != GLM_4_7_FLASH_SANITY_PROMPT
+            or self.marker != GLM_4_7_FLASH_SANITY_MARKER
+            or self.chat_template_sha256 != GLM_4_7_FLASH_SANITY_CHAT_TEMPLATE_SHA256
+            or self.rendered_prompt_sha256
+            != GLM_4_7_FLASH_SANITY_RENDERED_PROMPT_SHA256
+            or self.input_token_count != GLM_4_7_FLASH_SANITY_INPUT_TOKENS
+            or self.input_ids_sha256 != GLM_4_7_FLASH_SANITY_INPUT_IDS_SHA256
+            or self.max_new_tokens != GLM_4_7_FLASH_SANITY_MAX_NEW_TOKENS
+            or self.temperature != 0.0
+            or self.prompt_tokens != self.input_token_count
+            or self.completion_tokens != len(self.output_ids)
+            or not self.output_ids
+            or self.completion_tokens > self.max_new_tokens
+            or self.output_ids_sha256
+            != calculate_sglang_kt_token_ids_sha256(self.output_ids)
+            or self.server_output_text.strip() != self.marker
+            or self.locally_decoded_output_text.strip() != self.marker
+        ):
+            raise ValueError("serving sanity response is not the pinned marker")
+        return self
+
+
+@final
 class SglangKtServingJitCacheEvidence(_StrictModel):
     cache_directories: tuple[AbsoluteRuntimePath, ...]
     after_penultimate_warmup_manifest_sha256: Sha256Digest
@@ -945,6 +1017,7 @@ class WarmServingRunReceiptV1(_StrictModel):
     identity_sha256: Sha256Digest
     identity: SglangKtWarmServingRunIdentity
     setup: SglangKtServingSetupEvidence
+    sanity: SglangKtServingSanityEvidence
     jit_cache: SglangKtServingJitCacheEvidence
     workloads: tuple[SglangKtServingWorkloadEvidence, ...]
     coordination_guard: SglangKtServingCoordinationGuardEvidence | None
@@ -1002,6 +1075,8 @@ class WarmServingRunReceiptV1(_StrictModel):
                     "performance receipt must be generated after cleanup completes"
                 )
         timeout = self.identity.client.request_timeout_seconds
+        if self.sanity.total_client_seconds > timeout:
+            raise ValueError("serving sanity request exceeded the bound client timeout")
         if any(
             invocation.total_client_seconds > timeout
             for workload in self.workloads

@@ -10,12 +10,13 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib
 import json
 import math
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
-from typing import Literal, cast, final
+from typing import Literal, Protocol, cast, final
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
@@ -32,6 +33,13 @@ from exo.worker.sglang_kt.serving_benchmark_receipt import (
     GLM_4_7_FLASH_PINNED_SGLANG_SERVER_VERSION,
     GLM_4_7_FLASH_PREFILL_INPUT_TOKENS,
     GLM_4_7_FLASH_PREFILL_OUTPUT_TOKENS,
+    GLM_4_7_FLASH_SANITY_CHAT_TEMPLATE_SHA256,
+    GLM_4_7_FLASH_SANITY_INPUT_IDS_SHA256,
+    GLM_4_7_FLASH_SANITY_INPUT_TOKENS,
+    GLM_4_7_FLASH_SANITY_MARKER,
+    GLM_4_7_FLASH_SANITY_MAX_NEW_TOKENS,
+    GLM_4_7_FLASH_SANITY_PROMPT,
+    GLM_4_7_FLASH_SANITY_RENDERED_PROMPT_SHA256,
     GLM_4_7_FLASH_SERVING_SAMPLING_SEED,
     SGLANG_KT_SERVING_MAXIMUM_SSE_LINE_BYTES,
     SGLANG_KT_SERVING_SSE_EVENT_SLACK,
@@ -40,6 +48,7 @@ from exo.worker.sglang_kt.serving_benchmark_receipt import (
     WARM_SERVING_MINIMUM_WARMUPS,
     ServingWorkloadKind,
     SglangKtServingInvocationEvidence,
+    SglangKtServingSanityEvidence,
     SglangKtServingServerInfoIdentity,
     SglangKtServingWorkloadEvidence,
     SglangKtServingWorkloadRequest,
@@ -55,6 +64,7 @@ GLM_4_7_FLASH_VOCABULARY_SIZE = 154_880
 DETERMINISTIC_INPUT_ID_FLOOR = 100
 TTFT_SEMANTICS = "client_stream_first_output_event_including_http_and_queue_v1"
 SSE_READ_CHUNK_BYTES = 16 * 1024
+SANITY_RESPONSE_MAXIMUM_BYTES = 64 * 1024
 
 
 class Glm47ServingClientError(RuntimeError):
@@ -63,6 +73,44 @@ class Glm47ServingClientError(RuntimeError):
 
 class _StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+
+class SanityTokenizer(Protocol):
+    chat_template: str | None
+
+    def apply_chat_template(
+        self,
+        conversation: list[dict[str, str]],
+        *,
+        tokenize: Literal[False],
+        add_generation_prompt: Literal[True],
+        enable_thinking: Literal[False],
+    ) -> str: ...
+
+    def encode(
+        self,
+        text: str,
+        *,
+        add_special_tokens: Literal[False],
+    ) -> list[int]: ...
+
+    def decode(
+        self,
+        token_ids: list[int],
+        *,
+        skip_special_tokens: Literal[True],
+        clean_up_tokenization_spaces: Literal[False],
+    ) -> str: ...
+
+
+class _AutoTokenizerFactory(Protocol):
+    @staticmethod
+    def from_pretrained(
+        pretrained_model_name_or_path: str,
+        *,
+        local_files_only: Literal[True],
+        trust_remote_code: Literal[False],
+    ) -> object: ...
 
 
 @final
@@ -102,6 +150,43 @@ class NativeGenerateRequest(_StrictModel):
 
 
 @final
+class NativeSanitySamplingParameters(_StrictModel):
+    max_new_tokens: Literal[16]
+    temperature: float
+    ignore_eos: Literal[False]
+    sampling_seed: Literal[20_260_719]
+
+    @model_validator(mode="after")
+    def validate_greedy_request(self) -> "NativeSanitySamplingParameters":
+        if not math.isfinite(self.temperature) or self.temperature != 0.0:
+            raise ValueError("native sanity sampling parameters are not pinned")
+        return self
+
+
+@final
+class NativeSanityGenerateRequest(_StrictModel):
+    input_ids: tuple[int, ...]
+    sampling_params: NativeSanitySamplingParameters
+    stream: Literal[False]
+    return_logprob: Literal[False]
+    log_metrics: Literal[False]
+
+    @model_validator(mode="after")
+    def validate_input_ids(self) -> "NativeSanityGenerateRequest":
+        if (
+            len(self.input_ids) != GLM_4_7_FLASH_SANITY_INPUT_TOKENS
+            or any(
+                token_id < 0 or token_id >= GLM_4_7_FLASH_VOCABULARY_SIZE
+                for token_id in self.input_ids
+            )
+            or calculate_sglang_kt_token_ids_sha256(self.input_ids)
+            != GLM_4_7_FLASH_SANITY_INPUT_IDS_SHA256
+        ):
+            raise ValueError("native sanity request input IDs are not pinned")
+        return self
+
+
+@final
 class _LengthFinishReason(_StrictModel):
     type: Literal["length"]
     length: int = Field(gt=0)
@@ -133,6 +218,45 @@ class _NativeGenerateEvent(BaseModel):
             raise ValueError(
                 "native response output IDs are outside the GLM vocabulary"
             )
+        return self
+
+
+@final
+class _SanityFinishReason(BaseModel):
+    model_config = ConfigDict(extra="allow", frozen=True, strict=True)
+
+    type: Literal["stop", "length"]
+
+
+@final
+class _NativeSanityMetaInfo(BaseModel):
+    model_config = ConfigDict(extra="allow", frozen=True, strict=True)
+
+    prompt_tokens: int = Field(gt=0)
+    completion_tokens: int = Field(gt=0)
+    finish_reason: _SanityFinishReason
+
+
+@final
+class _NativeSanityGenerateResponse(BaseModel):
+    model_config = ConfigDict(extra="allow", frozen=True, strict=True)
+
+    text: str
+    output_ids: tuple[int, ...]
+    meta_info: _NativeSanityMetaInfo
+
+    @model_validator(mode="after")
+    def validate_output(self) -> "_NativeSanityGenerateResponse":
+        if (
+            not self.output_ids
+            or len(self.output_ids) > GLM_4_7_FLASH_SANITY_MAX_NEW_TOKENS
+            or self.meta_info.completion_tokens != len(self.output_ids)
+            or any(
+                token_id < 0 or token_id >= GLM_4_7_FLASH_VOCABULARY_SIZE
+                for token_id in self.output_ids
+            )
+        ):
+            raise ValueError("native sanity response has invalid output tokens")
         return self
 
 
@@ -238,6 +362,72 @@ class NativeGenerateObservation(_StrictModel):
 class PreparedServingWorkload:
     native_request: NativeGenerateRequest
     receipt_request: SglangKtServingWorkloadRequest
+
+
+@final
+@dataclass(frozen=True)
+class PreparedSanityRequest:
+    tokenizer: SanityTokenizer
+    tokenizer_class: str
+    chat_template_sha256: str
+    rendered_prompt_sha256: str
+    native_request: NativeSanityGenerateRequest
+
+
+def load_glm47_sanity_tokenizer(model_path: str) -> SanityTokenizer:
+    transformers_module = importlib.import_module("transformers")
+    factory_object = cast(object, getattr(transformers_module, "AutoTokenizer", None))
+    if factory_object is None:
+        raise Glm47ServingClientError("transformers AutoTokenizer is unavailable")
+    factory = cast(_AutoTokenizerFactory, factory_object)
+    tokenizer = factory.from_pretrained(
+        model_path,
+        local_files_only=True,
+        trust_remote_code=False,
+    )
+    return cast(SanityTokenizer, tokenizer)
+
+
+def prepare_glm47_sanity_request(
+    model_path: str,
+    *,
+    tokenizer: SanityTokenizer | None = None,
+) -> PreparedSanityRequest:
+    local_tokenizer = tokenizer or load_glm47_sanity_tokenizer(model_path)
+    chat_template = local_tokenizer.chat_template
+    if not isinstance(chat_template, str) or not chat_template:
+        raise Glm47ServingClientError("local GLM tokenizer has no chat template")
+    chat_template_sha256 = hashlib.sha256(chat_template.encode()).hexdigest()
+    if chat_template_sha256 != GLM_4_7_FLASH_SANITY_CHAT_TEMPLATE_SHA256:
+        raise Glm47ServingClientError("local GLM chat template is not pinned")
+    rendered_prompt = local_tokenizer.apply_chat_template(
+        [{"role": "user", "content": GLM_4_7_FLASH_SANITY_PROMPT}],
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=False,
+    )
+    rendered_prompt_sha256 = hashlib.sha256(rendered_prompt.encode()).hexdigest()
+    if rendered_prompt_sha256 != GLM_4_7_FLASH_SANITY_RENDERED_PROMPT_SHA256:
+        raise Glm47ServingClientError("local GLM sanity prompt rendering changed")
+    input_ids = tuple(local_tokenizer.encode(rendered_prompt, add_special_tokens=False))
+    return PreparedSanityRequest(
+        tokenizer=local_tokenizer,
+        tokenizer_class=type(local_tokenizer).__name__,
+        chat_template_sha256=chat_template_sha256,
+        rendered_prompt_sha256=rendered_prompt_sha256,
+        native_request=NativeSanityGenerateRequest(
+            input_ids=input_ids,
+            sampling_params=NativeSanitySamplingParameters(
+                max_new_tokens=GLM_4_7_FLASH_SANITY_MAX_NEW_TOKENS,
+                temperature=0.0,
+                ignore_eos=False,
+                sampling_seed=GLM_4_7_FLASH_SERVING_SAMPLING_SEED,
+            ),
+            stream=False,
+            return_logprob=False,
+            log_metrics=False,
+        ),
+    )
 
 
 def build_deterministic_glm47_input_ids(
@@ -451,6 +641,55 @@ class Glm47NativeServingClient:
             response=response,
             canonical_response_sha256=canonical_response_sha256,
         )
+
+    def generate_sanity(
+        self,
+        request: NativeSanityGenerateRequest,
+    ) -> tuple[_NativeSanityGenerateResponse, float]:
+        started_ns = self._clock_ns()
+        deadline_ns = self._deadline_clock_ns() + self._timeout_ns
+        contents = bytearray()
+        with self._client.stream(
+            "POST",
+            "/generate",
+            json=request.model_dump(mode="json"),
+        ) as response:
+            if response.status_code != 200:
+                raise Glm47ServingClientError(
+                    f"POST /generate sanity returned HTTP {response.status_code}"
+                )
+            if response.headers.get("content-encoding", "identity") != "identity":
+                raise Glm47ServingClientError(
+                    "native sanity response uses an unpinned content encoding"
+                )
+            for chunk in response.iter_bytes():
+                if self._deadline_clock_ns() > deadline_ns:
+                    raise Glm47ServingClientError(
+                        "native sanity response exceeded the client duration bound"
+                    )
+                contents.extend(chunk)
+                if len(contents) > SANITY_RESPONSE_MAXIMUM_BYTES:
+                    raise Glm47ServingClientError(
+                        "native sanity response exceeded its byte bound"
+                    )
+        completed_ns = self._clock_ns()
+        if completed_ns - started_ns > self._timeout_ns:
+            raise Glm47ServingClientError(
+                "native sanity response exceeded the client duration bound"
+            )
+        encoded_response = bytes(contents)
+        _strict_json_object(encoded_response, "native sanity response")
+        try:
+            parsed = _NativeSanityGenerateResponse.model_validate_json(encoded_response)
+        except ValidationError as error:
+            raise Glm47ServingClientError(
+                "native sanity response is invalid"
+            ) from error
+        if parsed.meta_info.prompt_tokens != len(request.input_ids):
+            raise Glm47ServingClientError(
+                "native sanity response has the wrong prompt token count"
+            )
+        return parsed, (completed_ns - started_ns) / 1_000_000_000
 
     def generate(
         self,
@@ -710,6 +949,68 @@ def run_glm47_serving_invocation(
         flush=client.flush_cache(),
         generate=client.generate(workload.native_request),
     )
+
+
+def run_glm47_serving_sanity(
+    client: Glm47NativeServingClient,
+    model_path: str,
+    *,
+    tokenizer: SanityTokenizer | None = None,
+    prepared_request: PreparedSanityRequest | None = None,
+) -> SglangKtServingSanityEvidence:
+    """Run one unscored coherent prompt and flush it before benchmark warmups."""
+
+    if tokenizer is not None and prepared_request is not None:
+        raise ValueError("sanity tokenizer and prepared request are mutually exclusive")
+    prepared = prepared_request or prepare_glm47_sanity_request(
+        model_path, tokenizer=tokenizer
+    )
+    response, total_client_seconds = client.generate_sanity(prepared.native_request)
+    post_sanity_flush = client.flush_cache()
+    locally_decoded = prepared.tokenizer.decode(
+        list(response.output_ids),
+        skip_special_tokens=True,
+        clean_up_tokenization_spaces=False,
+    )
+    finish_reason = response.meta_info.finish_reason
+    try:
+        return SglangKtServingSanityEvidence(
+            prompt=GLM_4_7_FLASH_SANITY_PROMPT,
+            marker=GLM_4_7_FLASH_SANITY_MARKER,
+            chat_template_sha256=prepared.chat_template_sha256,
+            rendered_prompt_sha256=prepared.rendered_prompt_sha256,
+            tokenizer_class=prepared.tokenizer_class,
+            input_token_count=len(prepared.native_request.input_ids),
+            input_ids_sha256=calculate_sglang_kt_token_ids_sha256(
+                prepared.native_request.input_ids
+            ),
+            max_new_tokens=prepared.native_request.sampling_params.max_new_tokens,
+            sampling_seed=prepared.native_request.sampling_params.sampling_seed,
+            temperature=prepared.native_request.sampling_params.temperature,
+            ignore_eos=prepared.native_request.sampling_params.ignore_eos,
+            stream=prepared.native_request.stream,
+            return_logprob=prepared.native_request.return_logprob,
+            log_metrics=prepared.native_request.log_metrics,
+            prompt_tokens=response.meta_info.prompt_tokens,
+            completion_tokens=response.meta_info.completion_tokens,
+            output_ids=response.output_ids,
+            output_ids_sha256=calculate_sglang_kt_token_ids_sha256(response.output_ids),
+            server_output_text=response.text,
+            locally_decoded_output_text=locally_decoded,
+            finish_reason_type=finish_reason.type,
+            finish_reason_sha256=hashlib.sha256(
+                canonical_sglang_kt_json(finish_reason.model_dump(mode="json"))
+            ).hexdigest(),
+            total_client_seconds=total_client_seconds,
+            post_sanity_cache_flush_status_code=cast(
+                Literal[200], post_sanity_flush.status_code
+            ),
+            post_sanity_cache_flush_response_sha256=(post_sanity_flush.response_sha256),
+        )
+    except ValidationError as error:
+        raise Glm47ServingClientError(
+            "GLM sanity generation did not return the coherent marker"
+        ) from error
 
 
 def run_glm47_serving_workload(

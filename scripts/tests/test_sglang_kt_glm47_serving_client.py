@@ -17,10 +17,14 @@ from scripts.sglang_kt_glm47_serving_client import (
     Glm47ServingClientError,
     NativeGenerateRequest,
     NativeSamplingParameters,
+    NativeSanityGenerateRequest,
+    NativeSanitySamplingParameters,
+    PreparedSanityRequest,
     build_deterministic_glm47_input_ids,
     build_glm47_server_info_identity,
     prepare_glm47_serving_workload,
     run_glm47_serving_invocation,
+    run_glm47_serving_sanity,
     run_glm47_serving_workload,
 )
 
@@ -46,6 +50,88 @@ class StepClock:
         value = self._value
         self._value += self._step_ns
         return value
+
+
+SANITY_INPUT_IDS = (
+    154822,
+    154824,
+    154827,
+    20795,
+    448,
+    6896,
+    4063,
+    46,
+    62674,
+    3333,
+    8374,
+    323,
+    4302,
+    770,
+    13,
+    154828,
+    154842,
+)
+SANITY_OUTPUT_IDS = (3257, 46, 62674, 3333, 8374)
+
+
+class FakeSanityTokenizer:
+    chat_template = "unused by a prepared request"
+
+    def __init__(self, decoded_text: str = "EXO_SANITY_OK") -> None:
+        self._decoded_text = decoded_text
+
+    def apply_chat_template(
+        self,
+        _conversation: list[dict[str, str]],
+        *,
+        tokenize: bool,
+        add_generation_prompt: bool,
+        enable_thinking: bool,
+    ) -> str:
+        assert not tokenize and add_generation_prompt and not enable_thinking
+        return "unused"
+
+    def encode(self, _text: str, *, add_special_tokens: bool) -> list[int]:
+        assert not add_special_tokens
+        return list(SANITY_INPUT_IDS)
+
+    def decode(
+        self,
+        token_ids: list[int],
+        *,
+        skip_special_tokens: bool,
+        clean_up_tokenization_spaces: bool,
+    ) -> str:
+        assert token_ids == list(SANITY_OUTPUT_IDS)
+        assert skip_special_tokens and not clean_up_tokenization_spaces
+        return self._decoded_text
+
+
+def _prepared_sanity(
+    decoded_text: str = "EXO_SANITY_OK",
+) -> PreparedSanityRequest:
+    return PreparedSanityRequest(
+        tokenizer=FakeSanityTokenizer(decoded_text),
+        tokenizer_class="TokenizersBackend",
+        chat_template_sha256=(
+            "d63ad536c3c81880043e22ec7fd08db42b4d8fb7c89c7138bc562bfa25281375"
+        ),
+        rendered_prompt_sha256=(
+            "62acda2056933064acbc3211ff3474871d746256bc57e3cd195032e9507b7604"
+        ),
+        native_request=NativeSanityGenerateRequest(
+            input_ids=SANITY_INPUT_IDS,
+            sampling_params=NativeSanitySamplingParameters(
+                max_new_tokens=16,
+                temperature=0.0,
+                ignore_eos=False,
+                sampling_seed=20_260_719,
+            ),
+            stream=False,
+            return_logprob=False,
+            log_metrics=False,
+        ),
+    )
 
 
 class GuardedOversizedStream(httpx.SyncByteStream):
@@ -732,3 +818,85 @@ def test_generate_rejects_stream_without_done_marker() -> None:
         pytest.raises(Glm47ServingClientError, match="incomplete"),
     ):
         client.generate(request)
+
+
+def test_sanity_generation_records_marker_and_flushes_before_return() -> None:
+    paths: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        paths.append(request.url.path)
+        if request.url.path == "/flush_cache":
+            return httpx.Response(200, text="Cache flushed.\n")
+        assert request.url.path == "/generate"
+        posted = NativeSanityGenerateRequest.model_validate_json(request.content)
+        assert posted.input_ids == SANITY_INPUT_IDS
+        assert not posted.stream
+        assert not posted.log_metrics
+        return httpx.Response(
+            200,
+            json={
+                "text": "EXO_SANITY_OK",
+                "output_ids": list(SANITY_OUTPUT_IDS),
+                "meta_info": {
+                    "prompt_tokens": len(SANITY_INPUT_IDS),
+                    "completion_tokens": len(SANITY_OUTPUT_IDS),
+                    "cached_tokens": 0,
+                    "finish_reason": {"type": "stop", "matched": 154813},
+                },
+            },
+        )
+
+    with _client(handler, clock=StepClock()) as client:
+        evidence = run_glm47_serving_sanity(
+            client,
+            "/models/glm47",
+            prepared_request=_prepared_sanity(),
+        )
+
+    assert paths == ["/generate", "/flush_cache"]
+    assert evidence.output_ids == SANITY_OUTPUT_IDS
+    assert evidence.server_output_text == "EXO_SANITY_OK"
+    assert evidence.locally_decoded_output_text == "EXO_SANITY_OK"
+    assert evidence.post_sanity_cache_flush_status_code == 200
+
+
+@pytest.mark.parametrize(
+    ("server_text", "decoded_text"),
+    [
+        ("WRONG", "EXO_SANITY_OK"),
+        ("EXO_SANITY_OK", "WRONG"),
+    ],
+)
+def test_sanity_generation_rejects_incoherent_marker(
+    server_text: str,
+    decoded_text: str,
+) -> None:
+    paths: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        paths.append(request.url.path)
+        if request.url.path == "/flush_cache":
+            return httpx.Response(200, text="Cache flushed.\n")
+        return httpx.Response(
+            200,
+            json={
+                "text": server_text,
+                "output_ids": list(SANITY_OUTPUT_IDS),
+                "meta_info": {
+                    "prompt_tokens": len(SANITY_INPUT_IDS),
+                    "completion_tokens": len(SANITY_OUTPUT_IDS),
+                    "finish_reason": {"type": "stop", "matched": 154813},
+                },
+            },
+        )
+
+    with (
+        _client(handler, clock=StepClock()) as client,
+        pytest.raises(Glm47ServingClientError, match="coherent marker"),
+    ):
+        run_glm47_serving_sanity(
+            client,
+            "/models/glm47",
+            prepared_request=_prepared_sanity(decoded_text),
+        )
+    assert paths == ["/generate", "/flush_cache"]

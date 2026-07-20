@@ -94,6 +94,7 @@ from exo.worker.sglang_kt.serving_benchmark_receipt import (  # noqa: E402
     SglangKtServingOwnedServerProcessIdentity,
     SglangKtServingProcessSpecIdentity,
     SglangKtServingRuntimeIdentity,
+    SglangKtServingSanityEvidence,
     SglangKtServingServerInfoIdentity,
     SglangKtServingSetupEvidence,
     SglangKtServingSourceFileIdentity,
@@ -118,6 +119,7 @@ from scripts.sglang_kt_glm47_serving_client import (  # noqa: E402
     build_glm47_server_info_identity,
     prepare_glm47_serving_workload,
     run_glm47_serving_invocation,
+    run_glm47_serving_sanity,
 )
 
 JsonScalar: TypeAlias = str | int | float | bool | None
@@ -385,6 +387,7 @@ class WarmServingMeasurementV1(validation.StrictModel):
     identity_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     identity: SglangKtWarmServingRunIdentity
     setup: SglangKtServingSetupEvidence
+    sanity: SglangKtServingSanityEvidence
     jit_cache: SglangKtServingJitCacheEvidence
     workloads: tuple[SglangKtServingWorkloadEvidence, ...]
     coordination_guard: SglangKtServingCoordinationGuardEvidence
@@ -489,6 +492,7 @@ class ServerProcess:
 class CompletedMeasurement:
     identity: SglangKtWarmServingRunIdentity
     setup: SglangKtServingSetupEvidence
+    sanity: SglangKtServingSanityEvidence
     jit_cache: SglangKtServingJitCacheEvidence
     workloads: tuple[SglangKtServingWorkloadEvidence, ...]
     server: ServerProcess
@@ -2030,6 +2034,11 @@ def collect_serving_measurement(
         identity = build_run_identity(
             config, deployment, admission, server_info, server, server_identity
         )
+        sanity = run_glm47_serving_sanity(client, config.model_path)
+        if observe_running_server_process(config, server) != server_identity:
+            raise Glm47ServingHarnessError(
+                "owned serving process identity changed during sanity generation"
+            )
         workloads, jit_cache = collect_interleaved_workloads(
             client,
             server,
@@ -2054,6 +2063,7 @@ def collect_serving_measurement(
             health_generate_status_code=cast(Literal[200], health.status_code),
             health_generate_response_sha256=health.response_sha256,
         ),
+        sanity=sanity,
         jit_cache=jit_cache,
         workloads=workloads,
         server=server,
@@ -2103,6 +2113,12 @@ def build_serving_static_metadata(
             "postflight_before_release": True,
         },
         "resident_gpu_experts": config.resident_gpu_experts,
+        "semantic_sanity": {
+            "required": True,
+            "before_warmups": True,
+            "local_tokenizer_and_chat_template": True,
+            "post_sanity_cache_flush": True,
+        },
         "warmup_rounds": 2,
         "measurement_rounds": 3,
         "workload_order": ["prefill", "decode"],
@@ -2250,6 +2266,7 @@ def _publish_measurement(
         ),
         identity=completed.identity,
         setup=completed.setup,
+        sanity=completed.sanity,
         jit_cache=completed.jit_cache,
         workloads=completed.workloads,
         coordination_guard=coordination_guard,
@@ -3102,6 +3119,7 @@ def _build_performance_receipt(
         identity_sha256=measurement.identity_sha256,
         identity=measurement.identity,
         setup=measurement.setup,
+        sanity=measurement.sanity,
         jit_cache=measurement.jit_cache,
         workloads=measurement.workloads,
         coordination_guard=measurement.coordination_guard,

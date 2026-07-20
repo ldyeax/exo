@@ -31,6 +31,7 @@ from exo.worker.sglang_kt.serving_benchmark_receipt import (
     SglangKtServingOwnedServerProcessIdentity,
     SglangKtServingProcessSpecIdentity,
     SglangKtServingRuntimeIdentity,
+    SglangKtServingSanityEvidence,
     SglangKtServingServerInfoIdentity,
     SglangKtServingSetupEvidence,
     SglangKtServingSourceFileIdentity,
@@ -46,6 +47,7 @@ from exo.worker.sglang_kt.serving_benchmark_receipt import (
     calculate_sglang_kt_length_finish_reason_sha256,
     calculate_sglang_kt_serving_coordination_guard_evidence_sha256,
     calculate_sglang_kt_serving_source_bundle_sha256,
+    calculate_sglang_kt_token_ids_sha256,
     calculate_sglang_kt_warm_serving_run_identity_sha256,
     canonicalize_sglang_kt_warm_serving_run_receipt,
     load_sglang_kt_warm_serving_run_receipt,
@@ -242,6 +244,43 @@ def _workload(kind: ServingWorkloadKind) -> SglangKtServingWorkloadEvidence:
     )
 
 
+def _sanity() -> SglangKtServingSanityEvidence:
+    output_ids = (3257, 46, 62674, 3333, 8374)
+    return SglangKtServingSanityEvidence(
+        prompt="Reply with exactly EXO_SANITY_OK and nothing else.",
+        marker="EXO_SANITY_OK",
+        chat_template_sha256=(
+            "d63ad536c3c81880043e22ec7fd08db42b4d8fb7c89c7138bc562bfa25281375"
+        ),
+        rendered_prompt_sha256=(
+            "62acda2056933064acbc3211ff3474871d746256bc57e3cd195032e9507b7604"
+        ),
+        tokenizer_class="TokenizersBackend",
+        input_token_count=17,
+        input_ids_sha256=(
+            "0506b57087c67f3f4a3c92b488e60484f2fc6ffa5d32609df1d8e07ed438f876"
+        ),
+        max_new_tokens=16,
+        sampling_seed=20_260_719,
+        temperature=0.0,
+        ignore_eos=False,
+        stream=False,
+        return_logprob=False,
+        log_metrics=False,
+        prompt_tokens=17,
+        completion_tokens=len(output_ids),
+        output_ids=output_ids,
+        output_ids_sha256=calculate_sglang_kt_token_ids_sha256(output_ids),
+        server_output_text="EXO_SANITY_OK",
+        locally_decoded_output_text="EXO_SANITY_OK",
+        finish_reason_type="stop",
+        finish_reason_sha256="5" * 64,
+        total_client_seconds=1.0,
+        post_sanity_cache_flush_status_code=200,
+        post_sanity_cache_flush_response_sha256="6" * 64,
+    )
+
+
 def _coordination_guard() -> SglangKtServingCoordinationGuardEvidence:
     config_sha256 = "8" * 64
     binding_sha256 = "9" * 64
@@ -325,6 +364,7 @@ def _receipt() -> WarmServingRunReceiptV1:
             health_generate_status_code=200,
             health_generate_response_sha256="6" * 64,
         ),
+        sanity=_sanity(),
         jit_cache=SglangKtServingJitCacheEvidence(
             cache_directories=("/cache/triton",),
             after_penultimate_warmup_manifest_sha256="7" * 64,
@@ -440,6 +480,17 @@ def test_receipt_rejects_changed_output_ids() -> None:
     sample = samples[-1]
     assert isinstance(sample, dict)
     sample["output_ids_sha256"] = "f" * 64
+    with pytest.raises(SglangKtWarmServingRunReceiptError):
+        canonicalize_sglang_kt_warm_serving_run_receipt(payload)
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["server_output_text", "locally_decoded_output_text"],
+)
+def test_receipt_rejects_incoherent_sanity_marker(field: str) -> None:
+    payload = _payload()
+    _object(payload, "sanity")[field] = "WRONG"
     with pytest.raises(SglangKtWarmServingRunReceiptError):
         canonicalize_sglang_kt_warm_serving_run_receipt(payload)
 
