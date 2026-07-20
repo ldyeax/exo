@@ -43,7 +43,7 @@ from exo.worker.sglang_kt.serving_benchmark_receipt import (
     SglangKtServingWorkloadRequest,
     SglangKtWarmServingRunIdentity,
     SglangKtWarmServingRunReceiptError,
-    WarmServingRunReceiptV2,
+    WarmServingRunReceiptV3,
     calculate_sglang_kt_length_finish_reason_sha256,
     calculate_sglang_kt_serving_coordination_guard_evidence_sha256,
     calculate_sglang_kt_serving_source_bundle_sha256,
@@ -346,10 +346,10 @@ def _coordination_guard() -> SglangKtServingCoordinationGuardEvidence:
     )
 
 
-def _receipt() -> WarmServingRunReceiptV2:
+def _receipt() -> WarmServingRunReceiptV3:
     identity = _identity()
-    return WarmServingRunReceiptV2(
-        schema_version=2,
+    return WarmServingRunReceiptV3(
+        schema_version=3,
         status="passed",
         generated_at_utc="2026-07-19T20:31:00+00:00",
         evidence_class="performance",
@@ -448,20 +448,31 @@ def test_canonical_receipt_rejects_v1_payload_with_sanity() -> None:
         canonicalize_sglang_kt_warm_serving_run_receipt(payload)
 
 
-def test_canonical_receipt_rejects_v2_payload_without_sanity() -> None:
+def test_canonical_receipt_rejects_v2_payload() -> None:
+    payload = _payload()
+    payload["schema_version"] = 2
+    with pytest.raises(SglangKtWarmServingRunReceiptError):
+        canonicalize_sglang_kt_warm_serving_run_receipt(payload)
+
+
+def test_canonical_receipt_rejects_v3_payload_without_sanity() -> None:
     payload = _payload()
     del payload["sanity"]
     with pytest.raises(SglangKtWarmServingRunReceiptError):
         canonicalize_sglang_kt_warm_serving_run_receipt(payload)
 
 
-@pytest.mark.parametrize("invalid_shape", ["v1_with_sanity", "v2_without_sanity"])
-def test_receipt_loader_rejects_non_v2_shape(
+@pytest.mark.parametrize(
+    "invalid_shape", ["v1_with_sanity", "v2_with_sanity", "v3_without_sanity"]
+)
+def test_receipt_loader_rejects_non_v3_shape(
     tmp_path: Path, invalid_shape: str
 ) -> None:
     payload = _payload()
     if invalid_shape == "v1_with_sanity":
         payload["schema_version"] = 1
+    elif invalid_shape == "v2_with_sanity":
+        payload["schema_version"] = 2
     else:
         del payload["sanity"]
     path = tmp_path / "invalid-serving.json"
@@ -760,6 +771,21 @@ def test_performance_receipt_requires_cleanup_evidence() -> None:
     incomplete["cleanup"] = None
     with pytest.raises(SglangKtWarmServingRunReceiptError):
         canonicalize_sglang_kt_warm_serving_run_receipt(incomplete)
+
+
+def test_performance_receipt_accepts_sglang_self_sigkill_after_sigterm() -> None:
+    payload = _payload()
+    cleanup = _object(payload, "cleanup")
+    cleanup["server_return_code"] = -9
+
+    receipt = WarmServingRunReceiptV3.model_validate_json(
+        canonicalize_sglang_kt_warm_serving_run_receipt(payload)
+    )
+
+    assert receipt.cleanup is not None
+    assert receipt.cleanup.server_return_code == -9
+    assert receipt.cleanup.termination_signal == "SIGTERM"
+    assert receipt.cleanup.forced is False
 
 
 def test_receipt_is_published_only_after_cleanup_completes() -> None:

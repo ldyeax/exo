@@ -43,7 +43,7 @@ from exo.worker.sglang_kt.receipt_io import (
     read_sglang_kt_bound_file,
 )
 
-WARM_SERVING_RUN_RECEIPT_SCHEMA_VERSION = 2
+WARM_SERVING_RUN_RECEIPT_SCHEMA_VERSION = 3
 WARM_SERVING_RUN_RECEIPT_MAXIMUM_BYTES = 4 * 1024 * 1024
 WARM_SERVING_RUN_IDENTITY_CANONICALIZATION = (
     "exo-sglang-kt-warm-serving-run-identity-v1"
@@ -977,7 +977,7 @@ class SglangKtServingCleanupEvidence(_StrictModel):
     benchmark_completed_normally: Literal[True]
     server_process: SglangKtServingOwnedServerProcessIdentity
     termination_signal: Literal["SIGTERM"]
-    server_return_code: Literal[-15, 0]
+    server_return_code: Literal[-15, -9, 0]
     forced: Literal[False]
     owned_processes_absent: Literal[True]
     service_host: NonemptyText
@@ -1004,8 +1004,8 @@ class SglangKtServingCleanupEvidence(_StrictModel):
 
 
 @final
-class WarmServingRunReceiptV2(_StrictModel):
-    schema_version: Literal[2]
+class WarmServingRunReceiptV3(_StrictModel):
+    schema_version: Literal[3]
     status: Literal["passed"]
     generated_at_utc: NonemptyText
     evidence_class: Literal["diagnostic", "performance"]
@@ -1030,7 +1030,7 @@ class WarmServingRunReceiptV2(_StrictModel):
         return _validate_generated_at_utc(value)
 
     @model_validator(mode="after")
-    def validate_complete_run(self) -> "WarmServingRunReceiptV2":
+    def validate_complete_run(self) -> "WarmServingRunReceiptV3":
         expected_identity_sha256 = calculate_sglang_kt_warm_serving_run_identity_sha256(
             self.identity
         )
@@ -1092,7 +1092,7 @@ class SglangKtWarmServingRunReceiptObservation(_StrictModel):
     receipt_path: AbsoluteRuntimePath
     receipt_size_bytes: PositiveInt
     receipt_sha256: Sha256Digest
-    receipt: WarmServingRunReceiptV2
+    receipt: WarmServingRunReceiptV3
 
 
 def _validate_expected_sha256(value: str, description: str) -> None:
@@ -1104,13 +1104,13 @@ def _validate_expected_sha256(value: str, description: str) -> None:
 
 def _validate_warm_serving_run_receipt_contents(
     contents: bytes,
-) -> WarmServingRunReceiptV2:
+) -> WarmServingRunReceiptV3:
     parse_sglang_kt_strict_json(contents)
-    return WarmServingRunReceiptV2.model_validate_json(contents)
+    return WarmServingRunReceiptV3.model_validate_json(contents)
 
 
 def canonicalize_sglang_kt_warm_serving_run_receipt(payload: object) -> bytes:
-    """Validate a warm-serving v2 receipt and return canonical JSON bytes."""
+    """Validate a warm-serving v3 receipt and return canonical JSON bytes."""
 
     try:
         contents = canonical_sglang_kt_json(payload)
@@ -1132,7 +1132,7 @@ def load_sglang_kt_warm_serving_run_receipt(
     expected_identity_sha256: str,
     expected_receipt_sha256: str | None = None,
 ) -> SglangKtWarmServingRunReceiptObservation:
-    """Load a stable v2 receipt and bind it to an independent identity."""
+    """Load a stable v3 receipt and bind it to an independent identity."""
 
     _validate_expected_sha256(expected_identity_sha256, "serving identity")
     if expected_receipt_sha256 is not None:

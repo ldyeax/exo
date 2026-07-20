@@ -5,6 +5,7 @@ import fcntl
 import hashlib
 import json
 import os
+import signal
 import socket
 import subprocess
 from collections.abc import Sequence
@@ -730,7 +731,7 @@ def serving_measurement(
     config: harness.ServingBenchmarkConfig,
     cgroup_path: Path,
     handoff: harness.ServingHandoffIdentity | None = None,
-) -> harness.WarmServingMeasurementV2:
+) -> harness.WarmServingMeasurementV3:
     identity = serving_identity(config)
     prefill = harness.prepare_glm47_serving_workload("prefill").receipt_request
     decode = harness.prepare_glm47_serving_workload("decode").receipt_request
@@ -781,8 +782,8 @@ def serving_measurement(
         post_sanity_cache_flush_response_sha256="7" * 64,
     )
     coordination_guard = coordination_evidence(config)
-    return harness.WarmServingMeasurementV2(
-        schema_version=2,
+    return harness.WarmServingMeasurementV3(
+        schema_version=3,
         status="passed",
         generated_at_utc="2026-07-19T20:00:00+00:00",
         profiler="none",
@@ -951,13 +952,13 @@ def mock_successful_finalization_proofs(monkeypatch: pytest.MonkeyPatch) -> None
     def identity_files(
         _config: harness.ServingBenchmarkConfig,
         _deployment: validation.DeploymentIdentity,
-        _measurement: harness.WarmServingMeasurementV2,
+        _measurement: harness.WarmServingMeasurementV3,
     ) -> None:
         return None
 
     def processes_absent(
         _manifest: harness.JsonObject,
-        _measurement: harness.WarmServingMeasurementV2,
+        _measurement: harness.WarmServingMeasurementV3,
     ) -> None:
         return None
 
@@ -1183,23 +1184,47 @@ def test_measurement_timestamp_must_be_utc(tmp_path: Path) -> None:
     payload = serving_measurement(config, tmp_path / "cgroup").model_dump(mode="json")
     payload["generated_at_utc"] = "2026-07-19T16:00:00-04:00"
     with pytest.raises(ValidationError, match="must be UTC"):
-        harness.WarmServingMeasurementV2.model_validate_json(json.dumps(payload))
+        harness.WarmServingMeasurementV3.model_validate_json(json.dumps(payload))
 
 
-def test_measurement_v2_rejects_v1_payload_with_sanity(tmp_path: Path) -> None:
+def test_measurement_accepts_sglang_self_sigkill_after_sigterm(
+    tmp_path: Path,
+) -> None:
+    config = make_config(tmp_path)
+    payload = serving_measurement(config, tmp_path / "cgroup").model_dump(mode="json")
+    payload["server_return_code"] = -9
+
+    measurement = harness.WarmServingMeasurementV3.model_validate_json(
+        json.dumps(payload)
+    )
+
+    assert measurement.server_return_code == -9
+    assert measurement.termination_signal == "SIGTERM"
+    assert measurement.forced is False
+
+
+def test_measurement_v3_rejects_v2_payload(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    payload = serving_measurement(config, tmp_path / "cgroup").model_dump(mode="json")
+    payload["schema_version"] = 2
+    with pytest.raises(ValidationError):
+        harness.WarmServingMeasurementV3.model_validate_json(json.dumps(payload))
+
+
+def test_measurement_v3_rejects_v1_payload(tmp_path: Path) -> None:
     config = make_config(tmp_path)
     payload = serving_measurement(config, tmp_path / "cgroup").model_dump(mode="json")
     payload["schema_version"] = 1
     with pytest.raises(ValidationError):
-        harness.WarmServingMeasurementV2.model_validate_json(json.dumps(payload))
+        harness.WarmServingMeasurementV3.model_validate_json(json.dumps(payload))
 
 
-def test_measurement_v2_requires_sanity(tmp_path: Path) -> None:
+def test_measurement_v3_requires_sanity(tmp_path: Path) -> None:
     config = make_config(tmp_path)
     payload = serving_measurement(config, tmp_path / "cgroup").model_dump(mode="json")
     del payload["sanity"]
     with pytest.raises(ValidationError):
-        harness.WarmServingMeasurementV2.model_validate_json(json.dumps(payload))
+        harness.WarmServingMeasurementV3.model_validate_json(json.dumps(payload))
 
 
 def relocated_validator_admission(
@@ -1764,6 +1789,84 @@ def test_already_exited_zero_server_cannot_claim_sigterm_delivery(
     )
     with pytest.raises(harness.Glm47ServingHarnessError, match="exited early"):
         harness.terminate_server_unforced(config, server, "owner-token", identity)
+
+
+@pytest.mark.parametrize(
+    ("return_code", "accepted"), ((-9, True), (-6, False), (137, False))
+)
+def test_server_shutdown_accepts_only_canonical_codes_after_verified_sigterm(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    return_code: int,
+    accepted: bool,
+) -> None:
+    config = make_config(tmp_path)
+    identity = serving_measurement(config, tmp_path / "cgroup").server_process
+
+    class ShutdownProcess:
+        pid = 4242
+
+        def __init__(self) -> None:
+            self.returncode: int | None = None
+
+        def poll(self) -> int | None:
+            return self.returncode
+
+        def wait(self, timeout: float | None = None) -> int:
+            del timeout
+            if self.returncode is None:
+                raise subprocess.TimeoutExpired("server", 0)
+            return self.returncode
+
+    process = ShutdownProcess()
+    server = harness.ServerProcess(
+        process=cast(subprocess.Popen[bytes], cast(object, process)),
+        owned=validation.OwnedProcess(
+            host_name=config.host.hostname,
+            pid=process.pid,
+            process_group_id=process.pid,
+            start_time_ticks=identity.proc_start_time_ticks,
+            transport_pid=process.pid,
+            namespace=config.namespace,
+            owner_token="owner-token",
+            log_path="/tmp/server.log",
+        ),
+        command=("/usr/bin/numactl",),
+        environment={},
+        working_directory=str(tmp_path),
+        launch_argv_sha256=identity.argv_sha256,
+        launch_seconds=1.0,
+    )
+    delivered_signals: list[tuple[int, int]] = []
+
+    def observe_server(
+        _config: harness.ServingBenchmarkConfig,
+        _server: harness.ServerProcess,
+    ) -> SglangKtServingOwnedServerProcessIdentity:
+        return identity
+
+    def group_ownership(_process_group_id: int, _owner_token: str) -> str:
+        return "owned" if process.returncode is None else "absent"
+
+    def send_signal(process_group_id: int, signal_number: int) -> None:
+        delivered_signals.append((process_group_id, signal_number))
+        process.returncode = return_code
+
+    monkeypatch.setattr(harness, "observe_running_server_process", observe_server)
+    monkeypatch.setattr(validation, "live_group_ownership", group_ownership)
+    monkeypatch.setattr(validation, "owned_token_processes", lambda _token: {})
+    monkeypatch.setattr(validation, "reap_adopted_children", lambda: None)
+    monkeypatch.setattr(harness.os, "killpg", send_signal)
+
+    if accepted:
+        assert (
+            harness.terminate_server_unforced(config, server, "owner-token", identity)
+            == return_code
+        )
+    else:
+        with pytest.raises(harness.Glm47ServingHarnessError, match="noncanonical code"):
+            harness.terminate_server_unforced(config, server, "owner-token", identity)
+    assert delivered_signals == [(process.pid, signal.SIGTERM)]
 
 
 def test_finalization_lock_fails_closed_when_another_owner_wins(tmp_path: Path) -> None:
