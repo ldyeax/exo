@@ -56,6 +56,8 @@ from exo.worker.sglang_kt.launch_spec import (  # noqa: E402
     GLM_4_7_FLASH_LAYER_COUNT,
     GLM_4_7_FLASH_MAX_TOTAL_TOKENS,
     GLM_4_7_FLASH_PP3_DIAGNOSTIC_TARGET_PROFILE,
+    GLM_4_7_FLASH_PP3_PIPELINE_LAYER_PARTITION,
+    GLM_4_7_FLASH_PP3_PIPELINE_LAYER_PARTITIONS,
     GLM_4_7_FLASH_SGLANG_REVISION,
     SglangKtProcessLaunchSpec,
     build_glm_4_7_flash_bf16_pp3_diagnostic_process_launch_specs,
@@ -99,7 +101,6 @@ FWUFF_STAGE_TWO_GPU: Final = "GPU-93e47864-13c3-0211-f3a9-ccee1a00d618"
 DWAGON_STAGE_ZERO_CPUS: Final = tuple(range(56))
 DWAGON_STAGE_ONE_CPUS: Final = tuple(range(56, 112))
 FWUFF_STAGE_TWO_CPUS: Final = tuple(range(60))
-PIPELINE_RANGES: Final = ((0, 16), (16, 32), (32, 47))
 DEFAULT_DWAGON_MODEL_PATH: Final = (
     "/var/lib/exo/models/"
     "zai-org--GLM-4.7-Flash--7dd20894a642a0aa287e9827cb1a1f7f91386b67"
@@ -145,6 +146,7 @@ class Pp3DiagnosticConfig:
     distributed_port: int
     stage_ports: tuple[int, int, int]
     hca_devices: tuple[str, ...]
+    pipeline_layer_partition: tuple[int, int, int]
     dwagon_stage_placement: DwagonStagePlacement
     resident_gpu_experts: int
     readiness_timeout_seconds: float
@@ -254,8 +256,27 @@ def stage_ownership_namespace(spec: SglangKtProcessLaunchSpec) -> str:
     return str(spec.service_endpoint.port)
 
 
+def _pipeline_ranges(
+    partition: tuple[int, int, int],
+) -> tuple[tuple[int, int], tuple[int, int], tuple[int, int]]:
+    if partition not in GLM_4_7_FLASH_PP3_PIPELINE_LAYER_PARTITIONS:
+        raise Pp3DiagnosticError(
+            "pipeline_layer_partition must be 16,16,15 or 16,15,16"
+        )
+    first_end = partition[0]
+    second_end = first_end + partition[1]
+    third_end = second_end + partition[2]
+    if third_end != GLM_4_7_FLASH_LAYER_COUNT:
+        raise Pp3DiagnosticError(
+            "pipeline_layer_partition must cover all GLM-4.7 Flash layers"
+        )
+    return ((0, first_end), (first_end, second_end), (second_end, third_end))
+
+
 def build_pp3_plan(config: Pp3DiagnosticConfig) -> SglangKtLaunchPlan:
     """Build the exact dwagon -> dwagon -> fwuff hardware plan."""
+
+    pipeline_ranges = _pipeline_ranges(config.pipeline_layer_partition)
 
     pipeline_order_placements = (
         (DWAGON_STAGE_ZERO_GPU, DWAGON_STAGE_ZERO_CPUS, 0),
@@ -302,8 +323,8 @@ def build_pp3_plan(config: Pp3DiagnosticConfig) -> SglangKtLaunchPlan:
     stages = tuple(
         SglangKtStageSpec(
             pipeline_rank=rank,
-            start_layer=PIPELINE_RANGES[rank][0],
-            end_layer=PIPELINE_RANGES[rank][1],
+            start_layer=pipeline_ranges[rank][0],
+            end_layer=pipeline_ranges[rank][1],
             node_id=node_id,
             gpu_uuid=gpu_uuid,
             service_endpoint=Host(ip=service_ip, port=service_port),
@@ -1106,6 +1127,7 @@ def _write_receipt(config: Pp3DiagnosticConfig, payload: JsonObject) -> None:
 def _configuration_receipt(config: Pp3DiagnosticConfig) -> JsonObject:
     return {
         "dwagon_stage_placement": config.dwagon_stage_placement,
+        "pipeline_layer_partition": list(config.pipeline_layer_partition),
     }
 
 
@@ -1268,6 +1290,20 @@ def _positive_float(raw: str) -> float:
     return value
 
 
+def _pipeline_layer_partition(raw: str) -> tuple[int, int, int]:
+    try:
+        partition = tuple(int(item) for item in raw.split(","))
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "pipeline layer partition must be 16,16,15 or 16,15,16"
+        ) from error
+    if partition not in GLM_4_7_FLASH_PP3_PIPELINE_LAYER_PARTITIONS:
+        raise argparse.ArgumentTypeError(
+            "pipeline layer partition must be 16,16,15 or 16,15,16"
+        )
+    return cast(tuple[int, int, int], partition)
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-id", required=True)
@@ -1297,6 +1333,13 @@ def _parser() -> argparse.ArgumentParser:
         "--hca-devices",
         type=_parse_hca_devices,
         default=DEFAULT_HCA_DEVICES,
+    )
+    parser.add_argument(
+        "--pipeline-layer-partition",
+        type=_pipeline_layer_partition,
+        default=GLM_4_7_FLASH_PP3_PIPELINE_LAYER_PARTITION,
+        metavar="LAYERS",
+        help="three-stage layer counts: 16,16,15 (default) or 16,15,16",
     )
     parser.add_argument(
         "--dwagon-stage-placement",
@@ -1362,6 +1405,9 @@ def _config_from_arguments(arguments: argparse.Namespace) -> Pp3DiagnosticConfig
         distributed_port=ports[0],
         stage_ports=cast(tuple[int, int, int], ports[1:]),
         hca_devices=cast(tuple[str, ...], arguments.hca_devices),
+        pipeline_layer_partition=cast(
+            tuple[int, int, int], arguments.pipeline_layer_partition
+        ),
         dwagon_stage_placement=cast(
             DwagonStagePlacement,
             arguments.dwagon_stage_placement,

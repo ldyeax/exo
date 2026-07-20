@@ -37,6 +37,7 @@ def make_config(tmp_path: Path) -> pp3.Pp3DiagnosticConfig:
         distributed_port=62400,
         stage_ports=(62410, 62411, 62412),
         hca_devices=("mlx4_0:1", "mlx4_0:2"),
+        pipeline_layer_partition=(16, 16, 15),
         dwagon_stage_placement=pp3.DWAGON_STAGE_PLACEMENT_PIPELINE_ORDER,
         resident_gpu_experts=4,
         readiness_timeout_seconds=60.0,
@@ -132,6 +133,7 @@ def test_swaps_dwagon_hardware_without_changing_pipeline_ranges(
     assert plan_receipt["stages"][1]["gpu_uuid"] == pp3.DWAGON_STAGE_ZERO_GPU
     assert pp3._configuration_receipt(config) == {
         "dwagon_stage_placement": pp3.DWAGON_STAGE_PLACEMENT_CROSS_HOST_HCA_LOCAL,
+        "pipeline_layer_partition": [16, 16, 15],
     }
 
 
@@ -148,6 +150,8 @@ def test_cli_selects_cross_host_hca_local_placement(tmp_path: Path) -> None:
             "/runtime/fwuff/bin/python",
             "--dwagon-stage-placement",
             pp3.DWAGON_STAGE_PLACEMENT_CROSS_HOST_HCA_LOCAL,
+            "--pipeline-layer-partition",
+            "16,15,16",
         )
     )
 
@@ -156,6 +160,75 @@ def test_cli_selects_cross_host_hca_local_placement(tmp_path: Path) -> None:
     assert (
         config.dwagon_stage_placement == pp3.DWAGON_STAGE_PLACEMENT_CROSS_HOST_HCA_LOCAL
     )
+    assert config.pipeline_layer_partition == (16, 15, 16)
+
+
+def test_cli_preserves_default_layer_partition(tmp_path: Path) -> None:
+    arguments = pp3._parser().parse_args(
+        (
+            "--run-id",
+            "default-partition",
+            "--result-directory",
+            str(tmp_path / "result"),
+            "--dwagon-runtime-python",
+            "/runtime/dwagon/bin/python",
+            "--fwuff-runtime-python",
+            "/runtime/fwuff/bin/python",
+        )
+    )
+
+    config = pp3._config_from_arguments(arguments)
+
+    assert config.pipeline_layer_partition == (16, 16, 15)
+
+
+def test_selects_cross_host_heavier_layer_partition(tmp_path: Path) -> None:
+    config = replace(
+        make_config(tmp_path),
+        pipeline_layer_partition=(16, 15, 16),
+    )
+
+    specs = pp3.build_pp3_process_specs(config)
+
+    assert tuple((spec.start_layer, spec.end_layer) for spec in specs) == (
+        (0, 16),
+        (16, 31),
+        (31, 47),
+    )
+    assert {dict(spec.environment)["SGLANG_PP_LAYER_PARTITION"] for spec in specs} == {
+        "16,15,16"
+    }
+    assert pp3._configuration_receipt(config)["pipeline_layer_partition"] == [
+        16,
+        15,
+        16,
+    ]
+
+
+def test_rejects_unapproved_layer_partition(tmp_path: Path) -> None:
+    config = replace(
+        make_config(tmp_path),
+        pipeline_layer_partition=(15, 16, 16),
+    )
+
+    with pytest.raises(pp3.Pp3DiagnosticError, match="16,16,15 or 16,15,16"):
+        pp3.build_pp3_process_specs(config)
+
+    with pytest.raises(SystemExit):
+        pp3._parser().parse_args(
+            (
+                "--run-id",
+                "bad-partition",
+                "--result-directory",
+                str(tmp_path / "bad-result"),
+                "--dwagon-runtime-python",
+                "/runtime/dwagon/bin/python",
+                "--fwuff-runtime-python",
+                "/runtime/fwuff/bin/python",
+                "--pipeline-layer-partition",
+                "15,16,16",
+            )
+        )
 
 
 def test_builds_numactl_commands_and_clean_nccl_environment(tmp_path: Path) -> None:

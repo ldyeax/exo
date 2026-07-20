@@ -19,8 +19,13 @@ Rows without a decode measurement follow the decoded rows for that model.
 | Ornith-1.0-397B | `bench_internal_agent_prefill_4x20000_1.jsonl#rows-1-3` | same; four concurrent requests | 1,066.393 / 1,061.920 / 996.876 | - | **IMPORTED HISTORICAL** |
 | Ornith-1.0-397B | `bench_internal_agent_prefill_4x20000_1.jsonl#rows-4-6` | same; four concurrent requests | 80.551 / 135.626 / 184.006 | - | **IMPORTED HISTORICAL, DEGRADED**; zero-TTFT anomaly |
 | GLM-4.7 Flash 30B-A3B | `tp2-glm47flash-20260719-v1` | dwagon 1x RTX 3090 + fwuff 1x RTX 3090; MLX/NCCL TP2; dual QDR | 45.31 | 19.57 | **PASS (diagnostic)**; exact TP1 equality; not a controlled performance comparison |
+| GLM-4.7 Flash 30B-A3B | `glm47-pp3-diagnostic-dwagon-fwuff-20260720-v10` | PP3/TP1; v3 placement and 16/15/16 split; full 56/56/60 cores; E48; dual QDR | 6.976789422* | 7.228700241 | **PASS (diagnostic)**; best native hybrid PP3 result so far |
+| GLM-4.7 Flash 30B-A3B | `glm47-pp3-diagnostic-dwagon-fwuff-20260720-v8` | PP3/TP1; v3 placement and 16/16/15 split; full 56/56/60 cores; E48; dual QDR | 6.745452171* | 7.163711287 | **PASS (diagnostic)**; E48 partition control |
 | GLM-4.7 Flash 30B-A3B | `glm47-kt-serving-local-dwagon-20260719-v10` | dwagon; 1x RTX 3090; TP1; 112 physical cores; 2x56 AMX pools; E4 | 6.066921877* | 7.112858950 | **ENGINEERING ONLY**; immutable measurement; final receipt failed closed after inference |
+| GLM-4.7 Flash 30B-A3B | `glm47-pp3-diagnostic-dwagon-fwuff-20260720-v6` | PP3/TP1; v3 placement and 16/16/15 split; full 56/56/60 cores; E32; dual QDR | 6.215342096* | 6.924257787 | **PASS (diagnostic)**; best PP3 result through v6 |
+| GLM-4.7 Flash 30B-A3B | `glm47-pp3-diagnostic-dwagon-fwuff-20260720-v5` | PP3/TP1; v3 placement and 16/16/15 split; full 56/56/60 cores; E16; dual QDR | 5.289909964* | 6.553438809 | **PASS (diagnostic)**; decode improved over E4; prefill-heavy output regressed |
 | GLM-4.7 Flash 30B-A3B | `glm47-pp3-diagnostic-dwagon-fwuff-20260720-v3` | PP3/TP1; dwagon 2x RTX 3090 + 112 physical cores/2 AMX pools -> fwuff 1x RTX 3090 + 60 physical cores/AMX; 16/16/15 layers; E4; dual QDR | 5.766342756* | 6.290703294 | **PASS (diagnostic)**; exact semantic sanity, balanced dual-rail payload, clean unforced shutdown |
+| GLM-4.7 Flash 30B-A3B | `glm47-pp3-diagnostic-dwagon-fwuff-20260720-v4` | same PP3/TP1 model and split; dwagon ranks swapped so cross-host rank 1 uses HCA-local NUMA0/GPU0; E4; dual QDR | 5.726548780* | 6.255591493 | **PASS (diagnostic)**; placement hypothesis did not improve throughput |
 | GLM-4.7 Flash 30B-A3B | `glm47-pp3-diagnostic-dwagon-fwuff-20260720-v2` | same PP3/TP1 topology as v3 | 5.219545197* | 6.213798282 | **ENGINEERING ONLY**; inference valid; cleanup verifier false-negative fixed before v3; no process survived |
 | GPT-OSS 20B | `tp2-gptoss20b-20260718-v1` | dwagon 1x RTX 3090 + fwuff 1x RTX 3090; MLX/NCCL TP2; dual QDR | 148.77 | 38.13 | **PASS (diagnostic)**; exact TP1 equality; not a controlled performance comparison |
 | Llama 3.1 8B | `tp2-llama31-8b-20260718-v1` | dwagon 1x RTX 3090 + fwuff 1x RTX 3090; MLX/NCCL TP2; dual QDR | 134.15 | 26.02 | **PASS (diagnostic)**; exact TP1 equality; not a controlled performance comparison |
@@ -28,8 +33,8 @@ Rows without a decode measurement follow the decoded rows for that model.
 | SmolLM2 135M | `tp3-smollm2-20260718-v6` | dwagon 2x RTX 3090 + fwuff 1x RTX 3090; MLX/NCCL TP3 over InfiniBand | 210.53 | 29.20 | **PASS (diagnostic)**; no per-rail PMA proof; not a controlled performance comparison |
 
 This is an inventory, not a cross-row leaderboard: request shapes,
-concurrency, quantization, and harness definitions differ. `*` The v10, PP3
-v2, and PP3 v3 values are median end-to-end output rates for their
+concurrency, quantization, and harness definitions differ. `*` The local v10
+and PP3 v2-v6, v8, and v10 values are median end-to-end output rates for their
 1,024-input/32-output prefill-heavy workload, not the input-token prefill
 metric used by the older harness. Approximate live-log rates from failed v8/v9
 transactions remain in the detailed ledger but are excluded here because no
@@ -61,13 +66,15 @@ exact measurement survived.
   listed below.
 - Completed ladder rungs: Llama 3.2 1B, Llama 3.2 3B, Llama 3.1 8B,
   GPT-OSS 20B, and GLM-4.7 Flash.
-- Latest GLM engineering result: PP3 v3 ran layers 0-15 on dwagon NUMA0/GPU0,
-  16-31 on dwagon NUMA1/GPU1, and 32-46 on fwuff NUMA0/GPU0. It used all
+- Latest GLM engineering result: PP3 v10 used the v3 placement, shifted one
+  routed layer from dwagon's middle stage to fwuff for a 16/15/16 split, and
+  retained 48 resident GPU experts plus all
   56/56/60 physical cores with one AMX-BF16 pool per stage, produced exact
-  `EXO_SANITY_OK`, measured 6.290703294 decode tok/s, carried 27,223,772 and
-  27,217,344 bytes on the two QDR rails, added no HCA health errors, and
+  `EXO_SANITY_OK`, measured 7.228700241 decode tok/s and 6.976789422
+  prefill-heavy output tok/s, added no HCA health errors, and
   cleaned up all ranks without force. It remains diagnostic because NCCL INFO
-  instrumentation was enabled.
+  instrumentation was enabled. The split improves decode 0.91% and
+  prefill-heavy output 3.43% over the E48 16/16/15 control.
 - Latest controlled proof result remains GLM-4.7 Flash MLX/NCCL TP=2: exact
   TP1 output equality, two-rank NCCL initialization, payload on both QDR rails,
   clean HCA health counters, instance deletion, process cleanup, and resource
@@ -222,6 +229,13 @@ performance claim.
 | GLM-4.7 Flash PP3 v1 | **EXPECTED FAIL (setup)** | `/var/lib/exo/benchmarks/glm47-pp3-diagnostic-dwagon-fwuff-20260720-v1`; Gloo resolved an IPv6 dwagon endpoint against IPv4 fwuff and failed before model load. Per-host `GLOO_SOCKET_IFNAME` and `NCCL_SOCKET_IFNAME` fixed the family mismatch in place; cleanup passed. Result SHA `5003b64ee47c6a7bd0f9522ac9a0ff0944cd4903c9352862b7ae90aeba68f2`. |
 | GLM-4.7 Flash PP3 v2 | **ENGINEERING ONLY** | `/var/lib/exo/benchmarks/glm47-pp3-diagnostic-dwagon-fwuff-20260720-v2`; exact semantic sanity and all workloads completed at 5.219545197 prefill-heavy output tok/s and 6.213798282 decode tok/s. A child-environment cleanup assumption caused a false-negative receipt after all processes were gone. Result SHA `ce2e6ce4dc5e0917ad4b27e208acbc1f1a247e46584e7d056a0d58f92fbb550f`. |
 | GLM-4.7 Flash PP3 v3 | **PASS (diagnostic)** | `/var/lib/exo/benchmarks/glm47-pp3-diagnostic-dwagon-fwuff-20260720-v3`; exact `EXO_SANITY_OK`, 5.766342756 prefill-heavy output tok/s, 6.290703294 decode tok/s, balanced 27,223,772/27,217,344-byte dual-rail payload, zero HCA health deltas, and three ownership-verified unforced rank cleanups. Result SHA `4b8399bd2b94307e7fffd41c6461ef99c83530b41b870dfce33d767c9d52d0e5`. |
+| GLM-4.7 Flash PP3 v4 | **PASS (diagnostic)** | `/var/lib/exo/benchmarks/glm47-pp3-diagnostic-dwagon-fwuff-20260720-v4`; HCA-local cross-host placement, exact semantic sanity, 5.726548780 prefill-heavy output tok/s, 6.255591493 decode tok/s, balanced dual-rail payload, zero HCA health deltas, and clean unforced shutdown. Result SHA `50b046b3c5e7ba61e194ab59be00d64941ba7454c450dbdff8304a45464f9632`. |
+| GLM-4.7 Flash PP3 v5 | **PASS (diagnostic)** | `/var/lib/exo/benchmarks/glm47-pp3-diagnostic-dwagon-fwuff-20260720-v5`; E16 used only 5.87-6.63 GB GPU weight memory per stage, exact semantic sanity passed, prefill-heavy output was 5.289909964 tok/s, decode was 6.553438809 tok/s, both rails were balanced with zero health deltas, and cleanup was unforced. Result SHA `adcb81b03f8781dc1f2ce55c5ee1287d258481d6673bad895f3ef9daf3c284b8`. |
+| GLM-4.7 Flash PP3 v6 | **PASS (diagnostic)** | `/var/lib/exo/benchmarks/glm47-pp3-diagnostic-dwagon-fwuff-20260720-v6`; E32 used 10.09-10.85 GB GPU weights per stage, exact sanity passed, prefill-heavy output was 6.215342096 tok/s, decode was 6.924257787 tok/s, HCA health remained clean, and shutdown was unforced. Result SHA `ab00ff5d7617ac7e7d126932fe1eac5c32761061d7c5fbd801c0592c639f6e74`. |
+| GLM-4.7 Flash PP3 v7 | **EXPECTED FAIL (setup)** | `/var/lib/exo/benchmarks/glm47-pp3-diagnostic-dwagon-fwuff-20260720-v7`; the E48 command mistyped the immutable fwuff overlay ID, failed before remote model launch, and cleaned both started local ranks unforced. The corrected path is used by v8. Result SHA `ee2467f467037f1a8de1d4526e4a4ae06617112cf15d07686ab2dff12c853923`. |
+| GLM-4.7 Flash PP3 v8 | **PASS (diagnostic)** | `/var/lib/exo/benchmarks/glm47-pp3-diagnostic-dwagon-fwuff-20260720-v8`; corrected E48 run used 14.31-15.22 GB GPU weights per stage, passed exact sanity, reached 6.745452171 prefill-heavy output and 7.163711287 decode tok/s, retained clean HCA health, and cleaned all ranks unforced. Result SHA `4db51926d9ca089a8268dd18ee254c010dc680efeab33eae50d9a1e779fe8753`. |
+| GLM-4.7 Flash PP3 v9 | **EXPECTED FAIL (setup)** | `/var/lib/exo/benchmarks/glm47-pp3-diagnostic-dwagon-fwuff-20260720-v9`; the command incorrectly placed fwuff's immutable runtime overlay under `/mnt/sanic` instead of `/var/lib/exo`. It failed before the remote model launched and left no rank running. Result SHA `7de8537a50101b536cc2a861da7047e784958f5f9d85d0dfc3c713ecb90cef2b`. |
+| GLM-4.7 Flash PP3 v10 | **PASS (diagnostic)** | `/var/lib/exo/benchmarks/glm47-pp3-diagnostic-dwagon-fwuff-20260720-v10`; the E48 16/15/16 split passed exact sanity, reached 6.976789422 prefill-heavy output and 7.228700241 decode tok/s, carried balanced 27,222,332/27,215,904-byte rail payload, added no HCA health errors, and cleaned all ranks unforced. Result SHA `c0cad5464a6b2bf3f5b373ed20403fc05467e30831df73ebcec6e307d99a34ae`. |
 
 All strict TP runs above that are marked clean completed ownership-confirmed process
 termination, instance deletion, lease removal, lock release, and reserved-port
@@ -844,6 +858,39 @@ canonical process-spec/config SHA-256 values are
   recovers from three concurrent CPU/GPU stages at batch one. The next runs
   therefore test NUMA/HCA boundary placement and expert residency before adding
   more machinery.
+- V4 moved dwagon rank 1 from NUMA1/GPU1 to the HCA-local NUMA0/GPU0 placement
+  while moving rank 0 in the opposite direction. Decode fell 0.56% to
+  6.255591493 tok/s and prefill-heavy end-to-end output fell 0.69% to
+  5.726548780 tok/s. Rail payload was effectively identical to v3, confirming
+  that roughly 54.4 MB of cross-host traffic per complete run is not enough for
+  the removed UPI hop to matter. Retain v3's mapping and change expert residency
+  next.
+- V5 restored the v3 mapping and raised resident experts from E4 to E16. Decode
+  improved 4.18% to 6.553438809 tok/s and TTFT fell to 0.877620794 s, while the
+  1,024/32 end-to-end output rate regressed 8.26% to 5.289909964 tok/s. GPU
+  weights occupied only 5.87-6.63 GB per stage, leaving room to sweep E32. The
+  result also motivates a later full-GPU prefill threshold control rather than
+  assuming one expert placement is optimal for both phases.
+- V6 raised residency to E32. It improved decode another 5.66% over E16 to
+  6.924257787 tok/s and reversed the prefill regression, reaching 6.215342096
+  prefill-heavy output tok/s. Relative to E4 v3, those are 10.07% and 7.79%
+  improvements. Each stage still had roughly 12.3-13.1 GB free after weights,
+  so E48 is a valid final upper sweep point before changing the partition.
+- V7 was a command-only setup failure caused by a mistyped fwuff overlay ID;
+  both started local ranks cleaned up and no remote model process launched. V8
+  corrected that one path and completed E48. Decode improved another 3.46% over
+  E32 to 7.163711287 tok/s, while prefill-heavy output improved 8.53% to
+  6.745452171 tok/s. Relative to E4 v3, the gains are 13.88% and 16.98%.
+  E48 leaves 7.9-8.8 GB free per stage and becomes the partition-control
+  baseline.
+- V9 made no performance attempt because its command placed fwuff's existing
+  runtime overlay under the model-volume mount. V10 corrected only that path
+  and moved one routed layer from rank 1 to fwuff, producing stages `[0,16)`,
+  `[16,31)`, and `[31,47)`. Against v8, decode improved 0.91% to 7.228700241
+  tok/s and prefill-heavy output improved 3.43% to 6.976789422 tok/s. Both rails
+  remained balanced and clean. Retain 16/15/16 as the best observed split, but
+  stop the partition sweep: the batch-one decode gain is below 1%, so a broader
+  split search is lower value than local PP2/TP2 controls.
 
 ### Distributed expert-parallel research result
 
@@ -854,9 +901,14 @@ canonical process-spec/config SHA-256 values are
   dispatcher masks non-local experts and NCCL-reduces partial expert results,
   making it the shortest correct proof path on SM86. DeepEP/DeepGEMM are not an
   appropriate RTX 3090 cross-host baseline.
-- Start with `allenai/OLMoE-1B-7B-0924`: compare TP2/EP1 with TP2/EP2 on dwagon,
-  then repeat across dwagon/fwuff. Keep `--moe-a2a-backend none` and
-  `--moe-runner-backend triton` for the first proof.
+- Start with `allenai/OLMoE-1B-7B-0924` revision
+  `6d84c48581ece794365f2b8e9cfb043c68ade9c5`, but do not launch the four-arm
+  TP2/EP1 versus TP2/EP2 comparison yet. Pinned SGLang incorrectly applies a
+  full-width 2,048-element Q/K RMSNorm to 1,024-wide TP2 shards. First shard the
+  norm weights and all-reduce the paired FP32 Q/K sum-of-squares once per layer,
+  then rebuild both runtimes and prove TP2 parity against full-vector RMSNorm.
+  After that fix, keep `--moe-a2a-backend none` and `--moe-runner-backend
+  triton` for the first local and cross-host proof.
 - GLM-4.7 has 64 routed experts. BF16 EP2 still leaves about 25.875 GiB of
   routed weights per rank before shared weights, activations, and KV cache, so
   it cannot fit a 24 GiB RTX 3090. EP3 is not a valid even expert/head topology;
@@ -865,26 +917,27 @@ canonical process-spec/config SHA-256 values are
 
 ## Pending tests
 
-1. Swap the two dwagon stage placements so the cross-host boundary originates
-   from the HCA-local NUMA/GPU pair, then compare the exact v3 workloads.
-2. Sweep GLM PP3 resident experts while retaining all 172 physical cores, then
-   test layer splits informed by the slowest-stage timings.
-3. Add mixed TP/PP trials after the PP3 controls, and implement the operational
-   collective stage-local receipt producer before claiming production Exo PP3
-   admission. The current engineering harness directly launches the audited
-   three-stage runtime and does not pretend that gap is closed.
-4. Run native SGLang OLMoE TP2/EP1 versus TP2/EP2 locally and across InfiniBand;
-   use it to measure whether true weight-sharded EP can amortize all-reduce at
-   the relevant batch and sequence sizes.
-5. Convert the verified GLM BF16 source to AMXINT8 only after BF16 placement and
+1. Run controlled dwagon-only GLM PP2/TP1 and TP2/PP1 optimization ladders with
+   both NUMA CPU pools and both RTX 3090s, using the same semantic sanity and
+   1,024/32 plus 128/128 workloads as PP3.
+2. Add feasible mixed TP/PP trials after the local controls, and implement the
+   operational collective stage-local receipt producer before claiming
+   production Exo PP3 admission. The current engineering harness directly
+   launches the audited three-stage runtime and does not pretend that gap is
+   closed.
+3. Fix and prove TP-sharded OLMoE Q/K RMSNorm, then run native SGLang TP2/EP1
+   versus TP2/EP2 locally and across InfiniBand. Use it to measure whether true
+   weight-sharded EP can amortize all-reduce at the relevant batch and sequence
+   sizes.
+4. Convert the verified GLM BF16 source to AMXINT8 only after BF16 placement and
    hybrid execution comparisons; keep packed-GPU mode disabled initially.
-6. Resume exact staging, deterministic TP1, and strict TP=2 for Qwen3-Coder 30B
+5. Resume exact staging, deterministic TP1, and strict TP=2 for Qwen3-Coder 30B
    A3B, followed by Qwen3.5 35B A3B.
-7. After the first larger-model correctness proof, complete at least five
+6. After the first larger-model correctness proof, complete at least five
    distinct dwagon-only optimization runs and five distinct dwagon-plus-fwuff
    InfiniBand optimization runs. Each run needs repeated samples and a recorded
    hypothesis/lesson. Keep a matched-artifact comparison workload; when a
    different exact-revision HF quantization or format wins one track, add a
    quality-gated matched-format control so topology and format effects remain
    separable.
-8. Re-run the preserved QDR receipts after the ConnectX-5 EDR hardware swap.
+7. Re-run the preserved QDR receipts after the ConnectX-5 EDR hardware swap.

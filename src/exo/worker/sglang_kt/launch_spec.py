@@ -54,6 +54,12 @@ GLM_4_7_FLASH_PP3_DIAGNOSTIC_TARGET_PROFILE: Final[SglangKtTargetProfile] = (
     "glm47_flash_bf16_sm86_pp3_diagnostic_v1"
 )
 GLM_4_7_FLASH_PP3_PIPELINE_LAYER_PARTITION: Final = (16, 16, 15)
+GLM_4_7_FLASH_PP3_PIPELINE_LAYER_PARTITIONS: Final = frozenset(
+    (
+        GLM_4_7_FLASH_PP3_PIPELINE_LAYER_PARTITION,
+        (16, 15, 16),
+    )
+)
 GLM_4_7_FLASH_TARGET_PROFILES: Final = frozenset(
     (
         GLM_4_7_FLASH_TARGET_PROFILE,
@@ -619,9 +625,10 @@ def _validate_glm_4_7_flash_bf16_pp3_diagnostic_plan(
 ) -> None:
     if len(plan.stages) != len(GLM_4_7_FLASH_PP3_PIPELINE_LAYER_PARTITION):
         raise ValueError("GLM-4.7-Flash PP3 diagnostic profile requires three stages")
-    if plan.pipeline_layer_partition != GLM_4_7_FLASH_PP3_PIPELINE_LAYER_PARTITION:
+    if plan.pipeline_layer_partition not in GLM_4_7_FLASH_PP3_PIPELINE_LAYER_PARTITIONS:
         raise ValueError(
-            "GLM-4.7-Flash PP3 diagnostic profile requires the 16,16,15 layer partition"
+            "GLM-4.7-Flash PP3 diagnostic profile requires the 16,16,15 or "
+            "16,15,16 layer partition"
         )
 
     for stage in plan.stages:

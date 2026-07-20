@@ -16,6 +16,7 @@ from exo.worker.sglang_kt.launch_spec import (
     GLM_4_7_FLASH_KTRANSFORMERS_REVISION,
     GLM_4_7_FLASH_PP3_DIAGNOSTIC_TARGET_PROFILE,
     GLM_4_7_FLASH_PP3_PIPELINE_LAYER_PARTITION,
+    GLM_4_7_FLASH_PP3_PIPELINE_LAYER_PARTITIONS,
     GLM_4_7_FLASH_SERVING_BASELINE_TARGET_PROFILE,
     GLM_4_7_FLASH_SGLANG_REVISION,
     GLM_4_7_FLASH_TARGET_PROFILE,
@@ -503,6 +504,27 @@ def test_builds_glm_4_7_flash_bf16_pp3_diagnostic_process_group() -> None:
         )
 
 
+def test_glm_4_7_flash_pp3_admits_cross_host_heavier_partition() -> None:
+    plan = make_glm_4_7_flash_bf16_pp3_diagnostic_plan()
+    stages = (
+        plan.stages[0],
+        plan.stages[1].model_copy(update={"end_layer": 31}),
+        plan.stages[2].model_copy(update={"start_layer": 31}),
+    )
+    plan = plan.model_copy(update={"stages": stages})
+
+    specs = build_glm_4_7_flash_bf16_pp3_diagnostic_process_launch_specs(
+        plan,
+        PYTHON_EXECUTABLE,
+    )
+
+    assert plan.pipeline_layer_partition == (16, 15, 16)
+    assert plan.pipeline_layer_partition in GLM_4_7_FLASH_PP3_PIPELINE_LAYER_PARTITIONS
+    assert {dict(spec.environment)["SGLANG_PP_LAYER_PARTITION"] for spec in specs} == {
+        "16,15,16"
+    }
+
+
 def test_glm_4_7_flash_pp3_selects_python_executable_by_physical_node() -> None:
     plan = make_glm_4_7_flash_bf16_pp3_diagnostic_plan()
     executable_by_node = {
@@ -713,7 +735,7 @@ def test_glm_4_7_flash_pp3_diagnostic_requires_exact_layer_partition() -> None:
         plan.stages[2].model_copy(update={"start_layer": 31}),
     )
 
-    with pytest.raises(ValueError, match="16,16,15 layer partition"):
+    with pytest.raises(ValueError, match="16,16,15 or 16,15,16 layer partition"):
         build_glm_4_7_flash_bf16_pp3_diagnostic_process_launch_specs(
             plan.model_copy(update={"stages": stages}),
             PYTHON_EXECUTABLE,
