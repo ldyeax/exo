@@ -1637,11 +1637,13 @@ def _proc_status_resource_list(contents: str, field_name: str) -> tuple[int, ...
     return _parse_linux_resource_list(matches[0], field_name)
 
 
-def _parse_numa_maps_policy(value: str) -> tuple[int, ...]:
+def _parse_numa_maps_policy(value: str) -> tuple[int, ...] | None:
+    if value == "default":
+        return None
     policy, separator, resources = value.partition(":")
     if separator != ":" or policy != "bind":
         raise Glm47ServingHarnessError(
-            "server placement NUMA map does not use a bind policy"
+            "server placement NUMA map uses an unsupported policy"
         )
     return _parse_linux_resource_list(resources, "NUMA bind policy")
 
@@ -1695,6 +1697,11 @@ def observe_running_server_process(
     expected_cpu_affinity = tuple(config.host.cpu_cores)
     expected_memory_nodes = tuple(config.host.memory_nodes)
     observed_policies = tuple(fields[1] for fields in numa_lines if len(fields) >= 2)
+    observed_bind_policies = tuple(
+        policy
+        for value in observed_policies
+        if (policy := _parse_numa_maps_policy(value)) is not None
+    )
     if (
         executable != expected_executable
         or command_line != server.command[5:]
@@ -1704,10 +1711,8 @@ def observe_running_server_process(
         or status_cpu_affinity != expected_cpu_affinity
         or not set(expected_memory_nodes).issubset(allowed_memory_nodes)
         or not observed_policies
-        or any(
-            _parse_numa_maps_policy(policy) != expected_memory_nodes
-            for policy in observed_policies
-        )
+        or not observed_bind_policies
+        or any(policy != expected_memory_nodes for policy in observed_bind_policies)
     ):
         raise Glm47ServingHarnessError(
             "running server process differs from its admitted placement"

@@ -1362,7 +1362,10 @@ def test_server_placement_is_observed_from_proc_and_affinity(tmp_path: Path) -> 
         encoding="ascii",
     )
     (process_root / "numa_maps").write_text(
-        "00400000 bind:0-1 file=/runtime\n00600000 bind:0,1 heap\n",
+        "00400000 bind:0-1 file=/runtime\n"
+        "00600000 bind:0,1 heap anon=8 dirty=8 N0=4 N1=4\n"
+        "7f000000 default file=/dev/nvidiactl\n"
+        "7f100000 default file=/dev/shm/torch_4242_0 shmem N0=1\n",
         encoding="ascii",
     )
 
@@ -1406,6 +1409,17 @@ def test_server_placement_is_observed_from_proc_and_affinity(tmp_path: Path) -> 
             server,
             proc_root=tmp_path / "proc",
             affinity_reader=lambda _process_id: {0, 1, 2},
+        )
+    (process_root / "numa_maps").write_text(
+        "00400000 bind:0-1 file=/runtime\n00600000 bind:1 heap\n",
+        encoding="ascii",
+    )
+    with pytest.raises(harness.Glm47ServingHarnessError, match="placement"):
+        harness.observe_running_server_process(
+            config,
+            server,
+            proc_root=tmp_path / "proc",
+            affinity_reader=lambda _process_id: {0, 1, 2, 3},
         )
     (process_root / "numa_maps").write_text(
         "00400000 default file=/runtime\n", encoding="ascii"
