@@ -378,19 +378,28 @@ def _write_synthetic_scheduler(
     memory_policy: str,
 ) -> None:
     process_root = proc_root / str(pid)
-    task_root = process_root / "task" / str(pid)
-    task_root.mkdir(parents=True)
+    process_root.mkdir(parents=True)
     (process_root / "stat").write_text(
         _synthetic_process_stat(pid, process_group, pid * 10)
     )
     (process_root / "cmdline").write_bytes(title.encode() + b"\0--worker\0")
     status = f"Name:\tscheduler\nCpus_allowed_list:\t{cpus}\n"
     (process_root / "status").write_text(status)
-    (task_root / "status").write_text(status)
+    _write_synthetic_task_affinity(proc_root, pid=pid, task_id=pid, cpus=cpus)
     remote_node = 1 if memory_policy == "bind:0" else 0
     (process_root / "numa_maps").write_text(
         f"1000 {memory_policy} file=/mapped N{remote_node}=4\n"
         f"2000 {memory_policy} heap anon=4 dirty=4 N{memory_policy[-1]}=4\n"
+    )
+
+
+def _write_synthetic_task_affinity(
+    proc_root: Path, *, pid: int, task_id: int, cpus: str
+) -> None:
+    task_root = proc_root / str(pid) / "task" / str(task_id)
+    task_root.mkdir(parents=True, exist_ok=True)
+    task_root.joinpath("status").write_text(
+        f"Name:\tscheduler\nCpus_allowed_list:\t{cpus}\n"
     )
 
 
@@ -409,8 +418,14 @@ def _synthetic_numa_tree(tmp_path: Path) -> tuple[Path, Path]:
             pid=100 + node,
             process_group=100,
             title=f"sglang::scheduler_TP{node}_EP{node}",
-            cpus=cpus,
+            cpus="0,112" if node == 0 else "56,168",
             memory_policy=f"bind:{node}",
+        )
+        _write_synthetic_task_affinity(
+            proc_root,
+            pid=100 + node,
+            task_id=200 + node,
+            cpus="1,113" if node == 0 else "57,169",
         )
     return proc_root, sysfs_root
 
@@ -428,7 +443,71 @@ def test_observed_rank_local_numa_binds_both_scheduler_ranks(tmp_path: Path) -> 
 
     ranks = cast(list[dict[str, object]], evidence["ranks"])
     assert [rank["expected_node"] for rank in ranks] == [0, 1]
+    assert ranks[0]["task_affinity_sets"] == [
+        {"task_id": 100, "cpus": [0, 112]},
+        {"task_id": 200, "cpus": [1, 113]},
+    ]
+    assert ranks[0]["task_affinity_union"] == [0, 1, 112, 113]
+    assert isinstance(ranks[0]["task_affinity_sha256"], str)
     assert ranks[0]["numa_policy_counts"] == {"bind:0": 2}
+
+
+def test_observed_rank_local_numa_rejects_cross_node_task_affinity(
+    tmp_path: Path,
+) -> None:
+    proc_root, sysfs_root = _synthetic_numa_tree(tmp_path)
+    _write_synthetic_task_affinity(proc_root, pid=100, task_id=200, cpus="1,56")
+
+    with pytest.raises(olmoe.OlmoeEpBenchmarkError, match="thread outside NUMA"):
+        olmoe.observe_rank_local_numa(
+            process_ids=(100, 101),
+            process_group_id=100,
+            expert_parallel_size=2,
+            proc_root=proc_root,
+            sysfs_root=sysfs_root,
+        )
+
+
+def test_observed_rank_local_numa_retries_task_exit_race(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    proc_root, sysfs_root = _synthetic_numa_tree(tmp_path)
+    racing_status = proc_root / "100/task/200/status"
+    real_reader = olmoe._task_status_cpu_affinity
+    race_triggered = False
+
+    def task_reader(path: Path) -> frozenset[int] | None:
+        nonlocal race_triggered
+        if path == racing_status and not race_triggered:
+            race_triggered = True
+            path.unlink()
+            path.parent.rmdir()
+        return real_reader(path)
+
+    monkeypatch.setattr(olmoe, "_task_status_cpu_affinity", task_reader)
+
+    evidence = olmoe.observe_rank_local_numa(
+        process_ids=(100, 101),
+        process_group_id=100,
+        expert_parallel_size=2,
+        proc_root=proc_root,
+        sysfs_root=sysfs_root,
+    )
+
+    ranks = cast(list[dict[str, object]], evidence["ranks"])
+    assert race_triggered is True
+    assert ranks[0]["stable_observation_attempt"] == 2
+    assert ranks[0]["task_count"] == 1
+
+
+def test_task_affinity_reader_does_not_mask_non_exit_read_error(
+    tmp_path: Path,
+) -> None:
+    invalid_status = tmp_path / "status"
+    invalid_status.mkdir()
+
+    with pytest.raises(olmoe.OlmoeEpBenchmarkError, match="cannot read scheduler"):
+        olmoe._task_status_cpu_affinity(invalid_status)
 
 
 def test_observed_rank_local_numa_rejects_mixed_memory_policy(

@@ -1276,16 +1276,31 @@ def _read_bounded_proc_file(path: Path, maximum_bytes: int) -> bytes:
     return contents
 
 
-def _status_cpu_affinity(path: Path) -> frozenset[int]:
+def _task_status_cpu_affinity(path: Path) -> frozenset[int] | None:
+    """Read one live task affinity, returning None only if the task exited."""
+
     try:
-        contents = _read_bounded_proc_file(path, 256 * 1024).decode("ascii")
+        with path.open("rb") as source:
+            raw_contents = source.read(256 * 1024 + 1)
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise OlmoeEpBenchmarkError(
+            f"cannot read scheduler task status {path}: {error}"
+        ) from error
+    if len(raw_contents) > 256 * 1024:
+        raise OlmoeEpBenchmarkError(f"scheduler task status is oversized: {path}")
+    try:
+        contents = raw_contents.decode("ascii")
     except UnicodeDecodeError as error:
-        raise OlmoeEpBenchmarkError(f"process status is not ASCII: {path}") from error
+        raise OlmoeEpBenchmarkError(
+            f"scheduler task status is not ASCII: {path}"
+        ) from error
     for line in contents.splitlines():
         name, separator, value = line.partition(":")
         if separator and name == "Cpus_allowed_list":
             return _parse_cpu_list(value, f"CPU affinity in {path}")
-    raise OlmoeEpBenchmarkError(f"process status lacks CPU affinity: {path}")
+    raise OlmoeEpBenchmarkError(f"scheduler task status lacks CPU affinity: {path}")
 
 
 def _scheduler_process_title(pid: int, proc_root: Path) -> str:
@@ -1336,11 +1351,6 @@ def _observe_scheduler_numa(
         before_group, before_start, before_state = _read_process_stat_at(pid, proc_root)
         if before_group != process_group_id or before_state == "Z":
             raise OlmoeEpBenchmarkError("scheduler process identity is not owned")
-        main_affinity = _status_cpu_affinity(proc_root / str(pid) / "status")
-        if main_affinity != expected_cpus:
-            raise OlmoeEpBenchmarkError(
-                f"TP rank {tp_rank} scheduler is not bound to NUMA node {expected_node}"
-            )
         try:
             first_tasks = tuple(
                 sorted(
@@ -1356,16 +1366,34 @@ def _observe_scheduler_numa(
         if not first_tasks:
             raise OlmoeEpBenchmarkError("scheduler has no observable threads")
         affinity_counts: dict[tuple[int, ...], int] = {}
+        task_affinities: dict[int, frozenset[int]] = {}
+        task_exit_observed = False
         for task_id in first_tasks:
-            affinity = _status_cpu_affinity(
+            affinity = _task_status_cpu_affinity(
                 proc_root / str(pid) / "task" / str(task_id) / "status"
             )
+            if affinity is None:
+                task_exit_observed = True
+                break
             if not affinity or not affinity.issubset(expected_cpus):
                 raise OlmoeEpBenchmarkError(
                     f"TP rank {tp_rank} has a thread outside NUMA node {expected_node}"
                 )
+            task_affinities[task_id] = affinity
             key = tuple(sorted(affinity))
             affinity_counts[key] = affinity_counts.get(key, 0) + 1
+        if task_exit_observed:
+            after_group, after_start, after_state = _read_process_stat_at(
+                pid, proc_root
+            )
+            if (
+                after_group != before_group
+                or after_start != before_start
+                or after_state == "Z"
+            ):
+                raise OlmoeEpBenchmarkError("scheduler process identity changed")
+            time.sleep(0.05)
+            continue
         policies, map_line_count = _numa_policy_counts(pid, proc_root)
         expected_policy = f"bind:{expected_node}"
         if set(policies) != {expected_policy}:
@@ -1392,6 +1420,19 @@ def _observe_scheduler_numa(
         ):
             raise OlmoeEpBenchmarkError("scheduler process identity changed")
         if first_tasks == second_tasks:
+            task_affinity_union: set[int] = set()
+            for affinity in task_affinities.values():
+                task_affinity_union.update(affinity)
+            task_affinity_sets = cast(
+                list[JsonValue],
+                [
+                    {
+                        "task_id": task_id,
+                        "cpus": sorted(task_affinities[task_id]),
+                    }
+                    for task_id in first_tasks
+                ],
+            )
             return cast(
                 JsonObject,
                 {
@@ -1401,9 +1442,12 @@ def _observe_scheduler_numa(
                     "start_time_ticks": before_start,
                     "process_title": process_title,
                     "expected_node": expected_node,
-                    "main_cpus_allowed": sorted(main_affinity),
+                    "expected_node_cpus": sorted(expected_cpus),
                     "task_count": len(first_tasks),
-                    "task_affinity_sets": [
+                    "task_affinity_sets": task_affinity_sets,
+                    "task_affinity_union": sorted(task_affinity_union),
+                    "task_affinity_sha256": _canonical_sha256(task_affinity_sets),
+                    "task_affinity_set_counts": [
                         {"cpus": list(cpus), "thread_count": count}
                         for cpus, count in sorted(affinity_counts.items())
                     ],
