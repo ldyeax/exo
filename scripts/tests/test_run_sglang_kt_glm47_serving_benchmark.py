@@ -29,8 +29,8 @@ from exo.worker.sglang_kt.model_runtime_validation_receipt import (
     MODEL_RUNTIME_VALIDATOR_SOURCE_RELATIVE_PATHS,
     SglangKtModelRuntimeValidationReceiptObservation,
     calculate_sglang_kt_model_runtime_validator_bundle_sha256,
-    calculate_sglang_kt_model_runtime_validator_content_sha256,
 )
+from exo.worker.sglang_kt.receipt_io import SglangKtBoundFile
 from exo.worker.sglang_kt.serving_benchmark_receipt import (
     SGLANG_KT_SERVING_CLIENT_RELATIVE_PATH,
     SGLANG_KT_SERVING_RECEIPT_RELATIVE_PATH,
@@ -952,6 +952,20 @@ def relocated_validator_admission(
     admission["validator_sha256"] = (
         calculate_sglang_kt_model_runtime_validator_bundle_sha256(admitted_sources)
     )
+    admitted_contents = json.dumps(
+        {
+            "validator_sources": [
+                {"path": path, "sha256": sha256} for path, sha256 in admitted_sources
+            ]
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    admitted_receipt_sha256 = hashlib.sha256(admitted_contents).hexdigest()
+    model_receipt_binding = cast(
+        dict[str, object], admission["model_runtime_validation_receipt"]
+    )
+    model_receipt_binding["sha256"] = admitted_receipt_sha256
     config = harness.ServingBenchmarkConfig.model_validate_json(json.dumps(payload))
     deployment = validation.DeploymentIdentity(
         root=config.source.deployment_root,
@@ -996,19 +1010,27 @@ def relocated_validator_admission(
         )
         return cast(
             SglangKtModelRuntimeValidationReceiptObservation,
-            SimpleNamespace(
-                validator_content_sha256=(
-                    calculate_sglang_kt_model_runtime_validator_content_sha256(
-                        admitted_sources
-                    )
-                )
-            ),
+            SimpleNamespace(receipt_sha256=admitted_receipt_sha256),
+        )
+
+    def read_admitted_receipt(path: Path, *, maximum_bytes: int) -> SglangKtBoundFile:
+        assert path == Path(config.admission.model_runtime_validation_receipt.path)
+        assert maximum_bytes >= len(admitted_contents)
+        return SglangKtBoundFile(
+            path=path,
+            contents=admitted_contents,
+            sha256=admitted_receipt_sha256,
         )
 
     monkeypatch.setattr(
         harness,
         "load_sglang_kt_model_runtime_validation_receipt",
         load_admitted_receipt,
+    )
+    monkeypatch.setattr(
+        harness,
+        "read_sglang_kt_bound_file",
+        read_admitted_receipt,
     )
     return config, deployment
 

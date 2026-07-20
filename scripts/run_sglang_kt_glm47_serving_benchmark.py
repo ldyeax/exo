@@ -65,16 +65,17 @@ from exo.worker.sglang_kt.model_contract import (  # noqa: E402
     verify_sglang_kt_model_snapshot,
 )
 from exo.worker.sglang_kt.model_runtime_validation_receipt import (  # noqa: E402
+    MODEL_RUNTIME_VALIDATION_RECEIPT_MAXIMUM_BYTES,
     MODEL_RUNTIME_VALIDATOR_SOURCE_RELATIVE_PATHS,
     SglangKtModelRuntimeValidationReceiptError,
     SglangKtModelRuntimeValidationReceiptObservation,
-    calculate_sglang_kt_model_runtime_validator_content_sha256,
     load_sglang_kt_model_runtime_validation_receipt,
 )
 from exo.worker.sglang_kt.process_supervisor import (  # noqa: E402
     build_sglang_kt_process_environment,
 )
 from exo.worker.sglang_kt.receipt_io import (  # noqa: E402
+    SglangKtReceiptFileError,
     canonical_sglang_kt_json,
     parse_sglang_kt_strict_json,
     read_sglang_kt_bound_file,
@@ -1027,10 +1028,63 @@ def require_admitted_validator(
                 config.admission.model_runtime_validation_receipt.sha256
             ),
         )
-    except SglangKtModelRuntimeValidationReceiptError as error:
+        bound_receipt = read_sglang_kt_bound_file(
+            Path(config.admission.model_runtime_validation_receipt.path),
+            maximum_bytes=MODEL_RUNTIME_VALIDATION_RECEIPT_MAXIMUM_BYTES,
+        )
+        if bound_receipt.sha256 != admitted.receipt_sha256:
+            raise Glm47ServingHarnessError(
+                "admitted validator receipt changed while it was read"
+            )
+        receipt = validation.json_object(
+            parse_sglang_kt_strict_json(bound_receipt.contents),
+            "admitted model validation receipt",
+        )
+    except (
+        SglangKtModelRuntimeValidationReceiptError,
+        SglangKtReceiptFileError,
+        validation.Glm47HarnessError,
+    ) as error:
         raise Glm47ServingHarnessError(
             "admitted validator receipt is invalid"
         ) from error
+
+    raw_admitted_sources = receipt.get("validator_sources")
+    if not isinstance(raw_admitted_sources, list) or len(raw_admitted_sources) != len(
+        MODEL_RUNTIME_VALIDATOR_SOURCE_RELATIVE_PATHS
+    ):
+        raise Glm47ServingHarnessError("admitted validator source set is incomplete")
+
+    admitted_hashes: list[str] = []
+    admitted_roots: set[str] = set()
+    for relative_path, raw_source in zip(
+        MODEL_RUNTIME_VALIDATOR_SOURCE_RELATIVE_PATHS,
+        raw_admitted_sources,
+        strict=True,
+    ):
+        try:
+            source = validation.json_object(raw_source, "admitted validator source")
+        except validation.Glm47HarnessError as error:
+            raise Glm47ServingHarnessError(
+                "admitted validator source identity is invalid"
+            ) from error
+        path = source.get("path")
+        sha256 = source.get("sha256")
+        suffix = f"/{relative_path}"
+        if (
+            set(source) != {"path", "sha256"}
+            or not isinstance(path, str)
+            or not path.endswith(suffix)
+            or not isinstance(sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", sha256) is None
+        ):
+            raise Glm47ServingHarnessError(
+                "admitted validator source identity is invalid"
+            )
+        admitted_roots.add(path[: -len(suffix)])
+        admitted_hashes.append(sha256)
+    if len(admitted_roots) != 1 or not next(iter(admitted_roots)):
+        raise Glm47ServingHarnessError("admitted validator source identity is invalid")
 
     expected_root = Path(deployment.root) / "validator"
     expected_paths = tuple(
@@ -1039,9 +1093,8 @@ def require_admitted_validator(
     )
     if len(deployment.validator_files) != len(expected_paths):
         raise Glm47ServingHarnessError("immutable validator file set is incomplete")
-    sources: list[tuple[str, str]] = []
-    for expected_path, file_identity in zip(
-        expected_paths, deployment.validator_files, strict=True
+    for expected_path, admitted_sha256, file_identity in zip(
+        expected_paths, admitted_hashes, deployment.validator_files, strict=True
     ):
         path = file_identity.get("path")
         size_bytes = file_identity.get("size_bytes")
@@ -1053,23 +1106,11 @@ def require_admitted_validator(
             or type(size_bytes) is not int
             or size_bytes < 0
             or not isinstance(sha256, str)
+            or sha256 != admitted_sha256
         ):
             raise Glm47ServingHarnessError(
-                "immutable validator file identity is invalid"
+                "immutable validator content differs from the admitted validator"
             )
-        sources.append((path, sha256))
-    try:
-        current_content_sha256 = (
-            calculate_sglang_kt_model_runtime_validator_content_sha256(tuple(sources))
-        )
-    except ValueError as error:
-        raise Glm47ServingHarnessError(
-            "immutable validator file identity is invalid"
-        ) from error
-    if current_content_sha256 != admitted.validator_content_sha256:
-        raise Glm47ServingHarnessError(
-            "immutable validator content differs from the admitted validator"
-        )
 
 
 def _serving_child_argv(

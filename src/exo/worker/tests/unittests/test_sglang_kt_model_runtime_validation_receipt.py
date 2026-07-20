@@ -21,7 +21,6 @@ from exo.worker.sglang_kt.model_runtime_validation_receipt import (
     build_glm_4_7_flash_layer_one_reference_tensor_keys,
     calculate_glm_4_7_flash_expert_mask_sha256,
     calculate_sglang_kt_model_runtime_validator_bundle_sha256,
-    calculate_sglang_kt_model_runtime_validator_content_sha256,
     canonicalize_sglang_kt_model_runtime_validation_receipt,
     load_sglang_kt_model_runtime_validation_receipt,
 )
@@ -370,27 +369,6 @@ def test_validator_source_bundle_hash_uses_canonical_sorted_evidence() -> None:
     )
 
 
-def test_validator_content_hash_is_relocation_independent_and_exact() -> None:
-    relocated_sources = tuple(
-        (path.replace("/opt/exo/", "/srv/relocated/", 1), sha256)
-        for path, sha256 in VALIDATOR_SOURCES
-    )
-    changed_sources = (
-        (relocated_sources[0][0], "f" * 64),
-        *relocated_sources[1:],
-    )
-
-    assert calculate_sglang_kt_model_runtime_validator_content_sha256(
-        VALIDATOR_SOURCES
-    ) == calculate_sglang_kt_model_runtime_validator_content_sha256(relocated_sources)
-    assert calculate_sglang_kt_model_runtime_validator_bundle_sha256(
-        VALIDATOR_SOURCES
-    ) != calculate_sglang_kt_model_runtime_validator_bundle_sha256(relocated_sources)
-    assert calculate_sglang_kt_model_runtime_validator_content_sha256(
-        relocated_sources
-    ) != calculate_sglang_kt_model_runtime_validator_content_sha256(changed_sources)
-
-
 @pytest.mark.parametrize(
     "sources",
     (
@@ -421,9 +399,6 @@ def test_canonicalizes_valid_payload_for_loader_round_trip(
     receipt_sha256 = hashlib.sha256(contents).hexdigest()
     observation = _load(path, expected_receipt_sha256=receipt_sha256)
     assert observation.receipt_sha256 == receipt_sha256
-    assert observation.validator_content_sha256 == (
-        calculate_sglang_kt_model_runtime_validator_content_sha256(VALIDATOR_SOURCES)
-    )
     assert observation.resident_gpu_experts == (0 if cpu_control else 2)
 
 

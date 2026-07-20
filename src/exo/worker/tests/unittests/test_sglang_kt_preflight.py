@@ -217,7 +217,6 @@ def make_model_runtime_validation_receipt(
         schema_version=1,
         generated_at_utc="2026-07-19T00:00:00+00:00",
         validator_sha256="b" * 64,
-        validator_content_sha256="c" * 64,
         process_spec_sha256=calculate_sglang_kt_process_launch_spec_sha256(spec),
         model_contract_path=snapshot_receipt.contract_path,
         model_path=snapshot_receipt.model_path,
