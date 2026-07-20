@@ -39,8 +39,8 @@ Rows without a decode measurement follow the decoded rows for that model.
 | GLM-4.7 Flash 30B-A3B | `glm47-pp2-local-dwagon-20260719-v5` | dwagon; PP2/TP1; 23/24 split; 2x RTX 3090 over NV4; full 56/56 cores; E42 | 6.559804369* | 5.970868191 | **PASS (diagnostic)**; prefill improved while decode regressed |
 | GPT-OSS 20B | `tp2-gptoss20b-20260718-v1` | dwagon 1x RTX 3090 + fwuff 1x RTX 3090; MLX/NCCL TP2; dual QDR | 148.77 | 38.13 | **PASS (diagnostic)**; exact TP1 equality; not a controlled performance comparison |
 | Llama 3.1 8B | `tp2-llama31-8b-20260718-v1` | dwagon 1x RTX 3090 + fwuff 1x RTX 3090; MLX/NCCL TP2; dual QDR | 134.15 | 26.02 | **PASS (diagnostic)**; exact TP1 equality; not a controlled performance comparison |
-| OLMoE-1B-7B-0924 7B-total/1B-active | `olmoe-ep1-local-dwagon-20260720-v1` | dwagon; 2x RTX 3090 over NV4; full 56/56 physical cores; PP1/TP2/EP1; 64 half-width experts per rank; standard dispatcher; CPU performance policy | 225.543915539* | 308.808973660 | **PASS (diagnostic)**; exact prefill-heavy output parity with EP2; decode route diverges at generated token 4 |
-| OLMoE-1B-7B-0924 7B-total/1B-active | `olmoe-ep2-local-dwagon-20260720-v1` | dwagon; 2x RTX 3090 over NV4; full 56/56 physical cores; PP1/TP2/EP2; 32 full-width experts per rank; standard dispatcher; CPU performance policy | 202.942340498* | 270.100859149 | **PASS (diagnostic)**; true expert-ID/weight sharding; decode route diverges at generated token 4 |
+| OLMoE-1B-7B-0924 7B-total/1B-active | `olmoe-ep1-local-dwagon-20260720-v1` | dwagon; 2x RTX 3090 over NV4; full 56/56 physical cores; PP1/TP2/EP1; 64 half-width experts per rank; standard dispatcher; CPU performance policy | 225.543915539* | 308.808973660 | **PASS (diagnostic)**; exact prefill-heavy output parity; decode token 4 is an exact-logprob tie |
+| OLMoE-1B-7B-0924 7B-total/1B-active | `olmoe-ep2-local-dwagon-20260720-v1` | dwagon; 2x RTX 3090 over NV4; full 56/56 physical cores; PP1/TP2/EP2; 32 full-width experts per rank; standard dispatcher; CPU performance policy | 202.942340498* | 270.100859149 | **PASS (diagnostic)**; true expert-ID/weight sharding; tied token 4 resolves differently and changes later routes |
 | Llama 3.2 3B | `tp2-llama32-3b-20260718-v1` | dwagon 1x RTX 3090 + fwuff 1x RTX 3090; MLX/NCCL TP2; dual QDR | 210.46 | 33.17 | **PASS (diagnostic)**; exact TP1 equality; not a controlled performance comparison |
 | SmolLM2 135M | `tp3-smollm2-20260718-v6` | dwagon 2x RTX 3090 + fwuff 1x RTX 3090; MLX/NCCL TP3 over InfiniBand | 210.53 | 29.20 | **PASS (diagnostic)**; no per-rail PMA proof; not a controlled performance comparison |
 
@@ -71,10 +71,11 @@ detailed ledger but are excluded here because no exact measurement survived.
 
 ## Current summary
 
-- Latest published proof-harness source: native OLMoE EP commit `927ee847`,
-  including exact one-token completion sanity, authenticated process ownership,
-  bounded KV allocation, transactional CPU policy, and stable NUMA attestation.
-- Latest completed live-validation source: OLMoE EP at `927ee847`, using the
+- Latest published proof-harness source: native OLMoE EP commit `14302708`,
+  including exact completion sanity, bounded logit-parity evidence,
+  authenticated process ownership, bounded KV allocation, transactional CPU
+  policy, and stable NUMA attestation.
+- Latest completed live-validation source: OLMoE EP at `14302708`, using the
   exact SGLang `7fea582043df06ebdde549ee3de602a3d11b96c6` overlay and model contract
   listed below.
 - Completed ladder rungs: Llama 3.2 1B, Llama 3.2 3B, Llama 3.1 8B,
@@ -84,9 +85,12 @@ detailed ledger but are excluded here because no exact measurement survived.
   EP2 is true expert-ID/weight sharding through SGLang's standard masked-local
   dispatcher and output all-reduce, not token A2A. It was 12.53% slower at
   batch-one decode and 10.02% slower in the matched-output prefill-heavy test.
-  Both modes passed exact one-token sanity and all prefill-heavy outputs matched;
-  the long decode first differs at generated token 4, so its timing delta is
-  route-diverged pending a short top-k logit check.
+  Both modes passed exact one-token sanity and all prefill-heavy outputs matched.
+  The receipt-backed 131-token probe found IDs 139 and 1769 at exactly equal
+  logprob in both modes: `-4.532527446746826` under EP1 and
+  `-4.558165073394775` under EP2. The token-4 split is therefore benign tie
+  resolution, not evidence of broken sharding. Its later decode timing remains
+  route-diverged and should not be treated as an exact-output A/B.
 - Latest GLM topology result: local PP1/TP2 v2 raised residency from E40 to
   E44 while retaining both RTX 3090s over four NCCL P2P/IPC channels, all 112
   physical cores in two AMX pools, and the CPU performance policy. It reached
@@ -136,8 +140,8 @@ detailed ledger but are excluded here because no exact measurement survived.
   rejecting prefixed, suffixed, or multiple JSON records instead of parsing the
   last line. The broad focused slice passes 749 tests; repository-wide
   Basedpyright and Ruff pass, and changed Python files are formatted.
-- Next work: clear the narrow OLMoE logit-parity question, tune the exact RTX
-  3090 Triton MoE shapes, sweep request concurrency, then repeat the matched
+- Next work: tune the exact RTX 3090 Triton MoE shapes, sweep request
+  concurrency, then repeat the matched
   EP comparison across dwagon/fwuff over InfiniBand. Use PP3 concurrency and
   stage timing after that; KTransformers `kt_ep` remains local routing and is
   not distributed expert parallelism. Keep admission, stage-kernel, and
@@ -152,6 +156,7 @@ test total.
 | --- | --- | --- |
 | Earlier corrected SGLang launch, snapshot, and preflight slice | **PASS** | 94 passed; this is the pre-OLMoE launch/snapshot suite |
 | Native OLMoE local EP harness | **PASS (software)** | 94 passed: 76 OLMoE harness/client/contract tests plus 18 transactional CPU-policy tests. Ruff, formatting, and `git diff --check` passed; independent final reviews found no remaining high- or medium-severity issue. |
+| OLMoE tied-logit diagnostic | **PASS (software)** | Commit `14302708` adds a capture-only, exact-context logit probe with arbitrary candidate IDs, top-k consistency, greedy-argmax, size, compression, deadline, and cleanup bounds. The final focused slice passed 90 tests; targeted strict type checking passed for the new client, Ruff and `git diff --check` passed, and final independent review found no remaining high- or medium-severity issue. |
 | GLM-4.7 Flash target profile, preflight, snapshot verifier, and local process supervisor | **PASS** | 148 passed on 2026-07-19, including 25 supervisor lifecycle tests; inherited NCCL/SGLang isolation and shutdown/error-race receipt regressions included |
 | Reproducible GLM-4.7 SGLang-KTransformers source integration | **PASS** | Exact clean-base replay produced SGLang `42504e59810130460fc24fdd17ef534cb8278a4b` and KTransformers `6e0a4480936effa7bf0ece429f78a00b29932bec`. The GLM Lite constructor now initializes inherited non-hash/shared-expert state and rejects hash-mode configs; old-source regression tests fail at the missing state while the new source passes. |
 | Pinned dwagon GLM-4.7 native runtime build | **PASS (artifact)** | Build ID `ea9de367cfebe35dc6afe51c1bda5e7daf35d6f51114f404dfebd63d055eec20`; receipt SHA-256 `1f304ea5667445cdd66e9c6938e78682b7119a6c3c3b946cf42ce816a0639542`; all three exact CUDA/AMX runtime wheels were built from the admitted revisions |
@@ -289,7 +294,11 @@ performance claim.
 | OLMoE EP2 capture v2 | **PASS** | `/var/lib/exo/benchmarks/olmoe-ep2-stage-capture-dwagon-20260720-v2`; exact completion ` 42`, token 5976, exact EP0/EP1 expert identities, admitted NUMA snapshots, clean unforced cleanup, and policy restoration. Receipt SHA `37073e93e7400dbcfa820edf8ef4f8658647f1f26cd9de120a2852feebff205f`; log SHA `347cd2da1e9563ef5e1b4082ad12d28c9e1cdf28f29580c5bc604975b4ef5af4`; capture SHA `375d887c9af8821ef8fe368890c11008d991158a827d3bcb0f6228a818587156`. |
 | OLMoE paired stage contract | **PASS (artifact)** | `/var/lib/exo/benchmarks/olmoe-stage-contract-dwagon-20260720-v1/olmoe-stage-contract.json`; binds the exact 13,838,721,960-byte snapshot and EP1/EP2 captures with exact one-token equality. Contract SHA `de01bd6d668fb0efe7004c0f3678393ed5bbda7428b355f4ed40d08d902d3975`; snapshot canonical SHA `b12f837d25b4a085e7a9dcd64fe35f6d7414c380fceb3720b1cea9d4bcfb5abc`. |
 | OLMoE local EP1 timed v1 | **PASS (diagnostic)** | `/var/lib/exo/benchmarks/olmoe-ep1-local-dwagon-20260720-v1`; two warmups and three samples reached 225.543915539 prefill-heavy end-to-end output and 308.808973660 generation-window decode tok/s. Prefill output SHA `f38ea77a...`; decode SHA `a240d0e4...`. Cleanup was unforced and the CPU policy restored. Receipt SHA `1ad4da3812a1ac93e70da9f3ab6350478cf44dde7b822f08c824c03bec560b64`; log SHA `7f69040c555501061a0294944118fea856a3c7070db449346ca58675bd2c90f1`. |
-| OLMoE local EP2 timed v1 | **PASS (diagnostic)** | `/var/lib/exo/benchmarks/olmoe-ep2-local-dwagon-20260720-v1`; true expert-ID/weight sharding reached 202.942340498 prefill-heavy end-to-end output and 270.100859149 generation-window decode tok/s. All prefill outputs exactly match EP1. The decode first differs at generated token 4 (`139` versus `1769`), so its 12.53% delta includes different later expert routes pending a top-k logit check. Cleanup was unforced and policy restored. Receipt SHA `79d803e380967ca268a3ad6e845c1c9beab4bd9117bb1e2c43910ea5d9e41e52`; log SHA `38b50e54289c4fdee27a4ba31b1e23be6760029e8dad3e22878735079f3434aa`. |
+| OLMoE local EP2 timed v1 | **PASS (diagnostic)** | `/var/lib/exo/benchmarks/olmoe-ep2-local-dwagon-20260720-v1`; true expert-ID/weight sharding reached 202.942340498 prefill-heavy end-to-end output and 270.100859149 generation-window decode tok/s. All prefill outputs exactly match EP1. The decode first differs at an exact-logprob tie on generated token 4 (`139` versus `1769`), so the semantic concern is cleared but its 12.53% timing delta still includes different later expert routes. Cleanup was unforced and policy restored. Receipt SHA `79d803e380967ca268a3ad6e845c1c9beab4bd9117bb1e2c43910ea5d9e41e52`; log SHA `38b50e54289c4fdee27a4ba31b1e23be6760029e8dad3e22878735079f3434aa`. |
+| OLMoE EP1 tied-logit capture v1 | **PASS** | `/var/lib/exo/benchmarks/olmoe-ep1-logit-capture-dwagon-20260720-v1`; committed source `14302708` reproduced the exact 131-token divergence context. Candidate IDs 139 and 1769 both had logprob `-4.532527446746826`; generated ID 139 is therefore a valid greedy tie resolution. Exact completion sanity, NUMA admission, unforced cleanup, and CPU-policy restoration passed. Receipt SHA `6151e37a5952a97c49b99a4035f39d3275bfb904298df7f8936db9b7c0339a8d`; log SHA `af223131d7cc5c80ac60bae555518609e37f312423533d290c18fe99c8e8950b`; capture SHA `72137d76745f5846fe434eaadd6233043fde2f5f000fdb1aa3d63fad97676881`. |
+| OLMoE EP2 tied-logit capture v1 | **EXPECTED FAIL (setup)** | `/var/lib/exo/benchmarks/olmoe-ep2-logit-capture-dwagon-20260720-v1`; the contract-required port 62630 was still in TCP `TIME_WAIT` immediately after EP1. The preflight failed before model launch or GPU allocation, and CPU policy restored exactly. Receipt SHA `b5dbef3a82454b69e7cbc50c6b8407a7c6272c0f0df7a003a01fe8eb4f66b972`. |
+| OLMoE EP2 tied-logit capture v2 | **PASS** | `/var/lib/exo/benchmarks/olmoe-ep2-logit-capture-dwagon-20260720-v2`; after the kernel timeout cleared, the identical context gave both candidate IDs 139 and 1769 logprob `-4.558165073394775`. Exact equality in both EP modes clears the token-4 semantic concern: later output divergence begins at a legitimate greedy tie. Exact sanity, expert identity, NUMA admission, unforced cleanup, and CPU-policy restoration passed. Receipt SHA `6d7643ac06de9f145a616ee22869fd4e14835c258d72ccca379f806da27c153d`; log SHA `eb5145305f31244f89f2d96137f18f8d246df297472013168572811f2640871b`; capture SHA `2da2ba24d5efb3e51fdeb0a851787357829c24c57093683f519a3449f2e6a753`. |
+| OLMoE paired stage contract v2 | **PASS (artifact)** | `/var/lib/exo/benchmarks/olmoe-stage-contract-dwagon-20260720-v2/olmoe-stage-contract.json`; full-rehashes the exact 13,838,721,960-byte snapshot and binds the committed-source EP1/EP2 captures with exact one-token ` 42` equality. Contract SHA `d54c92f60483f3786c85a2e92f2dbb8d3898bb924902fd9a87c3093912976881`; snapshot canonical SHA `b12f837d25b4a085e7a9dcd64fe35f6d7414c380fceb3720b1cea9d4bcfb5abc`. |
 
 All strict TP runs above that are marked clean completed ownership-confirmed process
 termination, instance deletion, lease removal, lock release, and reserved-port
@@ -961,8 +970,8 @@ canonical process-spec/config SHA-256 values are
   bytes and has canonical SHA
   `b12f837d25b4a085e7a9dcd64fe35f6d7414c380fceb3720b1cea9d4bcfb5abc`.
   The paired contract at
-  `/var/lib/exo/benchmarks/olmoe-stage-contract-dwagon-20260720-v1/olmoe-stage-contract.json`
-  has SHA `de01bd6d668fb0efe7004c0f3678393ed5bbda7428b355f4ed40d08d902d3975`
+  `/var/lib/exo/benchmarks/olmoe-stage-contract-dwagon-20260720-v2/olmoe-stage-contract.json`
+  has SHA `d54c92f60483f3786c85a2e92f2dbb8d3898bb924902fd9a87c3093912976881`
   and binds exact EP1/EP2 one-token ` 42` captures.
 - PP1/TP2/EP1 keeps 64 half-width experts on each rank. PP1/TP2/EP2 performs
   true expert-ID and weight sharding with 32 full-width experts per rank. Both
@@ -974,10 +983,12 @@ canonical process-spec/config SHA-256 values are
   slower in matched-output prefill end-to-end throughput, 12.535% slower in
   route-diverged decode generation-window throughput, and 12.116% slower in
   decode end-to-end throughput. Prefill outputs match exactly. Decode is stable
-  within each mode but first differs at generated token 4 after common IDs
-  `[431, 3056, 209]`; a short teacher-forced top-k logit check must distinguish
-  a near-tie/reduction-order flip from a semantic defect before claiming long
-  decode equivalence.
+  within each timed mode but first differs at generated token 4 after common
+  IDs `[431, 3056, 209]`. The committed-source teacher-forced probe found IDs
+  139 and 1769 at exactly equal logprob in both modes, so this is legitimate
+  tie resolution under different reduction/kernel geometry, not a semantic EP
+  defect. Later decode tokens follow different expert routes, so those
+  throughput values remain diagnostic rather than an exact-output A/B.
 - Bounding the token pool at 4,096 cut each rank's KV allocation from about
   7.15 GB K plus 7.15 GB V to about 0.13 GB K plus 0.13 GB V, leaving about
   15.84 GB free after CUDA graph capture. This directly shows that a full,
@@ -991,11 +1002,12 @@ canonical process-spec/config SHA-256 values are
 
 ## Pending tests
 
-1. Run the short OLMoE EP1/EP2 top-k logit diagnostic, then repeat an
-   interleaved EP1/EP2 timing pair to quantify launch/run variance.
-2. Tune the exact RTX 3090 Triton configurations for OLMoE's EP1 and EP2
-   shapes, then sweep concurrency 1/2/4/8 with per-rank expert-load and GPU
-   utilization evidence.
+1. Add an immutable external Triton MoE config contract and tune the exact RTX
+   3090 EP1 `E=64,N=512` and EP2 `E=32,N=1024` shapes with a small route-aware
+   candidate sweep, followed by interleaved serving A/B validation.
+2. Sweep concurrency 1/2/4/8 using aggregate group throughput and stable
+   per-lane requests, with expert-load telemetry kept in separate untimed runs
+   so its device-to-host synchronization cannot contaminate timing.
 3. Repeat the matched OLMoE matrix with one GPU per host over InfiniBand,
    retaining host-staged NCCL, exact output checks, HCA counters, and a local
    NVLink control.
