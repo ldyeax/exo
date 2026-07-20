@@ -2552,6 +2552,49 @@ def _valid_wrapper_manifest(
     )
 
 
+def test_wrapper_manifest_accepts_json_normalized_deployment(tmp_path: Path) -> None:
+    config = local_result_config(tmp_path)
+    immutable_config = (
+        Path(config.source.deployment_root) / validation.IMMUTABLE_CONFIG_RELATIVE_PATH
+    )
+    immutable_config.parent.mkdir(parents=True)
+    immutable_config.write_bytes(
+        harness.canonical_sglang_kt_json(config.model_dump(mode="json"))
+    )
+    deployment = validation.DeploymentIdentity(
+        root=config.source.deployment_root,
+        orchestrator_sha256="1" * 64,
+        validator_sha256="2" * 64,
+        validator_files=(),
+        source=validation.SourceIdentity("3" * 40, {}),
+    )
+    measurement = serving_measurement(config, tmp_path / "cgroup")
+    contents = harness.canonical_sglang_kt_json(measurement.model_dump(mode="json"))
+    snapshot = harness.BoundMeasurementSnapshot(
+        measurement=measurement,
+        contents=contents,
+        sha256=hashlib.sha256(contents).hexdigest(),
+        device=1,
+        inode=2,
+    )
+    manifest = _valid_wrapper_manifest(config, deployment, snapshot)
+    descriptor = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    results = validation.ResultDirectory(tmp_path, descriptor)
+    os.close(descriptor)
+    results.write_json(validation.CHILD_MANIFEST_FILENAME, manifest, replace=False)
+    try:
+        observed = harness._validate_wrapper_manifest(
+            config, deployment, results, snapshot
+        )
+    finally:
+        results.close()
+
+    observed_child = cast(dict[str, object], observed["child_manifest"])
+    observed_deployment = cast(dict[str, object], observed_child["deployment"])
+    assert observed_deployment["validator_files"] == []
+    assert asdict(deployment)["validator_files"] == ()
+
+
 @pytest.mark.parametrize(
     ("path", "replacement"),
     [
@@ -2564,6 +2607,7 @@ def _valid_wrapper_manifest(
         (("cleanup_grace_seconds",), 1.0),
         (("metadata", "command"), ["/bin/false"]),
         (("runtime_metadata", "containment"), {"scope": "foreign"}),
+        (("child_manifest", "deployment", "validator_sha256"), "4" * 64),
     ],
 )
 def test_wrapper_manifest_rejects_authorization_and_containment_substitution(

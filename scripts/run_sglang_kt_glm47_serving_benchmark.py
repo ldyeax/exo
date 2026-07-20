@@ -2949,7 +2949,8 @@ def _validate_wrapper_manifest(
         or child_manifest.get("run_id") != config.run_id
         or child_manifest.get("namespace") != config.namespace
         or child_manifest.get("config") != config.model_dump(mode="json")
-        or child_manifest.get("deployment") != asdict(deployment)
+        or canonical_sglang_kt_json(child_manifest.get("deployment"))
+        != canonical_sglang_kt_json(asdict(deployment))
         or runtime_metadata.get("owner_token") != measurement.owner_token
         or runtime_metadata.get("run_id") != config.run_id
         or runtime_metadata.get("namespace") != config.namespace
