@@ -638,6 +638,42 @@ canonical process-spec/config SHA-256 values are
   LIDs 2/4. This was infrastructure restoration only: no payload traffic, GPU,
   model, performance measurement, or profiler ran.
 
+### Post-reboot Nvidia device-node restoration
+
+- On 2026-07-19, dwagon's 610.43.03 open Nvidia kernel modules were loaded and
+  both RTX 3090 PCI functions were bound to `nvidia`, but `/dev/nvidia*` was
+  absent and `nvidia-smi` could not communicate with the driver. Recreating the
+  standard nodes with `nvidia-modprobe` restored both expected GPU UUIDs;
+  `GPU-a442b72e-6727-6322-ba5d-5a9512b79886` and
+  `GPU-63a7760a-6164-0758-9228-03dbf35d721c` each reported 24,576 MiB total,
+  1 MiB used, and 0% utilization. Fwuff's GPU was independently idle, both QDR
+  rails remained `ACTIVE` at 40 Gb/s, and fwuff's persistent OpenSM service
+  remained active. This was a control-plane repair and idle health check only;
+  no CUDA workload, model, network payload, benchmark, or profiler ran.
+
+### ConnectX-3 firmware and topology checkpoint
+
+- The user-completed hardware work is documented in `infiniband_cards.md`.
+  Both HCAs now negotiate PCIe 3.0 x8 with 512-byte maximum payloads. Fwuff's
+  card was backed up and cross-flashed from OEM QDR PSID `ISL1090110018`
+  firmware 2.40.5030 to generic FDR PSID `MT_1090120019` firmware 2.42.5000.
+  The hardware-level post-flash tests reported 52.90 Gb/s aggregate
+  dwagon-to-fwuff and 52.74 Gb/s fwuff-to-dwagon over the two QDR rails, versus
+  roughly 32 Gb/s before, with no error/discard increments. Preserve those as
+  externally produced hardware evidence; a new leased Exo receipt still needs
+  to reproduce the baseline.
+- Read-only post-change verification found dwagon's HCA at `38:00.0`, NUMA 0,
+  Gen3 x8 and both ports `ACTIVE` at 4X QDR. The NUMA-0 RTX 3090 is now UUID
+  `GPU-63a7760a-6164-0758-9228-03dbf35d721c` at `27:00.0` with PCIe x8; UUID
+  `GPU-a442b72e-6727-6322-ba5d-5a9512b79886` is at `d8:00.0`, NUMA 1, PCIe
+  x16. NV4 remains active. Existing admission receipts with the prior PCI/NUMA
+  identities must not be reused.
+- Fwuff's enabled Ollama service had automatically occupied 23,262 MiB on its
+  RTX 3090 through `llama-server` PID 9196 without a benchmark lease. The unit
+  was disabled and stopped; it then reported `disabled`/`inactive`, no compute
+  process, and 1 MiB idle GPU use before any Exo work. No benchmark or model
+  transfer was started during these checks.
+
 ## Pending tests
 
 1. Run fresh mixed one- and four-resident-GPU-expert BF16 controls with complete

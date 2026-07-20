@@ -10,9 +10,15 @@ Bring Exo to a working, efficient Linux/NVIDIA deployment that can serve GLM-5.2
 
 - Dual-socket Intel Xeon 8570-class system: 112 cores/224 threads total, AMX BF16/INT8, AVX-512 BF16/FP16/VNNI.
 - 768 GB installed DDR5-6000 RDIMM; the current CPU/firmware may train it below the DIMM rating.
-- Two RTX 3090 GPUs at `16:00.0` and `27:00.0`, both currently attached to NUMA 0, with an active NV4/NVLink connection. Preserve the bridge when testing slot changes.
+- Two RTX 3090 GPUs with an active NV4/NVLink connection after the slot
+  change: `GPU-63a7760a-6164-0758-9228-03dbf35d721c` is at `27:00.0` on
+  NUMA 0 with PCIe x8, while `GPU-a442b72e-6727-6322-ba5d-5a9512b79886` is at
+  `d8:00.0` on NUMA 1 with PCIe x16. GPU link speed downshifts while idle, so
+  report negotiated speed only under a controlled load.
 - Dual-port Intel X710 10 GbE on NUMA 1.
-- NVIDIA driver 610.43.03 and MLX CUDA 13 are healthy. The ConnectX-3 HCA is at `0000:d8:00.0`, PCIe 3.0 x8, on NUMA 1.
+- NVIDIA driver 610.43.03 and MLX CUDA 13 are healthy. The ConnectX-3 HCA is at
+  `0000:38:00.0`, PCIe 3.0 x8 with a 512-byte maximum payload, on NUMA 0. It
+  is topologically `NODE` from the NUMA-0 GPU and `SYS` from the NUMA-1 GPU.
 
 ### fwuff
 
@@ -22,6 +28,9 @@ Bring Exo to a working, efficient Linux/NVIDIA deployment that can serve GLM-5.2
 - Dual-port Intel X550 10 GbE.
 - The ConnectX-3 HCA is at `0000:16:00.0`, PCIe 3.0 x8, on NUMA 0 after the slot move.
 - `/mnt/sanic` is a 3x2 TB RAID0 model volume.
+- `ollama.service` is disabled and inactive so it cannot silently reserve the
+  fwuff GPU outside the benchmark lease. Re-enable it only when deliberately
+  using Ollama, and stop it again before Exo admission or measurement.
 
 ### Interconnect
 
@@ -31,7 +40,22 @@ Bring Exo to a working, efficient Linux/NVIDIA deployment that can serve GLM-5.2
 - Keep 10 GbE as the management/control plane. QDR ports do not aggregate automatically; select and benchmark both rails explicitly.
 - Default to host-staged NCCL/InfiniBand. RTX 3090 GPUDirect RDMA is not an officially supported configuration; test `nvidia-peermem` only as an optional A/B path.
 - NCCL 2.28 GIN requires ConnectX-4 or newer. On these ConnectX-3 cards, NCCL crashed in `ncclNetInit` while initializing its GIN plugin; `NCCL_GIN_ENABLE=0` alone was insufficient. Set both `NCCL_GIN_ENABLE=0` and `NCCL_GIN_TYPE=0`. GIN is a device-side API, not the ordinary host-launched NCCL/verbs transport, so disabling it loses no standard IB collective capability. `NCCL_NET=IB` selects the generic IB transport and fails rather than silently falling back to Socket; `NCCL_NET_GDR_LEVEL=LOC` deliberately keeps this baseline host-staged. [NCCL network selection](https://github.com/NVIDIA/nccl/blob/ae7aed194dc63c65d1bf5c0385ba3d68d3b64c8c/src/plugin/net.cc#L351-L380) [NCCL GDR level](https://github.com/NVIDIA/nccl/blob/5067397c2676d5aed50042fc39e5c8ee96eb0027/docs/userguide/source/env.rst#L1113-L1143)
-- Historical fwuff-x4 `ib_write_bw` baseline: 28.46 and 28.56 Gb/s single-rail, 29.80 Gb/s concurrent aggregate. After both HCAs negotiated PCIe 3.0 x8, the reportable v4 baseline measured 31.74 Gb/s on either rail and 32.56 Gb/s for both native dual-port and two independently launched, concurrently pinned client/server pairs. The independent pairs split 16.28/16.28 Gb/s, only 1.026x one standalone rail and 51.29% of the 63.48 Gb/s sum of the two standalone-rail cases. Native `ib_write_bw --dualport` single-process serialization is therefore not the sole explanation for the observed same-direction limit. The one-QP, 8 MiB v4 workload confirms a shared HCA/PCIe/host-path ceiling for that configuration, although it does not yet distinguish HCA internals from DMA, NUMA, interrupt, or PCIe transaction tuning. Every one of the 12 selected HCA health/error counter deltas remained zero on both ports and hosts.
+- Historical fwuff-x4 `ib_write_bw` baseline: 28.46 and 28.56 Gb/s
+  single-rail, 29.80 Gb/s concurrent aggregate. With both HCAs at PCIe 3.0 x8
+  but fwuff's OEM QDR personality, the reportable v4 baseline measured 31.74
+  Gb/s on either rail and 32.56 Gb/s for both native dual-port and two
+  independently launched pairs. The independent pairs split 16.28/16.28
+  Gb/s, proving the old same-direction limit was not merely `--dualport`
+  serialization. Fwuff was then backed up and cross-flashed from OEM PSID
+  `ISL1090110018` firmware 2.40.5030 to generic FDR PSID `MT_1090120019`
+  firmware 2.42.5000. The post-flash hardware test recorded 52.90 Gb/s
+  dwagon-to-fwuff and 52.74 Gb/s fwuff-to-dwagon across both QDR rails, with no
+  error/discard counter increase; this is about 65% above the old aggregate and
+  near the practical unidirectional PCIe 3.0 x8 ceiling. See
+  `infiniband_cards.md` for the firmware image, backup paths, recovery details,
+  and non-Exo test method. These hardware tests are not yet replacement Exo
+  benchmark receipts. Both links still train QDR because at least one current
+  cable path does not qualify for FDR.
 
 ## Model and Memory Findings
 
@@ -276,6 +300,7 @@ If three logical resources cannot be launched reliably, design a separate fail-c
 - `test_results.md` is the maintained human-readable ledger for automated suites, live passes, diagnostic receipts, expected failures, pending tests, and artifact integrity. Update it with every subsequent test; do not add overlapping suite counts into a fictitious unique total.
 - Cross-task arbitration in `/ai/coordinate.md` was reactivated by the user on 2026-07-19. Every performance or model-staging run must use the shared lease wrapper, five-minute same-owner cooldown, unique namespace/ports, strict two-host preflight, ownership-safe cleanup, and per-run manifest. Coding and short unit tests remain non-benchmark work; they must still avoid resources held by an active lease.
 - A previous out-of-tree VTune SEP/PAX profiling attempt loaded `sep5`/`pax` kernel drivers and crashed dwagon. The server is considered stable now, but those drivers must never be loaded or used again on either host. All further profiling must be driverless, using `perf` and ordinary application, CUDA, and runtime counters; this prohibition also appears in `/ai/coordinate.md`.
+- After that reboot, dwagon's Nvidia 610.43.03 modules bound both RTX 3090 PCI functions but udev had not created `/dev/nvidia*`. Running `nvidia-modprobe` for GPU minors 0 and 1 plus UVM restored both expected UUIDs and an idle `nvidia-smi` health check. Future preflight must fail before lease preparation when the configured GPU UUIDs are unavailable; recreating missing standard device nodes is infrastructure repair, never benchmark setup or performance evidence.
 - The formal x8/x8 baseline is reportable and clean at `/var/lib/exo/benchmarks/ib-qdr-x8x8-20260718-v3`: child and wrapper returned 0, all eight owned client/server/OpenSM process groups terminated with verified ownership, and the lease was removed. It used clean commit `bbea0dc59a1a79f9c41b667d172d322348b44382`, config SHA-256 `a4937b973cb7337defa0edfa0b4a71de44f3b5bec37fecbb016c0c1bb9c2ebd6`, harness SHA-256 `0fda6ce29a8b172e915d2f2417309ed0952189d02385d4949b5957f615114852`, and perftest SHA-256 `60cf23a301b14d2a789fa5ea0776343c3081062d4baa46b0353800f98ae72d3a`. v1 failed before traffic because ports 58140-58142 overlapped the ephemeral range; v2's 31.74 Gb/s port-1 row is diagnostic only because its old post-case strict probe encountered expected TCP `TIME_WAIT`.
 - The definitive independent-process extension is reportable and clean at `/var/lib/exo/benchmarks/ib-qdr-x8x8-independent-20260718-v4`. It ran the same three v3 cases plus two concurrent per-rail client/server pairs on disjoint NUMA-local physical cores and SMT siblings. It used clean commit `0750642cff761401d3b633225317fb1822720154`, config SHA-256 `8d89ab83288653da74dacfac765b5e7fabb9bbbfa8fd80fa21b1b4941e566481`, harness SHA-256 `7485df84153d8a6eaca1a86405e93a360a5eb00686536219bb21a8f4ed8830dc`, perftest SHA-256 `60cf23a301b14d2a789fa5ea0776343c3081062d4baa46b0353800f98ae72d3a`, and result SHA-256 `7598faedf6e5343727e65352f00c17241ea5247891063760ba3511b076c538fd`.
 - The deterministic SmolLM2 TP1 oracle is reportable and clean at `/var/lib/exo/benchmarks/tp1-smollm2-20260718-v1`. Three repetitions produced the same completion SHA-256 `3f466ee4633b7a26654a26badb971ab41a08908ed4adf4ad9a5277a498c596ca`, each with 42 prompt tokens, 32 completion tokens, and `finish_reason=length`. It used clean commit `bbea0dc59a1a79f9c41b667d172d322348b44382`, config SHA-256 `2809b9890783d493fb258f725adbe26ca5b2175480d6c2cc6a5e5529bebbf59e`, request SHA-256 `5f937f417c5db8cb46974b1d8211dc9b6dc03afbdf402d51da7e157bf1d8f7d8`, result SHA-256 `744a4f1a19fe173aada16227e2f3f95a49c658b5fb581941e7f676b1792abb6a`, and manifest SHA-256 `def85d40285ace1fd422925e0f3670fb849e7f1faba20ab3bd7fec2975e2f8b3`. This exact completion hash is bound into the completed TP3 proof contract.
