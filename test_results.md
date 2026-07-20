@@ -53,12 +53,12 @@ source of truth. Update this file in the same commit that records each new test.
   in-place Triton fused-MoE invocation a fresh clone of the pristine dispatch
   input, and both combined, CPU, and GPU repeats were bitwise identical without
   relaxing admission tolerances.
-- The instrumentation-free GLM-4.7 serving baseline profile now has a fresh
-  four-resident hardware admission receipt. It strips hybrid timing and
-  expert-distribution recording, disables radix caching and CUDA graphs, and
-  strips inherited `SGLANG_*` variables so no tuner output can enter the
-  untuned control. This proves the exact launch profile and model path; a warm
-  server throughput receipt remains pending.
+- The instrumentation-free GLM-4.7 serving baseline now has a preserved v10
+  full-CPU warm measurement: median decode output was 7.112858950 tok/s with
+  cores 0-111, both NUMA nodes, two 56-thread AMX pools, one RTX 3090, and four
+  resident GPU experts. The authoritative receipt failed closed only during a
+  post-cleanup tuple/list comparison; commit `6040820a` fixes that defect. V10
+  remains engineering evidence, and a fresh normal receipt is still required.
 - Historical Ornith AMXINT8 conversion and serving receipts were recovered and
   hashed below. They inform the GLM hybrid-runtime work but are not Exo tests.
 - Commit `65a04353` routes the disposable backend child's OS-level stdout to the
@@ -67,10 +67,10 @@ source of truth. Update this file in the same commit that records each new test.
   rejecting prefixed, suffixed, or multiple JSON records instead of parsing the
   last line. The broad focused slice passes 749 tests; repository-wide
   Basedpyright and Ruff pass, and changed Python files are formatted.
-- Next work: launch and measure the admitted untuned four-resident server, then
-  finish the independent receipt/tuner security reviews and generate candidate
-  RTX 3090 E=4 gate/up and down-kernel configurations. Keep admission,
-  stage-kernel candidate, and matched serving-performance receipts separate.
+- Next work: extend the GLM contract and pinned runtime launch to both local RTX
+  3090s while retaining the full 112-core/two-NUMA AMX allocation, then produce
+  the first normal matched warm-serving receipt. Keep admission, stage-kernel
+  candidate, and matched serving-performance receipts separate.
 
 ## Automated validation
 
@@ -674,20 +674,126 @@ canonical process-spec/config SHA-256 values are
   process, and 1 MiB idle GPU use before any Exo work. No benchmark or model
   transfer was started during these checks.
 
+### Guarded serving and model-staging release checkpoint
+
+- Commit `83e9e2e5` adds the fail-closed GLM-4.7 serving benchmark harness and
+  receipt extensions. Its release slice passed `177` focused tests, Ruff lint
+  and format checks, repository-wide Basedpyright with zero issues, and an
+  independent final review. It binds the exact lease invocation, systemd
+  containment, local block-device model provenance, local HCA counters, and
+  bracketed fwuff host/fabric state before a result can be comparable.
+- Commit `1b7e19a0` hardens the two-host model-staging transaction for an
+  existing verified remote source. It transports the canonical model contract,
+  retains descriptor-pinned tree identities, freezes the published snapshot,
+  and records installation truth at the successful `renameat2` boundary before
+  directory `fsync` or signal delivery can fail. Its release slice passed `145`
+  focused tests, Ruff lint and format checks, repository-wide Basedpyright with
+  zero issues, and an independent final review.
+- Both commits were pushed normally to
+  `ldyeax/exo:agent/linux-cuda-nccl`. Identical clean deployments for
+  `1b7e19a05809a4ea252237e28f1448c25502c364` are frozen on both hosts at
+  `/var/lib/exo/deployments/linux-cuda-nccl-1b7e19a05809a4ea252237e28f1448c25502c364`.
+  Their staging-script SHA-256 is
+  `04e6d1182d4a77cf1a92df54646e0c6549d0fb50883203859d85d079b687d3bf`.
+
+### GLM-4.7 BF16 local-NVMe staging receipt
+
+- The leased transaction
+  `/var/lib/exo/benchmarks/glm47-bf16-local-stage-dwagon-20260719-v1`
+  completed normally from 2026-07-20 02:48:05 through 03:04:58 UTC. It copied
+  the exact fwuff source through dwagon's read-only NFS view into
+  `/var/lib/exo/models/zai-org--GLM-4.7-Flash--7dd20894a642a0aa287e9827cb1a1f7f91386b67`,
+  then atomically published a root-owned, non-writable tree containing 117
+  files and 62,465,293,519 bytes.
+- Source, local, and final remote verifications are exactly equal: revision
+  `7dd20894a642a0aa287e9827cb1a1f7f91386b67`, 48 shards,
+  31,221,488,576 indexed bytes, and model-contract SHA-256
+  `4e7333f341ddc5855aa4253d454e3210d84427fae0159eb956104ff00c437479`.
+  Fwuff's snapshot was preexisting and unchanged; no remote install occurred.
+- Cleanup was confirmed and unforced. Both owned fwuff helpers exited, no
+  `.stage` path, lease, or held lock remained, and the command returned zero.
+  Staging deliberately records `reportable=false`,
+  `performance_comparable=false`, and no performance claim because it is an
+  artifact-correctness transaction, not a benchmark. Result/manifest/runtime
+  SHA-256 values are
+  `4402e93021291b8138660008b1bd7d27cf77c8dc9c31ca29ac1b51d083ae49d8`,
+  `a60105f975aa667e9372205f53345c4571f4c11c42bb2829aaf3258c97dce0b6`,
+  and `d82b90508b00ef0a1399e960a43de51f4a979a695426fe58b14dd98d2d561344`.
+- Coarse owned-process counters were used only to monitor progress. They are not
+  benchmark evidence. The 10 GbE NFS path visibly left the repaired dual-rail
+  fabric unused, motivating a separate artifact-transport implementation:
+  content-addressed revision caching, concurrent per-shard IPoIB/RDMA transfer
+  over both rails, optional 10 GbE overflow, and placement-aware transfer of
+  only shared tensors plus assigned layers/experts. Safetensors that mix
+  placements within one file require range-aware loading or a one-time
+  placement-aligned repack. Start with registered host buffers and pinned-host
+  GPU staging; do not assume GPUDirect RDMA support on RTX 3090/ConnectX-3.
+
+### GLM-4.7 BF16 local warm-serving iterations
+
+- `glm47-kt-serving-local-dwagon-20260719-v8` completed the semantic sanity
+  request, two interleaved warmup pairs, and three measured request pairs with
+  the 1,024-input/32-output prefill and 128-input/128-output workloads. It was
+  an intentionally superseded 16-core, single-NUMA diagnostic. Live SGLang
+  logging showed roughly 2.1-2.4 decode tok/s, but the harness lost its owner
+  token during post-run cleanup because `setproctitle` rewrote the environment.
+  No immutable measurement was published, and its failed-closed receipt is not
+  performance evidence.
+- `glm47-kt-serving-local-dwagon-20260719-v9` repeated the same workload with
+  all 112 physical cores, both NUMA nodes, two 56-thread AMX pools, one RTX
+  3090, and four resident GPU experts per routed layer. All requests completed,
+  with live logs around 6-7.5 decode tok/s. The pinned SGLang SIGTERM handler
+  drained all requests and then intentionally SIGKILLed its own process tree;
+  the harness rejected that post-drain `-9` return before serializing the
+  measurement. Cleanup succeeded, but no exact performance result survives.
+- `glm47-kt-serving-local-dwagon-20260719-v10` is the first preserved
+  full-CPU engineering measurement. Semantic sanity produced exactly
+  `EXO_SANITY_OK`. All measured requests had zero cached tokens and stable
+  output hashes. The 1,024/32 samples had median total latency 6.418898395 s,
+  median TTFT 1.251576989 s, and median output rate 6.066921877 tok/s. The
+  128/128 samples had median total latency 19.086266795 s, median TTFT
+  1.230329836 s, and median output rate 7.112858950 tok/s; individual decode
+  rates were 6.728878438, 7.539495531, and 7.112858950 tok/s. TTFT includes
+  HTTP and queue time through the first streamed output event.
+- V10 bound cores 0-111, NUMA nodes 0/1, two 56-thread AMX pools, BF16 weights,
+  four resident GPU experts on every MoE layer, and only UUID
+  `GPU-63a7760a-6164-0758-9228-03dbf35d721c`. It therefore exposed the full
+  physical CPU but not both local GPUs: the current GLM serving contract is
+  TP1/single-GPU. The measurement records affinity and allocation rather than
+  sampled CPU/GPU saturation. Server logs reported 7.77 GB GPU weight use,
+  0.21 GB BF16 KV cache allocation, and 14.78 GB remaining GPU memory. Fwuff
+  stayed idle and the InfiniBand counters confirm that no payload traversed the
+  fabric.
+- The immutable v10 measurement is
+  `/var/lib/exo/benchmarks/glm47-kt-serving-local-dwagon-20260719-v10/warm-serving-measurement.json`
+  with SHA-256
+  `2900337411fc3088428b905bedc2d11b866fbacb0464bc9c083de9ea40d9bea8`.
+  Its normal authoritative performance receipt remains failed closed: final
+  validation compared a JSON list with the producer's equivalent tuple after
+  all inference and cleanup had passed. Commit `6040820a` fixes that comparison
+  using canonical JSON and adds positive plus deployment-substitution tests;
+  65 harness tests, Ruff, and repository-wide Basedpyright pass. The failed
+  receipt is preserved rather than overwritten, so v10 is engineering evidence
+  and the next run must produce the first authoritative performance receipt.
+
 ## Pending tests
 
-1. Run fresh mixed one- and four-resident-GPU-expert BF16 controls with complete
+1. Extend the GLM SGLang-KTransformers contract from TP1/single-GPU to a
+   validated two-RTX-3090 local topology while retaining all 112 physical cores,
+   both NUMA nodes, and AMX expert offload. Re-run the v10 workload only after
+   both GPUs are admitted and the server reports TP=2.
+2. Run fresh mixed one- and four-resident-GPU-expert BF16 controls with complete
    46-layer wrapper, CPU/GPU routing, merge, and numerical evidence. The admitted
    zero-resident CPU-control baseline is v8.
-2. Convert the verified BF16 source to AMXINT8 only after BF16 parity and hybrid
+3. Convert the verified BF16 source to AMXINT8 only after BF16 parity and hybrid
    execution evidence pass; keep packed-GPU mode disabled initially.
-3. Resume exact staging, deterministic TP1, and strict TP=2 for Qwen3-Coder 30B
+4. Resume exact staging, deterministic TP1, and strict TP=2 for Qwen3-Coder 30B
    A3B, followed by Qwen3.5 35B A3B.
-4. After the first larger-model correctness proof, complete at least five
+5. After the first larger-model correctness proof, complete at least five
    distinct dwagon-only optimization runs and five distinct dwagon-plus-fwuff
    InfiniBand optimization runs. Each run needs repeated samples and a recorded
    hypothesis/lesson. Keep a matched-artifact comparison workload; when a
    different exact-revision HF quantization or format wins one track, add a
    quality-gated matched-format control so topology and format effects remain
    separable.
-5. Re-run the preserved QDR receipts after the ConnectX-5 EDR hardware swap.
+6. Re-run the preserved QDR receipts after the ConnectX-5 EDR hardware swap.
