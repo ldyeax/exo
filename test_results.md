@@ -96,6 +96,8 @@ detailed ledger but are excluded here because no exact measurement survived.
 
 ## Current summary
 
+- Latest published repository source: commit `e947954c`, adding the reviewed
+  native GLM three-rank TP3/EP1 and TP3/EP3 launch/evidence contract.
 - Latest published proof-harness source: commit `31bb8526`, including
   fail-closed external MoE config snapshots, exact per-rank config-load proof,
   immutable v2 stage-evidence admission, cancellable synchronized concurrency,
@@ -209,6 +211,8 @@ test total.
 | Prior fwuff GLM-4.7 runtime and overlay | **SUPERSEDED (artifact)** | Build `e21ef087b1c50cf961339e1bd1a2e1a3f60047579f811385614297de6a2abfc9` and overlay `82d20634f743ed87ae9cc71f2b7f4936d9451363db1ca46a207218f22de51ef8` remain immutable evidence for SGLang `41d4d300...`; the current two-host run uses the newer runtime below. |
 | Current PP3 native runtimes and overlays | **PASS (artifact)** | Dwagon build `c9c150d940bd2314eb2a9607bca37a0973ca70743690961f56e9c0d9a0d98d25` / overlay `32aa384b06c33fbc562462aeb4b9a0f2da1beb0a469ea225ea24671eca793e95`; fwuff build `386fe038bb32f834306d7992001ffb3b239c0cb81027c77fc4faee4cd982f63a` / overlay `563dba484c323139f05b7853384dc565d6f6f8282f38e365327fa1bb3d9782aa`. Both bind SGLang `3721d710102456b6bf849122e781129dc3f7d9c6` and KTransformers `f9ca69648421f5774215c4da9cf711dccf54f49e`; pure-source hashes match across hosts and each host has its own native KTransformers kernel. Install-receipt SHA-256 values are `85d9f67b557113f1b19ee85bf2c8427f6f5988700b87cebbd86110f69f36b7b6` and `9cae56658bd9d1f631b5e3bfd053cba086be4ca52600cba236f026f4b3b7ba78`. |
 | Head-patched dwagon runtime and overlay | **PASS (artifact)** | Build `cdc759d2a86b8a01c09a3aa5fe2960c45bf891184260f3036c207206c5750153` and overlay `14b9e8f8577d812ea954cffa0d2833b9535e589a1fb8fc606c20e2edd3e00455` bind SGLang `7fea582043df06ebdde549ee3de602a3d11b96c6` and KTransformers `f9ca69648421f5774215c4da9cf711dccf54f49e`. The build-receipt SHA-256 is `053fa7158b83030a4d8436b24ccb764fd0a1af4756b50d55308a1da27f9afb09`; the install-receipt SHA-256 is `77ddc2f4c4f84b628a81d0d05868e0f973441f023da385483384abde2b0aa924`. The admitted OLMoE Q/K RMSNorm TP-sharding patch has SHA-256 `229aaf328a24a5266b62b7a503c071fe6c3d5558c629df1821b60db2ec0c079` and was exercised by the live TP2 EP1/EP2 runs below. |
+| Final-pin fwuff runtime and overlay | **PASS (artifact)** | Build `1e3c413ddc3fd7993374c46f3b20818434ca7143e85af8841d2b454b13a57e2e` and overlay `a4bbcbcdb9a65a4433fbeb88d65151a3c12354d425908265e6720f371f78a2cb` bind the same SGLang `7fea582043df06ebdde549ee3de602a3d11b96c6` and KTransformers `f9ca69648421f5774215c4da9cf711dccf54f49e` revisions as dwagon while retaining fwuff's host-native AMX/CUDA kernel. Build/install receipt SHA-256 values are `4a1b0d2683d53cc64f4d7e94c02f7caa4237ff9deceb6e0993637beacf278c2f` and `08e321ce0cac02aec6670b190d650670c3e0734fd891168df066b33ca18adc7e`. The committed inspector found clean source, byte-identical source/runtime modules, inherited expert-location support, and no EP1/EP3 blocker. |
+| Native GLM TP3/EP launch contract | **PASS (software)** | Commit `e947954c` defines three logical one-GPU nodes across the 2+1 physical layout, full 56/56/60-core NUMA placement, TP3/DP3 attention-DP, dense TP1, EP1 and padded EP3 modes, dual-rail host-staged NCCL, bounded token memory, exact source/runtime/model bindings, and sanity-first benchmark protocol. All 49 focused and 470 SGLang worker tests passed; Ruff, formatting, and strict targeted Basedpyright passed; independent review found no remaining scoped issue. This is not yet a process controller or live performance result. |
 | GLM PP LM-head source patch | **PASS (software)** | The deterministic mail patch creates SGLang `7fea5820...`, allocates `ParallelLMHead` only on the final PP rank, and saves exactly 634,388,480 bytes (605 MiB) on each non-final TP1 rank. The source/launch suite passed 101 tests; the intermediate-revision resume regression passed all 11 source-preparation tests. |
 | Local PP2 phase-boundary telemetry | **PASS (software)** | Eight non-polling, non-fatal snapshots cover launch, readiness, sanity, both workload warmup/sample boundaries, and cleanup. The focused PP2/client suite passed 53 tests; targeted Ruff, formatting, and `git diff --check` passed. |
 | Local TP2 engineering harness | **PASS (software)** | Commit `237788dc` adds pinned PP1/TP2 launch, exact raw server-info admission, owned service/rendezvous evidence, durable pre-`Popen` recovery state, semantic sanity, canonical token workloads, telemetry, and ownership-safe cleanup. Commit `050f75b7` adds receipt-bound E1-E44 residency control. The focused suite passed 30 tests; the combined TP2/PP2/PP3/client slice passed 101; two independent reviews found no remaining issue; Ruff and formatting passed. |
@@ -1065,20 +1069,20 @@ canonical process-spec/config SHA-256 values are
   experts, producing 22 physical expert slots per rank. Checkpoint-header
   accounting estimates about 20.34 GiB static parameters/rank for TP3/EP1 and
   20.88 GiB/rank for TP3/EP3 before buffers, activations, and KV. The pinned
-  GLM-Lite class already inherits the required expert-location metadata, but
-  pinned SGLang requires `(tp_size * pp_size) % nnodes == 0`; a three-rank
-  world cannot therefore use its standard launcher across the 2+1 physical
-  host layout. Add a heterogeneous 2-local+1-remote launcher/controller before
-  treating either topology as a native admission test. Use standard
-  host-staged NCCL, not DeepEP, on SM86. OSCAR remains a later KV-cache
-  compression and placement candidate, not an expert dispatcher.
+  GLM-Lite class inherits the required expert-location metadata. The committed
+  contract models the 2+1 physical layout as three logical one-GPU SGLang nodes,
+  satisfying `(tp_size * pp_size) % nnodes == 0`; the remaining step is the
+  ownership-safe controller and live launch. Both hosts now carry clean,
+  matching final-pin runtimes that admit EP1 and EP3. Use standard host-staged
+  NCCL, not DeepEP, on SM86. OSCAR remains a later KV-cache compression and
+  placement candidate, not an expert dispatcher.
 
 ## Pending tests
 
 1. Repeat the matched OLMoE matrix with one GPU per host over InfiniBand,
    retaining host-staged NCCL, exact sanity, strict response coherence, HCA
    counters, sequence-variation evidence, and a local NVLink control.
-2. Add the heterogeneous SGLang 2-local+1-remote launcher/controller, then run
+2. Finish the heterogeneous SGLang 2-local+1-remote process controller, then run
    a native GLM TP3/EP1 control followed by TP3/EP3 with DP attention, dense
    TP1, two padded experts, small token pools, and CUDA graphs initially
    disabled.
