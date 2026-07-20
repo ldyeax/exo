@@ -7,6 +7,32 @@ and InfiniBand workstream. `FWUFFYDWAGON.md` remains the implementation plan;
 the JSON receipts under `/var/lib/exo/benchmarks` are the machine-readable
 source of truth. Update this file in the same commit that records each new test.
 
+## Model throughput inventory
+
+Rows are ordered by total model parameters, then by measured decode throughput.
+Rows without a decode measurement follow the decoded rows for that model.
+
+| Model | Run or artifact row | Topology | Prefill tok/s | Decode tok/s | Evidence status |
+| --- | --- | --- | ---: | ---: | --- |
+| Ornith-1.0-397B | `bench_internal_agent_decode_4x512_256.jsonl#row-2` | dwagon; 2x RTX 3090; TP2/PP1; 100 CPUInfer threads across 2 NUMA nodes; AMXINT8; E4 | - | 17.422 | **IMPORTED HISTORICAL**; no Exo source or cleanup receipt |
+| Ornith-1.0-397B | `bench_internal_agent_decode_4x512_256.jsonl#row-1` | same | - | 16.823 | **IMPORTED HISTORICAL**; no Exo source or cleanup receipt |
+| Ornith-1.0-397B | `bench_internal_agent_prefill_4x20000_1.jsonl#rows-1-3` | same; four concurrent requests | 1,066.393 / 1,061.920 / 996.876 | - | **IMPORTED HISTORICAL** |
+| Ornith-1.0-397B | `bench_internal_agent_prefill_4x20000_1.jsonl#rows-4-6` | same; four concurrent requests | 80.551 / 135.626 / 184.006 | - | **IMPORTED HISTORICAL, DEGRADED**; zero-TTFT anomaly |
+| GLM-4.7 Flash 30B-A3B | `tp2-glm47flash-20260719-v1` | dwagon 1x RTX 3090 + fwuff 1x RTX 3090; MLX/NCCL TP2; dual QDR | 45.31 | 19.57 | **PASS (diagnostic)**; exact TP1 equality; not a controlled performance comparison |
+| GLM-4.7 Flash 30B-A3B | `glm47-kt-serving-local-dwagon-20260719-v10` | dwagon; 1x RTX 3090; TP1; 112 physical cores; 2x56 AMX pools; E4 | 6.066921877* | 7.112858950 | **ENGINEERING ONLY**; immutable measurement; final receipt failed closed after inference |
+| GPT-OSS 20B | `tp2-gptoss20b-20260718-v1` | dwagon 1x RTX 3090 + fwuff 1x RTX 3090; MLX/NCCL TP2; dual QDR | 148.77 | 38.13 | **PASS (diagnostic)**; exact TP1 equality; not a controlled performance comparison |
+| Llama 3.1 8B | `tp2-llama31-8b-20260718-v1` | dwagon 1x RTX 3090 + fwuff 1x RTX 3090; MLX/NCCL TP2; dual QDR | 134.15 | 26.02 | **PASS (diagnostic)**; exact TP1 equality; not a controlled performance comparison |
+| Llama 3.2 3B | `tp2-llama32-3b-20260718-v1` | dwagon 1x RTX 3090 + fwuff 1x RTX 3090; MLX/NCCL TP2; dual QDR | 210.46 | 33.17 | **PASS (diagnostic)**; exact TP1 equality; not a controlled performance comparison |
+| SmolLM2 135M | `tp3-smollm2-20260718-v6` | dwagon 2x RTX 3090 + fwuff 1x RTX 3090; MLX/NCCL TP3 over InfiniBand | 210.53 | 29.20 | **PASS (diagnostic)**; no per-rail PMA proof; not a controlled performance comparison |
+
+This is an inventory, not a cross-row leaderboard: request shapes,
+concurrency, quantization, and harness definitions differ. `*` The v10
+6.066921877 value is the median output rate of its 1,024-input/32-output
+prefill-heavy workload, not the input-token prefill metric used by the older
+harness. Approximate live-log rates from failed v8/v9 transactions remain in
+the detailed ledger but are excluded here because no exact measurement
+survived.
+
 ## Result meanings
 
 - **PASS:** the asserted contract passed and cleanup was verified.
