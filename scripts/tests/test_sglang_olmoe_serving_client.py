@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import json
+from collections.abc import AsyncIterator
 
 import httpx
 import pytest
@@ -10,6 +12,7 @@ from scripts.sglang_olmoe_serving_client import (
     LOGIT_PARITY_RESPONSE_MAXIMUM_BYTES,
     OLMOE_VOCABULARY_SIZE,
     OlmoeLogitParityRequest,
+    OlmoeNativeAsyncServingClient,
     OlmoeNativeGenerateRequest,
     OlmoeNativeServingClient,
     OlmoeSamplingParameters,
@@ -360,6 +363,77 @@ def test_stream_accepts_complete_cumulative_token_evidence() -> None:
     assert observation.stream_event_count == 3
     assert observation.output_bearing_event_count == 3
     assert observation.client_observed_decode_tokens_per_second > 0.0
+
+
+def test_stream_retains_absolute_monotonic_event_timestamps() -> None:
+    timestamps = iter((100, 200, 300, 400, 500, 600))
+    with OlmoeNativeServingClient(
+        "http://test",
+        timeout_seconds=10.0,
+        transport=_stream_transport(),
+        clock_ns=lambda: next(timestamps),
+    ) as client:
+        observation = client.generate(_request(stream=True))
+
+    assert observation.request_started_monotonic_ns == 100
+    assert observation.first_output_monotonic_ns == 200
+    assert observation.last_output_monotonic_ns == 400
+    assert observation.request_completed_monotonic_ns == 600
+
+
+@pytest.mark.asyncio
+async def test_async_stream_matches_bounded_timestamp_evidence() -> None:
+    timestamps = iter((100, 200, 300, 400, 500, 600))
+    async with OlmoeNativeAsyncServingClient(
+        "http://test",
+        timeout_seconds=10.0,
+        transport=_stream_transport(),
+        clock_ns=lambda: next(timestamps),
+    ) as client:
+        observation = await client.generate(_request(stream=True))
+
+    assert observation.output_ids == (201, 202, 203)
+    assert observation.request_started_monotonic_ns == 100
+    assert observation.first_output_monotonic_ns == 200
+    assert observation.last_output_monotonic_ns == 400
+    assert observation.request_completed_monotonic_ns == 600
+
+
+class _BlockingAsyncByteStream(httpx.AsyncByteStream):
+    def __init__(self) -> None:
+        self.entered = asyncio.Event()
+        self.cancelled = asyncio.Event()
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        self.entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.cancelled.set()
+            raise
+        yield b""
+
+
+@pytest.mark.asyncio
+async def test_async_stream_cancellation_interrupts_blocked_response_body() -> None:
+    stream = _BlockingAsyncByteStream()
+    transport = httpx.MockTransport(
+        lambda _request: httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            stream=stream,
+        )
+    )
+    async with OlmoeNativeAsyncServingClient(
+        "http://test", timeout_seconds=900.0, transport=transport
+    ) as client:
+        request_task = asyncio.create_task(client.generate(_request(stream=True)))
+        await asyncio.wait_for(stream.entered.wait(), timeout=0.5)
+        request_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(request_task, timeout=0.5)
+
+    assert stream.cancelled.is_set()
 
 
 def test_stream_accepts_complete_delta_token_evidence() -> None:

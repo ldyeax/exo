@@ -1,16 +1,18 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
+from typing import Literal, cast
 
 import pytest
 
@@ -21,6 +23,7 @@ from scripts.sglang_olmoe_serving_client import (
     LogitParityObservation,
     LogprobObservation,
     OlmoeLogitParityRequest,
+    OlmoeNativeAsyncServingClient,
     OlmoeNativeGenerateRequest,
     OlmoeNativeServingClient,
     SanityResponseObservation,
@@ -436,6 +439,26 @@ def test_server_command_is_native_tp2_with_rank_local_numa(
     assert not any("kt-" in value or "ktransformers" in value for value in command)
 
 
+def test_concurrency_capacity_is_explicit_and_serial_command_is_unchanged(
+    tmp_path: Path,
+) -> None:
+    serial = olmoe.build_server_command(_base_config(tmp_path))
+    concurrent = olmoe.build_server_command(
+        replace(_base_config(tmp_path), aggregate_concurrency=True)
+    )
+
+    assert serial[serial.index("--max-total-tokens") + 1] == "4096"
+    assert serial[serial.index("--max-running-requests") + 1] == "1"
+    assert "--cuda-graph-max-bs" not in serial
+    assert concurrent[concurrent.index("--max-total-tokens") + 1] == "9216"
+    assert concurrent[concurrent.index("--max-running-requests") + 1] == "8"
+    assert concurrent[concurrent.index("--cuda-graph-max-bs") + 1] == "8"
+    assert (
+        concurrent[: concurrent.index("--max-total-tokens")]
+        == serial[: serial.index("--max-total-tokens")]
+    )
+
+
 def test_server_environment_uses_all_cores_as_two_rank_local_pools(
     tmp_path: Path,
 ) -> None:
@@ -518,16 +541,49 @@ def test_configuration_receipt_names_token_pool_and_nccl_fallback(
     assert "moe_kernel_config" not in receipt
 
 
-def _valid_server_startup_log(ep_size: olmoe.ExpertParallelSize = 1) -> str:
+def test_configuration_receipt_isolates_concurrency_capacity(tmp_path: Path) -> None:
+    receipt = olmoe._configuration_receipt(
+        replace(_base_config(tmp_path), aggregate_concurrency=True)
+    )
+
+    assert receipt["benchmark_mode"] == "aggregate_concurrency"
+    assert receipt["token_pool"] == {
+        "context_length": 4096,
+        "max_total_tokens": 9216,
+        "max_running_requests": 8,
+        "cuda_graph_max_batch_size": 8,
+    }
+    serial = olmoe._configuration_receipt(_base_config(tmp_path))
+    assert "benchmark_mode" not in serial
+
+
+def _valid_server_startup_log(
+    ep_size: olmoe.ExpertParallelSize = 1,
+    *,
+    max_total_tokens: int = 4096,
+    max_running_requests: int = 1,
+    cuda_graph_max_batch_size: int | None = None,
+) -> str:
     rank_labels = ("TP0", "TP1") if ep_size == 1 else ("TP0 EP0", "TP1 EP1")
+    concurrency_arguments = (
+        ""
+        if max_running_requests == 1
+        else f", max_running_requests={max_running_requests}"
+    )
+    cuda_graph_argument = (
+        ""
+        if cuda_graph_max_batch_size is None
+        else f", cuda_graph_max_bs={cuda_graph_max_batch_size}"
+    )
     return "\n".join(
         (
-            "server_args=ServerArgs(max_total_tokens=4096, "
+            f"server_args=ServerArgs(max_total_tokens={max_total_tokens}"
+            f"{concurrency_arguments}{cuda_graph_argument}, "
             "disable_custom_all_reduce=True)",
             f"[2026-07-20 07:15:28 {rank_labels[0]}] KV Cache is allocated. "
-            "#tokens: 4096, K size: 1 GB",
+            f"#tokens: {max_total_tokens}, K size: 1 GB",
             f"[2026-07-20 07:15:28 {rank_labels[1]}] KV Cache is allocated. "
-            "#tokens: 4096, K size: 1 GB",
+            f"#tokens: {max_total_tokens}, K size: 1 GB",
         )
     )
 
@@ -552,6 +608,29 @@ def test_server_log_contract_verifies_exact_rank_allocations(
     assert receipt["expert_parallel_size"] == ep_size
     assert receipt["max_total_tokens"] == 4096
     assert receipt["custom_all_reduce_disabled"] is True
+
+
+def test_server_log_contract_verifies_concurrency_capacity(tmp_path: Path) -> None:
+    contents = _valid_server_startup_log(
+        2,
+        max_total_tokens=9216,
+        max_running_requests=8,
+        cuda_graph_max_batch_size=8,
+    ).encode()
+    log_path = tmp_path / "native-sglang-server.log"
+    log_path.write_bytes(contents)
+
+    receipt = olmoe.verify_server_log_contract(
+        log_path,
+        2,
+        max_total_tokens=9216,
+        max_running_requests=8,
+        cuda_graph_max_batch_size=8,
+    )
+
+    assert receipt["max_total_tokens"] == 9216
+    assert receipt["max_running_requests"] == 8
+    assert receipt["cuda_graph_max_batch_size"] == 8
 
 
 def test_server_log_contract_verifies_each_rank_loaded_both_moe_configs(
@@ -1328,6 +1407,10 @@ class _WorkloadClient:
             output_bearing_event_count=128,
             maximum_stream_line_bytes=1024,
             first_stream_event_output_tokens=1,
+            request_started_monotonic_ns=1_000_000_000,
+            first_output_monotonic_ns=1_100_000_000,
+            last_output_monotonic_ns=2_100_000_000,
+            request_completed_monotonic_ns=2_200_000_000,
             total_client_seconds=128.0 / rate,
             client_observed_ttft_seconds=0.1,
             client_observed_generation_window_seconds=127.0 / rate,
@@ -1352,6 +1435,454 @@ def test_canonical_workload_checks_liveness_after_every_phase() -> None:
     assert len(phases) == 10
     summary = cast(dict[str, object], evidence["summary"])
     assert summary["median_client_decode_tokens_per_second"] == 4.0
+
+
+def _concurrency_observation(
+    request: OlmoeNativeGenerateRequest,
+    lane: int,
+    *,
+    release_ns: int = 1_000_000_000,
+    output_ids: tuple[int, ...] | None = None,
+) -> GenerateObservation:
+    output = (
+        tuple(
+            1_000 + lane * 256 + offset
+            for offset in range(request.sampling_params.max_new_tokens)
+        )
+        if output_ids is None
+        else output_ids
+    )
+    started = release_ns + (lane + 1) * 100_000_000
+    first = release_ns + (lane + 2) * 1_000_000_000
+    last = release_ns + (lane + 5) * 1_000_000_000
+    completed = last + 100_000_000
+    return GenerateObservation(
+        input_ids_sha256=token_ids_sha256(request.input_ids),
+        output_ids=output,
+        prompt_tokens=len(request.input_ids),
+        completion_tokens=len(output),
+        cached_tokens=0,
+        output_ids_sha256=token_ids_sha256(output),
+        finish_reason_sha256=SHA,
+        stream_line_count=len(output) + 1,
+        stream_event_count=len(output),
+        output_bearing_event_count=len(output),
+        maximum_stream_line_bytes=1024,
+        first_stream_event_output_tokens=1,
+        request_started_monotonic_ns=started,
+        first_output_monotonic_ns=first,
+        last_output_monotonic_ns=last,
+        request_completed_monotonic_ns=completed,
+        total_client_seconds=(completed - started) / 1_000_000_000,
+        client_observed_ttft_seconds=(first - started) / 1_000_000_000,
+        client_observed_generation_window_seconds=(last - first) / 1_000_000_000,
+        client_observed_decode_tokens_per_second=(len(output) - 1)
+        / ((last - first) / 1_000_000_000),
+    )
+
+
+def _concurrency_request(
+    lane: int, kind: Literal["prefill", "decode"] = "decode"
+) -> OlmoeNativeGenerateRequest:
+    return OlmoeNativeGenerateRequest(
+        input_ids=olmoe.build_concurrency_input_ids(kind, 8, lane),
+        sampling_params=olmoe.OlmoeSamplingParameters(
+            max_new_tokens=4,
+            temperature=0.0,
+            ignore_eos=True,
+            sampling_seed=olmoe.CANONICAL_SAMPLING_SEED,
+        ),
+        stream=True,
+        log_metrics=True,
+    )
+
+
+def test_aggregate_concurrency_math_uses_group_wall_and_decode_envelope() -> None:
+    requests = tuple(_concurrency_request(lane) for lane in range(2))
+    observations = tuple(
+        _concurrency_observation(request, lane) for lane, request in enumerate(requests)
+    )
+
+    metrics = olmoe._aggregate_concurrency_metrics(observations, 1_000_000_000)
+
+    assert metrics["total_completion_tokens"] == 8
+    assert metrics["group_wall_seconds"] == pytest.approx(6.1)
+    assert metrics["aggregate_end_to_end_output_tokens_per_second"] == pytest.approx(
+        8 / 6.1
+    )
+    assert metrics["total_tokens_after_first_events"] == 6
+    assert metrics["decode_envelope_seconds"] == pytest.approx(4.0)
+    assert metrics["aggregate_decode_tokens_per_second"] == pytest.approx(1.5)
+    formulas = cast(dict[str, object], metrics["formulas"])
+    assert formulas["per_lane_rates_summed"] is False
+
+
+class _ConcurrencyAdministrativeClient:
+    def __init__(self, *, block_flush: bool = False) -> None:
+        self.flush_count = 0
+        self.block_flush = block_flush
+        self.entered = asyncio.Event()
+        self.cancelled = asyncio.Event()
+
+    async def flush_cache(self) -> EndpointObservation:
+        self.flush_count += 1
+        self.entered.set()
+        if self.block_flush:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.cancelled.set()
+                raise
+        return EndpointObservation(200, SHA, 0.01)
+
+
+class _ConcurrencyLaneClient:
+    def __init__(
+        self,
+        lane: int,
+        *,
+        fail_generate: bool = False,
+        block_generate: bool = False,
+        fail_after_event: asyncio.Event | None = None,
+    ) -> None:
+        self.lane = lane
+        self.fail_generate = fail_generate
+        self.block_generate = block_generate
+        self.fail_after_event = fail_after_event
+        self.entered = asyncio.Event()
+        self.cancelled = asyncio.Event()
+
+    async def generate(
+        self, request: OlmoeNativeGenerateRequest
+    ) -> GenerateObservation:
+        self.entered.set()
+        if self.fail_generate:
+            if self.fail_after_event is not None:
+                await self.fail_after_event.wait()
+            raise RuntimeError("synthetic lane generation failure")
+        if self.block_generate:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.cancelled.set()
+                raise
+        release_floor = time.perf_counter_ns()
+        return _concurrency_observation(
+            request,
+            self.lane,
+            release_ns=release_floor - 100_000_000,
+        )
+
+
+def _async_client(value: object) -> OlmoeNativeAsyncServingClient:
+    return cast(OlmoeNativeAsyncServingClient, value)
+
+
+def _assert_no_concurrency_workers() -> None:
+    assert not [
+        thread for thread in threading.enumerate() if thread.name.startswith("olmoe-")
+    ]
+    current = asyncio.current_task()
+    assert not [
+        task
+        for task in asyncio.all_tasks()
+        if task is not current and task.get_name().startswith("olmoe-")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_concurrency_group_rendezvous_precedes_ordered_lane_generation() -> None:
+    administrative = _ConcurrencyAdministrativeClient()
+    requests = tuple(_concurrency_request(lane) for lane in range(2))
+    phases: list[str] = []
+
+    receipt, observations = await olmoe._run_concurrency_group(
+        _async_client(administrative),
+        tuple(_async_client(_ConcurrencyLaneClient(lane)) for lane in range(2)),
+        requests,
+        kind="decode",
+        phase="sample",
+        ordinal=1,
+        barrier_timeout_seconds=1.0,
+        assert_after_phase=phases.append,
+        cancellation_checkpoint=lambda: None,
+    )
+
+    assert administrative.flush_count == 1
+    assert len(observations) == 2
+    assert [cast(dict[str, object], lane)["lane"] for lane in receipt["lanes"]] == [
+        0,
+        1,
+    ]
+    barrier = cast(dict[str, object], receipt["barrier"])
+    assert barrier["participant_count"] == 3
+    assert barrier["lane_ready_count_at_release"] == 2
+    assert barrier["lane_ready_ordinals_at_release"] == [0, 1]
+    assert barrier["all_lane_requests_started_at_or_after_release"] is True
+    release_ns = cast(int, barrier["common_release_monotonic_ns"])
+    assert all(
+        observation.request_started_monotonic_ns >= release_ns
+        for observation in observations
+    )
+    assert phases == ["decode C2 sample 1 cache flush", "decode C2 sample 1"]
+    _assert_no_concurrency_workers()
+
+
+@pytest.mark.asyncio
+async def test_concurrency_lane_failure_cancels_blocked_sibling_promptly() -> None:
+    administrative = _ConcurrencyAdministrativeClient()
+    requests = tuple(_concurrency_request(lane) for lane in range(2))
+    blocked = _ConcurrencyLaneClient(1, block_generate=True)
+    failing = _ConcurrencyLaneClient(
+        0, fail_generate=True, fail_after_event=blocked.entered
+    )
+    started = time.monotonic()
+
+    with pytest.raises(olmoe.OlmoeEpBenchmarkError, match="lane 0 failed"):
+        await asyncio.wait_for(
+            olmoe._run_concurrency_group(
+                _async_client(administrative),
+                (_async_client(failing), _async_client(blocked)),
+                requests,
+                kind="decode",
+                phase="warmup",
+                ordinal=1,
+                barrier_timeout_seconds=30.0,
+                assert_after_phase=lambda _phase: None,
+                cancellation_checkpoint=lambda: None,
+            ),
+            timeout=0.5,
+        )
+
+    assert time.monotonic() - started < 0.5
+    assert administrative.flush_count == 1
+    assert blocked.cancelled.is_set()
+    await asyncio.sleep(0)
+    _assert_no_concurrency_workers()
+
+
+@pytest.mark.asyncio
+async def test_concurrency_managed_signal_cancels_blocked_lanes_promptly() -> None:
+    administrative = _ConcurrencyAdministrativeClient()
+    requests = tuple(_concurrency_request(lane) for lane in range(2))
+    lanes = tuple(
+        _ConcurrencyLaneClient(lane, block_generate=True) for lane in range(2)
+    )
+    checkpoints = 0
+
+    def managed_signal_checkpoint() -> None:
+        nonlocal checkpoints
+        checkpoints += 1
+        if checkpoints == 3:
+            raise olmoe.OlmoeEpManagedSignalError(signal.SIGINT)
+
+    started = time.monotonic()
+    with pytest.raises(olmoe.OlmoeEpManagedSignalError, match="managed signal 2"):
+        await asyncio.wait_for(
+            olmoe._run_concurrency_group(
+                _async_client(administrative),
+                tuple(_async_client(lane) for lane in lanes),
+                requests,
+                kind="decode",
+                phase="warmup",
+                ordinal=1,
+                barrier_timeout_seconds=30.0,
+                assert_after_phase=lambda _phase: None,
+                cancellation_checkpoint=managed_signal_checkpoint,
+            ),
+            timeout=0.5,
+        )
+
+    assert time.monotonic() - started < 0.5
+    assert checkpoints == 3
+    assert all(lane.cancelled.is_set() for lane in lanes)
+    await asyncio.sleep(0)
+    _assert_no_concurrency_workers()
+
+
+@pytest.mark.asyncio
+async def test_concurrency_managed_signal_cancels_blocked_cache_flush() -> None:
+    administrative = _ConcurrencyAdministrativeClient(block_flush=True)
+    requests = tuple(_concurrency_request(lane) for lane in range(2))
+    lanes = tuple(_ConcurrencyLaneClient(lane) for lane in range(2))
+    checkpoints = 0
+
+    def managed_signal_checkpoint() -> None:
+        nonlocal checkpoints
+        checkpoints += 1
+        if checkpoints == 2:
+            raise olmoe.OlmoeEpManagedSignalError(signal.SIGTERM)
+
+    with pytest.raises(olmoe.OlmoeEpManagedSignalError, match="managed signal 15"):
+        await asyncio.wait_for(
+            olmoe._run_concurrency_group(
+                _async_client(administrative),
+                tuple(_async_client(lane) for lane in lanes),
+                requests,
+                kind="decode",
+                phase="warmup",
+                ordinal=1,
+                barrier_timeout_seconds=30.0,
+                assert_after_phase=lambda _phase: None,
+                cancellation_checkpoint=managed_signal_checkpoint,
+            ),
+            timeout=0.5,
+        )
+
+    assert administrative.entered.is_set()
+    assert administrative.cancelled.is_set()
+    assert all(not lane.entered.is_set() for lane in lanes)
+    await asyncio.sleep(0)
+    _assert_no_concurrency_workers()
+
+
+@pytest.mark.asyncio
+async def test_concurrency_main_task_cancellation_cancels_blocked_lanes() -> None:
+    administrative = _ConcurrencyAdministrativeClient()
+    requests = tuple(_concurrency_request(lane) for lane in range(2))
+    lanes = tuple(
+        _ConcurrencyLaneClient(lane, block_generate=True) for lane in range(2)
+    )
+    group = asyncio.create_task(
+        olmoe._run_concurrency_group(
+            _async_client(administrative),
+            tuple(_async_client(lane) for lane in lanes),
+            requests,
+            kind="decode",
+            phase="warmup",
+            ordinal=1,
+            barrier_timeout_seconds=30.0,
+            assert_after_phase=lambda _phase: None,
+            cancellation_checkpoint=lambda: None,
+        )
+    )
+    await asyncio.gather(*(lane.entered.wait() for lane in lanes))
+
+    group.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(group, timeout=0.5)
+
+    assert all(lane.cancelled.is_set() for lane in lanes)
+    await asyncio.sleep(0)
+    _assert_no_concurrency_workers()
+
+
+def test_concurrency_determinism_rejects_output_drift_without_tie_exception() -> None:
+    request = _concurrency_request(0)
+    reference = _concurrency_observation(request, 0)
+    references: dict[tuple[Literal["prefill", "decode"], int], tuple[int, ...]] = {}
+    first = olmoe._verify_concurrency_determinism(
+        kind="decode",
+        requests=(request,),
+        observations=(reference,),
+        references=references,
+    )
+
+    tie_policy = cast(dict[str, object], first["known_token_4_tie"])
+    assert tie_policy["exception_enabled"] is False
+    with pytest.raises(olmoe.OlmoeEpBenchmarkError, match="not coherent"):
+        olmoe._verify_concurrency_determinism(
+            kind="decode",
+            requests=(request,),
+            observations=(replace(reference, cached_tokens=1),),
+            references=references,
+        )
+    drifted_ids = (*reference.output_ids[:3], 1_769)
+    drifted = _concurrency_observation(request, 0, output_ids=drifted_ids)
+    with pytest.raises(olmoe.OlmoeEpBenchmarkError, match="exactly deterministic"):
+        olmoe._verify_concurrency_determinism(
+            kind="decode",
+            requests=(request,),
+            observations=(drifted,),
+            references=references,
+        )
+
+
+@pytest.mark.asyncio
+async def test_concurrency_suite_uses_exact_workload_and_c_grid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, int, str, int]] = []
+
+    async def fake_group(
+        _administrative_client: OlmoeNativeAsyncServingClient,
+        _lane_client_factory: object,
+        requests: tuple[OlmoeNativeGenerateRequest, ...],
+        *,
+        kind: str,
+        phase: str,
+        ordinal: int,
+        barrier_timeout_seconds: float,
+        assert_after_phase: object,
+        cancellation_checkpoint: object,
+        clock_ns: object = time.perf_counter_ns,
+    ) -> tuple[dict[str, object], tuple[GenerateObservation, ...]]:
+        del (
+            barrier_timeout_seconds,
+            assert_after_phase,
+            cancellation_checkpoint,
+            clock_ns,
+        )
+        calls.append((kind, len(requests), phase, ordinal))
+        observations = tuple(
+            _concurrency_observation(request, lane)
+            for lane, request in enumerate(requests)
+        )
+        return (
+            {
+                "aggregate": {
+                    "aggregate_decode_tokens_per_second": 10.0,
+                    "aggregate_end_to_end_output_tokens_per_second": 9.0,
+                    "group_wall_seconds": 1.0,
+                    "decode_envelope_seconds": 0.9,
+                }
+            },
+            observations,
+        )
+
+    monkeypatch.setattr(olmoe, "_run_concurrency_group", fake_group)
+    workloads = await olmoe._run_aggregate_concurrency_benchmark(
+        _async_client(object()),
+        tuple(
+            _async_client(object())
+            for _lane in range(olmoe.OLMOE_CONCURRENCY_MAX_RUNNING_REQUESTS)
+        ),
+        10.0,
+        lambda _phase: None,
+        lambda: None,
+    )
+
+    expected = [
+        (kind, concurrency, phase, ordinal)
+        for kind in ("prefill", "decode")
+        for concurrency in olmoe.CONCURRENCY_LEVELS
+        for phase, count in (
+            ("warmup", olmoe.CANONICAL_WARMUP_COUNT),
+            ("sample", olmoe.CANONICAL_SAMPLE_COUNT),
+        )
+        for ordinal in range(1, count + 1)
+    ]
+    assert calls == expected
+    assert [cast(dict[str, object], workload)["kind"] for workload in workloads] == [
+        "prefill",
+        "decode",
+    ]
+    for workload in workloads:
+        document = cast(dict[str, object], workload)
+        assert document["concurrency_levels"] == [1, 2, 4, 8]
+        lane_pool = cast(dict[str, object], document["lane_client_pool"])
+        assert lane_pool["execution_model"] == (
+            "cancellable_asyncio_tasks_without_executor_threads"
+        )
+        results = cast(list[object], document["results"])
+        assert [
+            cast(dict[str, object], result)["concurrency"] for result in results
+        ] == [
+            1,
+            2,
+            4,
+            8,
+        ]
 
 
 def test_ep_receipt_distinguishes_tp_control_from_true_ep() -> None:
@@ -1654,8 +2185,46 @@ def test_argument_parser_uses_trusted_stage_contract(tmp_path: Path) -> None:
     assert config.stage_contract == Path("/stage/contract.json")
     assert config.stage_capture_output is None
     assert config.moe_config_root is None
+    assert config.aggregate_concurrency is False
     assert olmoe.CANONICAL_WARMUP_COUNT == 2
     assert olmoe.CANONICAL_SAMPLE_COUNT == 3
+
+
+def test_argument_parser_selects_aggregate_concurrency_only_for_benchmark(
+    tmp_path: Path,
+) -> None:
+    base_arguments = [
+        "--run-id",
+        "ep2-concurrency",
+        "--result-directory",
+        str(tmp_path / "result"),
+        "--runtime-python",
+        "/runtime/python",
+        "--runtime-install-receipt",
+        "/runtime/install.json",
+        "--runtime-install-receipt-sha256",
+        SHA,
+        "--ep-size",
+        "2",
+        "--aggregate-concurrency",
+    ]
+    benchmark = olmoe.config_from_arguments(
+        olmoe._parser().parse_args(
+            [*base_arguments, "--stage-contract", "/stage/contract.json"]
+        )
+    )
+
+    assert benchmark.aggregate_concurrency is True
+    with pytest.raises(olmoe.OlmoeEpBenchmarkError, match="trusted stage contract"):
+        olmoe.config_from_arguments(
+            olmoe._parser().parse_args(
+                [
+                    *base_arguments,
+                    "--stage-capture-output",
+                    str(tmp_path / "capture.json"),
+                ]
+            )
+        )
 
 
 def test_argument_parser_requires_absolute_lexical_moe_config_root(

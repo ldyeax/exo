@@ -7,7 +7,7 @@ import hashlib
 import json
 import math
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator
 from dataclasses import asdict, dataclass
 from typing import Final, Literal, cast, final
 
@@ -316,6 +316,10 @@ class GenerateObservation:
     output_bearing_event_count: int
     maximum_stream_line_bytes: int
     first_stream_event_output_tokens: int
+    request_started_monotonic_ns: int
+    first_output_monotonic_ns: int
+    last_output_monotonic_ns: int
+    request_completed_monotonic_ns: int
     total_client_seconds: float
     client_observed_ttft_seconds: float
     client_observed_generation_window_seconds: float
@@ -341,6 +345,33 @@ def _iter_bounded_sse_lines(
     pending = bytearray()
     try:
         for chunk in response.iter_bytes():
+            require_within_deadline()
+            view = memoryview(chunk)
+            for offset in range(0, len(chunk), SSE_READ_CHUNK_BYTES):
+                pending.extend(view[offset : offset + SSE_READ_CHUNK_BYTES])
+                while (newline := pending.find(b"\n")) >= 0:
+                    line = bytes(pending[:newline])
+                    del pending[: newline + 1]
+                    if line.endswith(b"\r"):
+                        line = line[:-1]
+                    if len(line) > SSE_LINE_MAXIMUM_BYTES:
+                        raise OlmoeServingClientError("SSE line is oversized")
+                    yield line.decode("utf-8", errors="strict")
+                if len(pending) > SSE_LINE_MAXIMUM_BYTES + 1:
+                    raise OlmoeServingClientError("SSE line is oversized")
+    except UnicodeDecodeError as error:
+        raise OlmoeServingClientError("SSE response is not UTF-8") from error
+    if pending:
+        raise OlmoeServingClientError("SSE response has an unterminated line")
+
+
+async def _aiter_bounded_sse_lines(
+    response: httpx.Response,
+    require_within_deadline: Callable[[], None],
+) -> AsyncIterator[str]:
+    pending = bytearray()
+    try:
+        async for chunk in response.aiter_bytes():
             require_within_deadline()
             view = memoryview(chunk)
             for offset in range(0, len(chunk), SSE_READ_CHUNK_BYTES):
@@ -719,6 +750,217 @@ class OlmoeNativeServingClient:
             output_bearing_event_count=output_event_count,
             maximum_stream_line_bytes=maximum_line_bytes,
             first_stream_event_output_tokens=first_event_tokens,
+            request_started_monotonic_ns=started,
+            first_output_monotonic_ns=first_output_ns,
+            last_output_monotonic_ns=last_output_ns,
+            request_completed_monotonic_ns=completed,
+            total_client_seconds=(completed - started) / 1_000_000_000,
+            client_observed_ttft_seconds=(first_output_ns - started) / 1_000_000_000,
+            client_observed_generation_window_seconds=generation_window,
+            client_observed_decode_tokens_per_second=(
+                len(output_tuple) - first_event_tokens
+            )
+            / generation_window,
+        )
+
+
+@final
+class OlmoeNativeAsyncServingClient:
+    """Cancellable async client for synchronized aggregate-concurrency groups."""
+
+    def __init__(
+        self,
+        base_url: str,
+        *,
+        timeout_seconds: float,
+        transport: httpx.AsyncBaseTransport | None = None,
+        clock_ns: Callable[[], int] = time.perf_counter_ns,
+        deadline_clock_ns: Callable[[], int] = time.monotonic_ns,
+    ) -> None:
+        if timeout_seconds <= 0.0 or not math.isfinite(timeout_seconds):
+            raise ValueError("timeout must be positive and finite")
+        self._clock_ns = clock_ns
+        self._deadline_clock_ns = deadline_clock_ns
+        self._timeout_ns = int(timeout_seconds * 1_000_000_000)
+        self._client = httpx.AsyncClient(
+            base_url=base_url.rstrip("/"),
+            timeout=timeout_seconds,
+            transport=transport,
+            headers={"Accept-Encoding": "identity"},
+        )
+
+    async def __aenter__(self) -> "OlmoeNativeAsyncServingClient":
+        return self
+
+    async def __aexit__(self, *_args: object) -> None:
+        await self.close()
+
+    async def close(self) -> None:
+        await self._client.aclose()
+
+    async def flush_cache(self) -> EndpointObservation:
+        started = self._clock_ns()
+        response = await self._client.post("/flush_cache")
+        completed = self._clock_ns()
+        contents = response.content
+        observation = EndpointObservation(
+            status_code=response.status_code,
+            response_sha256=hashlib.sha256(contents).hexdigest(),
+            elapsed_seconds=(completed - started) / 1_000_000_000,
+        )
+        if response.status_code != 200:
+            raise OlmoeServingClientError(
+                f"POST /flush_cache returned HTTP {response.status_code}"
+            )
+        return observation
+
+    async def generate(
+        self, request: OlmoeNativeGenerateRequest
+    ) -> GenerateObservation:
+        if not request.stream:
+            raise ValueError("benchmark request must stream")
+        started = self._clock_ns()
+        deadline = self._deadline_clock_ns() + self._timeout_ns
+
+        def require_within_deadline() -> None:
+            if self._deadline_clock_ns() > deadline:
+                raise OlmoeServingClientError("generate stream exceeded its deadline")
+
+        maximum_events = request.sampling_params.max_new_tokens + SSE_EVENT_SLACK
+        maximum_lines = (
+            request.sampling_params.max_new_tokens + 2
+        ) * SSE_LINES_PER_TOKEN_LIMIT
+        output_ids: list[int] = []
+        line_count = 0
+        event_count = 0
+        output_event_count = 0
+        maximum_line_bytes = 0
+        first_output_ns: int | None = None
+        last_output_ns: int | None = None
+        first_event_tokens: int | None = None
+        previous_completion = 0
+        finish_reason: _LengthFinishReason | None = None
+        saw_done = False
+        async with self._client.stream(
+            "POST", "/generate", json=request.json_object()
+        ) as response:
+            if response.status_code != 200:
+                raise OlmoeServingClientError(
+                    f"POST /generate returned HTTP {response.status_code}"
+                )
+            if response.headers.get("content-encoding", "identity") != "identity":
+                raise OlmoeServingClientError("generate response is compressed")
+            async for line in _aiter_bounded_sse_lines(
+                response, require_within_deadline
+            ):
+                received = self._clock_ns()
+                line_count += 1
+                maximum_line_bytes = max(maximum_line_bytes, len(line.encode()))
+                if line_count > maximum_lines:
+                    raise OlmoeServingClientError("generate stream has too many lines")
+                if saw_done:
+                    if line:
+                        raise OlmoeServingClientError("data follows SSE [DONE]")
+                    continue
+                if line == "data: [DONE]":
+                    saw_done = True
+                    continue
+                if not line or line.startswith(":"):
+                    continue
+                if not line.startswith("data: "):
+                    raise OlmoeServingClientError("generate SSE line is not data")
+                try:
+                    event = _StreamEvent.model_validate_json(
+                        line.removeprefix("data: ")
+                    )
+                except ValidationError as error:
+                    raise OlmoeServingClientError(
+                        "generate SSE event is invalid"
+                    ) from error
+                event_count += 1
+                if event_count > maximum_events:
+                    raise OlmoeServingClientError("generate stream has too many events")
+                meta = event.meta_info
+                if (
+                    meta.prompt_tokens != len(request.input_ids)
+                    or meta.cached_tokens != 0
+                ):
+                    raise OlmoeServingClientError(
+                        "generate stream prompt/cache count is not exact"
+                    )
+                if meta.completion_tokens < previous_completion:
+                    raise OlmoeServingClientError("completion count moved backwards")
+                if meta.finish_reason is not None:
+                    if (
+                        meta.finish_reason.length
+                        != request.sampling_params.max_new_tokens
+                        or meta.completion_tokens
+                        != request.sampling_params.max_new_tokens
+                    ):
+                        raise OlmoeServingClientError("finish reason is not canonical")
+                    finish_reason = meta.finish_reason
+                if not event.output_ids:
+                    if meta.completion_tokens != previous_completion:
+                        raise OlmoeServingClientError(
+                            "completion advanced without output IDs"
+                        )
+                    continue
+                if meta.completion_tokens == len(event.output_ids):
+                    if len(event.output_ids) <= len(output_ids) or event.output_ids[
+                        : len(output_ids)
+                    ] != tuple(output_ids):
+                        raise OlmoeServingClientError(
+                            "cumulative output does not extend its prefix"
+                        )
+                    output_ids = list(event.output_ids)
+                elif meta.completion_tokens == len(output_ids) + len(event.output_ids):
+                    output_ids.extend(event.output_ids)
+                else:
+                    raise OlmoeServingClientError(
+                        "output IDs disagree with completion count"
+                    )
+                previous_completion = meta.completion_tokens
+                output_event_count += 1
+                if first_output_ns is None:
+                    first_output_ns = received
+                    first_event_tokens = len(event.output_ids)
+                last_output_ns = received
+        completed = self._clock_ns()
+        if (
+            not saw_done
+            or finish_reason is None
+            or len(output_ids) != request.sampling_params.max_new_tokens
+            or previous_completion != len(output_ids)
+            or first_output_ns is None
+            or last_output_ns is None
+            or first_event_tokens is None
+            or output_event_count < 2
+            or last_output_ns <= first_output_ns
+            or completed <= started
+            or completed - started > self._timeout_ns
+        ):
+            raise OlmoeServingClientError("generate stream lacks complete evidence")
+        output_tuple = tuple(output_ids)
+        generation_window = (last_output_ns - first_output_ns) / 1_000_000_000
+        return GenerateObservation(
+            input_ids_sha256=token_ids_sha256(request.input_ids),
+            output_ids=output_tuple,
+            prompt_tokens=len(request.input_ids),
+            completion_tokens=len(output_tuple),
+            cached_tokens=0,
+            output_ids_sha256=token_ids_sha256(output_tuple),
+            finish_reason_sha256=hashlib.sha256(
+                _canonical_json(finish_reason.model_dump(mode="json"))
+            ).hexdigest(),
+            stream_line_count=line_count,
+            stream_event_count=event_count,
+            output_bearing_event_count=output_event_count,
+            maximum_stream_line_bytes=maximum_line_bytes,
+            first_stream_event_output_tokens=first_event_tokens,
+            request_started_monotonic_ns=started,
+            first_output_monotonic_ns=first_output_ns,
+            last_output_monotonic_ns=last_output_ns,
+            request_completed_monotonic_ns=completed,
             total_client_seconds=(completed - started) / 1_000_000_000,
             client_observed_ttft_seconds=(first_output_ns - started) / 1_000_000_000,
             client_observed_generation_window_seconds=generation_window,

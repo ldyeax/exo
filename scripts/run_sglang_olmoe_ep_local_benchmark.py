@@ -24,6 +24,7 @@ configuration environment variable is inherited.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import base64
 import contextlib
 import csv
@@ -90,9 +91,11 @@ from scripts.sglang_olmoe_serving_client import (  # noqa: E402
     GenerateObservation,
     LogitParityObservation,
     OlmoeLogitParityRequest,
+    OlmoeNativeAsyncServingClient,
     OlmoeNativeGenerateRequest,
     OlmoeNativeServingClient,
     OlmoeSamplingParameters,
+    token_ids_sha256,
 )
 from scripts.validate_sglang_kt_runtime import (  # noqa: E402
     RuntimeValidationError,
@@ -120,6 +123,9 @@ OLMOE_EXPERTS_PER_TOKEN: Final = 8
 OLMOE_HIDDEN_SIZE: Final = 2_048
 OLMOE_CONTEXT_LENGTH: Final = 4_096
 OLMOE_MAX_TOTAL_TOKENS: Final = 4_096
+OLMOE_CONCURRENCY_MAX_TOTAL_TOKENS: Final = 9_216
+OLMOE_CONCURRENCY_MAX_RUNNING_REQUESTS: Final = 8
+OLMOE_CONCURRENCY_CUDA_GRAPH_MAX_BATCH_SIZE: Final = 8
 DWAGON_GPU_UUIDS: Final = (
     "GPU-63a7760a-6164-0758-9228-03dbf35d721c",
     "GPU-a442b72e-6727-6322-ba5d-5a9512b79886",
@@ -137,6 +143,7 @@ CANONICAL_WORKLOADS: Final = (
     ("prefill", 1_024, 32),
     ("decode", 128, 128),
 )
+CONCURRENCY_LEVELS: Final = (1, 2, 4, 8)
 LOGIT_PARITY_CANONICAL_INPUT_TOKENS: Final = 128
 LOGIT_PARITY_COMMON_PREFIX: Final = (431, 3_056, 209)
 LOGIT_PARITY_CANDIDATE_TOKEN_IDS: Final = (139, 1_769)
@@ -183,11 +190,8 @@ _MOE_CONFIG_ALLOWED_VALUES: Final[dict[str, frozenset[int]]] = {
 _KV_CACHE_ALLOCATION_PATTERN: Final = re.compile(
     r"\[(?:[^\]\r\n]* )?TP(?P<tp_rank>[01])"
     r"(?: EP(?P<ep_rank>[01]))?\] KV Cache is allocated\. "
-    r"#tokens: 4096(?:,|$)",
+    r"#tokens: (?P<token_count>4096|9216)(?:,|$)",
     re.ASCII,
-)
-_MAX_TOTAL_TOKENS_SERVER_ARGS_PATTERN: Final = re.compile(
-    r"\bmax_total_tokens=4096\b", re.ASCII
 )
 _DISABLED_CUSTOM_ALL_REDUCE_SERVER_ARGS_PATTERN: Final = re.compile(
     r"\bdisable_custom_all_reduce=True\b", re.ASCII
@@ -336,6 +340,7 @@ class OlmoeEpBenchmarkConfig:
     nvidia_smi_executable: str
     logit_parity_probe: bool = False
     moe_config_root: Path | None = None
+    aggregate_concurrency: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -1247,10 +1252,23 @@ def verify_runtime_install(config: OlmoeEpBenchmarkConfig) -> RuntimeAdmission:
     )
 
 
+def _server_capacity(config: OlmoeEpBenchmarkConfig) -> tuple[int, int, int | None]:
+    if config.aggregate_concurrency:
+        return (
+            OLMOE_CONCURRENCY_MAX_TOTAL_TOKENS,
+            OLMOE_CONCURRENCY_MAX_RUNNING_REQUESTS,
+            OLMOE_CONCURRENCY_CUDA_GRAPH_MAX_BATCH_SIZE,
+        )
+    return OLMOE_MAX_TOTAL_TOKENS, 1, None
+
+
 def build_server_command(config: OlmoeEpBenchmarkConfig) -> tuple[str, ...]:
     """Build the exact native PP1/TP2 server command."""
 
-    return (
+    max_total_tokens, max_running_requests, cuda_graph_max_batch_size = (
+        _server_capacity(config)
+    )
+    command = (
         config.numactl_executable,
         "--physcpubind",
         "0-111",
@@ -1283,16 +1301,19 @@ def build_server_command(config: OlmoeEpBenchmarkConfig) -> tuple[str, ...]:
         "--context-length",
         str(OLMOE_CONTEXT_LENGTH),
         "--max-total-tokens",
-        str(OLMOE_MAX_TOTAL_TOKENS),
+        str(max_total_tokens),
         "--mem-fraction-static",
         format(config.static_memory_fraction, ".17g"),
         "--max-running-requests",
-        "1",
+        str(max_running_requests),
         "--random-seed",
         str(CANONICAL_SAMPLING_SEED),
         "--disable-radix-cache",
         "--disable-custom-all-reduce",
     )
+    if cuda_graph_max_batch_size is not None:
+        command += ("--cuda-graph-max-bs", str(cuda_graph_max_batch_size))
+    return command
 
 
 def build_server_environment(
@@ -2927,6 +2948,10 @@ def verify_server_log_contract(
     log_path: Path,
     expert_parallel_size: ExpertParallelSize,
     moe_config_snapshot: MoeConfigSnapshotAdmission | None = None,
+    *,
+    max_total_tokens: int = OLMOE_MAX_TOTAL_TOKENS,
+    max_running_requests: int = 1,
+    cuda_graph_max_batch_size: int | None = None,
 ) -> JsonObject:
     """Bind the effective KV-pool and collective policy from startup logs."""
 
@@ -2950,7 +2975,17 @@ def verify_server_log_contract(
     matching_server_args_lines = [
         line
         for line in server_args_lines
-        if _MAX_TOTAL_TOKENS_SERVER_ARGS_PATTERN.search(line) is not None
+        if re.search(rf"\bmax_total_tokens={max_total_tokens}\b", line) is not None
+        and (
+            max_running_requests == 1
+            or re.search(rf"\bmax_running_requests={max_running_requests}\b", line)
+            is not None
+        )
+        and (
+            cuda_graph_max_batch_size is None
+            or re.search(rf"\bcuda_graph_max_bs={cuda_graph_max_batch_size}\b", line)
+            is not None
+        )
         and _DISABLED_CUSTOM_ALL_REDUCE_SERVER_ARGS_PATTERN.search(line) is not None
     ]
     kv_cache_allocation_lines = [
@@ -2963,7 +2998,13 @@ def verify_server_log_contract(
     matching_rank_bindings = {
         (match.group("tp_rank"), match.group("ep_rank"))
         for _, match in matching_kv_cache_lines
+        if int(match.group("token_count")) == max_total_tokens
     }
+    matching_kv_cache_lines = [
+        (line, match)
+        for line, match in matching_kv_cache_lines
+        if int(match.group("token_count")) == max_total_tokens
+    ]
     expected_rank_bindings = (
         {("0", None), ("1", None)}
         if expert_parallel_size == 1
@@ -2983,7 +3024,7 @@ def verify_server_log_contract(
     ):
         raise OlmoeEpBenchmarkError(
             "native SGLang log does not verify the expected TP/EP rank-bound "
-            "4096-token KV allocations"
+            f"{max_total_tokens}-token KV allocations"
         )
     if custom_all_reduce_failures:
         raise OlmoeEpBenchmarkError(
@@ -3069,7 +3110,9 @@ def verify_server_log_contract(
             )
         ],
         "expert_parallel_size": expert_parallel_size,
-        "max_total_tokens": OLMOE_MAX_TOTAL_TOKENS,
+        "max_total_tokens": max_total_tokens,
+        "max_running_requests": max_running_requests,
+        "cuda_graph_max_batch_size": cuda_graph_max_batch_size,
         "custom_all_reduce_disabled": True,
         "custom_all_reduce_failure_line_count": len(custom_all_reduce_failures),
     }
@@ -3088,6 +3131,9 @@ def verify_server_log_contract(
 def _verify_server_info(
     response: Mapping[str, object], config: OlmoeEpBenchmarkConfig
 ) -> JsonObject:
+    max_total_tokens, max_running_requests, cuda_graph_max_batch_size = (
+        _server_capacity(config)
+    )
     expected: dict[str, object] = {
         "version": "0.0.0.dev0",
         "model_path": config.model_path,
@@ -3100,9 +3146,9 @@ def _verify_server_info(
         "node_rank": 0,
         "dtype": "bfloat16",
         "context_length": OLMOE_CONTEXT_LENGTH,
-        "max_total_tokens": OLMOE_MAX_TOTAL_TOKENS,
+        "max_total_tokens": max_total_tokens,
         "mem_fraction_static": config.static_memory_fraction,
-        "max_running_requests": 1,
+        "max_running_requests": max_running_requests,
         "random_seed": CANONICAL_SAMPLING_SEED,
         "moe_a2a_backend": "none",
         "moe_runner_backend": "triton",
@@ -3110,6 +3156,8 @@ def _verify_server_info(
         "disable_custom_all_reduce": True,
         "numa_node": [0, 1],
     }
+    if cuda_graph_max_batch_size is not None:
+        expected["cuda_graph_max_bs"] = cuda_graph_max_batch_size
     mismatches = {
         key: {"expected": value, "actual": response.get(key)}
         for key, value in expected.items()
@@ -3397,6 +3445,549 @@ def run_canonical_workload(
     )
 
 
+def build_concurrency_input_ids(
+    kind: Literal["prefill", "decode"], token_count: int, lane: int
+) -> tuple[int, ...]:
+    if lane < 0 or lane >= OLMOE_CONCURRENCY_MAX_RUNNING_REQUESTS:
+        raise ValueError("concurrency lane is outside the admitted range")
+    return build_deterministic_input_ids(f"{kind}:concurrency-lane-{lane}", token_count)
+
+
+def _aggregate_concurrency_metrics(
+    observations: tuple[GenerateObservation, ...], release_monotonic_ns: int
+) -> JsonObject:
+    if not observations or release_monotonic_ns < 0:
+        raise OlmoeEpBenchmarkError("aggregate concurrency timing is empty or invalid")
+    for observation in observations:
+        if not (
+            release_monotonic_ns
+            <= observation.request_started_monotonic_ns
+            < observation.first_output_monotonic_ns
+            < observation.last_output_monotonic_ns
+            <= observation.request_completed_monotonic_ns
+        ):
+            raise OlmoeEpBenchmarkError(
+                "aggregate concurrency lane timing is not monotonic from release"
+            )
+        if (
+            observation.completion_tokens
+            <= observation.first_stream_event_output_tokens
+        ):
+            raise OlmoeEpBenchmarkError(
+                "aggregate concurrency lane has no post-first-event decode tokens"
+            )
+
+    latest_completion_ns = max(
+        observation.request_completed_monotonic_ns for observation in observations
+    )
+    earliest_first_output_ns = min(
+        observation.first_output_monotonic_ns for observation in observations
+    )
+    latest_last_output_ns = max(
+        observation.last_output_monotonic_ns for observation in observations
+    )
+    group_wall_ns = latest_completion_ns - release_monotonic_ns
+    decode_envelope_ns = latest_last_output_ns - earliest_first_output_ns
+    if group_wall_ns <= 0 or decode_envelope_ns <= 0:
+        raise OlmoeEpBenchmarkError("aggregate concurrency denominator is not positive")
+    total_completion_tokens = sum(
+        observation.completion_tokens for observation in observations
+    )
+    total_decode_tokens = sum(
+        observation.completion_tokens - observation.first_stream_event_output_tokens
+        for observation in observations
+    )
+    group_wall_seconds = group_wall_ns / 1_000_000_000
+    decode_envelope_seconds = decode_envelope_ns / 1_000_000_000
+    return {
+        "total_completion_tokens": total_completion_tokens,
+        "group_wall_seconds": group_wall_seconds,
+        "aggregate_end_to_end_output_tokens_per_second": (
+            total_completion_tokens / group_wall_seconds
+        ),
+        "total_tokens_after_first_events": total_decode_tokens,
+        "decode_envelope_seconds": decode_envelope_seconds,
+        "aggregate_decode_tokens_per_second": (
+            total_decode_tokens / decode_envelope_seconds
+        ),
+        "earliest_first_output_monotonic_ns": earliest_first_output_ns,
+        "latest_last_output_monotonic_ns": latest_last_output_ns,
+        "latest_request_completion_monotonic_ns": latest_completion_ns,
+        "formulas": {
+            "end_to_end": (
+                "sum(lane completion tokens) / "
+                "(latest lane request completion - common barrier release)"
+            ),
+            "decode": (
+                "sum(lane completion tokens - lane first-event tokens) / "
+                "(latest lane last-token event - earliest lane first-token event)"
+            ),
+            "per_lane_rates_summed": False,
+        },
+    }
+
+
+def _concurrency_lane_receipt(
+    lane: int,
+    observation: GenerateObservation,
+    release_monotonic_ns: int,
+) -> JsonObject:
+    return {
+        "lane": lane,
+        "input_ids_sha256": observation.input_ids_sha256,
+        "prompt_tokens": observation.prompt_tokens,
+        "completion_tokens": observation.completion_tokens,
+        "cached_tokens": observation.cached_tokens,
+        "output_ids": list(observation.output_ids),
+        "output_ids_sha256": observation.output_ids_sha256,
+        "finish_reason_sha256": observation.finish_reason_sha256,
+        "stream_line_count": observation.stream_line_count,
+        "stream_event_count": observation.stream_event_count,
+        "output_bearing_event_count": observation.output_bearing_event_count,
+        "maximum_stream_line_bytes": observation.maximum_stream_line_bytes,
+        "first_stream_event_output_tokens": (
+            observation.first_stream_event_output_tokens
+        ),
+        "timing": {
+            "request_started_monotonic_ns": observation.request_started_monotonic_ns,
+            "first_output_monotonic_ns": observation.first_output_monotonic_ns,
+            "last_output_monotonic_ns": observation.last_output_monotonic_ns,
+            "request_completed_monotonic_ns": (
+                observation.request_completed_monotonic_ns
+            ),
+            "request_start_after_release_seconds": (
+                observation.request_started_monotonic_ns - release_monotonic_ns
+            )
+            / 1_000_000_000,
+            "total_client_seconds": observation.total_client_seconds,
+            "client_observed_ttft_seconds": observation.client_observed_ttft_seconds,
+            "client_observed_generation_window_seconds": (
+                observation.client_observed_generation_window_seconds
+            ),
+            "client_observed_decode_tokens_per_second": (
+                observation.client_observed_decode_tokens_per_second
+            ),
+        },
+    }
+
+
+async def _run_concurrency_group(
+    administrative_client: OlmoeNativeAsyncServingClient,
+    lane_clients: tuple[OlmoeNativeAsyncServingClient, ...],
+    requests: tuple[OlmoeNativeGenerateRequest, ...],
+    *,
+    kind: Literal["prefill", "decode"],
+    phase: Literal["warmup", "sample"],
+    ordinal: int,
+    barrier_timeout_seconds: float,
+    assert_after_phase: Callable[[str], None],
+    cancellation_checkpoint: Callable[[], None],
+    clock_ns: Callable[[], int] = time.perf_counter_ns,
+) -> tuple[JsonObject, tuple[GenerateObservation, ...]]:
+    concurrency = len(requests)
+    if concurrency not in CONCURRENCY_LEVELS:
+        raise OlmoeEpBenchmarkError("concurrency group size is not admitted")
+    if len(lane_clients) < concurrency:
+        raise OlmoeEpBenchmarkError("concurrency lane client pool is undersized")
+
+    async def monitor_cancellation() -> None:
+        while True:
+            await asyncio.sleep(0.05)
+            cancellation_checkpoint()
+
+    cancellation_checkpoint()
+    flush_task = asyncio.create_task(
+        administrative_client.flush_cache(),
+        name=f"olmoe-{kind}-c{concurrency}-cache-flush",
+    )
+    flush_monitor = asyncio.create_task(
+        monitor_cancellation(),
+        name=f"olmoe-{kind}-c{concurrency}-flush-signal-checkpoint",
+    )
+    try:
+        flush_done, _flush_pending = await asyncio.wait(
+            (flush_task, flush_monitor), return_when=asyncio.FIRST_COMPLETED
+        )
+        if flush_monitor in flush_done:
+            exception = flush_monitor.exception()
+            if exception is None:
+                raise OlmoeEpBenchmarkError(
+                    "cache-flush signal checkpoint stopped unexpectedly"
+                )
+            raise exception
+        flush = flush_task.result()
+    finally:
+        flush_task.cancel()
+        flush_monitor.cancel()
+        await asyncio.gather(flush_task, flush_monitor, return_exceptions=True)
+    cancellation_checkpoint()
+    assert_after_phase(f"{kind} C{concurrency} {phase} {ordinal} cache flush")
+
+    release = asyncio.Event()
+    all_lanes_ready = asyncio.Event()
+    ready_lanes: set[int] = set()
+
+    async def run_lane(lane: int) -> GenerateObservation:
+        ready_lanes.add(lane)
+        if len(ready_lanes) == concurrency:
+            all_lanes_ready.set()
+        await asyncio.wait_for(release.wait(), timeout=barrier_timeout_seconds)
+        return await lane_clients[lane].generate(requests[lane])
+
+    lane_tasks = tuple(
+        asyncio.create_task(
+            run_lane(lane), name=f"olmoe-{kind}-c{concurrency}-lane-{lane}"
+        )
+        for lane in range(concurrency)
+    )
+    task_lanes = {task: lane for lane, task in enumerate(lane_tasks)}
+    monitor_task = asyncio.create_task(
+        monitor_cancellation(), name=f"olmoe-{kind}-c{concurrency}-signal-checkpoint"
+    )
+    ready_task = asyncio.create_task(
+        all_lanes_ready.wait(), name=f"olmoe-{kind}-c{concurrency}-ready-rendezvous"
+    )
+    release_ns: int
+    ready_lanes_at_release: tuple[int, ...]
+    observations_by_lane: dict[int, GenerateObservation] = {}
+    pending_lanes = set(lane_tasks)
+    try:
+        ready_done, _ready_pending = await asyncio.wait(
+            (ready_task, monitor_task),
+            timeout=barrier_timeout_seconds,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if monitor_task in ready_done:
+            exception = monitor_task.exception()
+            if exception is None:
+                raise OlmoeEpBenchmarkError(
+                    "concurrency signal checkpoint stopped unexpectedly"
+                )
+            raise exception
+        if ready_task not in ready_done or ready_lanes != set(range(concurrency)):
+            raise OlmoeEpBenchmarkError(
+                f"{kind} C{concurrency} lane-ready rendezvous timed out"
+            )
+        ready_lanes_at_release = tuple(sorted(ready_lanes))
+        release_ns = clock_ns()
+        release.set()
+        while pending_lanes:
+            done, _pending = await asyncio.wait(
+                (*pending_lanes, monitor_task),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if monitor_task in done:
+                exception = monitor_task.exception()
+                if exception is None:
+                    raise OlmoeEpBenchmarkError(
+                        "concurrency signal checkpoint stopped unexpectedly"
+                    )
+                raise exception
+            completed_lane_tasks = sorted(
+                (
+                    cast(asyncio.Task[GenerateObservation], raw_task)
+                    for raw_task in done
+                    if raw_task is not monitor_task
+                ),
+                key=task_lanes.__getitem__,
+            )
+            for task in completed_lane_tasks:
+                lane = task_lanes[task]
+                pending_lanes.remove(task)
+                try:
+                    observations_by_lane[lane] = task.result()
+                except OlmoeEpManagedSignalError:
+                    raise
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:
+                    raise OlmoeEpBenchmarkError(
+                        f"{kind} C{concurrency} {phase} {ordinal} lane {lane} failed"
+                    ) from error
+    finally:
+        monitor_task.cancel()
+        ready_task.cancel()
+        for task in pending_lanes:
+            task.cancel()
+        await asyncio.gather(
+            monitor_task, ready_task, *pending_lanes, return_exceptions=True
+        )
+
+    observed = tuple(observations_by_lane[lane] for lane in range(concurrency))
+    metrics = _aggregate_concurrency_metrics(observed, release_ns)
+    assert_after_phase(f"{kind} C{concurrency} {phase} {ordinal}")
+    receipt = cast(
+        JsonObject,
+        {
+            "phase": phase,
+            "ordinal": ordinal,
+            "concurrency": concurrency,
+            "cache_flush_status_code": flush.status_code,
+            "cache_flush_response_sha256": flush.response_sha256,
+            "barrier": {
+                "participant_count": concurrency + 1,
+                "lane_count": concurrency,
+                "lane_ready_count_at_release": len(ready_lanes_at_release),
+                "lane_ready_ordinals_at_release": list(ready_lanes_at_release),
+                "mechanism": "asyncio_lane_ready_rendezvous_and_controller_release",
+                "common_release_monotonic_ns": release_ns,
+                "all_lane_requests_started_at_or_after_release": all(
+                    observation.request_started_monotonic_ns >= release_ns
+                    for observation in observed
+                ),
+            },
+            "lanes": [
+                _concurrency_lane_receipt(lane, observation, release_ns)
+                for lane, observation in enumerate(observed)
+            ],
+            "aggregate": metrics,
+        },
+    )
+    return receipt, observed
+
+
+def _verify_concurrency_determinism(
+    *,
+    kind: Literal["prefill", "decode"],
+    requests: tuple[OlmoeNativeGenerateRequest, ...],
+    observations: tuple[GenerateObservation, ...],
+    references: dict[tuple[Literal["prefill", "decode"], int], tuple[int, ...]],
+) -> JsonObject:
+    if len(requests) != len(observations):
+        raise OlmoeEpBenchmarkError("concurrency request/observation count differs")
+    lane_evidence: list[JsonValue] = []
+    for lane, (request, observation) in enumerate(
+        zip(requests, observations, strict=True)
+    ):
+        expected_input_hash = token_ids_sha256(request.input_ids)
+        expected_output_count = request.sampling_params.max_new_tokens
+        observed_output_hash = token_ids_sha256(observation.output_ids)
+        if (
+            observation.input_ids_sha256 != expected_input_hash
+            or observation.prompt_tokens != len(request.input_ids)
+            or observation.completion_tokens != expected_output_count
+            or len(observation.output_ids) != expected_output_count
+            or observation.cached_tokens != 0
+            or observation.output_ids_sha256 != observed_output_hash
+        ):
+            raise OlmoeEpBenchmarkError(
+                f"{kind} concurrency lane {lane} output is not coherent"
+            )
+        key = (kind, lane)
+        reference = references.setdefault(key, observation.output_ids)
+        if observation.output_ids != reference:
+            raise OlmoeEpBenchmarkError(
+                f"{kind} concurrency lane {lane} output is not exactly deterministic"
+            )
+        lane_evidence.append(
+            {
+                "lane": lane,
+                "input_ids_sha256": expected_input_hash,
+                "reference_output_ids_sha256": token_ids_sha256(reference),
+                "observed_output_ids_sha256": observation.output_ids_sha256,
+                "status": "exact_match",
+            }
+        )
+    return {
+        "status": "exact_match",
+        "policy": "exact_output_ids_per_kind_and_lane_across_all_groups",
+        "lanes": lane_evidence,
+        "known_token_4_tie": {
+            "candidate_token_ids": list(LOGIT_PARITY_CANDIDATE_TOKEN_IDS),
+            "decode_lane": 0,
+            "output_index": 3,
+            "exception_enabled": False,
+            "exception_applied": False,
+            "reason": (
+                "the admitted stage contract does not bind concurrency-output "
+                "tie evidence"
+            ),
+        },
+    }
+
+
+async def _run_aggregate_concurrency_benchmark(
+    administrative_client: OlmoeNativeAsyncServingClient,
+    lane_clients: tuple[OlmoeNativeAsyncServingClient, ...],
+    request_timeout_seconds: float,
+    assert_after_phase: Callable[[str], None],
+    cancellation_checkpoint: Callable[[], None],
+) -> list[JsonValue]:
+    if len(lane_clients) != OLMOE_CONCURRENCY_MAX_RUNNING_REQUESTS:
+        raise OlmoeEpBenchmarkError(
+            "aggregate concurrency requires one persistent client per admitted lane"
+        )
+    references: dict[tuple[Literal["prefill", "decode"], int], tuple[int, ...]] = {}
+    workloads: list[JsonValue] = []
+    for raw_kind, input_tokens, output_tokens in CANONICAL_WORKLOADS:
+        kind = cast(Literal["prefill", "decode"], raw_kind)
+        concurrency_results: list[JsonValue] = []
+        for concurrency in CONCURRENCY_LEVELS:
+            requests = tuple(
+                OlmoeNativeGenerateRequest(
+                    input_ids=build_concurrency_input_ids(kind, input_tokens, lane),
+                    sampling_params=OlmoeSamplingParameters(
+                        max_new_tokens=output_tokens,
+                        temperature=0.0,
+                        ignore_eos=True,
+                        sampling_seed=CANONICAL_SAMPLING_SEED,
+                    ),
+                    stream=True,
+                    return_logprob=False,
+                    log_metrics=True,
+                )
+                for lane in range(concurrency)
+            )
+            if len({request.input_ids for request in requests}) != concurrency:
+                raise OlmoeEpBenchmarkError(
+                    f"{kind} C{concurrency} prompts are not distinct"
+                )
+            warmups: list[JsonValue] = []
+            samples: list[JsonValue] = []
+            for phase, count, destination in (
+                ("warmup", CANONICAL_WARMUP_COUNT, warmups),
+                ("sample", CANONICAL_SAMPLE_COUNT, samples),
+            ):
+                for ordinal in range(1, count + 1):
+                    group, observations = await _run_concurrency_group(
+                        administrative_client,
+                        lane_clients,
+                        requests,
+                        kind=kind,
+                        phase=cast(Literal["warmup", "sample"], phase),
+                        ordinal=ordinal,
+                        barrier_timeout_seconds=request_timeout_seconds,
+                        assert_after_phase=assert_after_phase,
+                        cancellation_checkpoint=cancellation_checkpoint,
+                    )
+                    group["determinism"] = _verify_concurrency_determinism(
+                        kind=kind,
+                        requests=requests,
+                        observations=observations,
+                        references=references,
+                    )
+                    destination.append(group)
+            sample_aggregates = [
+                cast(dict[str, object], cast(dict[str, object], sample)["aggregate"])
+                for sample in samples
+            ]
+            concurrency_results.append(
+                {
+                    "concurrency": concurrency,
+                    "request": {
+                        "input_token_count_per_lane": input_tokens,
+                        "input_ids_sha256_by_lane": [
+                            token_ids_sha256(request.input_ids) for request in requests
+                        ],
+                        "distinct_input_count": len(
+                            {request.input_ids for request in requests}
+                        ),
+                        "output_token_count_per_lane": output_tokens,
+                        "sampling_seed": CANONICAL_SAMPLING_SEED,
+                        "temperature": 0.0,
+                        "ignore_eos": True,
+                        "stream": True,
+                    },
+                    "warmup_count": CANONICAL_WARMUP_COUNT,
+                    "sample_count": CANONICAL_SAMPLE_COUNT,
+                    "warmups": warmups,
+                    "samples": samples,
+                    "summary": {
+                        "median_aggregate_decode_tokens_per_second": (
+                            statistics.median(
+                                cast(
+                                    float,
+                                    aggregate["aggregate_decode_tokens_per_second"],
+                                )
+                                for aggregate in sample_aggregates
+                            )
+                        ),
+                        "median_aggregate_end_to_end_output_tokens_per_second": (
+                            statistics.median(
+                                cast(
+                                    float,
+                                    aggregate[
+                                        "aggregate_end_to_end_output_tokens_per_second"
+                                    ],
+                                )
+                                for aggregate in sample_aggregates
+                            )
+                        ),
+                        "median_group_wall_seconds": statistics.median(
+                            cast(float, aggregate["group_wall_seconds"])
+                            for aggregate in sample_aggregates
+                        ),
+                        "median_decode_envelope_seconds": statistics.median(
+                            cast(float, aggregate["decode_envelope_seconds"])
+                            for aggregate in sample_aggregates
+                        ),
+                    },
+                }
+            )
+        workloads.append(
+            {
+                "kind": kind,
+                "concurrency_levels": list(CONCURRENCY_LEVELS),
+                "lane_client_pool": {
+                    "size": len(lane_clients),
+                    "connection_policy": (
+                        "one_persistent_independent_http_client_per_lane"
+                    ),
+                    "execution_model": "cancellable_asyncio_tasks_without_executor_threads",
+                },
+                "results": concurrency_results,
+            }
+        )
+    return workloads
+
+
+async def _run_aggregate_concurrency_session(
+    base_url: str,
+    request_timeout_seconds: float,
+    assert_after_phase: Callable[[str], None],
+    cancellation_checkpoint: Callable[[], None],
+) -> list[JsonValue]:
+    async with contextlib.AsyncExitStack() as client_stack:
+        administrative_client = await client_stack.enter_async_context(
+            OlmoeNativeAsyncServingClient(
+                base_url, timeout_seconds=request_timeout_seconds
+            )
+        )
+        lane_clients = tuple(
+            [
+                await client_stack.enter_async_context(
+                    OlmoeNativeAsyncServingClient(
+                        base_url, timeout_seconds=request_timeout_seconds
+                    )
+                )
+                for _lane in range(OLMOE_CONCURRENCY_MAX_RUNNING_REQUESTS)
+            ]
+        )
+        return await _run_aggregate_concurrency_benchmark(
+            administrative_client,
+            lane_clients,
+            request_timeout_seconds,
+            assert_after_phase,
+            cancellation_checkpoint,
+        )
+
+
+def run_aggregate_concurrency_benchmark(
+    base_url: str,
+    request_timeout_seconds: float,
+    assert_after_phase: Callable[[str], None],
+    cancellation_checkpoint: Callable[[], None],
+) -> list[JsonValue]:
+    return asyncio.run(
+        _run_aggregate_concurrency_session(
+            base_url,
+            request_timeout_seconds,
+            assert_after_phase,
+            cancellation_checkpoint,
+        )
+    )
+
+
 def expert_parallel_semantics(expert_parallel_size: ExpertParallelSize) -> JsonObject:
     true_ep = expert_parallel_size == 2
     return {
@@ -3477,6 +4068,9 @@ def _configuration_receipt(
     config: OlmoeEpBenchmarkConfig,
     moe_config_snapshot: MoeConfigSnapshotAdmission | None = None,
 ) -> JsonObject:
+    max_total_tokens, max_running_requests, cuda_graph_max_batch_size = (
+        _server_capacity(config)
+    )
     receipt: JsonObject = {
         "host_name": "dwagon",
         "scope": "single_host",
@@ -3500,8 +4094,13 @@ def _configuration_receipt(
         "static_memory_fraction": config.static_memory_fraction,
         "token_pool": {
             "context_length": OLMOE_CONTEXT_LENGTH,
-            "max_total_tokens": OLMOE_MAX_TOTAL_TOKENS,
-            "max_running_requests": 1,
+            "max_total_tokens": max_total_tokens,
+            "max_running_requests": max_running_requests,
+            **(
+                {"cuda_graph_max_batch_size": cuda_graph_max_batch_size}
+                if cuda_graph_max_batch_size is not None
+                else {}
+            ),
         },
         "tensor_parallel_collective": {
             "custom_all_reduce": False,
@@ -3510,6 +4109,11 @@ def _configuration_receipt(
         },
         "warmup_count": CANONICAL_WARMUP_COUNT,
         "sample_count": CANONICAL_SAMPLE_COUNT,
+        **(
+            {"benchmark_mode": "aggregate_concurrency"}
+            if config.aggregate_concurrency
+            else {}
+        ),
         "expert_parallel_semantics": expert_parallel_semantics(
             config.expert_parallel_size
         ),
@@ -3650,17 +4254,24 @@ def _run_benchmark_under_cpu_policy(config: OlmoeEpBenchmarkConfig) -> JsonObjec
         try:
             running = start_server(config, owner_token, namespace, moe_config_snapshot)
             signal_state.checkpoint()
+            base_url = f"http://{config.host}:{config.port}"
             with OlmoeNativeServingClient(
-                f"http://{config.host}:{config.port}",
+                base_url,
                 timeout_seconds=config.request_timeout_seconds,
             ) as client:
                 readiness = _wait_for_readiness(
                     running, client, config.readiness_timeout_seconds
                 )
+                max_total_tokens, max_running_requests, cuda_graph_max_batch_size = (
+                    _server_capacity(config)
+                )
                 server_log_contract = verify_server_log_contract(
                     Path(running.owned.log_path),
                     config.expert_parallel_size,
                     moe_config_snapshot,
+                    max_total_tokens=max_total_tokens,
+                    max_running_requests=max_running_requests,
+                    cuda_graph_max_batch_size=cuda_graph_max_batch_size,
                 )
                 listener_ownership.append(verify_listener_owned(running, config.port))
                 signal_state.checkpoint()
@@ -3677,24 +4288,38 @@ def _run_benchmark_under_cpu_policy(config: OlmoeEpBenchmarkConfig) -> JsonObjec
                 sanity = _run_exact_sanity(client, oracle)
                 assert_server_alive(running, "deterministic sanity")
                 signal_state.checkpoint()
-                for raw_kind, input_tokens, output_tokens in CANONICAL_WORKLOADS:
-                    kind = cast(Literal["prefill", "decode"], raw_kind)
-                    workloads.append(
-                        run_canonical_workload(
-                            client,
-                            kind,
-                            input_tokens,
-                            output_tokens,
+                if config.aggregate_concurrency:
+                    workloads.extend(
+                        run_aggregate_concurrency_benchmark(
+                            base_url,
+                            config.request_timeout_seconds,
                             lambda phase: assert_server_alive(running, phase),
+                            signal_state.checkpoint,
                         )
                     )
                     signal_state.checkpoint()
+                else:
+                    for raw_kind, input_tokens, output_tokens in CANONICAL_WORKLOADS:
+                        kind = cast(Literal["prefill", "decode"], raw_kind)
+                        workloads.append(
+                            run_canonical_workload(
+                                client,
+                                kind,
+                                input_tokens,
+                                output_tokens,
+                                lambda phase: assert_server_alive(running, phase),
+                            )
+                        )
+                        signal_state.checkpoint()
                 rank_local_numa.append(verify_rank_local_numa(running))
                 if moe_config_snapshot is not None:
                     server_log_contract = verify_server_log_contract(
                         Path(running.owned.log_path),
                         config.expert_parallel_size,
                         moe_config_snapshot,
+                        max_total_tokens=max_total_tokens,
+                        max_running_requests=max_running_requests,
+                        cuda_graph_max_batch_size=cuda_graph_max_batch_size,
                     )
         except BaseException as error:
             failure = error
@@ -4367,6 +4992,14 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="capture one receipt-backed logit probe without timed workloads",
     )
+    parser.add_argument(
+        "--aggregate-concurrency",
+        action="store_true",
+        help=(
+            "run synchronized C=1,2,4,8 aggregate-throughput groups with an "
+            "isolated 9216-token/8-request server capacity"
+        ),
+    )
     return parser
 
 
@@ -4394,8 +5027,13 @@ def config_from_arguments(arguments: argparse.Namespace) -> OlmoeEpBenchmarkConf
     stage_capture_output = cast(Path | None, arguments.stage_capture_output)
     moe_config_root = cast(Path | None, arguments.moe_config_root)
     logit_parity_probe = cast(bool, arguments.logit_parity_probe)
+    aggregate_concurrency = cast(bool, arguments.aggregate_concurrency)
     if logit_parity_probe and stage_capture_output is None:
         raise OlmoeEpBenchmarkError("logit parity probe requires managed stage capture")
+    if aggregate_concurrency and stage_capture_output is not None:
+        raise OlmoeEpBenchmarkError(
+            "aggregate concurrency is available only with a trusted stage contract"
+        )
     if stage_contract is not None and (
         not stage_contract.is_absolute() or ".." in stage_contract.parts
     ):
@@ -4459,6 +5097,7 @@ def config_from_arguments(arguments: argparse.Namespace) -> OlmoeEpBenchmarkConf
         ),
         logit_parity_probe=logit_parity_probe,
         moe_config_root=moe_config_root,
+        aggregate_concurrency=aggregate_concurrency,
     )
 
 
