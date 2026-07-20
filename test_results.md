@@ -19,6 +19,7 @@ Rows without a decode measurement follow the decoded rows for that model.
 | Ornith-1.0-397B | `bench_internal_agent_prefill_4x20000_1.jsonl#rows-1-3` | same; four concurrent requests | 1,066.393 / 1,061.920 / 996.876 | - | **IMPORTED HISTORICAL** |
 | Ornith-1.0-397B | `bench_internal_agent_prefill_4x20000_1.jsonl#rows-4-6` | same; four concurrent requests | 80.551 / 135.626 / 184.006 | - | **IMPORTED HISTORICAL, DEGRADED**; zero-TTFT anomaly |
 | GLM-4.7 Flash 30B-A3B | `tp2-glm47flash-20260719-v1` | dwagon 1x RTX 3090 + fwuff 1x RTX 3090; MLX/NCCL TP2; dual QDR | 45.31 | 19.57 | **PASS (diagnostic)**; exact TP1 equality; not a controlled performance comparison |
+| GLM-4.7 Flash 30B-A3B | `glm47-pp2-local-dwagon-20260720-v9` | dwagon; PP2/TP1; 23/24 split; 2x RTX 3090 over NV4; full 56/56 cores; E44; CPU performance policy | 6.752822778* | 8.150791955 | **PASS (diagnostic)**; best reproducible native hybrid result, 4.12% above E40 V7 |
 | GLM-4.7 Flash 30B-A3B | `glm47-pp2-local-dwagon-20260719-v3` | dwagon; PP2/TP1; 23/24 split; 2x RTX 3090 over NV4; full 56/56 cores; E40 | 5.420292914* | 7.928729814 | **PASS (diagnostic)**; historical best, nearly reproduced by V7 under CPU performance policy |
 | GLM-4.7 Flash 30B-A3B | `glm47-pp2-local-dwagon-20260720-v7` | dwagon; PP2/TP1; 23/24 split; 2x RTX 3090 over NV4; full 56/56 cores; E40; CPU performance policy | 6.444521018* | 7.828144167 | **PASS (diagnostic)**; controlled V6 A/B gained 17.9% decode with no throttling |
 | GLM-4.7 Flash 30B-A3B | `glm47-pp2-local-dwagon-20260720-v8` | dwagon; PP2/TP1; 24/23 split; 2x RTX 3090 over NV4; full 56/56 cores; E40; CPU performance policy | 6.393873350* | 7.768722947 | **PASS (diagnostic)**; reverse-placement A/B was 0.76% slower than V7 |
@@ -73,17 +74,19 @@ exact measurement survived.
   overlay and model contract listed below.
 - Completed ladder rungs: Llama 3.2 1B, Llama 3.2 3B, Llama 3.1 8B,
   GPT-OSS 20B, and GLM-4.7 Flash.
-- Latest GLM engineering result: local PP2 v8 reversed V7's layer partition to
-  24/23 while retaining the head-patched E40 runtime and CPU performance
-  policy. It reached 7.768722947 decode and 6.393873350 prefill-heavy output
-  tok/s, 0.759% and 0.786% below V7, respectively, so 23/24 remains the better
-  placement. V7's controlled CPU-policy A/B remains the important gain:
-  17.912% decode and 15.512% prefill-heavy output over V6. V8 drew
-  321.0/318.1 W during decode under the 330 W package limits, peaked at 86/79 C,
-  accumulated no hardware throttle counts, restored all CPU policies, and
-  released both GPUs. V5's E42 result still shows residency is not a monotonic
-  batch-one optimization. All local PP2 results remain diagnostic while NCCL
-  INFO and phase telemetry are enabled.
+- Latest GLM engineering result: local PP2 v9 retained the proven 23/24
+  placement and CPU performance policy, raised GPU-resident experts from E40
+  to E44, and used the head-patched runtime at the bounded 0.95 memory
+  fraction. It reached 8.150791955 decode and 6.752822778 prefill-heavy output
+  tok/s, gains of 4.122% and 4.784% over V7 and the best reproducible native
+  hybrid result so far. Decode samples were tightly grouped at 8.114-8.153
+  tok/s. Package power averaged 312.6/326.1 W during decode under 330 W PL1,
+  temperatures peaked at 71/79 C, hardware throttle counts stayed at zero,
+  all CPU policies were restored, and both GPUs were released. V8 established
+  that reversing the partition costs about 0.76%, while V5 still shows that
+  residency is not universally monotonic across policy/runtime states. All
+  local PP2 results remain diagnostic while NCCL INFO and phase telemetry are
+  enabled.
 - Latest controlled proof result remains GLM-4.7 Flash MLX/NCCL TP=2: exact
   TP1 output equality, two-rank NCCL initialization, payload on both QDR rails,
   clean HCA health counters, instance deletion, process cleanup, and resource
@@ -247,6 +250,7 @@ performance claim.
 | GLM-4.7 Flash local PP2 v6 | **PASS (diagnostic)** | `/var/lib/exo/benchmarks/glm47-pp2-local-dwagon-20260720-v6`; the exact SGLang `7fea5820` runtime omitted the 605 MiB LM head from non-final rank 0, retained E40 and the 23/24 split, passed exact `EXO_SANITY_OK`, reached 5.579114192 prefill-heavy output tok/s and 6.638956221 decode tok/s, and cleaned up completely. All eight non-polling telemetry boundaries were complete; the three decode samples were 6.634080338/6.645821799/6.638956221 tok/s, CPU package temperatures peaked at 78/82 C, GPU clocks held 1695 MHz, and post-run hardware throttle counters were zero. Result SHA `39079b44d2bbcf70efd29b8464eb39e827d40950b0d7ecfdbc894789bfb5c2cf`. |
 | GLM-4.7 Flash local PP2 v7 | **PASS (diagnostic)** | `/var/lib/exo/benchmarks/glm47-pp2-local-dwagon-20260720-v7`; an identical V6 A/B temporarily selected the `performance` governor/EPP across all online CPU policies and restored the verified original state on shell exit. Exact sanity passed; 6.444521018 prefill-heavy output tok/s and 7.828144167 decode tok/s improved 15.512% and 17.912%, respectively. Decode samples were 7.806325808/7.866586537/7.828144167 tok/s, decode package power averaged 318.8/323.1 W under 330 W PL1, temperatures peaked at 72/79 C, throttle counters remained zero, and cleanup was complete. Result SHA `876ceae85e57feac3a2aa3c6cd9da693671ff69324b6b08031be8b60bd9b02ae`. |
 | GLM-4.7 Flash local PP2 v8 | **PASS (diagnostic)** | `/var/lib/exo/benchmarks/glm47-pp2-local-dwagon-20260720-v8`; V7's controlled placement A/B reversed only the partition to 24/23. Exact sanity passed; 6.393873350 prefill-heavy output tok/s and 7.768722947 decode tok/s were 0.786% and 0.759% below V7. Decode samples were 7.810123418/7.768722947/7.674028049 tok/s, decode package power averaged 321.0/318.1 W under 330 W PL1, temperatures peaked at 86/79 C, throttle counters remained zero, all CPU policies were restored, both GPUs released to 1 MiB, and cleanup was complete. Receipt content SHA `a26104bbaa02961abbf8fe2ec1db3499cfda35051891d00f23d39217304b3126`; file SHA `4d0b06a2ec01318672dc7025782bacd4cec15a89374b5d9b318ad39af26754b8`. |
+| GLM-4.7 Flash local PP2 v9 | **PASS (diagnostic)** | `/var/lib/exo/benchmarks/glm47-pp2-local-dwagon-20260720-v9`; the head-patched 23/24 runtime raised residency to E44 at the bounded 0.95 memory fraction under the CPU performance policy. Exact sanity passed; 6.752822778 prefill-heavy output tok/s and 8.150791955 decode tok/s improved 4.784% and 4.122% over E40 V7 and 2.801% over the historical V3 decode peak. Decode samples were 8.114369977/8.150791955/8.153355273 tok/s; decode package power averaged 312.6/326.1 W under 330 W PL1, temperatures peaked at 71/79 C, hardware throttle counts remained zero, all CPU policies restored, both GPUs released to 1 MiB, and cleanup was complete. Receipt content SHA `07f54c889e14095646883c60e29c34ec66b1898bcabff18ccb21a2d4fb47a524`; file SHA `4396e91da879ab4fe952b7618cd04d633de863cb561b301703d6708e77ecfd38`. |
 | GLM-4.7 Flash PP3 v1 | **EXPECTED FAIL (setup)** | `/var/lib/exo/benchmarks/glm47-pp3-diagnostic-dwagon-fwuff-20260720-v1`; Gloo resolved an IPv6 dwagon endpoint against IPv4 fwuff and failed before model load. Per-host `GLOO_SOCKET_IFNAME` and `NCCL_SOCKET_IFNAME` fixed the family mismatch in place; cleanup passed. Result SHA `5003b64ee47c6a7bd0f9522ac9a0ff0944cd4903c9352862b7ae90aeba68f2`. |
 | GLM-4.7 Flash PP3 v2 | **ENGINEERING ONLY** | `/var/lib/exo/benchmarks/glm47-pp3-diagnostic-dwagon-fwuff-20260720-v2`; exact semantic sanity and all workloads completed at 5.219545197 prefill-heavy output tok/s and 6.213798282 decode tok/s. A child-environment cleanup assumption caused a false-negative receipt after all processes were gone. Result SHA `ce2e6ce4dc5e0917ad4b27e208acbc1f1a247e46584e7d056a0d58f92fbb550f`. |
 | GLM-4.7 Flash PP3 v3 | **PASS (diagnostic)** | `/var/lib/exo/benchmarks/glm47-pp3-diagnostic-dwagon-fwuff-20260720-v3`; exact `EXO_SANITY_OK`, 5.766342756 prefill-heavy output tok/s, 6.290703294 decode tok/s, balanced 27,223,772/27,217,344-byte dual-rail payload, zero HCA health deltas, and three ownership-verified unforced rank cleanups. Result SHA `4b8399bd2b94307e7fffd41c6461ef99c83530b41b870dfce33d767c9d52d0e5`. |
