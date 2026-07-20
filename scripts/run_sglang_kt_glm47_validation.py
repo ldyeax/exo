@@ -161,12 +161,15 @@ _REQUIRED_AMX_FEATURES = frozenset(
     {"amx_bf16", "amx_int8", "amx_tile", "avx512_bf16", "avx512f"}
 )
 _ORCHESTRATOR_SCRIPT_PATHS = (
+    Path("scripts/benchmark_host_guard.py"),
     Path("scripts/benchmark_lease.py"),
     Path("scripts/build_sglang_kt_runtime.py"),
     Path("scripts/create_sglang_kt_glm47_validation_process_spec.py"),
     Path("scripts/prepare_sglang_kt_source.py"),
+    Path("scripts/run_sglang_kt_glm47_serving_benchmark.py"),
     Path("scripts/run_sglang_kt_glm47_validation.py"),
     Path("scripts/sglang_kt_glm47_live.py"),
+    Path("scripts/sglang_kt_glm47_serving_client.py"),
     Path("scripts/validate_sglang_kt_runtime.py"),
 )
 MODEL_CONTRACT_RELATIVE_PATH = (
@@ -1797,7 +1800,11 @@ def collect_local_hca_evidence(
     return evidence
 
 
-def collect_live_preflight(config: ValidationConfig) -> JsonObject:
+def collect_live_preflight(
+    config: ValidationConfig,
+    *,
+    gpu_probe: Callable[[Sequence[str], str], str] = _run_probe,
+) -> JsonObject:
     verify_runtime_python(config.runtime_python)
     _verify_artifact(config.build_receipt, "build receipt")
     _verify_artifact(config.model_contract, "model contract")
@@ -1838,7 +1845,7 @@ def collect_live_preflight(config: ValidationConfig) -> JsonObject:
         for features in feature_lines
     ):
         raise Glm47HarnessError("required AMX-BF16 CPU features are unavailable")
-    gpu_rows = _run_probe(
+    gpu_rows = gpu_probe(
         (
             "/usr/bin/nvidia-smi",
             "--query-gpu=uuid,pci.bus_id",
@@ -1860,7 +1867,7 @@ def collect_live_preflight(config: ValidationConfig) -> JsonObject:
         raise Glm47HarnessError(
             "configured GPU UUID/PCI identity was not found exactly once"
         )
-    compute_rows = _run_probe(
+    compute_rows = gpu_probe(
         (
             "/usr/bin/nvidia-smi",
             "--query-compute-apps=pid,gpu_uuid",
@@ -3267,6 +3274,36 @@ def run_validation(
         replace=False,
     )
     return result
+
+
+# Public support surface for sibling immutable benchmark harnesses.  These
+# aliases keep ownership, cgroup, and lease semantics centralized.
+SHA256_PATTERN = _SHA256
+lexical_absolute_path = _lexical_absolute_path
+systemd_unit_name = _systemd_unit_name
+parse_command_json = _parse_command_json
+require_success = _require_success
+verify_artifact = _verify_artifact
+require_single_threaded_harness = _require_single_threaded_harness
+open_owned_cgroup_control = _open_owned_cgroup_control
+enter_owned_cgroup = _enter_owned_cgroup
+process_identity = _process_identity
+terminate_owned_group = _terminate_owned_group
+signal_owned_group = _signal_owned_group
+reap_adopted_children = _reap_adopted_children
+live_group_ownership = _live_group_ownership
+owned_token_processes = _owned_token_processes
+read_json_regular = _read_json_regular
+json_object = _json_object
+config_sha256 = _config_sha256
+enable_child_subreaper = _enable_child_subreaper
+create_owned_cgroup = _create_owned_cgroup
+owned_cgroup_evidence = _owned_cgroup_evidence
+create_scratch = _create_scratch
+process_stat_fields = _process_stat_fields
+validate_metadata = _validate_metadata
+systemd_benchmark_argv = _systemd_benchmark_argv
+write_new_json = _write_new_json
 
 
 class RunArguments(argparse.Namespace):

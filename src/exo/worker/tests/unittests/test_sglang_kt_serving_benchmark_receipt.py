@@ -22,9 +22,11 @@ from exo.worker.sglang_kt.serving_benchmark_receipt import (
     SglangKtServingAdmissionBinding,
     SglangKtServingCleanupEvidence,
     SglangKtServingClientIdentity,
+    SglangKtServingCoordinationGuardEvidence,
     SglangKtServingFileIdentity,
     SglangKtServingInvocationEvidence,
     SglangKtServingJitCacheEvidence,
+    SglangKtServingModelFilesystemEvidence,
     SglangKtServingModelIdentity,
     SglangKtServingOwnedServerProcessIdentity,
     SglangKtServingProcessSpecIdentity,
@@ -42,6 +44,7 @@ from exo.worker.sglang_kt.serving_benchmark_receipt import (
     SglangKtWarmServingRunReceiptError,
     WarmServingRunReceiptV1,
     calculate_sglang_kt_length_finish_reason_sha256,
+    calculate_sglang_kt_serving_coordination_guard_evidence_sha256,
     calculate_sglang_kt_serving_source_bundle_sha256,
     calculate_sglang_kt_warm_serving_run_identity_sha256,
     canonicalize_sglang_kt_warm_serving_run_receipt,
@@ -90,15 +93,18 @@ def _identity() -> SglangKtWarmServingRunIdentity:
         runtime=SglangKtServingRuntimeIdentity(
             executable="/runtime/bin/python",
             runtime_build_receipt=_file("/receipts/build.json", "4"),
-            runtime_build_id="5" * 64,
+            numactl_executable=_file("/usr/bin/numactl", "5"),
+            nvidia_smi_executable=_file("/usr/bin/nvidia-smi", "6"),
+            systemctl_executable=_file("/usr/bin/systemctl", "7"),
+            runtime_build_id="8" * 64,
             python_version="3.12.11",
             torch_version="2.9.1+cu128",
             cuda_version="12.8",
             sglang_revision=GLM_4_7_FLASH_SGLANG_REVISION,
             ktransformers_revision=GLM_4_7_FLASH_KTRANSFORMERS_REVISION,
-            sgl_kernel_build_id="6" * 64,
-            deep_gemm_build_id="7" * 64,
-            kt_kernel_build_id="8" * 64,
+            sgl_kernel_build_id="a" * 64,
+            deep_gemm_build_id="b" * 64,
+            kt_kernel_build_id="c" * 64,
         ),
         model=SglangKtServingModelIdentity(
             model_id=ModelId("zai-org/GLM-4.7-Flash"),
@@ -236,6 +242,66 @@ def _workload(kind: ServingWorkloadKind) -> SglangKtServingWorkloadEvidence:
     )
 
 
+def _coordination_guard() -> SglangKtServingCoordinationGuardEvidence:
+    config_sha256 = "8" * 64
+    binding_sha256 = "9" * 64
+    preflight: dict[str, object] = {
+        "phase": "preflight",
+        "binding_sha256": binding_sha256,
+        "config_sha256": config_sha256,
+        "snapshot_sha256": "a" * 64,
+    }
+    postflight: dict[str, object] = {
+        "phase": "postflight",
+        "binding_sha256": binding_sha256,
+        "config_sha256": config_sha256,
+        "snapshot_sha256": "b" * 64,
+    }
+    comparison: dict[str, object] = {
+        "stable": True,
+        "failures": [],
+        "binding_sha256": binding_sha256,
+        "config_sha256": config_sha256,
+        "preflight_snapshot_sha256": "a" * 64,
+        "postflight_snapshot_sha256": "b" * 64,
+    }
+    local_preflight: dict[str, object] = {"device": "mlx5_0", "marker": 1}
+    local_postflight: dict[str, object] = {"device": "mlx5_0", "marker": 2}
+    filesystem = SglangKtServingModelFilesystemEvidence(
+        model_path=MODEL_PATH,
+        mount_point="/mnt",
+        mount_source="/dev/nvme0n1p3",
+        filesystem_type="xfs",
+        device_major=259,
+        device_minor=3,
+        local_block_filesystem=True,
+    )
+    evidence_sha256 = calculate_sglang_kt_serving_coordination_guard_evidence_sha256(
+        host_guard_config_sha256=config_sha256,
+        peer_binding_sha256=binding_sha256,
+        remote_preflight=preflight,
+        remote_postflight=postflight,
+        comparison=comparison,
+        local_hca_preflight=local_preflight,
+        local_hca_postflight=local_postflight,
+        model_filesystem=filesystem,
+    )
+    return SglangKtServingCoordinationGuardEvidence(
+        peer_role="idle_nonparticipant",
+        host_guard_config_sha256=config_sha256,
+        peer_binding_sha256=binding_sha256,
+        remote_preflight=preflight,
+        remote_postflight=postflight,
+        comparison=comparison,
+        local_hca_preflight=local_preflight,
+        local_hca_postflight=local_postflight,
+        model_filesystem=filesystem,
+        remote_peer_unchanged=True,
+        cross_host_fabric_validated=True,
+        evidence_sha256=evidence_sha256,
+    )
+
+
 def _receipt() -> WarmServingRunReceiptV1:
     identity = _identity()
     return WarmServingRunReceiptV1(
@@ -248,6 +314,7 @@ def _receipt() -> WarmServingRunReceiptV1:
         instrumentation="none",
         radix_cache_disabled=True,
         max_concurrent_requests=1,
+        measurement_sha256="d" * 64,
         identity_sha256=calculate_sglang_kt_warm_serving_run_identity_sha256(identity),
         identity=identity,
         setup=SglangKtServingSetupEvidence(
@@ -265,13 +332,17 @@ def _receipt() -> WarmServingRunReceiptV1:
             after_measurement_manifest_sha256="7" * 64,
         ),
         workloads=(_workload("prefill"), _workload("decode")),
+        coordination_guard=_coordination_guard(),
         cleanup=SglangKtServingCleanupEvidence(
+            lease_id="a" * 32,
             benchmark_completed_normally=True,
             server_process=SglangKtServingOwnedServerProcessIdentity(
                 pid=12_345,
                 proc_start_time_ticks=987_654,
                 executable=identity.runtime.executable,
                 argv_sha256="c" * 64,
+                cpu_affinity=identity.process_spec.cpu_cores,
+                memory_nodes=identity.process_spec.memory_nodes,
             ),
             termination_signal="SIGTERM",
             server_return_code=-15,
@@ -328,6 +399,34 @@ def test_canonical_receipt_round_trips_and_loads(tmp_path: Path) -> None:
 def test_receipt_rejects_debug_instrumentation_as_performance() -> None:
     payload = _payload()
     payload["instrumentation"] = "debug_timing"
+    with pytest.raises(SglangKtWarmServingRunReceiptError):
+        canonicalize_sglang_kt_warm_serving_run_receipt(payload)
+
+
+def test_performance_receipt_requires_coordination_guard_evidence() -> None:
+    payload = _payload()
+    payload["coordination_guard"] = None
+    with pytest.raises(SglangKtWarmServingRunReceiptError):
+        canonicalize_sglang_kt_warm_serving_run_receipt(payload)
+
+
+@pytest.mark.parametrize(
+    ("section", "field", "value"),
+    [
+        ("comparison", "stable", False),
+        ("comparison", "failures", ["peer changed"]),
+        ("remote_postflight", "binding_sha256", "f" * 64),
+        ("remote_postflight", "config_sha256", "f" * 64),
+        ("coordination_guard", "evidence_sha256", "f" * 64),
+    ],
+)
+def test_receipt_rejects_changed_coordination_guard_evidence(
+    section: str, field: str, value: JsonValue
+) -> None:
+    payload = _payload()
+    guard = _object(payload, "coordination_guard")
+    target = guard if section == "coordination_guard" else _object(guard, section)
+    target[field] = value
     with pytest.raises(SglangKtWarmServingRunReceiptError):
         canonicalize_sglang_kt_warm_serving_run_receipt(payload)
 

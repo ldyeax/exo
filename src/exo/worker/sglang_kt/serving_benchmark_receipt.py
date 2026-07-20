@@ -4,7 +4,7 @@ import os
 import re
 from datetime import datetime
 from pathlib import Path, PurePosixPath
-from typing import Annotated, Literal, final
+from typing import Annotated, Literal, TypeAlias, cast, final
 
 from pydantic import (
     BaseModel,
@@ -83,10 +83,14 @@ _GIT_COMMIT_PATTERN = re.compile(r"[0-9a-f]{40}")
 
 NonemptyText = Annotated[str, StringConstraints(min_length=1)]
 Sha256Digest = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
+LeaseId = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{32}$")]
 NonnegativeFiniteFloat = Annotated[float, Field(ge=0.0)]
 PositiveFiniteFloat = Annotated[float, Field(gt=0.0)]
 TokenId = Annotated[int, Field(ge=0, lt=154_880)]
 ServingWorkloadKind = Literal["prefill", "decode"]
+JsonScalar: TypeAlias = str | int | float | bool | None
+JsonValue: TypeAlias = JsonScalar | list["JsonValue"] | dict[str, "JsonValue"]
+JsonObject: TypeAlias = dict[str, JsonValue]
 
 
 class SglangKtWarmServingRunReceiptError(ValueError):
@@ -190,6 +194,9 @@ class SglangKtServingAdmissionBinding(_StrictModel):
 class SglangKtServingRuntimeIdentity(_StrictModel):
     executable: AbsoluteRuntimePath
     runtime_build_receipt: SglangKtServingFileIdentity
+    numactl_executable: SglangKtServingFileIdentity
+    nvidia_smi_executable: SglangKtServingFileIdentity
+    systemctl_executable: SglangKtServingFileIdentity
     runtime_build_id: Sha256Digest
     python_version: NonemptyText
     torch_version: NonemptyText
@@ -212,6 +219,13 @@ class SglangKtServingRuntimeIdentity(_StrictModel):
             or self.ktransformers_revision != GLM_4_7_FLASH_KTRANSFORMERS_REVISION
         ):
             raise ValueError("serving runtime source revisions are not pinned")
+        tool_paths = (
+            self.numactl_executable.path,
+            self.nvidia_smi_executable.path,
+            self.systemctl_executable.path,
+        )
+        if len(set(tool_paths)) != 3:
+            raise ValueError("serving host-tool paths must be distinct")
         return self
 
 
@@ -717,15 +731,176 @@ class SglangKtServingOwnedServerProcessIdentity(_StrictModel):
     proc_start_time_ticks: PositiveInt
     executable: AbsoluteRuntimePath
     argv_sha256: Sha256Digest
+    cpu_affinity: tuple[ResourceIndex, ...]
+    memory_nodes: tuple[ResourceIndex, ...]
 
     @field_validator("executable")
     @classmethod
     def validate_executable(cls, value: str) -> str:
         return _validate_absolute_normalized_path(value)
 
+    @model_validator(mode="after")
+    def validate_placement(self) -> "SglangKtServingOwnedServerProcessIdentity":
+        if (
+            not self.cpu_affinity
+            or self.cpu_affinity != tuple(sorted(set(self.cpu_affinity)))
+            or not self.memory_nodes
+            or self.memory_nodes != tuple(sorted(set(self.memory_nodes)))
+        ):
+            raise ValueError("owned server placement evidence is not canonical")
+        return self
+
+
+@final
+class SglangKtServingModelFilesystemEvidence(_StrictModel):
+    model_path: AbsoluteRuntimePath
+    mount_point: str
+    mount_source: AbsoluteRuntimePath
+    filesystem_type: Literal["xfs", "ext4", "btrfs"]
+    device_major: int = Field(ge=0)
+    device_minor: int = Field(ge=0)
+    local_block_filesystem: Literal[True]
+
+    @field_validator("model_path", "mount_source")
+    @classmethod
+    def validate_path(cls, value: str) -> str:
+        return _validate_absolute_normalized_path(value)
+
+    @field_validator("mount_point")
+    @classmethod
+    def validate_mount_point(cls, value: str) -> str:
+        if value == "/":
+            return value
+        return _validate_absolute_normalized_path(value)
+
+    @model_validator(mode="after")
+    def validate_mount(self) -> "SglangKtServingModelFilesystemEvidence":
+        model_path = PurePosixPath(self.model_path)
+        mount_point = PurePosixPath(self.mount_point)
+        if mount_point != model_path and mount_point not in model_path.parents:
+            raise ValueError("model path is outside its bound local mount")
+        if not self.mount_source.startswith("/dev/"):
+            raise ValueError("model mount source is not a local block device")
+        return self
+
+
+def _coordination_guard_evidence_payload(
+    *,
+    host_guard_config_sha256: str,
+    peer_binding_sha256: str,
+    remote_preflight: dict[str, object],
+    remote_postflight: dict[str, object],
+    comparison: dict[str, object],
+    local_hca_preflight: dict[str, object],
+    local_hca_postflight: dict[str, object],
+    model_filesystem: SglangKtServingModelFilesystemEvidence,
+) -> JsonObject:
+    return cast(
+        JsonObject,
+        cast(
+            object,
+            {
+                "host_guard_config_sha256": host_guard_config_sha256,
+                "peer_binding_sha256": peer_binding_sha256,
+                "local_hca_postflight": local_hca_postflight,
+                "local_hca_preflight": local_hca_preflight,
+                "model_filesystem": cast(
+                    JsonObject, cast(object, model_filesystem.model_dump(mode="json"))
+                ),
+                "peer_role": "idle_nonparticipant",
+                "remote_peer_unchanged": True,
+                "remote_postflight": remote_postflight,
+                "remote_preflight": remote_preflight,
+                "comparison": comparison,
+                "cross_host_fabric_validated": True,
+            },
+        ),
+    )
+
+
+def calculate_sglang_kt_serving_coordination_guard_evidence_sha256(
+    *,
+    host_guard_config_sha256: str,
+    peer_binding_sha256: str,
+    remote_preflight: dict[str, object],
+    remote_postflight: dict[str, object],
+    comparison: dict[str, object],
+    local_hca_preflight: dict[str, object],
+    local_hca_postflight: dict[str, object],
+    model_filesystem: SglangKtServingModelFilesystemEvidence,
+) -> str:
+    """Bind the complete peer, fabric, and local-storage evidence bundle."""
+
+    return hashlib.sha256(
+        canonical_sglang_kt_json(
+            _coordination_guard_evidence_payload(
+                host_guard_config_sha256=host_guard_config_sha256,
+                peer_binding_sha256=peer_binding_sha256,
+                remote_preflight=remote_preflight,
+                remote_postflight=remote_postflight,
+                comparison=comparison,
+                local_hca_preflight=local_hca_preflight,
+                local_hca_postflight=local_hca_postflight,
+                model_filesystem=model_filesystem,
+            )
+        )
+    ).hexdigest()
+
+
+@final
+class SglangKtServingCoordinationGuardEvidence(_StrictModel):
+    peer_role: Literal["idle_nonparticipant"]
+    host_guard_config_sha256: Sha256Digest
+    peer_binding_sha256: Sha256Digest
+    remote_preflight: dict[str, object]
+    remote_postflight: dict[str, object]
+    comparison: dict[str, object]
+    local_hca_preflight: dict[str, object]
+    local_hca_postflight: dict[str, object]
+    model_filesystem: SglangKtServingModelFilesystemEvidence
+    remote_peer_unchanged: Literal[True]
+    cross_host_fabric_validated: Literal[True]
+    evidence_sha256: Sha256Digest
+
+    @model_validator(mode="after")
+    def validate_complete_evidence(self) -> "SglangKtServingCoordinationGuardEvidence":
+        preflight_digest = self.remote_preflight.get("snapshot_sha256")
+        postflight_digest = self.remote_postflight.get("snapshot_sha256")
+        if (
+            self.remote_preflight.get("phase") != "preflight"
+            or self.remote_postflight.get("phase") != "postflight"
+            or self.comparison.get("stable") is not True
+            or self.comparison.get("failures") != []
+            or self.comparison.get("preflight_snapshot_sha256") != preflight_digest
+            or self.comparison.get("postflight_snapshot_sha256") != postflight_digest
+            or self.remote_preflight.get("binding_sha256") != self.peer_binding_sha256
+            or self.remote_postflight.get("binding_sha256") != self.peer_binding_sha256
+            or self.remote_preflight.get("config_sha256")
+            != self.host_guard_config_sha256
+            or self.remote_postflight.get("config_sha256")
+            != self.host_guard_config_sha256
+            or self.comparison.get("binding_sha256") != self.peer_binding_sha256
+            or self.comparison.get("config_sha256") != self.host_guard_config_sha256
+        ):
+            raise ValueError("serving coordination guard evidence is not stable")
+        expected = calculate_sglang_kt_serving_coordination_guard_evidence_sha256(
+            host_guard_config_sha256=self.host_guard_config_sha256,
+            peer_binding_sha256=self.peer_binding_sha256,
+            remote_preflight=self.remote_preflight,
+            remote_postflight=self.remote_postflight,
+            comparison=self.comparison,
+            local_hca_preflight=self.local_hca_preflight,
+            local_hca_postflight=self.local_hca_postflight,
+            model_filesystem=self.model_filesystem,
+        )
+        if self.evidence_sha256 != expected:
+            raise ValueError("serving coordination guard evidence digest changed")
+        return self
+
 
 @final
 class SglangKtServingCleanupEvidence(_StrictModel):
+    lease_id: LeaseId
     benchmark_completed_normally: Literal[True]
     server_process: SglangKtServingOwnedServerProcessIdentity
     termination_signal: Literal["SIGTERM"]
@@ -766,11 +941,13 @@ class WarmServingRunReceiptV1(_StrictModel):
     instrumentation: Literal["none", "debug_timing"]
     radix_cache_disabled: Literal[True]
     max_concurrent_requests: Literal[1]
+    measurement_sha256: Sha256Digest | None
     identity_sha256: Sha256Digest
     identity: SglangKtWarmServingRunIdentity
     setup: SglangKtServingSetupEvidence
     jit_cache: SglangKtServingJitCacheEvidence
     workloads: tuple[SglangKtServingWorkloadEvidence, ...]
+    coordination_guard: SglangKtServingCoordinationGuardEvidence | None
     cleanup: SglangKtServingCleanupEvidence | None
 
     @field_validator("generated_at_utc")
@@ -789,8 +966,14 @@ class WarmServingRunReceiptV1(_StrictModel):
             raise ValueError("performance comparison flag contradicts evidence class")
         if self.evidence_class == "performance" and self.instrumentation != "none":
             raise ValueError("performance evidence cannot enable debug instrumentation")
-        if self.performance_comparable and self.cleanup is None:
-            raise ValueError("performance evidence requires completed cleanup")
+        if self.performance_comparable and (
+            self.cleanup is None
+            or self.coordination_guard is None
+            or self.measurement_sha256 is None
+        ):
+            raise ValueError(
+                "performance evidence requires cleanup and coordination guard proof"
+            )
         if tuple(workload.request.kind for workload in self.workloads) != (
             "prefill",
             "decode",
@@ -803,6 +986,10 @@ class WarmServingRunReceiptV1(_StrictModel):
                 != self.identity.runtime.executable
                 or self.cleanup.server_process.argv_sha256
                 != self.identity.process_spec.launch_argv_sha256
+                or self.cleanup.server_process.cpu_affinity
+                != self.identity.process_spec.cpu_cores
+                or self.cleanup.server_process.memory_nodes
+                != self.identity.process_spec.memory_nodes
                 or (self.cleanup.service_host, self.cleanup.service_port)
                 != (stage.host, stage.port)
                 or self.cleanup.gpu_uuid != stage.gpu_uuid
