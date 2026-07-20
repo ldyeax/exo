@@ -212,6 +212,64 @@ def test_prepares_exact_revisions_from_clean_bases_and_is_idempotent(
     )
 
 
+def test_applies_followup_patch_after_integrated_gitlink(tmp_path: Path) -> None:
+    fixture = make_source_fixture(tmp_path)
+    prepare_sglang_kt_source(fixture.ktransformers_source, fixture.plan)
+    gitlink_revision = fixture.plan.sglang_result_revision
+    run_git(fixture.sglang_source, "config", "user.name", GIT_NAME)
+    run_git(fixture.sglang_source, "config", "user.email", GIT_EMAIL)
+
+    module_path = fixture.sglang_source / "module.py"
+    module_path.write_text("WRAPPER_REGISTERED = True\nTP_QK_RMSNORM_SHARDED = True\n")
+    final_revision = commit_all(
+        fixture.sglang_source,
+        "fix: shard QK RMSNorm",
+        "2026-01-01T00:04:00+00:00",
+    )
+    followup_patch_path = tmp_path / "0003-sglang-followup.patch"
+    followup_patch_sha256 = write_mail_patch(
+        fixture.sglang_source,
+        final_revision,
+        followup_patch_path,
+    )
+    run_git(fixture.sglang_source, "checkout", "--detach", gitlink_revision)
+    run_git(fixture.sglang_source, "reflog", "expire", "--expire=now", "--all")
+    run_git(fixture.sglang_source, "gc", "--prune=now")
+
+    plan = replace(
+        fixture.plan,
+        sglang_result_revision=final_revision,
+        sglang_followup_patches=(
+            MailPatch(
+                path=followup_patch_path,
+                sha256=followup_patch_sha256,
+                committer_name=GIT_NAME,
+                committer_email=GIT_EMAIL,
+                base_revision=gitlink_revision,
+                result_revision=final_revision,
+            ),
+        ),
+        sglang_gitlink_revision=gitlink_revision,
+    )
+
+    receipt = prepare_sglang_kt_source(fixture.ktransformers_source, plan)
+    second_receipt = prepare_sglang_kt_source(fixture.ktransformers_source, plan)
+
+    assert receipt == second_receipt
+    assert receipt.sglang_revision == final_revision
+    assert run_git(fixture.sglang_source, "rev-parse", "HEAD") == final_revision
+    assert run_git(fixture.sglang_source, "status", "--porcelain=v1") == ""
+    assert (
+        run_git(fixture.ktransformers_source, "status", "--porcelain=v1")
+        == "M third_party/sglang"
+    )
+    assert tuple(Path(patch["path"]).name for patch in receipt.patches) == (
+        fixture.plan.sglang_patch.path.name,
+        followup_patch_path.name,
+        fixture.plan.ktransformers_patch.path.name,
+    )
+
+
 def test_reconstructs_uninitialized_submodule_from_integrated_parent(
     tmp_path: Path,
 ) -> None:

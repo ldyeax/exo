@@ -16,7 +16,8 @@ from typing import Self
 KTRANSFORMERS_BASE_REVISION = "8e46e5896c3d993a1285052f2618f5a9f01882d4"
 KTRANSFORMERS_RESULT_REVISION = "f9ca69648421f5774215c4da9cf711dccf54f49e"
 SGLANG_BASE_REVISION = "5d6bef9f61637aaeaf047bf8209def2af3eaa83f"
-SGLANG_RESULT_REVISION = "3721d710102456b6bf849122e781129dc3f7d9c6"
+SGLANG_GITLINK_REVISION = "3721d710102456b6bf849122e781129dc3f7d9c6"
+SGLANG_RESULT_REVISION = "da64717bb2e87f7ebc6e69768ba575c18454ab3c"
 SGLANG_SUBMODULE_PATH = Path("third_party/sglang")
 PATCH_DIRECTORY = Path(__file__).resolve().parent / "patches" / "sglang_kt"
 
@@ -31,6 +32,8 @@ class MailPatch:
     sha256: str
     committer_name: str
     committer_email: str
+    base_revision: str | None = None
+    result_revision: str | None = None
 
 
 @dataclass(frozen=True)
@@ -42,6 +45,8 @@ class SglangKtSourcePlan:
     sglang_submodule_path: Path
     sglang_patch: MailPatch
     ktransformers_patch: MailPatch
+    sglang_followup_patches: tuple[MailPatch, ...] = ()
+    sglang_gitlink_revision: str | None = None
 
     @classmethod
     def exo_default(cls) -> Self:
@@ -59,6 +64,8 @@ class SglangKtSourcePlan:
                 ),
                 committer_name="jimm",
                 committer_email="jimm@jimm.horse",
+                base_revision=SGLANG_BASE_REVISION,
+                result_revision=SGLANG_GITLINK_REVISION,
             ),
             ktransformers_patch=MailPatch(
                 path=PATCH_DIRECTORY / "0002-build-pin-GLM-Flash-KT-registration.patch",
@@ -68,6 +75,20 @@ class SglangKtSourcePlan:
                 committer_name="jimm",
                 committer_email="jimm@jimm.horse",
             ),
+            sglang_followup_patches=(
+                MailPatch(
+                    path=PATCH_DIRECTORY
+                    / "0003-fix-shard-OLMoE-QK-RMSNorm-across-TP-ranks.patch",
+                    sha256=(
+                        "229aaf328a24a5266b62b7a503c071fe6c3d5558c629df1821b60db2ec0c079d"
+                    ),
+                    committer_name="jimm",
+                    committer_email="jimm@jimm.horse",
+                    base_revision=SGLANG_GITLINK_REVISION,
+                    result_revision=SGLANG_RESULT_REVISION,
+                ),
+            ),
+            sglang_gitlink_revision=SGLANG_GITLINK_REVISION,
         )
 
 
@@ -162,6 +183,41 @@ def _require_patch(patch: MailPatch) -> None:
         )
 
 
+def _resolved_sglang_patch_steps(
+    plan: SglangKtSourcePlan,
+) -> tuple[tuple[MailPatch, str, str], ...]:
+    patches = (plan.sglang_patch, *plan.sglang_followup_patches)
+    steps: list[tuple[MailPatch, str, str]] = []
+    expected_base = plan.sglang_base_revision
+    for index, patch in enumerate(patches):
+        base_revision = patch.base_revision or expected_base
+        is_final_patch = index == len(patches) - 1
+        result_revision = patch.result_revision
+        if result_revision is None:
+            if not is_final_patch:
+                result_revision = patches[index + 1].base_revision
+                if result_revision is None:
+                    raise SourcePreparationError(
+                        "adjacent SGLang mail patches do not declare their shared "
+                        f"revision: {patch.path}"
+                    )
+            else:
+                result_revision = plan.sglang_result_revision
+        if base_revision != expected_base:
+            raise SourcePreparationError(
+                f"SGLang mail patch {patch.path} starts at {base_revision}, "
+                f"expected {expected_base}"
+            )
+        steps.append((patch, base_revision, result_revision))
+        expected_base = result_revision
+    if expected_base != plan.sglang_result_revision:
+        raise SourcePreparationError(
+            f"SGLang mail patch stack ends at {expected_base}, expected "
+            f"{plan.sglang_result_revision}"
+        )
+    return tuple(steps)
+
+
 def _apply_mail_patch(
     repository: Path,
     patch: MailPatch,
@@ -184,6 +240,46 @@ def _apply_mail_patch(
         _require_revision(repository, expected_revision, f"patched source {repository}")
         if require_clean_result:
             _require_clean(repository, f"patched source {repository}")
+    except SourcePreparationError:
+        _run_git(repository, ("am", "--abort"), check=False)
+        _run_git(repository, ("reset", "--hard", original_revision), check=False)
+        raise
+
+
+def _apply_sglang_patch_stack(
+    repository: Path,
+    plan: SglangKtSourcePlan,
+) -> None:
+    steps = _resolved_sglang_patch_steps(plan)
+    for patch, _, _ in steps:
+        _require_patch(patch)
+
+    original_revision = _head_revision(repository)
+    if original_revision == plan.sglang_result_revision:
+        _require_clean(repository, "SGLang integration")
+        return
+    try:
+        for patch, base_revision, result_revision in steps:
+            observed_revision = _head_revision(repository)
+            if observed_revision == result_revision:
+                continue
+            if observed_revision != base_revision:
+                raise SourcePreparationError(
+                    f"SGLang patch stack revision is {observed_revision}; expected "
+                    f"boundary {base_revision} or {result_revision}"
+                )
+            _require_clean(repository, f"SGLang patch base {base_revision}")
+            result_exists = _run_git(
+                repository,
+                ("cat-file", "-e", f"{result_revision}^{{commit}}"),
+                check=False,
+            )
+            if result_exists.returncode == 0:
+                _run_git(repository, ("checkout", "--detach", result_revision))
+            else:
+                _apply_mail_patch(repository, patch, result_revision)
+        _require_revision(repository, plan.sglang_result_revision, "SGLang integration")
+        _require_clean(repository, "SGLang integration")
     except SourcePreparationError:
         _run_git(repository, ("am", "--abort"), check=False)
         _run_git(repository, ("reset", "--hard", original_revision), check=False)
@@ -240,6 +336,16 @@ def _submodule_url(ktransformers_source: Path, submodule_path: Path) -> str:
     return recorded_url
 
 
+def _submodule_gitlink_revision(repository: Path, submodule_path: Path) -> str:
+    entry = _git_output(repository, "ls-tree", "HEAD", "--", str(submodule_path))
+    fields = entry.split(maxsplit=3)
+    if len(fields) != 4 or fields[0] != "160000" or fields[1] != "commit":
+        raise SourcePreparationError(
+            f"KTransformers commit has no gitlink for {submodule_path}: {entry!r}"
+        )
+    return fields[2].lower()
+
+
 def _clone_sglang_base_for_integrated_parent(
     ktransformers_source: Path, plan: SglangKtSourcePlan
 ) -> Path:
@@ -271,11 +377,7 @@ def _clone_sglang_base_for_integrated_parent(
         )
     _run_git(sglang_source, ("checkout", "--detach", plan.sglang_base_revision))
     _require_clean(sglang_source, "SGLang base for integrated parent")
-    _apply_mail_patch(
-        sglang_source,
-        plan.sglang_patch,
-        plan.sglang_result_revision,
-    )
+    _apply_sglang_patch_stack(sglang_source, plan)
     return sglang_source.resolve(strict=True)
 
 
@@ -310,33 +412,38 @@ def _require_integrated_source(
         str(plan.sglang_submodule_path),
         "KTransformers integration excluding its SGLang submodule",
     )
+    expected_gitlink_revision = (
+        plan.sglang_gitlink_revision or plan.sglang_result_revision
+    )
+    observed_gitlink_revision = _submodule_gitlink_revision(
+        ktransformers_source, plan.sglang_submodule_path
+    )
+    if observed_gitlink_revision != expected_gitlink_revision:
+        raise SourcePreparationError(
+            f"KTransformers SGLang gitlink is {observed_gitlink_revision}, expected "
+            f"{expected_gitlink_revision}"
+        )
     sglang_source = ktransformers_source / plan.sglang_submodule_path
     if not _is_repository_root(sglang_source):
         sglang_source = _clone_sglang_base_for_integrated_parent(
             ktransformers_source, plan
         )
     observed_sglang_revision = _head_revision(sglang_source)
-    if observed_sglang_revision == plan.sglang_base_revision:
-        _require_clean(sglang_source, "SGLang base for integrated parent")
-        result_exists = _run_git(
-            sglang_source,
-            ("cat-file", "-e", f"{plan.sglang_result_revision}^{{commit}}"),
-            check=False,
+    valid_sglang_boundaries = {
+        plan.sglang_base_revision,
+        *(result for _, _, result in _resolved_sglang_patch_steps(plan)),
+    }
+    if observed_sglang_revision not in valid_sglang_boundaries:
+        raise SourcePreparationError(
+            f"SGLang integration revision is {observed_sglang_revision}; expected "
+            f"one of {sorted(valid_sglang_boundaries)}"
         )
-        if result_exists.returncode == 0:
-            _run_git(
-                sglang_source,
-                ("checkout", "--detach", plan.sglang_result_revision),
-            )
-        else:
-            _apply_mail_patch(
-                sglang_source,
-                plan.sglang_patch,
-                plan.sglang_result_revision,
-            )
-    _require_revision(sglang_source, plan.sglang_result_revision, "SGLang integration")
-    _require_clean(sglang_source, "SGLang integration")
-    _require_clean(ktransformers_source, "KTransformers integration")
+    _apply_sglang_patch_stack(sglang_source, plan)
+    _require_clean_ignoring_submodule(
+        ktransformers_source,
+        str(plan.sglang_submodule_path),
+        "KTransformers integration",
+    )
     return sglang_source
 
 
@@ -347,7 +454,9 @@ def prepare_sglang_kt_source(
     """Apply both exact mail patches and return a machine-readable receipt."""
     selected_plan = plan or SglangKtSourcePlan.exo_default()
     source = ktransformers_source.expanduser().resolve(strict=True)
-    _require_patch(selected_plan.sglang_patch)
+    sglang_patch_steps = _resolved_sglang_patch_steps(selected_plan)
+    for patch, _, _ in sglang_patch_steps:
+        _require_patch(patch)
     _require_patch(selected_plan.ktransformers_patch)
     observed_revision = _head_revision(source)
 
@@ -356,11 +465,7 @@ def prepare_sglang_kt_source(
     elif observed_revision == selected_plan.ktransformers_base_revision:
         _require_clean(source, "KTransformers base")
         sglang_source = _initialize_sglang_submodule(source, selected_plan)
-        _apply_mail_patch(
-            sglang_source,
-            selected_plan.sglang_patch,
-            selected_plan.sglang_result_revision,
-        )
+        _apply_sglang_patch_stack(sglang_source, selected_plan)
 
         # The outer mail patch needs a clean base checkout. Keep the new commit
         # object locally, return the worktree to the old gitlink, apply the
@@ -395,10 +500,13 @@ def prepare_sglang_kt_source(
         sglang_source=str(sglang_source),
         sglang_revision=selected_plan.sglang_result_revision,
         patches=(
-            {
-                "path": str(selected_plan.sglang_patch.path),
-                "sha256": selected_plan.sglang_patch.sha256,
-            },
+            *(
+                {
+                    "path": str(patch.path),
+                    "sha256": patch.sha256,
+                }
+                for patch, _, _ in sglang_patch_steps
+            ),
             {
                 "path": str(selected_plan.ktransformers_patch.path),
                 "sha256": selected_plan.ktransformers_patch.sha256,

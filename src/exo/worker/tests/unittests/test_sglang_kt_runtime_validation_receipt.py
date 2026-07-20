@@ -5,10 +5,6 @@ from typing import cast
 
 import pytest
 
-from exo.worker.sglang_kt.launch_spec import (
-    GLM_4_7_FLASH_KTRANSFORMERS_REVISION,
-    GLM_4_7_FLASH_SGLANG_REVISION,
-)
 from exo.worker.sglang_kt.runtime_validation_receipt import (
     KERNEL_RUNTIME_VALIDATION_RECEIPT_MAXIMUM_BYTES,
     SglangKtKernelRuntimeValidationReceiptError,
@@ -41,6 +37,7 @@ _HISTORICAL_DWAGON_V4_RECEIPT_SHA256 = (
 _CURRENT_DWAGON_V6_RECEIPT_SHA256 = (
     "5cfffa1e450f0dbcded077f7496e5b9d3094bed1f73aeab370f2ebb2775867c6"
 )
+_SUPERSEDED_DWAGON_V6_SGLANG_REVISION = "42504e59810130460fc24fdd17ef534cb8278a4b"
 _HISTORICAL_DWAGON_V4_SGLANG_REVISION = "41d4d300a21fd2f486681d56f1017789dfb355fe"
 _HISTORICAL_DWAGON_V4_KTRANSFORMERS_REVISION = (
     "7e70d7518edd26af6a0638593037d68c9b6bd6bf"
@@ -107,27 +104,21 @@ def _replace_json_path(
         _json_array(current)[last_part] = replacement
 
 
-def test_loads_current_dwagon_v6_golden_and_derives_only_kernel_capability() -> None:
-    observation = load_sglang_kt_kernel_runtime_validation_receipt(
-        _CURRENT_DWAGON_V6_RECEIPT,
-        expected_receipt_sha256=_CURRENT_DWAGON_V6_RECEIPT_SHA256,
-    )
+def test_rejects_dwagon_v6_golden_after_sglang_revision_advance() -> None:
+    contents = _CURRENT_DWAGON_V6_RECEIPT.read_bytes()
+    document = cast(JsonObject, json.loads(contents))
+    provenance = _json_object(document["provenance"])
 
-    assert observation.receipt_path == str(_CURRENT_DWAGON_V6_RECEIPT)
-    assert observation.receipt_sha256 == _CURRENT_DWAGON_V6_RECEIPT_SHA256
-    assert observation.receipt_size_bytes == _CURRENT_DWAGON_V6_RECEIPT.stat().st_size
-    assert observation.schema_version == 1
-    assert observation.capabilities == ("kt_bf16_amx_executed_v1",)
-    assert observation.gpu_uuid == "GPU-a442b72e-6727-6322-ba5d-5a9512b79886"
-    assert observation.gpu_compute_capability == (8, 6)
-    assert observation.cpu_cores == tuple(range(16))
-    assert observation.allowed_memory_nodes == (0, 1)
-    assert observation.memory_nodes == (0,)
-    assert observation.threads_per_subpool == (16,)
-    assert observation.sglang_revision == GLM_4_7_FLASH_SGLANG_REVISION
-    assert observation.ktransformers_revision == GLM_4_7_FLASH_KTRANSFORMERS_REVISION
-    assert observation.torch_version == "2.9.1+cu128"
-    assert observation.cuda_version == "12.8"
+    assert hashlib.sha256(contents).hexdigest() == _CURRENT_DWAGON_V6_RECEIPT_SHA256
+    assert provenance["sglang_revision"] == _SUPERSEDED_DWAGON_V6_SGLANG_REVISION
+    with pytest.raises(
+        SglangKtKernelRuntimeValidationReceiptError,
+        match="invalid SGLang-KTransformers kernel runtime receipt",
+    ):
+        load_sglang_kt_kernel_runtime_validation_receipt(
+            _CURRENT_DWAGON_V6_RECEIPT,
+            expected_receipt_sha256=_CURRENT_DWAGON_V6_RECEIPT_SHA256,
+        )
 
 
 def test_dwagon_v4_golden_preserves_historical_hash_and_provenance() -> None:

@@ -230,6 +230,21 @@ def test_observes_exact_clean_recursive_source(tmp_path: Path) -> None:
     )
 
 
+def test_observes_independently_pinned_sglang_after_gitlink(tmp_path: Path) -> None:
+    source, pins = make_runtime_source(tmp_path)
+    sglang = source / pins.sglang_submodule_path
+    (sglang / "tp_qk_norm.py").write_text("SHARDED = True\n")
+    final_sglang_revision = commit_all(sglang, "fix: shard TP QK norm")
+
+    observation = observe_runtime_source(
+        source,
+        replace(pins, sglang_revision=final_sglang_revision),
+    )
+
+    assert observation.sglang_revision == final_sglang_revision
+    assert run_git(source, "status", "--porcelain=v1") == "M third_party/sglang"
+
+
 def test_rejects_dirty_parent_source(tmp_path: Path) -> None:
     source, pins = make_runtime_source(tmp_path)
     (source / "untracked.txt").write_text("dirty\n")

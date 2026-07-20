@@ -413,7 +413,15 @@ def _direct_gitlinks(repository: Path) -> tuple[tuple[Path, str], ...]:
 def _observe_build_submodules(
     repository: Path,
     required_paths: Sequence[Path],
+    *,
+    independently_pinned_paths: frozenset[Path] = frozenset(),
 ) -> tuple[SubmoduleObservation, ...]:
+    unexpected_pins = independently_pinned_paths.difference(required_paths)
+    if unexpected_pins:
+        raise RuntimeBuildError(
+            "independently pinned paths are not required build submodules: "
+            + ", ".join(sorted(path.as_posix() for path in unexpected_pins))
+        )
     gitlinks = dict(_direct_gitlinks(repository))
     observations: list[SubmoduleObservation] = []
     for direct_path in sorted(required_paths, key=lambda path: path.as_posix()):
@@ -426,7 +434,10 @@ def _observe_build_submodules(
         description = f"build submodule {direct_path.as_posix()}"
         _require_repository_root(submodule, description)
         observed_revision = _head_revision(submodule)
-        if observed_revision != expected_revision:
+        if (
+            direct_path not in independently_pinned_paths
+            and observed_revision != expected_revision
+        ):
             raise RuntimeBuildError(
                 f"{description} revision is {observed_revision}, "
                 f"expected gitlink {expected_revision}"
@@ -500,7 +511,13 @@ def observe_runtime_source(
     )
     submodules = tuple(
         sorted(
-            _observe_build_submodules(source, required_submodules),
+            _observe_build_submodules(
+                source,
+                required_submodules,
+                independently_pinned_paths=frozenset(
+                    (selected_pins.sglang_submodule_path,)
+                ),
+            ),
             key=lambda observation: observation.path,
         )
     )
