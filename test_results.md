@@ -24,6 +24,7 @@ Rows without a decode measurement follow the decoded rows for that model.
 | GLM-4.7 Flash 30B-A3B | `glm47-pp3-diagnostic-dwagon-fwuff-20260720-v8` | PP3/TP1; v3 placement and 16/16/15 split; full 56/56/60 cores; E48; dual QDR | 6.745452171* | 7.163711287 | **PASS (diagnostic)**; E48 partition control |
 | GLM-4.7 Flash 30B-A3B | `glm47-kt-serving-local-dwagon-20260719-v10` | dwagon; 1x RTX 3090; TP1; 112 physical cores; 2x56 AMX pools; E4 | 6.066921877* | 7.112858950 | **ENGINEERING ONLY**; immutable measurement; final receipt failed closed after inference |
 | GLM-4.7 Flash 30B-A3B | `glm47-pp3-diagnostic-dwagon-fwuff-20260720-v6` | PP3/TP1; v3 placement and 16/16/15 split; full 56/56/60 cores; E32; dual QDR | 6.215342096* | 6.924257787 | **PASS (diagnostic)**; best PP3 result through v6 |
+| GLM-4.7 Flash 30B-A3B | `glm47-pp2-local-dwagon-20260720-v6` | dwagon; PP2/TP1; 23/24 split; 2x RTX 3090 over NV4; full 56/56 cores; E40; non-final LM head removed | 5.579114192* | 6.638956221 | **PASS (diagnostic)**; exact sanity, complete phase telemetry, no thermal throttling |
 | GLM-4.7 Flash 30B-A3B | `glm47-pp3-diagnostic-dwagon-fwuff-20260720-v5` | PP3/TP1; v3 placement and 16/16/15 split; full 56/56/60 cores; E16; dual QDR | 5.289909964* | 6.553438809 | **PASS (diagnostic)**; decode improved over E4; prefill-heavy output regressed |
 | GLM-4.7 Flash 30B-A3B | `glm47-pp2-local-dwagon-20260719-v4` | dwagon; PP2/TP1; 23/24 split; 2x RTX 3090 over NV4; full 56/56 cores; E40 | 5.793319759* | 6.515610808 | **PASS (diagnostic)**; clean replication exposed material run variance |
 | GLM-4.7 Flash 30B-A3B | `glm47-pp3-diagnostic-dwagon-fwuff-20260720-v3` | PP3/TP1; dwagon 2x RTX 3090 + 112 physical cores/2 AMX pools -> fwuff 1x RTX 3090 + 60 physical cores/AMX; 16/16/15 layers; E4; dual QDR | 5.766342756* | 6.290703294 | **PASS (diagnostic)**; exact semantic sanity, balanced dual-rail payload, clean unforced shutdown |
@@ -38,7 +39,7 @@ Rows without a decode measurement follow the decoded rows for that model.
 
 This is an inventory, not a cross-row leaderboard: request shapes,
 concurrency, quantization, and harness definitions differ. `*` The local v10
-  and PP2 v2-v4 and PP3 v2-v6, v8, and v10 values are median end-to-end output rates for their
+  and PP2 v2-v6 and PP3 v2-v6, v8, and v10 values are median end-to-end output rates for their
 1,024-input/32-output prefill-heavy workload, not the input-token prefill
 metric used by the older harness. Approximate live-log rates from failed v8/v9
 transactions remain in the detailed ledger but are excluded here because no
@@ -64,23 +65,24 @@ exact measurement survived.
 ## Current summary
 
 - Latest published proof-harness source: the commit containing this ledger
-  update, built on `60216e1b`.
-- Latest completed live-validation source: the PP3 harness worktree based on
-  `60216e1b`, with the exact host-specific immutable runtimes and overlays
-  listed below.
+  update, built on `8292a300`.
+- Latest completed live-validation source: the local PP2 harness at `8292a300`,
+  using the exact SGLang `7fea582043df06ebdde549ee3de602a3d11b96c6`
+  overlay and model contract listed below.
 - Completed ladder rungs: Llama 3.2 1B, Llama 3.2 3B, Llama 3.1 8B,
   GPT-OSS 20B, and GLM-4.7 Flash.
-- Latest GLM engineering result: local PP2 v4 repeated the v3 23/24 split with
-  E40, two NUMA-matched RTX 3090 stages, and all 56 physical cores per AMX pool.
-  It passed exact sanity and clean ownership-verified cleanup at 6.515610808
-  decode tok/s and 5.793319759 prefill-heavy output tok/s. V3 measured a
-  consistent 7.775-7.974 decode tok/s sample range with a 7.928729814 median,
-  but v4 did not reproduce that level. Treat v3 as a best observed result and
-  the v2-v4 spread as an unresolved variance signal, not a settled partition
-  gain. V5 increased residency from E40 to E42 and improved prefill-heavy output
-  to 6.559804369 tok/s, but decode fell to 5.970868191 tok/s. More resident
-  experts are therefore not a monotonic batch-one decode optimization. All
-  local PP2 results remain diagnostic while NCCL INFO is enabled.
+- Latest GLM engineering result: local PP2 v6 used the head-patched runtime,
+  the 23/24 E40 split, two NUMA-matched RTX 3090 stages, and all 56 physical
+  cores per AMX pool. It passed exact sanity and clean ownership-verified
+  cleanup at 6.638956221 decode tok/s and 5.579114192 prefill-heavy output
+  tok/s. Its three decode samples were tightly grouped at 6.634-6.646 tok/s.
+  Phase telemetry observed 78/82 C peak CPU-package temperatures, stable 1695
+  MHz GPU clocks, and zero hardware throttle counts; thermal throttling does
+  not explain the earlier variance. V3 remains a best observed 7.928729814
+  tok/s outlier that v4 and v6 did not reproduce. V5's E42 result improved
+  prefill-heavy output but reduced decode, so residency is not a monotonic
+  batch-one optimization. All local PP2 results remain diagnostic while NCCL
+  INFO and phase-boundary telemetry are enabled.
 - Latest controlled proof result remains GLM-4.7 Flash MLX/NCCL TP=2: exact
   TP1 output equality, two-rank NCCL initialization, payload on both QDR rails,
   clean HCA health counters, instance deletion, process cleanup, and resource
@@ -137,6 +139,9 @@ test total.
 | Immutable dwagon runtime overlay | **PASS (artifact)** | Install ID `b275ec08c01fdce2cd6adb64f10b35f0a5bda12af20899a1fac1de42aa29ecd3`; receipt SHA-256 `7a2b6fd01efb7f889f01ae2a47c66c2625c4162a93373ea116d3964fd405a5f5`; deterministic preflight reconstructed the ID and the old 9.9 GB base runtime remains untouched |
 | Prior fwuff GLM-4.7 runtime and overlay | **SUPERSEDED (artifact)** | Build `e21ef087b1c50cf961339e1bd1a2e1a3f60047579f811385614297de6a2abfc9` and overlay `82d20634f743ed87ae9cc71f2b7f4936d9451363db1ca46a207218f22de51ef8` remain immutable evidence for SGLang `41d4d300...`; the current two-host run uses the newer runtime below. |
 | Current PP3 native runtimes and overlays | **PASS (artifact)** | Dwagon build `c9c150d940bd2314eb2a9607bca37a0973ca70743690961f56e9c0d9a0d98d25` / overlay `32aa384b06c33fbc562462aeb4b9a0f2da1beb0a469ea225ea24671eca793e95`; fwuff build `386fe038bb32f834306d7992001ffb3b239c0cb81027c77fc4faee4cd982f63a` / overlay `563dba484c323139f05b7853384dc565d6f6f8282f38e365327fa1bb3d9782aa`. Both bind SGLang `3721d710102456b6bf849122e781129dc3f7d9c6` and KTransformers `f9ca69648421f5774215c4da9cf711dccf54f49e`; pure-source hashes match across hosts and each host has its own native KTransformers kernel. Install-receipt SHA-256 values are `85d9f67b557113f1b19ee85bf2c8427f6f5988700b87cebbd86110f69f36b7b6` and `9cae56658bd9d1f631b5e3bfd053cba086be4ca52600cba236f026f4b3b7ba78`. |
+| Head-patched dwagon runtime and overlay | **PASS (artifact)** | Build `cdc759d2a86b8a01c09a3aa5fe2960c45bf891184260f3036c207206c5750153` and overlay `14b9e8f8577d812ea954cffa0d2833b9535e589a1fb8fc606c20e2edd3e00455` bind SGLang `7fea582043df06ebdde549ee3de602a3d11b96c6` and KTransformers `f9ca69648421f5774215c4da9cf711dccf54f49e`. The build-receipt SHA-256 is `053fa7158b83030a4d8436b24ccb764fd0a1af4756b50d55308a1da27f9afb09`; the install-receipt SHA-256 is `77ddc2f4c4f84b628a81d0d05868e0f973441f023da385483384abde2b0aa924`. |
+| GLM PP LM-head source patch | **PASS (software)** | The deterministic mail patch creates SGLang `7fea5820...`, allocates `ParallelLMHead` only on the final PP rank, and saves exactly 634,388,480 bytes (605 MiB) on each non-final TP1 rank. The source/launch suite passed 101 tests; the intermediate-revision resume regression passed all 11 source-preparation tests. |
+| Local PP2 phase-boundary telemetry | **PASS (software)** | Eight non-polling, non-fatal snapshots cover launch, readiness, sanity, both workload warmup/sample boundaries, and cleanup. The focused PP2/client suite passed 53 tests; targeted Ruff, formatting, and `git diff --check` passed. |
 | PP3 stage CUDA/AMX kernel validation | **PASS** | `/var/lib/exo/benchmarks/glm47-pp3-runtime-validation-dwagon-fwuff-20260720-v1`; all three stage-local validators used their exact overlay interpreter and full 56/56/60-core affinity. Dwagon NUMA0/GPU0, dwagon NUMA1/GPU1, and fwuff NUMA0/GPU0 each derived only `kt_bf16_amx_executed_v1`; receipt SHA-256 values are `f4bc0230...`, `43ff516a...`, and `a1f8abbc...`. |
 | GLM-4.7 PP3 engineering harness | **PASS (software)** | 260 harness/shared-supervisor tests pass for raw three-rank readiness/server info, semantic sanity, token workloads, NCCL logs, HCA deltas, ownership verification, and cleanup. The 14 harness-specific tests include real descendants with sanitized environments, fail-closed `/proc` read errors, and local/remote startup-handoff failures. |
 | GLM-4.7 local PP2 engineering harness | **PASS (software)** | 88 focused PP2 and launch-contract tests pass. The harness binds the exact runtime/model receipts before launch, assigns NUMA0/GPU0 and NUMA1/GPU1 all 56 physical cores each, admits bounded 0.80-0.95 static-memory fractions, runs exact sanity plus canonical 1024/32 and 128/128 workloads, and retains a mode-0600 ownership journal until verified cleanup. |
@@ -238,6 +243,7 @@ performance claim.
 | GLM-4.7 Flash local PP2 v3 | **PASS (diagnostic)** | `/var/lib/exo/benchmarks/glm47-pp2-local-dwagon-20260719-v3`; reversed 23/24 split, exact sanity, 5.420292914 prefill-heavy output tok/s, and 7.928729814 decode tok/s with all three decode samples between 7.775 and 7.974. Cleanup was complete. Result SHA `671704e0de3702cea8a2e8223a84192c299cc68f1a68b9b31ae26176dafc8cd7`. |
 | GLM-4.7 Flash local PP2 v4 | **PASS (diagnostic)** | `/var/lib/exo/benchmarks/glm47-pp2-local-dwagon-20260719-v4`; clean 23/24 replication reached 5.793319759 prefill-heavy output tok/s and 6.515610808 decode tok/s, proving the v3 peak is not yet reproducible. Exact sanity, local P2P/IPC, and verified cleanup passed. Result SHA `595428c55139d171c4766742f6958e95819c87d1505abbe6c037c065b4167951`. |
 | GLM-4.7 Flash local PP2 v5 | **PASS (diagnostic)** | `/var/lib/exo/benchmarks/glm47-pp2-local-dwagon-20260719-v5`; E42 at memory fraction 0.92 used 19.13/19.99 GB for weights, passed exact sanity, reached 6.559804369 prefill-heavy output tok/s and 5.970868191 decode tok/s, and cleaned up completely. Result SHA `ed6d74b8c565aef947250087561c93d7c6f487bc8ac965cde41c880312a6160f`. |
+| GLM-4.7 Flash local PP2 v6 | **PASS (diagnostic)** | `/var/lib/exo/benchmarks/glm47-pp2-local-dwagon-20260720-v6`; the exact SGLang `7fea5820` runtime omitted the 605 MiB LM head from non-final rank 0, retained E40 and the 23/24 split, passed exact `EXO_SANITY_OK`, reached 5.579114192 prefill-heavy output tok/s and 6.638956221 decode tok/s, and cleaned up completely. All eight non-polling telemetry boundaries were complete; the three decode samples were 6.634080338/6.645821799/6.638956221 tok/s, CPU package temperatures peaked at 78/82 C, GPU clocks held 1695 MHz, and post-run hardware throttle counters were zero. Result SHA `39079b44d2bbcf70efd29b8464eb39e827d40950b0d7ecfdbc894789bfb5c2cf`. |
 | GLM-4.7 Flash PP3 v1 | **EXPECTED FAIL (setup)** | `/var/lib/exo/benchmarks/glm47-pp3-diagnostic-dwagon-fwuff-20260720-v1`; Gloo resolved an IPv6 dwagon endpoint against IPv4 fwuff and failed before model load. Per-host `GLOO_SOCKET_IFNAME` and `NCCL_SOCKET_IFNAME` fixed the family mismatch in place; cleanup passed. Result SHA `5003b64ee47c6a7bd0f9522ac9a0ff0944cd4903c9352862b7ae90aeba68f2`. |
 | GLM-4.7 Flash PP3 v2 | **ENGINEERING ONLY** | `/var/lib/exo/benchmarks/glm47-pp3-diagnostic-dwagon-fwuff-20260720-v2`; exact semantic sanity and all workloads completed at 5.219545197 prefill-heavy output tok/s and 6.213798282 decode tok/s. A child-environment cleanup assumption caused a false-negative receipt after all processes were gone. Result SHA `ce2e6ce4dc5e0917ad4b27e208acbc1f1a247e46584e7d056a0d58f92fbb550f`. |
 | GLM-4.7 Flash PP3 v3 | **PASS (diagnostic)** | `/var/lib/exo/benchmarks/glm47-pp3-diagnostic-dwagon-fwuff-20260720-v3`; exact `EXO_SANITY_OK`, 5.766342756 prefill-heavy output tok/s, 6.290703294 decode tok/s, balanced 27,223,772/27,217,344-byte dual-rail payload, zero HCA health deltas, and three ownership-verified unforced rank cleanups. Result SHA `4b8399bd2b94307e7fffd41c6461ef99c83530b41b870dfce33d767c9d52d0e5`. |
