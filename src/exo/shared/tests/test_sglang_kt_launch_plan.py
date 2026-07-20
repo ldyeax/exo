@@ -109,6 +109,55 @@ def test_target_launch_plan_roundtrip_and_partition() -> None:
     assert SglangKtLaunchPlan.model_validate_json(plan.model_dump_json()) == plan
 
 
+def test_glm_4_7_pp3_diagnostic_profile_roundtrip_and_partition() -> None:
+    stages = (
+        make_stage(
+            0,
+            0,
+            16,
+            node_id="dwagon",
+            gpu_suffix=1,
+            cpu_cores=tuple(range(56)),
+            memory_node=0,
+        ),
+        make_stage(
+            1,
+            16,
+            32,
+            node_id="dwagon",
+            gpu_suffix=2,
+            cpu_cores=tuple(range(56, 112)),
+            memory_node=1,
+        ),
+        make_stage(
+            2,
+            32,
+            47,
+            node_id="fwuff",
+            gpu_suffix=3,
+            cpu_cores=tuple(range(60)),
+            memory_node=0,
+        ),
+    )
+    plan = make_plan(
+        stages,
+        updates={
+            "target_profile": "glm47_flash_bf16_sm86_pp3_diagnostic_v1",
+            "model_id": ModelId("zai-org/GLM-4.7-Flash"),
+            "total_layers": 47,
+        },
+    )
+
+    assert plan.pipeline_layer_partition == (16, 16, 15)
+    assert plan.target_profile == "glm47_flash_bf16_sm86_pp3_diagnostic_v1"
+    assert SglangKtLaunchPlan.model_validate_json(plan.model_dump_json()) == plan
+
+
+def test_launch_plan_rejects_unknown_target_profile() -> None:
+    with pytest.raises(ValidationError, match="target_profile"):
+        make_plan(updates={"target_profile": "glm47_flash_bf16_sm86_pp3_unpinned"})
+
+
 def test_stage_rejects_oversubscribed_cpu_threads() -> None:
     with pytest.raises(ValidationError, match="cpu_infer_threads exceeds"):
         SglangKtStageSpec(

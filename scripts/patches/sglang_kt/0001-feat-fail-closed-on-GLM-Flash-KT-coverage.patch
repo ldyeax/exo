@@ -1,7 +1,7 @@
 From 449c59f07752189baf724630c6799c28736cee87 Mon Sep 17 00:00:00 2001
 From: jimm <jimm@jimm.horse>
 Date: Sun, 19 Jul 2026 02:00:11 -0400
-Subject: [PATCH 1/3] feat: fail closed on GLM Flash KT coverage
+Subject: [PATCH 1/4] feat: fail closed on GLM Flash KT coverage
 
 ---
  python/sglang/srt/layers/moe/kt_ep_wrapper.py |  30 ++-
@@ -621,14 +621,11 @@ index 000000000..6ce5e2714
 +
 +if __name__ == "__main__":
 +    unittest.main()
--- 
-2.54.0
-
 
 From 41d4d300a21fd2f486681d56f1017789dfb355fe Mon Sep 17 00:00:00 2001
 From: jimm <jimm@jimm.horse>
 Date: Sun, 19 Jul 2026 03:25:00 -0400
-Subject: [PATCH 2/3] fix: validate benchmark GPU expert weights
+Subject: [PATCH 2/4] fix: validate benchmark GPU expert weights
 
 ---
  .../sglang/srt/layers/moe/benchmark_kt_ep.py  | 226 ++++++++++++------
@@ -1082,14 +1079,11 @@ index 000000000..a361c1d17
 +
 +if __name__ == "__main__":
 +    unittest.main()
--- 
-2.54.0
-
 
 From 42504e59810130460fc24fdd17ef534cb8278a4b Mon Sep 17 00:00:00 2001
 From: jimm <jimm@jimm.horse>
 Date: Sun, 19 Jul 2026 13:18:42 -0400
-Subject: [PATCH 3/3] fix: initialize GLM Lite inherited MoE state
+Subject: [PATCH 3/4] fix: initialize GLM Lite inherited MoE state
 
 ---
  python/sglang/srt/models/glm4_moe_lite.py    |  20 ++-
@@ -1331,6 +1325,439 @@ index e02e419a8..a66ae609a 100644
      def test_coverage_rejects_unwrapped_layer(self):
          config, masks, layers = self._coverage_fixture()
          layers[23].mlp.experts.quant_method._quant_wrapper_id = "other"
--- 
-2.54.0
 
+From 3721d710102456b6bf849122e781129dc3f7d9c6 Mon Sep 17 00:00:00 2001
+From: jimm <jimm@jimm.horse>
+Date: Mon, 20 Jul 2026 02:25:11 -0400
+Subject: [PATCH 4/4] feat: support GLM Flash KT pipeline stages
+
+---
+ python/sglang/srt/layers/moe/kt_ep_wrapper.py |  41 +++++--
+ python/sglang/srt/models/glm4_moe_lite.py     |  32 ++++-
+ test/unit/test_glm47_flash_kt_ep_coverage.py  | 113 +++++++++++++++++-
+ test/unit/test_kt_ep_tp_group_broadcast.py    | 109 +++++++++++++++++
+ 4 files changed, 276 insertions(+), 19 deletions(-)
+ create mode 100644 test/unit/test_kt_ep_tp_group_broadcast.py
+
+diff --git a/python/sglang/srt/layers/moe/kt_ep_wrapper.py b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
+index 607d6d440..1be2bed06 100644
+--- a/python/sglang/srt/layers/moe/kt_ep_wrapper.py
++++ b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
+@@ -80,6 +80,32 @@ logger = logging.getLogger(__name__)
+ _KT_GPU_EXPERTS_MASKS: Optional[torch.Tensor] = None
+ 
+ 
++def _broadcast_tp_object_list(values: List[object]) -> None:
++    if not dist.is_initialized():
++        return
++    tp_group = get_tp_group()
++    if tp_group.world_size == 1:
++        return
++    dist.broadcast_object_list(
++        values,
++        src=tp_group.first_rank,
++        group=tp_group.cpu_group,
++    )
++
++
++def _broadcast_tp_tensor(tensor: torch.Tensor, *, on_device: bool) -> None:
++    if not dist.is_initialized():
++        return
++    tp_group = get_tp_group()
++    if tp_group.world_size == 1:
++        return
++    dist.broadcast(
++        tensor,
++        src=tp_group.first_rank,
++        group=tp_group.device_group if on_device else tp_group.cpu_group,
++    )
++
++
+ @dataclass
+ class KTConfig:
+     """Configuration for KTransformers heterogeneous computing CPU part.
+@@ -767,12 +793,9 @@ class SharedFullContext:
+             self.shm_unique_id = uuid.uuid4().hex[:8]
+         else:
+             self.shm_unique_id = None
+-        if dist.is_initialized():
+-            unique_id_list = [self.shm_unique_id]
+-            dist.broadcast_object_list(
+-                unique_id_list, src=0, group=get_tp_group().cpu_group
+-            )
+-            self.shm_unique_id = unique_id_list[0]
++        unique_id_list = [self.shm_unique_id]
++        _broadcast_tp_object_list(unique_id_list)
++        self.shm_unique_id = unique_id_list[0]
+ 
+         for name in self.weight_names:
+             gpu_tensor = getattr(self.gpu_layer, name)
+@@ -2009,8 +2032,7 @@ def _init_kt_gpu_experts_masks(server_args: "ServerArgs") -> Optional[torch.Tens
+     else:
+         raise ValueError(f"Unknown kt_expert_placement_strategy: {strategy}")
+ 
+-    if dist.is_initialized():
+-        dist.broadcast(masks, src=0, group=get_tp_group().cpu_group)
++    _broadcast_tp_tensor(masks, on_device=False)
+ 
+     _KT_GPU_EXPERTS_MASKS = masks
+ 
+@@ -3154,8 +3176,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+             )
+ 
+         # Broadcast selected experts to all ranks for consistent weight updates
+-        if dist.is_initialized():
+-            dist.broadcast(selected_experts, src=0, group=get_tp_group().device_group)
++        _broadcast_tp_tensor(selected_experts, on_device=True)
+ 
+         # Step 2: Copy weights from temporary layer to original layer
+         if ctx.is_fp8_quant:
+diff --git a/python/sglang/srt/models/glm4_moe_lite.py b/python/sglang/srt/models/glm4_moe_lite.py
+index b9f51463c..55ff230d0 100644
+--- a/python/sglang/srt/models/glm4_moe_lite.py
++++ b/python/sglang/srt/models/glm4_moe_lite.py
+@@ -125,10 +125,10 @@ def _require_glm47_flash_kt_ep(
+             "KTransformers GLM-4.7-Flash does not support hash-routed MoE "
+             f"layers: {hash_layer_counts}"
+         )
+-    if pp_size != 1:
++    if not 1 <= pp_size <= _GLM47_FLASH_NUM_LAYERS:
+         raise RuntimeError(
+-            "KTransformers GLM-4.7-Flash coverage receipts currently require "
+-            f"pipeline parallel size 1, got {pp_size}"
++            "KTransformers GLM-4.7-Flash requires a pipeline parallel size "
++            f"between 1 and {_GLM47_FLASH_NUM_LAYERS}, got {pp_size}"
+         )
+     if prefix != "model":
+         raise RuntimeError(
+@@ -142,6 +142,10 @@ def _build_glm47_flash_kt_ep_coverage_receipt(
+     layers: nn.ModuleList,
+     config: PretrainedConfig,
+     prefix: str,
++    pp_rank: int,
++    pp_size: int,
++    start_layer: int,
++    end_layer: int,
+ ) -> Dict[str, Any]:
+     """Verify every local routed layer and return a machine-readable receipt."""
+     from sglang.srt.layers.moe.kt_ep_wrapper import get_kt_ep_gpu_experts_masks
+@@ -158,8 +162,19 @@ def _build_glm47_flash_kt_ep_coverage_receipt(
+             f"expected {expected_mask_shape}, got {tuple(masks.shape)}"
+         )
+ 
++    if (
++        pp_size < 1
++        or not 0 <= pp_rank < pp_size
++        or not 0 <= start_layer < end_layer <= _GLM47_FLASH_NUM_LAYERS
++    ):
++        raise RuntimeError(
++            "KTransformers GLM-4.7-Flash received an invalid local pipeline "
++            f"range: rank={pp_rank}, size={pp_size}, "
++            f"layers=[{start_layer}, {end_layer})"
++        )
++
+     expected_layer_ids = list(
+-        range(_GLM47_FLASH_FIRST_MOE_LAYER, _GLM47_FLASH_NUM_LAYERS)
++        range(max(start_layer, _GLM47_FLASH_FIRST_MOE_LAYER), end_layer)
+     )
+     actual_layer_ids = [
+         layer_id
+@@ -259,7 +274,10 @@ def _build_glm47_flash_kt_ep_coverage_receipt(
+     return {
+         "schema_version": 1,
+         "model_architecture": "Glm4MoeLiteForCausalLM",
+-        "pipeline_parallel_size": 1,
++        "pipeline_parallel_rank": pp_rank,
++        "pipeline_parallel_size": pp_size,
++        "pipeline_layer_start": start_layer,
++        "pipeline_layer_end": end_layer,
+         "layer_count": _GLM47_FLASH_NUM_LAYERS,
+         "routed_layer_ids": expected_layer_ids,
+         "routed_expert_count": _GLM47_FLASH_NUM_ROUTED_EXPERTS,
+@@ -678,6 +696,10 @@ class Glm4MoeLiteModel(DeepseekV2Model):
+                 layers=self.layers,
+                 config=config,
+                 prefix=prefix,
++                pp_rank=self.pp_group.rank_in_group,
++                pp_size=self.pp_group.world_size,
++                start_layer=self.start_layer,
++                end_layer=self.end_layer,
+             )
+             logger.info(
+                 "GLM47_FLASH_KT_EP_COVERAGE_RECEIPT %s",
+diff --git a/test/unit/test_glm47_flash_kt_ep_coverage.py b/test/unit/test_glm47_flash_kt_ep_coverage.py
+index a66ae609a..a5ef06c20 100644
+--- a/test/unit/test_glm47_flash_kt_ep_coverage.py
++++ b/test/unit/test_glm47_flash_kt_ep_coverage.py
+@@ -122,7 +122,18 @@ class TestGlm47FlashKtEpCoverage(unittest.TestCase):
+             layers.append(SimpleNamespace(layer_id=layer_id, mlp=sparse_block))
+         return config, masks, layers
+ 
+-    def _build_receipt(self, config, masks, layers, server_args=None):
++    def _build_receipt(
++        self,
++        config,
++        masks,
++        layers,
++        server_args=None,
++        *,
++        pp_rank=0,
++        pp_size=1,
++        start_layer=0,
++        end_layer=47,
++    ):
+         fake_kt_module = SimpleNamespace(
+             get_kt_ep_gpu_experts_masks=lambda: masks,
+         )
+@@ -143,6 +154,10 @@ class TestGlm47FlashKtEpCoverage(unittest.TestCase):
+                 layers=layers,
+                 config=config,
+                 prefix="model",
++                pp_rank=pp_rank,
++                pp_size=pp_size,
++                start_layer=start_layer,
++                end_layer=end_layer,
+             )
+ 
+     def test_preconstruction_requirement_accepts_exact_profile(self):
+@@ -168,7 +183,7 @@ class TestGlm47FlashKtEpCoverage(unittest.TestCase):
+         self.assertTrue(enabled)
+         require_registration.assert_called_once_with()
+ 
+-    def test_preconstruction_requirement_rejects_pipeline_parallelism(self):
++    def test_preconstruction_requirement_accepts_pipeline_parallelism(self):
+         fake_kt_module = SimpleNamespace(require_kt_ep_registration=lambda: None)
+         with (
+             patch.object(
+@@ -180,10 +195,29 @@ class TestGlm47FlashKtEpCoverage(unittest.TestCase):
+                 sys.modules,
+                 {"sglang.srt.layers.moe.kt_ep_wrapper": fake_kt_module},
+             ),
+-            self.assertRaisesRegex(RuntimeError, "pipeline parallel size 1"),
++        ):
++            enabled = glm._require_glm47_flash_kt_ep(
++                config=self._config(), pp_size=3, prefix="model"
++            )
++
++        self.assertTrue(enabled)
++
++    def test_preconstruction_requirement_rejects_invalid_pipeline_size(self):
++        fake_kt_module = SimpleNamespace(require_kt_ep_registration=lambda: None)
++        with (
++            patch.object(
++                glm,
++                "get_global_server_args",
++                return_value=self._server_args(),
++            ),
++            patch.dict(
++                sys.modules,
++                {"sglang.srt.layers.moe.kt_ep_wrapper": fake_kt_module},
++            ),
++            self.assertRaisesRegex(RuntimeError, "between 1 and 47"),
+         ):
+             glm._require_glm47_flash_kt_ep(
+-                config=self._config(), pp_size=2, prefix="model"
++                config=self._config(), pp_size=0, prefix="model"
+             )
+ 
+     def test_preconstruction_requirement_rejects_hash_layers(self):
+@@ -269,6 +303,10 @@ class TestGlm47FlashKtEpCoverage(unittest.TestCase):
+ 
+         self.assertEqual(receipt["gpu_expert_mask_shape"], [47, 64])
+         self.assertEqual(receipt["configured_gpu_resident_experts_per_layer"], 3)
++        self.assertEqual(receipt["pipeline_parallel_rank"], 0)
++        self.assertEqual(receipt["pipeline_parallel_size"], 1)
++        self.assertEqual(receipt["pipeline_layer_start"], 0)
++        self.assertEqual(receipt["pipeline_layer_end"], 47)
+         self.assertEqual(receipt["routed_layer_ids"], list(range(1, 47)))
+         self.assertEqual(len(receipt["layers"]), 46)
+         self.assertEqual(
+@@ -281,6 +319,73 @@ class TestGlm47FlashKtEpCoverage(unittest.TestCase):
+         )
+         self.assertEqual(len(receipt["gpu_expert_mask_sha256"]), 64)
+ 
++    def test_coverage_receipt_binds_each_pp3_stage_local_range(self):
++        stage_ranges = ((0, 16), (16, 32), (32, 47))
++        for pp_rank, (start_layer, end_layer) in enumerate(stage_ranges):
++            with self.subTest(pp_rank=pp_rank):
++                config, masks, all_layers = self._coverage_fixture()
++                layers = [
++                    layer
++                    if start_layer <= layer_id < end_layer
++                    else SimpleNamespace(layer_id=layer_id, mlp=object())
++                    for layer_id, layer in enumerate(all_layers)
++                ]
++
++                receipt = self._build_receipt(
++                    config,
++                    masks,
++                    layers,
++                    pp_rank=pp_rank,
++                    pp_size=3,
++                    start_layer=start_layer,
++                    end_layer=end_layer,
++                )
++
++                expected_layer_ids = list(range(max(start_layer, 1), end_layer))
++                self.assertEqual(receipt["pipeline_parallel_rank"], pp_rank)
++                self.assertEqual(receipt["pipeline_parallel_size"], 3)
++                self.assertEqual(receipt["pipeline_layer_start"], start_layer)
++                self.assertEqual(receipt["pipeline_layer_end"], end_layer)
++                self.assertEqual(receipt["routed_layer_ids"], expected_layer_ids)
++                self.assertEqual(
++                    [layer["layer_id"] for layer in receipt["layers"]],
++                    expected_layer_ids,
++                )
++
++    def test_coverage_rejects_routed_layer_outside_local_range(self):
++        config, masks, all_layers = self._coverage_fixture()
++        layers = [
++            layer
++            if 16 <= layer_id < 32 or layer_id == 15
++            else SimpleNamespace(layer_id=layer_id, mlp=object())
++            for layer_id, layer in enumerate(all_layers)
++        ]
++
++        with self.assertRaisesRegex(RuntimeError, "routed-layer coverage mismatch"):
++            self._build_receipt(
++                config,
++                masks,
++                layers,
++                pp_rank=1,
++                pp_size=3,
++                start_layer=16,
++                end_layer=32,
++            )
++
++    def test_coverage_rejects_invalid_local_pipeline_range(self):
++        config, masks, layers = self._coverage_fixture()
++
++        with self.assertRaisesRegex(RuntimeError, "invalid local pipeline range"):
++            self._build_receipt(
++                config,
++                masks,
++                layers,
++                pp_rank=3,
++                pp_size=3,
++                start_layer=32,
++                end_layer=47,
++            )
++
+     def test_coverage_rejects_noncanonical_fused_moe_path(self):
+         config, masks, layers = self._coverage_fixture()
+         layers[12].mlp.experts._registry_prefix = "model.layers.11.mlp.experts"
+diff --git a/test/unit/test_kt_ep_tp_group_broadcast.py b/test/unit/test_kt_ep_tp_group_broadcast.py
+new file mode 100644
+index 000000000..5517b1c68
+--- /dev/null
++++ b/test/unit/test_kt_ep_tp_group_broadcast.py
+@@ -0,0 +1,109 @@
++import unittest
++from types import SimpleNamespace
++from unittest.mock import Mock, patch
++
++import torch
++
++with (
++    patch.object(torch.cuda, "get_device_capability", return_value=(8, 6)),
++    patch.object(torch.cuda, "current_device", return_value=0),
++):
++    from sglang.srt.layers.moe import kt_ep_wrapper as kt
++
++
++class TestKtEpTpGroupBroadcast(unittest.TestCase):
++    def _group(self):
++        return SimpleNamespace(
++            first_rank=2,
++            world_size=2,
++            cpu_group=object(),
++            device_group=object(),
++        )
++
++    def test_object_list_uses_global_first_rank_of_tp_group(self):
++        group = self._group()
++        broadcast = Mock()
++        values = ["stage-local"]
++
++        with (
++            patch.object(kt.dist, "is_initialized", return_value=True),
++            patch.object(kt.dist, "broadcast_object_list", broadcast),
++            patch.object(kt, "get_tp_group", return_value=group),
++        ):
++            kt._broadcast_tp_object_list(values)
++
++        broadcast.assert_called_once_with(
++            values,
++            src=2,
++            group=group.cpu_group,
++        )
++
++    def test_cpu_tensor_uses_global_first_rank_and_cpu_group(self):
++        group = self._group()
++        broadcast = Mock()
++        tensor = torch.zeros((2,), dtype=torch.bool)
++
++        with (
++            patch.object(kt.dist, "is_initialized", return_value=True),
++            patch.object(kt.dist, "broadcast", broadcast),
++            patch.object(kt, "get_tp_group", return_value=group),
++        ):
++            kt._broadcast_tp_tensor(tensor, on_device=False)
++
++        broadcast.assert_called_once_with(
++            tensor,
++            src=2,
++            group=group.cpu_group,
++        )
++
++    def test_device_tensor_uses_global_first_rank_and_device_group(self):
++        group = self._group()
++        broadcast = Mock()
++        tensor = torch.zeros((2,), dtype=torch.int64)
++
++        with (
++            patch.object(kt.dist, "is_initialized", return_value=True),
++            patch.object(kt.dist, "broadcast", broadcast),
++            patch.object(kt, "get_tp_group", return_value=group),
++        ):
++            kt._broadcast_tp_tensor(tensor, on_device=True)
++
++        broadcast.assert_called_once_with(
++            tensor,
++            src=2,
++            group=group.device_group,
++        )
++
++    def test_uninitialized_distributed_runtime_is_a_noop(self):
++        with (
++            patch.object(kt.dist, "is_initialized", return_value=False),
++            patch.object(kt, "get_tp_group") as get_tp_group,
++        ):
++            kt._broadcast_tp_object_list(["local"])
++            kt._broadcast_tp_tensor(torch.zeros((1,)), on_device=False)
++
++        get_tp_group.assert_not_called()
++
++    def test_singleton_tp_group_skips_all_broadcasts(self):
++        group = SimpleNamespace(
++            first_rank=2,
++            world_size=1,
++            cpu_group=object(),
++            device_group=object(),
++        )
++        with (
++            patch.object(kt.dist, "is_initialized", return_value=True),
++            patch.object(kt.dist, "broadcast") as broadcast,
++            patch.object(kt.dist, "broadcast_object_list") as broadcast_object_list,
++            patch.object(kt, "get_tp_group", return_value=group),
++        ):
++            kt._broadcast_tp_object_list(["local"])
++            kt._broadcast_tp_tensor(torch.zeros((1,)), on_device=False)
++            kt._broadcast_tp_tensor(torch.zeros((1,)), on_device=True)
++
++        broadcast.assert_not_called()
++        broadcast_object_list.assert_not_called()
++
++
++if __name__ == "__main__":
++    unittest.main()

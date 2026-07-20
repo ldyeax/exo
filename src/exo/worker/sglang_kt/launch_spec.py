@@ -1,4 +1,5 @@
 import hashlib
+from collections.abc import Mapping
 from typing import Annotated, Final, Literal, final
 
 from pydantic import PositiveInt, StringConstraints, model_validator
@@ -49,11 +50,16 @@ GLM_4_7_FLASH_CPU_ROUTED_EXPERTS_TARGET_PROFILE: Final[SglangKtTargetProfile] = 
 GLM_4_7_FLASH_SERVING_BASELINE_TARGET_PROFILE: Final[SglangKtTargetProfile] = (
     "glm47_flash_bf16_sm86_serving_baseline_v1"
 )
+GLM_4_7_FLASH_PP3_DIAGNOSTIC_TARGET_PROFILE: Final[SglangKtTargetProfile] = (
+    "glm47_flash_bf16_sm86_pp3_diagnostic_v1"
+)
+GLM_4_7_FLASH_PP3_PIPELINE_LAYER_PARTITION: Final = (16, 16, 15)
 GLM_4_7_FLASH_TARGET_PROFILES: Final = frozenset(
     (
         GLM_4_7_FLASH_TARGET_PROFILE,
         GLM_4_7_FLASH_CPU_ROUTED_EXPERTS_TARGET_PROFILE,
         GLM_4_7_FLASH_SERVING_BASELINE_TARGET_PROFILE,
+        GLM_4_7_FLASH_PP3_DIAGNOSTIC_TARGET_PROFILE,
     )
 )
 
@@ -61,8 +67,8 @@ GLM_4_7_FLASH_TARGET_PROFILES: Final = frozenset(
 # SGLang submodule pins the matching fork revision below.
 SUPPORTED_KTRANSFORMERS_REVISION: Final = "ce7c3ddbe93f7ac1f992375eed54058bbc512646"
 SUPPORTED_SGLANG_REVISION: Final = "8b636f9008dbad58c0a8e481b03e794739e6c146"
-GLM_4_7_FLASH_KTRANSFORMERS_REVISION: Final = "6e0a4480936effa7bf0ece429f78a00b29932bec"
-GLM_4_7_FLASH_SGLANG_REVISION: Final = "42504e59810130460fc24fdd17ef534cb8278a4b"
+GLM_4_7_FLASH_KTRANSFORMERS_REVISION: Final = "f9ca69648421f5774215c4da9cf711dccf54f49e"
+GLM_4_7_FLASH_SGLANG_REVISION: Final = "3721d710102456b6bf849122e781129dc3f7d9c6"
 REQUIRED_TRANSFORMERS_DISTRIBUTION: Final = "transformers-kt"
 REQUIRED_TRANSFORMERS_DISTRIBUTION_VERSION: Final = "5.6.0.post1"
 REQUIRED_TRANSFORMERS_MODULE_VERSION: Final = "5.6.0"
@@ -76,6 +82,7 @@ Sha256Digest = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 SGLANG_KT_PROCESS_LAUNCH_SPEC_CANONICALIZATION: Final = (
     "exo-sglang-kt-process-launch-spec-v1"
 )
+SglangKtPythonExecutable = str | Mapping[NodeId, str]
 
 
 @final
@@ -254,7 +261,10 @@ class SglangKtProcessLaunchSpec(FrozenModel):
                 "GLM-4.7-Flash",
                 "--trust-remote-code",
             )
-            if self.target_profile == GLM_4_7_FLASH_SERVING_BASELINE_TARGET_PROFILE:
+            if self.target_profile in (
+                GLM_4_7_FLASH_SERVING_BASELINE_TARGET_PROFILE,
+                GLM_4_7_FLASH_PP3_DIAGNOSTIC_TARGET_PROFILE,
+            ):
                 return (*glm47_arguments, "--disable-radix-cache")
             return (*glm47_arguments, "--record-kt-gpu-expert-distribution")
         return (
@@ -279,6 +289,20 @@ class SglangKtProcessLaunchSpec(FrozenModel):
             ("CUDA_VISIBLE_DEVICES", self.stage.gpu_uuid),
             ("PYTORCH_ALLOC_CONF", "expandable_segments:True"),
         )
+        if self.target_profile == GLM_4_7_FLASH_PP3_DIAGNOSTIC_TARGET_PROFILE:
+            layer_partition = ",".join(
+                str(layer_count) for layer_count in self.plan.pipeline_layer_partition
+            )
+            return (
+                common_environment[0],
+                ("NCCL_NET", "IB"),
+                ("NCCL_IB_HCA", f"={','.join(self.stage.hca_devices)}"),
+                ("NCCL_GIN_ENABLE", "0"),
+                ("NCCL_GIN_TYPE", "0"),
+                ("NCCL_NET_GDR_LEVEL", "LOC"),
+                common_environment[1],
+                ("SGLANG_PP_LAYER_PARTITION", layer_partition),
+            )
         if self.target_profile in GLM_4_7_FLASH_TARGET_PROFILES:
             if self.target_profile == GLM_4_7_FLASH_SERVING_BASELINE_TARGET_PROFILE:
                 return common_environment
@@ -344,7 +368,7 @@ def calculate_sglang_kt_process_launch_spec_sha256(
 
 def build_glm_5_2_fp8_process_launch_specs(
     plan: SglangKtLaunchPlan,
-    python_executable: str,
+    python_executable: SglangKtPythonExecutable,
 ) -> tuple[SglangKtProcessLaunchSpec, ...]:
     """Build pinned PP=stage-count, TP=1 SGLang-KT process descriptions.
 
@@ -361,7 +385,7 @@ def build_glm_5_2_fp8_process_launch_specs(
 
 def build_glm_4_7_flash_bf16_process_launch_specs(
     plan: SglangKtLaunchPlan,
-    python_executable: str,
+    python_executable: SglangKtPythonExecutable,
 ) -> tuple[SglangKtProcessLaunchSpec, ...]:
     """Build one inert, receipt-gated GLM-4.7-Flash hybrid smoke process."""
 
@@ -375,7 +399,7 @@ def build_glm_4_7_flash_bf16_process_launch_specs(
 
 def build_glm_4_7_flash_bf16_cpu_routed_experts_process_launch_specs(
     plan: SglangKtLaunchPlan,
-    python_executable: str,
+    python_executable: SglangKtPythonExecutable,
 ) -> tuple[SglangKtProcessLaunchSpec, ...]:
     """Build the receipt-gated zero-resident-GPU-expert control process."""
 
@@ -389,7 +413,7 @@ def build_glm_4_7_flash_bf16_cpu_routed_experts_process_launch_specs(
 
 def build_glm_4_7_flash_bf16_serving_baseline_process_launch_specs(
     plan: SglangKtLaunchPlan,
-    python_executable: str,
+    python_executable: SglangKtPythonExecutable,
 ) -> tuple[SglangKtProcessLaunchSpec, ...]:
     """Build the receipt-gated, instrumentation-free serving baseline."""
 
@@ -401,13 +425,47 @@ def build_glm_4_7_flash_bf16_serving_baseline_process_launch_specs(
     return build_sglang_kt_process_launch_specs(plan, python_executable)
 
 
+def build_glm_4_7_flash_bf16_pp3_diagnostic_process_launch_specs(
+    plan: SglangKtLaunchPlan,
+    python_executable: SglangKtPythonExecutable,
+) -> tuple[SglangKtProcessLaunchSpec, ...]:
+    """Build the three-stage GLM-4.7 serving diagnostic process group."""
+
+    if plan.target_profile != GLM_4_7_FLASH_PP3_DIAGNOSTIC_TARGET_PROFILE:
+        raise ValueError(
+            "GLM-4.7-Flash PP3 diagnostic builder requires target profile "
+            f"{GLM_4_7_FLASH_PP3_DIAGNOSTIC_TARGET_PROFILE}"
+        )
+    return build_sglang_kt_process_launch_specs(plan, python_executable)
+
+
 def build_sglang_kt_process_launch_specs(
     plan: SglangKtLaunchPlan,
-    python_executable: str,
+    python_executable: SglangKtPythonExecutable,
 ) -> tuple[SglangKtProcessLaunchSpec, ...]:
     """Build inert process descriptions for one statically admitted profile."""
 
     _validate_supported_plan(plan)
+    plan_node_ids = frozenset(stage.node_id for stage in plan.stages)
+    if isinstance(python_executable, str):
+        executable_by_node: Mapping[NodeId, str] = {
+            node_id: python_executable for node_id in plan_node_ids
+        }
+    else:
+        executable_node_ids = frozenset(python_executable)
+        if executable_node_ids != plan_node_ids:
+            missing_node_ids = (
+                ", ".join(sorted(plan_node_ids - executable_node_ids)) or "none"
+            )
+            unexpected_node_ids = (
+                ", ".join(sorted(executable_node_ids - plan_node_ids)) or "none"
+            )
+            raise ValueError(
+                "Python executable mapping keys must exactly match launch plan "
+                f"node IDs (missing: {missing_node_ids}; "
+                f"unexpected: {unexpected_node_ids})"
+            )
+        executable_by_node = python_executable
 
     # Each pipeline stage is one logical SGLang node. This permits two logical
     # nodes to share a physical host while satisfying SGLang's world-size rules.
@@ -415,7 +473,7 @@ def build_sglang_kt_process_launch_specs(
         SglangKtProcessLaunchSpec(
             plan=plan,
             pipeline_rank=stage.pipeline_rank,
-            executable=python_executable,
+            executable=executable_by_node[stage.node_id],
             model_contract_sha256=(
                 GLM_4_7_FLASH_BF16_MODEL_CONTRACT_SHA256
                 if plan.target_profile in GLM_4_7_FLASH_TARGET_PROFILES
@@ -499,7 +557,10 @@ def _validate_glm_4_7_flash_bf16_plan(plan: SglangKtLaunchPlan) -> None:
         )
     if plan.total_layers != GLM_4_7_FLASH_LAYER_COUNT:
         raise ValueError("GLM-4.7-Flash launch plans must contain exactly 47 layers")
-    if len(plan.stages) != 1:
+    if (
+        plan.target_profile != GLM_4_7_FLASH_PP3_DIAGNOSTIC_TARGET_PROFILE
+        and len(plan.stages) != 1
+    ):
         raise ValueError("GLM-4.7-Flash smoke profile requires PP=1 and TP=1")
     if plan.context_length != GLM_4_7_FLASH_CONTEXT_LENGTH:
         raise ValueError(
@@ -514,6 +575,10 @@ def _validate_glm_4_7_flash_bf16_plan(plan: SglangKtLaunchPlan) -> None:
         raise ValueError("GLM-4.7-Flash smoke profile requires one running request")
     if plan.static_memory_fraction != 0.8:
         raise ValueError("GLM-4.7-Flash smoke static memory fraction must be 0.8")
+
+    if plan.target_profile == GLM_4_7_FLASH_PP3_DIAGNOSTIC_TARGET_PROFILE:
+        _validate_glm_4_7_flash_bf16_pp3_diagnostic_plan(plan)
+        return
 
     stage = plan.stages[0]
     if stage.model_path != stage.ktransformers_weight_path:
@@ -547,3 +612,37 @@ def _validate_glm_4_7_flash_bf16_plan(plan: SglangKtLaunchPlan) -> None:
         raise ValueError("GLM-4.7-Flash smoke requires deferred experts disabled")
     if stage.hca_devices:
         raise ValueError("GLM-4.7-Flash PP=1 smoke profile does not admit HCA devices")
+
+
+def _validate_glm_4_7_flash_bf16_pp3_diagnostic_plan(
+    plan: SglangKtLaunchPlan,
+) -> None:
+    if len(plan.stages) != len(GLM_4_7_FLASH_PP3_PIPELINE_LAYER_PARTITION):
+        raise ValueError("GLM-4.7-Flash PP3 diagnostic profile requires three stages")
+    if plan.pipeline_layer_partition != GLM_4_7_FLASH_PP3_PIPELINE_LAYER_PARTITION:
+        raise ValueError(
+            "GLM-4.7-Flash PP3 diagnostic profile requires the 16,16,15 layer partition"
+        )
+
+    for stage in plan.stages:
+        if stage.model_path != stage.ktransformers_weight_path:
+            raise ValueError(
+                "the GLM-4.7-Flash BF16 PP3 diagnostic profile requires model_path "
+                "and ktransformers_weight_path to match"
+            )
+        if stage.ktransformers_method != "BF16":
+            raise ValueError(
+                "GLM-4.7-Flash BF16 PP3 diagnostic stages require KTransformers "
+                "method BF16"
+            )
+        if not 1 <= stage.resident_gpu_experts < GLM_4_7_FLASH_ROUTED_EXPERT_COUNT:
+            raise ValueError(
+                "GLM-4.7-Flash PP3 diagnostic stages require between 1 and 63 "
+                "resident GPU experts per MoE layer"
+            )
+        if stage.max_deferred_experts_per_token != 0:
+            raise ValueError(
+                "GLM-4.7-Flash PP3 diagnostic stages require deferred experts disabled"
+            )
+        if not stage.hca_devices:
+            raise ValueError("GLM-4.7-Flash PP3 diagnostic stages require hca_devices")

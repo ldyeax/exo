@@ -14,6 +14,8 @@ from exo.worker.sglang_kt.launch_spec import (
     GLM_4_7_FLASH_BF16_MODEL_REVISION,
     GLM_4_7_FLASH_CPU_ROUTED_EXPERTS_TARGET_PROFILE,
     GLM_4_7_FLASH_KTRANSFORMERS_REVISION,
+    GLM_4_7_FLASH_PP3_DIAGNOSTIC_TARGET_PROFILE,
+    GLM_4_7_FLASH_PP3_PIPELINE_LAYER_PARTITION,
     GLM_4_7_FLASH_SERVING_BASELINE_TARGET_PROFILE,
     GLM_4_7_FLASH_SGLANG_REVISION,
     GLM_4_7_FLASH_TARGET_PROFILE,
@@ -26,6 +28,7 @@ from exo.worker.sglang_kt.launch_spec import (
     SUPPORTED_SGLANG_REVISION,
     SglangKtProcessLaunchSpec,
     build_glm_4_7_flash_bf16_cpu_routed_experts_process_launch_specs,
+    build_glm_4_7_flash_bf16_pp3_diagnostic_process_launch_specs,
     build_glm_4_7_flash_bf16_process_launch_specs,
     build_glm_4_7_flash_bf16_serving_baseline_process_launch_specs,
     build_glm_5_2_fp8_process_launch_specs,
@@ -191,6 +194,93 @@ def make_glm_4_7_flash_bf16_serving_baseline_plan() -> SglangKtLaunchPlan:
     plan = make_glm_4_7_flash_bf16_plan()
     return plan.model_copy(
         update={"target_profile": GLM_4_7_FLASH_SERVING_BASELINE_TARGET_PROFILE}
+    )
+
+
+def make_glm_4_7_flash_bf16_pp3_diagnostic_plan(
+    *, resident_gpu_experts: int = 4
+) -> SglangKtLaunchPlan:
+    model_path = "/var/lib/exo/models/glm-4.7-flash-bf16"
+
+    def make_pp3_stage(
+        pipeline_rank: int,
+        start_layer: int,
+        end_layer: int,
+        *,
+        node_id: str,
+        gpu_suffix: int,
+        service_ip: str,
+        service_port: int,
+        cpu_cores: tuple[int, ...],
+        memory_node: int,
+    ) -> SglangKtStageSpec:
+        return SglangKtStageSpec(
+            pipeline_rank=pipeline_rank,
+            start_layer=start_layer,
+            end_layer=end_layer,
+            node_id=NodeId(node_id),
+            gpu_uuid=f"GPU-00000000-0000-0000-0000-{gpu_suffix:012x}",
+            service_endpoint=Host(ip=service_ip, port=service_port),
+            model_path=model_path,
+            ktransformers_weight_path=model_path,
+            cpu_cores=cpu_cores,
+            memory_nodes=(memory_node,),
+            cpu_infer_threads=len(cpu_cores),
+            threadpool_count=1,
+            ktransformers_method="BF16",
+            resident_gpu_experts=resident_gpu_experts,
+            max_deferred_experts_per_token=0,
+            hca_devices=("mlx4_0:1", "mlx4_0:2"),
+        )
+
+    return SglangKtLaunchPlan(
+        target_profile=GLM_4_7_FLASH_PP3_DIAGNOSTIC_TARGET_PROFILE,
+        model_id=GLM_4_7_FLASH_BF16_MODEL_ID,
+        model_revision=GLM_4_7_FLASH_BF16_MODEL_REVISION,
+        sglang_revision=GLM_4_7_FLASH_SGLANG_REVISION,
+        ktransformers_revision=GLM_4_7_FLASH_KTRANSFORMERS_REVISION,
+        total_layers=47,
+        context_length=202_752,
+        max_total_tokens=4_096,
+        static_memory_fraction=0.8,
+        max_concurrent_requests=1,
+        distributed_coordinator=Host(ip="192.168.40.248", port=29_520),
+        rank_zero_endpoint=Host(ip="192.168.40.248", port=30_200),
+        stages=(
+            make_pp3_stage(
+                0,
+                0,
+                16,
+                node_id="dwagon",
+                gpu_suffix=1,
+                service_ip="192.168.40.248",
+                service_port=30_200,
+                cpu_cores=tuple(range(56)),
+                memory_node=0,
+            ),
+            make_pp3_stage(
+                1,
+                16,
+                32,
+                node_id="dwagon",
+                gpu_suffix=2,
+                service_ip="192.168.40.248",
+                service_port=30_201,
+                cpu_cores=tuple(range(56, 112)),
+                memory_node=1,
+            ),
+            make_pp3_stage(
+                2,
+                32,
+                47,
+                node_id="fwuff",
+                gpu_suffix=3,
+                service_ip="192.168.40.249",
+                service_port=30_202,
+                cpu_cores=tuple(range(60)),
+                memory_node=0,
+            ),
+        ),
     )
 
 
@@ -369,6 +459,123 @@ def test_builds_instrumentation_free_glm_4_7_serving_baseline() -> None:
     assert SglangKtProcessLaunchSpec.model_validate_json(spec.model_dump_json()) == spec
 
 
+def test_builds_glm_4_7_flash_bf16_pp3_diagnostic_process_group() -> None:
+    plan = make_glm_4_7_flash_bf16_pp3_diagnostic_plan()
+
+    specs = build_glm_4_7_flash_bf16_pp3_diagnostic_process_launch_specs(
+        plan,
+        PYTHON_EXECUTABLE,
+    )
+
+    assert plan.pipeline_layer_partition == GLM_4_7_FLASH_PP3_PIPELINE_LAYER_PARTITION
+    assert tuple(spec.pipeline_rank for spec in specs) == (0, 1, 2)
+    assert tuple(spec.node_id for spec in specs) == (
+        NodeId("dwagon"),
+        NodeId("dwagon"),
+        NodeId("fwuff"),
+    )
+    assert tuple(spec.stage.resident_gpu_experts for spec in specs) == (4, 4, 4)
+    for expected_rank, spec in enumerate(specs):
+        assert spec.target_profile == GLM_4_7_FLASH_PP3_DIAGNOSTIC_TARGET_PROFILE
+        assert argument_value(spec.arguments, "--pp-size") == "3"
+        assert argument_value(spec.arguments, "--tp-size") == "1"
+        assert argument_value(spec.arguments, "--nnodes") == "3"
+        assert argument_value(spec.arguments, "--node-rank") == str(expected_rank)
+        assert argument_value(spec.arguments, "--kt-method") == "BF16"
+        assert argument_value(spec.arguments, "--kt-num-gpu-experts") == "4"
+        assert "--disable-radix-cache" in spec.arguments
+        assert "--record-kt-gpu-expert-distribution" not in spec.arguments
+        assert dict(spec.environment) == {
+            "CUDA_VISIBLE_DEVICES": spec.gpu_uuid,
+            "NCCL_NET": "IB",
+            "NCCL_IB_HCA": "=mlx4_0:1,mlx4_0:2",
+            "NCCL_GIN_ENABLE": "0",
+            "NCCL_GIN_TYPE": "0",
+            "NCCL_NET_GDR_LEVEL": "LOC",
+            "PYTORCH_ALLOC_CONF": "expandable_segments:True",
+            "SGLANG_PP_LAYER_PARTITION": "16,16,15",
+        }
+        assert "SGLANG_KT_HYBRID_TIMING" not in dict(spec.environment)
+        assert "SGLANG_ENABLE_JIT_DEEPGEMM" not in dict(spec.environment)
+        assert (
+            SglangKtProcessLaunchSpec.model_validate_json(spec.model_dump_json())
+            == spec
+        )
+
+
+def test_glm_4_7_flash_pp3_selects_python_executable_by_physical_node() -> None:
+    plan = make_glm_4_7_flash_bf16_pp3_diagnostic_plan()
+    executable_by_node = {
+        NodeId("dwagon"): "/var/lib/exo/runtimes/dwagon/venv/bin/python",
+        NodeId("fwuff"): "/var/lib/exo/runtimes/fwuff/venv/bin/python",
+    }
+
+    specs = build_glm_4_7_flash_bf16_pp3_diagnostic_process_launch_specs(
+        plan,
+        executable_by_node,
+    )
+
+    assert tuple(spec.executable for spec in specs) == (
+        executable_by_node[NodeId("dwagon")],
+        executable_by_node[NodeId("dwagon")],
+        executable_by_node[NodeId("fwuff")],
+    )
+    assert tuple(spec.command[0] for spec in specs) == tuple(
+        spec.executable for spec in specs
+    )
+
+
+@pytest.mark.parametrize(
+    ("executable_by_node", "error_detail"),
+    (
+        (
+            {NodeId("dwagon"): "/var/lib/exo/runtimes/dwagon/bin/python"},
+            "missing: fwuff; unexpected: none",
+        ),
+        (
+            {
+                NodeId("dwagon"): "/var/lib/exo/runtimes/dwagon/bin/python",
+                NodeId("fwuff"): "/var/lib/exo/runtimes/fwuff/bin/python",
+                NodeId("spare"): "/var/lib/exo/runtimes/spare/bin/python",
+            },
+            "missing: none; unexpected: spare",
+        ),
+    ),
+)
+def test_glm_4_7_flash_pp3_rejects_inexact_python_executable_node_keys(
+    executable_by_node: dict[NodeId, str],
+    error_detail: str,
+) -> None:
+    with pytest.raises(
+        ValueError,
+        match="Python executable mapping keys must exactly match launch plan node IDs",
+    ) as error:
+        build_glm_4_7_flash_bf16_pp3_diagnostic_process_launch_specs(
+            make_glm_4_7_flash_bf16_pp3_diagnostic_plan(),
+            executable_by_node,
+        )
+
+    assert error_detail in str(error.value)
+
+
+@pytest.mark.parametrize("resident_gpu_experts", (1, 63))
+def test_glm_4_7_flash_pp3_diagnostic_keeps_resident_expert_boundaries(
+    resident_gpu_experts: int,
+) -> None:
+    specs = build_glm_4_7_flash_bf16_pp3_diagnostic_process_launch_specs(
+        make_glm_4_7_flash_bf16_pp3_diagnostic_plan(
+            resident_gpu_experts=resident_gpu_experts
+        ),
+        PYTHON_EXECUTABLE,
+    )
+
+    assert tuple(spec.stage.resident_gpu_experts for spec in specs) == (
+        resident_gpu_experts,
+        resident_gpu_experts,
+        resident_gpu_experts,
+    )
+
+
 def test_builds_fail_closed_glm_4_7_flash_cpu_routed_experts_control() -> None:
     plan = make_glm_4_7_flash_bf16_cpu_routed_experts_plan()
 
@@ -488,6 +695,63 @@ def test_glm_4_7_flash_smoke_rejects_multiple_pipeline_stages() -> None:
         build_glm_4_7_flash_bf16_process_launch_specs(plan, PYTHON_EXECUTABLE)
 
 
+def test_glm_4_7_flash_pp3_diagnostic_requires_exact_stage_count() -> None:
+    plan = make_glm_4_7_flash_bf16_pp3_diagnostic_plan()
+
+    with pytest.raises(ValueError, match="requires three stages"):
+        build_glm_4_7_flash_bf16_pp3_diagnostic_process_launch_specs(
+            plan.model_copy(update={"stages": (plan.stages[0],)}),
+            PYTHON_EXECUTABLE,
+        )
+
+
+def test_glm_4_7_flash_pp3_diagnostic_requires_exact_layer_partition() -> None:
+    plan = make_glm_4_7_flash_bf16_pp3_diagnostic_plan()
+    stages = (
+        plan.stages[0].model_copy(update={"end_layer": 15}),
+        plan.stages[1].model_copy(update={"start_layer": 15, "end_layer": 31}),
+        plan.stages[2].model_copy(update={"start_layer": 31}),
+    )
+
+    with pytest.raises(ValueError, match="16,16,15 layer partition"):
+        build_glm_4_7_flash_bf16_pp3_diagnostic_process_launch_specs(
+            plan.model_copy(update={"stages": stages}),
+            PYTHON_EXECUTABLE,
+        )
+
+
+@pytest.mark.parametrize(
+    ("stage_update", "error_message"),
+    (
+        ({"ktransformers_method": "FP8"}, "method BF16"),
+        ({"resident_gpu_experts": 0}, "between 1 and 63"),
+        ({"resident_gpu_experts": 64}, "between 1 and 63"),
+        ({"max_deferred_experts_per_token": 1}, "deferred experts disabled"),
+        ({"hca_devices": ()}, "require hca_devices"),
+        (
+            {"ktransformers_weight_path": "/var/lib/exo/models/other"},
+            "model_path and ktransformers_weight_path",
+        ),
+    ),
+)
+def test_glm_4_7_flash_pp3_diagnostic_rejects_unvalidated_stage_options(
+    stage_update: dict[str, object],
+    error_message: str,
+) -> None:
+    plan = make_glm_4_7_flash_bf16_pp3_diagnostic_plan()
+    stages = (
+        plan.stages[0],
+        plan.stages[1].model_copy(update=stage_update),
+        plan.stages[2],
+    )
+
+    with pytest.raises(ValueError, match=error_message):
+        build_glm_4_7_flash_bf16_pp3_diagnostic_process_launch_specs(
+            plan.model_copy(update={"stages": stages}),
+            PYTHON_EXECUTABLE,
+        )
+
+
 def test_model_specific_builders_reject_the_other_target_profile() -> None:
     with pytest.raises(ValueError, match="GLM-5.2 builder requires"):
         build_glm_5_2_fp8_process_launch_specs(
@@ -501,6 +765,10 @@ def test_model_specific_builders_reject_the_other_target_profile() -> None:
         )
     with pytest.raises(ValueError, match="CPU-routed-experts builder requires"):
         build_glm_4_7_flash_bf16_cpu_routed_experts_process_launch_specs(
+            make_glm_4_7_flash_bf16_plan(), PYTHON_EXECUTABLE
+        )
+    with pytest.raises(ValueError, match="PP3 diagnostic builder requires"):
+        build_glm_4_7_flash_bf16_pp3_diagnostic_process_launch_specs(
             make_glm_4_7_flash_bf16_plan(), PYTHON_EXECUTABLE
         )
 
