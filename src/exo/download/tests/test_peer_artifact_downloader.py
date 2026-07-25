@@ -8,20 +8,28 @@ import pytest
 from pydantic import SecretStr
 
 import exo.download.download_utils as download_utils
-from exo.download.peer_artifact_downloader import PeerArtifactShardDownloader
+from exo.download.peer_artifact_downloader import (
+    PeerArtifactShardDownloader,
+    materialize_peer_artifact_snapshot,
+)
 from exo.download.peer_artifact_http import (
     PeerArtifactDeploymentConfig,
     PeerArtifactLinkUnavailableError,
     PeerArtifactPeerConfig,
     PeerArtifactSnapshotFile,
     PeerArtifactSnapshotManifest,
+    peer_artifact_snapshot_id,
 )
 from exo.download.peer_artifact_transfer import (
+    PEER_ARTIFACT_SNAPSHOT_RECEIPT_FILENAME,
     PeerArtifactLink,
     PeerArtifactLinkId,
     PeerArtifactManifest,
+    PeerArtifactSnapshotId,
     RelativeArtifactPath,
+    Sha256Digest,
     build_peer_artifact_manifest,
+    peer_artifact_manifest_fingerprint,
 )
 from exo.download.shard_downloader import NOOP_DOWNLOAD_PROGRESS, ShardDownloader
 from exo.shared.models.model_cards import ModelCard, ModelTask
@@ -123,19 +131,24 @@ class InMemoryPeerClient:
         self,
         *,
         link: PeerArtifactLink,
+        snapshot_id: PeerArtifactSnapshotId,
+        expected_manifest_sha256: Sha256Digest,
         artifact_path: RelativeArtifactPath,
     ) -> PeerArtifactManifest:
-        del link
+        del link, snapshot_id, expected_manifest_sha256
         return self.manifests[artifact_path]
 
     async def read_artifact_range(
         self,
         *,
         link: PeerArtifactLink,
+        snapshot_id: PeerArtifactSnapshotId,
+        artifact_sha256: Sha256Digest,
         artifact_path: RelativeArtifactPath,
         offset_bytes: int,
         size_bytes: int,
     ) -> bytes:
+        del snapshot_id, artifact_sha256
         self.range_link_ids.append(link.link_id)
         return self.contents[artifact_path][
             offset_bytes : offset_bytes + size_bytes
@@ -200,6 +213,8 @@ def _peer_fixture(
             b'"model-00001-of-00001.safetensors"}}'
         ),
         "model-00001-of-00001.safetensors": b"weights!",
+        "model/launch.json": b'{"model":"rank-view"}',
+        "ktransformers/index.json": b'{"experts":"rank-view"}',
     }
     source = tmp_path / "source"
     source.mkdir()
@@ -208,26 +223,36 @@ def _peer_fixture(
     artifact_contents: dict[str, bytes] = {}
     for file_path, file_contents in contents.items():
         source_path = source / file_path
+        source_path.parent.mkdir(parents=True, exist_ok=True)
         source_path.write_bytes(file_contents)
         artifact_path = f"snapshot/{file_path}"
-        manifests[artifact_path] = build_peer_artifact_manifest(
+        manifest = build_peer_artifact_manifest(
             source_path,
             artifact_path,
             chunk_size_bytes=4,
         )
+        manifests[artifact_path] = manifest
         artifact_contents[artifact_path] = file_contents
         files.append(
             PeerArtifactSnapshotFile(
                 file_path=file_path,
                 artifact_path=artifact_path,
                 size_bytes=len(file_contents),
+                sha256=manifest.sha256,
+                manifest_sha256=peer_artifact_manifest_fingerprint(manifest),
             )
         )
+    sorted_files = tuple(sorted(files, key=lambda file: file.file_path))
     snapshot = PeerArtifactSnapshotManifest(
         schema_version=1,
+        snapshot_id=peer_artifact_snapshot_id(
+            ModelId("example/model"),
+            "main",
+            sorted_files,
+        ),
         model_id=ModelId("example/model"),
         revision="main",
-        files=tuple(sorted(files, key=lambda file: file.file_path)),
+        files=sorted_files,
     )
     return snapshot, manifests, artifact_contents
 
@@ -235,7 +260,7 @@ def _peer_fixture(
 def _config(tmp_path: Path) -> PeerArtifactDeploymentConfig:
     return PeerArtifactDeploymentConfig(
         schema_version=1,
-        bearer_token=_TOKEN,
+        authentication_secret=_TOKEN,
         peers=(
             PeerArtifactPeerConfig(
                 peer_node_id=NodeId("source"),
@@ -298,7 +323,7 @@ async def test_peer_downloader_materializes_verified_snapshot_for_worker_flow(
         result / "model-00001-of-00001.safetensors"
     ).read_bytes() == contents["snapshot/model-00001-of-00001.safetensors"]
     assert progress[-1].status == "complete"
-    assert progress[-1].completed_files == 3
+    assert progress[-1].completed_files == 5
     assert set(client.range_link_ids) == {
         PeerArtifactLinkId("fast"),
         PeerArtifactLinkId("slow"),
@@ -326,3 +351,37 @@ async def test_unavailable_peer_falls_back_only_when_origin_is_enabled(
 
     assert await downloader.ensure_shard(_shard()) == origin_target
     assert origin.ensure_calls == 1
+
+
+async def test_direct_materializer_preserves_sglang_and_ktransformers_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "exo.download.peer_artifact_downloader.to_thread.run_sync",
+        _run_sync_inline,
+    )
+    snapshot, manifests, contents = _peer_fixture(tmp_path)
+    client = InMemoryPeerClient(snapshot, manifests, contents)
+    destination = tmp_path / "rank-2"
+
+    materialized = await materialize_peer_artifact_snapshot(
+        _config(tmp_path),
+        peer_node_id=NodeId("source"),
+        model_id=ModelId("example/model"),
+        revision="main",
+        destination=destination,
+        client_factory=lambda _peer: client,
+    )
+
+    assert materialized.snapshot_id == snapshot.snapshot_id
+    assert (destination / "model" / "launch.json").read_bytes() == contents[
+        "snapshot/model/launch.json"
+    ]
+    assert (
+        destination / "ktransformers" / "index.json"
+    ).read_bytes() == contents["snapshot/ktransformers/index.json"]
+    receipt = destination / PEER_ARTIFACT_SNAPSHOT_RECEIPT_FILENAME
+    assert PeerArtifactSnapshotManifest.model_validate_json(
+        receipt.read_bytes()
+    ).snapshot_id == snapshot.snapshot_id

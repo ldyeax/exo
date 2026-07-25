@@ -78,8 +78,7 @@ DEFAULT_RUNTIME_PYTHON: Final = (
 DEFAULT_MODEL_PATH: Final = "/mnt/sanic/glm52"
 DEFAULT_SERVER_URL: Final = "http://192.168.40.24:62710"
 DEFAULT_BENCHMARK_SCRIPT: Final = (
-    Path(__file__).resolve().parent
-    / "run_sglang_kt_glm52_tp2_local_benchmark.py"
+    Path(__file__).resolve().parent / "run_sglang_kt_glm52_tp2_local_benchmark.py"
 )
 _MAXIMUM_JSON_BYTES: Final = 32 * 1024 * 1024
 _MAXIMUM_PT_BYTES: Final = 512 * 1024 * 1024
@@ -305,13 +304,16 @@ def _read_json(path: Path, description: str) -> JsonObject:
 
 
 def _write_immutable_json(path: Path, value: JsonObject) -> None:
-    encoded = json.dumps(
-        value,
-        allow_nan=False,
-        ensure_ascii=True,
-        indent=2,
-        sort_keys=True,
-    ).encode() + b"\n"
+    encoded = (
+        json.dumps(
+            value,
+            allow_nan=False,
+            ensure_ascii=True,
+            indent=2,
+            sort_keys=True,
+        ).encode()
+        + b"\n"
+    )
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     try:
         descriptor = os.open(
@@ -356,7 +358,6 @@ def representative_prompt_manifest() -> JsonObject:
             "temperature": 0.0,
             "top_p": 1.0,
             "max_new_tokens": ROUTING_CAPTURE_MAX_NEW_TOKENS,
-            "seed": 52_026,
         },
     }
     manifest["manifest_content_sha256"] = _canonical_sha256(manifest)
@@ -457,7 +458,6 @@ def _send_representative_prompts(
                 "temperature": 0.0,
                 "top_p": 1.0,
                 "max_new_tokens": ROUTING_CAPTURE_MAX_NEW_TOKENS,
-                "seed": 52_026,
             },
             "stream": False,
         }
@@ -668,9 +668,7 @@ def _materialize_with_torch(
         temporary_path,
         maximum_bytes=_MAXIMUM_PT_BYTES,
     )
-    placement_path = (
-        output_directory / f"glm52-routing-frequency-{placement_sha256}.pt"
-    )
+    placement_path = output_directory / f"glm52-routing-frequency-{placement_sha256}.pt"
     if placement_path.exists() or placement_path.is_symlink():
         raise Glm52RoutingProfileError(
             f"refusing to overwrite placement artifact {placement_path}"
@@ -700,9 +698,7 @@ def _materialize_with_torch(
         "capture_contract": {
             "prompt_manifest_sha256": prompt_manifest_sha256,
             "routes_per_routed_layer": layer_totals[FIRST_ROUTED_LAYER],
-            "routed_tokens": (
-                layer_totals[FIRST_ROUTED_LAYER] // EXPERTS_PER_TOKEN
-            ),
+            "routed_tokens": (layer_totals[FIRST_ROUTED_LAYER] // EXPERTS_PER_TOKEN),
             "activation_counts_sha256": _canonical_sha256(
                 cast(JsonValue, [list(row) for row in counts])
             ),
@@ -761,9 +757,8 @@ def materialize_routing_artifact(
         raise Glm52RoutingProfileError(
             f"runtime Python is missing or not executable: {runtime_python}"
         )
-    if (
-        len(prompt_manifest_sha256) != _SHA256_LENGTH
-        or any(character not in "0123456789abcdef" for character in prompt_manifest_sha256)
+    if len(prompt_manifest_sha256) != _SHA256_LENGTH or any(
+        character not in "0123456789abcdef" for character in prompt_manifest_sha256
     ):
         raise Glm52RoutingProfileError("prompt manifest hash is not lowercase SHA-256")
     command = (
@@ -849,12 +844,8 @@ def capture_routing(
         finally:
             if started:
                 try:
-                    control_operations.append(
-                        _post_control(client, server_url, "stop")
-                    )
-                    control_operations.append(
-                        _post_control(client, server_url, "dump")
-                    )
+                    control_operations.append(_post_control(client, server_url, "stop"))
+                    control_operations.append(_post_control(client, server_url, "dump"))
                 except httpx.HTTPError:
                     pass
         source_path = _wait_for_one_new_recorder_file(
@@ -910,8 +901,7 @@ def capture_routing(
     }
     receipt["receipt_content_sha256"] = _canonical_sha256(receipt)
     receipt_path = output_directory / (
-        "glm52-routing-capture-"
-        f"{cast(str, receipt['receipt_content_sha256'])}.json"
+        f"glm52-routing-capture-{cast(str, receipt['receipt_content_sha256'])}.json"
     )
     _write_immutable_json(receipt_path, receipt)
     return {**receipt, "receipt_path": str(receipt_path)}
@@ -975,7 +965,11 @@ def _read_safetensors_header(path: Path) -> JsonObject:
 
 
 def inspect_expert_tensor_inventory(model_path: Path) -> ExpertTensorInventory:
-    if not model_path.is_absolute() or not model_path.is_dir() or model_path.is_symlink():
+    if (
+        not model_path.is_absolute()
+        or not model_path.is_dir()
+        or model_path.is_symlink()
+    ):
         raise Glm52RoutingProfileError(
             "model path must be an existing absolute non-symlink directory"
         )
@@ -1015,12 +1009,12 @@ def inspect_expert_tensor_inventory(model_path: Path) -> ExpertTensorInventory:
     for layer in range(FIRST_ROUTED_LAYER, MODEL_LAYER_COUNT):
         for expert in range(EXPERT_COUNT):
             for projection in _PROJECTION_NAMES:
-                name = (
-                    f"model.layers.{layer}.mlp.experts.{expert}."
-                    f"{projection}.weight"
-                )
+                name = f"model.layers.{layer}.mlp.experts.{expert}.{projection}.weight"
                 shard_name = typed_weight_map.get(name)
-                if not isinstance(shard_name, str) or Path(shard_name).name != shard_name:
+                if (
+                    not isinstance(shard_name, str)
+                    or Path(shard_name).name != shard_name
+                ):
                     raise Glm52RoutingProfileError(
                         f"safetensors index lacks a safe shard for {name}"
                     )
@@ -1145,9 +1139,7 @@ def read_baseline_capacity(
     snapshot = capacity.get("postreadiness_snapshot")
     gate = capacity.get("postreadiness_gate")
     if not isinstance(snapshot, dict) or not isinstance(gate, dict):
-        raise Glm52RoutingProfileError(
-            "baseline lacks post-readiness VRAM evidence"
-        )
+        raise Glm52RoutingProfileError("baseline lacks post-readiness VRAM evidence")
     devices = snapshot.get("devices")
     if (
         not isinstance(devices, list)
@@ -1156,16 +1148,12 @@ def read_baseline_capacity(
     ):
         raise Glm52RoutingProfileError("baseline VRAM device set is invalid")
     free_values = [
-        device.get("free_mib")
-        for device in cast(list[dict[str, JsonValue]], devices)
+        device.get("free_mib") for device in cast(list[dict[str, JsonValue]], devices)
     ]
     if not all(type(value) is int and cast(int, value) >= 0 for value in free_values):
         raise Glm52RoutingProfileError("baseline free-VRAM values are invalid")
     observed_floor = gate.get("minimum_free_vram_mib")
-    if (
-        type(observed_floor) is not int
-        or observed_floor != expected_vram_floor_mib
-    ):
+    if type(observed_floor) is not int or observed_floor != expected_vram_floor_mib:
         raise Glm52RoutingProfileError(
             f"baseline VRAM floor is {observed_floor!r}, expected "
             f"{expected_vram_floor_mib}"
@@ -1365,10 +1353,13 @@ def build_profile_plan(
         placement_sha256
     ):
         raise Glm52RoutingProfileError("frequency placement artifact hash changed")
-    if _sha256_file(
-        placement_receipt_path,
-        maximum_bytes=_MAXIMUM_JSON_BYTES,
-    ) != placement_receipt_sha256:
+    if (
+        _sha256_file(
+            placement_receipt_path,
+            maximum_bytes=_MAXIMUM_JSON_BYTES,
+        )
+        != placement_receipt_sha256
+    ):
         raise Glm52RoutingProfileError("frequency placement receipt hash changed")
     placement_receipt = _read_json(
         placement_receipt_path,
@@ -1395,12 +1386,10 @@ def build_profile_plan(
         )
 
     canonical_capacity = (
-        2 * (CANONICAL_INPUT_TOKENS + OUTPUT_TOKENS)
-        + SCHEDULER_HEADROOM_TOKENS
+        2 * (CANONICAL_INPUT_TOKENS + OUTPUT_TOKENS) + SCHEDULER_HEADROOM_TOKENS
     )
     resident_capacity = (
-        2 * (RESIDENT_INPUT_TOKENS + OUTPUT_TOKENS)
-        + SCHEDULER_HEADROOM_TOKENS
+        2 * (RESIDENT_INPUT_TOKENS + OUTPUT_TOKENS) + SCHEDULER_HEADROOM_TOKENS
     )
     if canonical_capacity != baseline.token_capacity:
         raise Glm52RoutingProfileError(
@@ -1468,9 +1457,7 @@ def build_profile_plan(
         ):
             typed_strategy = cast(PlacementStrategy, strategy)
             suffix = (
-                "zero"
-                if resident_count == 0
-                else f"{strategy}-global{resident_count}"
+                "zero" if resident_count == 0 else f"{strategy}-global{resident_count}"
             )
             profile_id = f"glm52-resident-ab-{suffix}-chunk{chunk_size}"
             arguments = _profile_arguments(
@@ -1559,9 +1546,7 @@ def build_profile_plan(
             "canonical_16k": cast(JsonObject, asdict(canonical_budget)),
             "matched_short": cast(JsonObject, asdict(resident_budget)),
             "admitted_sparse_global_budget": admitted_sparse_budget,
-            "admitted_ratio": _ratio_for_exact_total_budget(
-                admitted_sparse_budget
-            ),
+            "admitted_ratio": _ratio_for_exact_total_budget(admitted_sparse_budget),
             "per_rank_resident_bytes": (
                 admitted_sparse_budget * inventory.per_tp_rank_expert_bytes
             ),
@@ -1836,9 +1821,7 @@ def main() -> int:
             _write_immutable_json(plan_path, plan)
             receipt = {**plan, "receipt_path": str(plan_path)}
         else:
-            raise Glm52RoutingProfileError(
-                f"unknown command {arguments.command!r}"
-            )
+            raise Glm52RoutingProfileError(f"unknown command {arguments.command!r}")
     except (
         Glm52RoutingProfileError,
         httpx.HTTPError,

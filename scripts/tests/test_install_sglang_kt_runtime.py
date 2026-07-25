@@ -64,7 +64,12 @@ def write_wheel(
             )
 
 
-def write_build_receipt(tmp_path: Path) -> Path:
+def write_build_receipt(
+    tmp_path: Path,
+    *,
+    ktransformers_revision: str = GLM_4_7_FLASH_KTRANSFORMERS_REVISION,
+    sglang_revision: str = GLM_4_7_FLASH_SGLANG_REVISION,
+) -> Path:
     build_id = "b" * 64
     build_root = tmp_path / "builds" / "dwagon" / build_id
     wheel_directory = build_root / "wheels"
@@ -76,7 +81,14 @@ def write_build_receipt(tmp_path: Path) -> Path:
             "-py3-none-any.whl"
         )
         wheel_path = wheel_directory / filename
-        write_wheel(wheel_path, distribution)
+        write_wheel(
+            wheel_path,
+            distribution,
+            provenance=installer._embedded_provenance_contents(
+                ktransformers_revision,
+                sglang_revision,
+            ),
+        )
         artifacts.append(
             {
                 "distribution": distribution,
@@ -100,8 +112,8 @@ def write_build_receipt(tmp_path: Path) -> Path:
             .read_bytes()
         ),
         "source": {
-            "ktransformers_revision": GLM_4_7_FLASH_KTRANSFORMERS_REVISION,
-            "sglang_revision": GLM_4_7_FLASH_SGLANG_REVISION,
+            "ktransformers_revision": ktransformers_revision,
+            "sglang_revision": sglang_revision,
             "package_version": EXPECTED_PACKAGE_VERSION,
         },
         "toolchain": {"host_profile": "dwagon"},
@@ -234,6 +246,27 @@ def test_build_observation_rejects_non_glm_source(tmp_path: Path) -> None:
 
     with pytest.raises(RuntimeInstallError, match="SGLang revision"):
         observe_runtime_build(receipt_path)
+
+
+def test_build_observation_accepts_explicit_experimental_revisions(
+    tmp_path: Path,
+) -> None:
+    ktransformers_revision = "1" * 40
+    sglang_revision = "2" * 40
+    receipt_path = write_build_receipt(
+        tmp_path,
+        ktransformers_revision=ktransformers_revision,
+        sglang_revision=sglang_revision,
+    )
+
+    observation = observe_runtime_build(
+        receipt_path,
+        expected_ktransformers_revision=ktransformers_revision,
+        expected_sglang_revision=sglang_revision,
+    )
+
+    assert observation.ktransformers_revision == ktransformers_revision
+    assert observation.sglang_revision == sglang_revision
 
 
 def test_build_observation_rejects_different_builder(tmp_path: Path) -> None:

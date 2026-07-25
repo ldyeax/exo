@@ -1,0 +1,136 @@
+{
+  "schema_version": 1,
+  "cluster_id": "fwuffydwagon-five-link-v1",
+  "api_port": 52415,
+  "hosts": {
+    "dwagon": {
+      "node_id": "dwagon",
+      "hostname": "dwagon"
+    },
+    "fwuff": {
+      "node_id": "fwuff",
+      "hostname": "fwuff"
+    }
+  },
+  "infiniband_rails": [
+    {
+      "link_id": "ib-edr",
+      "hca_name": "mlx5_0",
+      "port": 1,
+      "minimum_rate_gbps": 100,
+      "transport_mode": "datagram",
+      "mtu": 2044,
+      "estimated_bytes_per_second": 11000000000,
+      "maximum_concurrent_chunks": 4,
+      "hosts": {
+        "dwagon": {
+          "node_guid": "248a:0703:0095:afd4",
+          "port_guid": "248a:0703:0095:afd4",
+          "address": "10.44.0.1/30"
+        },
+        "fwuff": {
+          "node_guid": "248a:0703:00a3:2154",
+          "port_guid": "248a:0703:00a3:2154",
+          "address": "10.44.0.2/30"
+        }
+      }
+    },
+    {
+      "link_id": "ib-qdr-a",
+      "hca_name": "mlx4_0",
+      "port": 1,
+      "minimum_rate_gbps": 40,
+      "transport_mode": "datagram",
+      "mtu": 2044,
+      "estimated_bytes_per_second": 3500000000,
+      "maximum_concurrent_chunks": 2,
+      "hosts": {
+        "dwagon": {
+          "node_guid": "0010:e000:0166:3a18",
+          "port_guid": "0010:e000:0166:3a19",
+          "address": "10.44.1.1/30"
+        },
+        "fwuff": {
+          "node_guid": "e41d:2d03:004d:32e0",
+          "port_guid": "e41d:2d03:004d:32e1",
+          "address": "10.44.1.2/30"
+        }
+      }
+    },
+    {
+      "link_id": "ib-qdr-b",
+      "hca_name": "mlx4_0",
+      "port": 2,
+      "minimum_rate_gbps": 40,
+      "transport_mode": "datagram",
+      "mtu": 2044,
+      "estimated_bytes_per_second": 3500000000,
+      "maximum_concurrent_chunks": 2,
+      "hosts": {
+        "dwagon": {
+          "node_guid": "0010:e000:0166:3a18",
+          "port_guid": "0010:e000:0166:3a1a",
+          "address": "10.44.2.1/30"
+        },
+        "fwuff": {
+          "node_guid": "e41d:2d03:004d:32e0",
+          "port_guid": "e41d:2d03:004d:32e2",
+          "address": "10.44.2.2/30"
+        }
+      }
+    }
+  ],
+  "ethernet_rails": [
+    {
+      "link_id": "ethernet-a",
+      "estimated_bytes_per_second": 1100000000,
+      "maximum_concurrent_chunks": 1,
+      "hosts": {
+        "dwagon": {
+          "interface": "ens13f0np0",
+          "address": "192.168.40.24"
+        },
+        "fwuff": {
+          "interface": "ens17f0",
+          "address": "192.168.40.93"
+        }
+      }
+    },
+    {
+      "link_id": "ethernet-b",
+      "estimated_bytes_per_second": 1100000000,
+      "maximum_concurrent_chunks": 1,
+      "hosts": {
+        "dwagon": {
+          "interface": "ens13f1np1",
+          "address": "192.168.40.250"
+        },
+        "fwuff": {
+          "interface": "ens17f1",
+          "address": "192.168.40.228"
+        }
+      }
+    }
+  ],
+  "deployment": {
+    "source_host": "fwuff",
+    "receiver_host": "dwagon",
+    "served_root": "/mnt/sanic/glm52-pp-26-28-24",
+    "manifest_cache_directory": "/var/lib/exo/peer-manifests",
+    "receiver_disk_cache_directory": "/var/lib/exo/peer-artifacts",
+    "receiver_memory_cache_directory": "/dev/shm/exo-peer-artifacts",
+    "receiver_materialization_root": "/var/lib/exo/glm52-pp",
+    "served_snapshots": [
+      {
+        "model_id": "local/glm-5.2-pp-rank-0",
+        "revision": "main",
+        "relative_directory": "rank-0"
+      },
+      {
+        "model_id": "local/glm-5.2-pp-rank-1",
+        "revision": "main",
+        "relative_directory": "rank-1"
+      }
+    ]
+  }
+}

@@ -26,6 +26,7 @@ from scripts.build_sglang_kt_runtime import (
     SubmoduleObservation,
     ToolObservation,
     _embedded_provenance_contents,
+    _selected_pins,
     execute_runtime_build,
     export_runtime_source_snapshot,
     inspect_wheel,
@@ -204,6 +205,15 @@ def test_admitted_pins_match_launch_spec() -> None:
 
     assert pins.ktransformers_revision == GLM_4_7_FLASH_KTRANSFORMERS_REVISION
     assert pins.sglang_revision == GLM_4_7_FLASH_SGLANG_REVISION
+
+
+def test_custom_pins_require_both_exact_revisions() -> None:
+    pins = _selected_pins("1" * 40, "2" * 40)
+    assert pins.ktransformers_revision == "1" * 40
+    assert pins.sglang_revision == "2" * 40
+
+    with pytest.raises(RuntimeBuildError, match="requires both exact"):
+        _selected_pins("1" * 40, None)
 
 
 def test_observes_exact_clean_recursive_source(tmp_path: Path) -> None:

@@ -4,7 +4,7 @@ import hashlib
 import json
 import os
 import socket
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import ParamSpec, TypeVar, cast
 
@@ -21,6 +21,7 @@ from exo.download.peer_artifact_http import (
     PeerArtifactConfigurationError,
     PeerArtifactDeploymentConfig,
     PeerArtifactHttpClient,
+    PeerArtifactHttpSource,
     PeerArtifactLink,
     PeerArtifactLinkId,
     PeerArtifactPeerConfig,
@@ -30,6 +31,11 @@ from exo.download.peer_artifact_http import (
     build_peer_artifact_authentication_headers,
     install_peer_artifact_http_routes,
     load_peer_artifact_deployment_config,
+)
+from exo.download.peer_artifact_transfer import (
+    PeerArtifactManifest,
+    PeerArtifactSnapshotId,
+    Sha256Digest,
 )
 from exo.shared.types.common import Host, ModelId, NodeId
 
@@ -88,7 +94,7 @@ def _deployment(
 
 def _headers(
     path: str,
-    parameters: dict[str, str | int],
+    parameters: Mapping[str, str | int],
     *,
     nonce: str | None = None,
 ) -> dict[str, str]:
@@ -134,36 +140,61 @@ async def test_authenticated_routes_serve_confined_manifests_and_ranges(
         )
         assert unauthorized.status_code == 401
 
-        headers = {"Authorization": f"Bearer {_TOKEN.get_secret_value()}"}
+        snapshot_parameters = {
+            "model_id": "example/model",
+            "revision": "main",
+        }
         snapshot_response = await client.get(
             PEER_ARTIFACT_SNAPSHOT_PATH,
-            params={"model_id": "example/model", "revision": "main"},
-            headers=headers,
+            params=snapshot_parameters,
+            headers=_headers(
+                PEER_ARTIFACT_SNAPSHOT_PATH,
+                snapshot_parameters,
+            ),
         )
         # The escaped symlink makes the configured snapshot invalid rather than
         # disclosing a file outside the configured roots.
         assert snapshot_response.status_code == 404
 
+        escaped_parameters = {"artifact_path": "snapshot/escaped.bin"}
         escaped = await client.get(
             PEER_ARTIFACT_MANIFEST_PATH,
-            params={"artifact_path": "snapshot/escaped.bin"},
-            headers=headers,
+            params=escaped_parameters,
+            headers=_headers(
+                PEER_ARTIFACT_MANIFEST_PATH,
+                escaped_parameters,
+            ),
         )
-        assert escaped.status_code == 404
+        assert escaped.status_code == 422
+        traversal_parameters = {"artifact_path": "../outside.bin"}
         traversal = await client.get(
             PEER_ARTIFACT_MANIFEST_PATH,
-            params={"artifact_path": "../outside.bin"},
-            headers=headers,
+            params=traversal_parameters,
+            headers=_headers(
+                PEER_ARTIFACT_MANIFEST_PATH,
+                traversal_parameters,
+            ),
         )
-        assert traversal.status_code in {404, 409, 422}
+        assert traversal.status_code == 422
 
         (snapshot / "escaped.bin").unlink()
+        replay_headers = _headers(
+            PEER_ARTIFACT_SNAPSHOT_PATH,
+            snapshot_parameters,
+            nonce="1" * 32,
+        )
         snapshot_response = await client.get(
             PEER_ARTIFACT_SNAPSHOT_PATH,
-            params={"model_id": "example/model", "revision": "main"},
-            headers=headers,
+            params=snapshot_parameters,
+            headers=replay_headers,
         )
         assert snapshot_response.status_code == 200
+        replay = await client.get(
+            PEER_ARTIFACT_SNAPSHOT_PATH,
+            params=snapshot_parameters,
+            headers=replay_headers,
+        )
+        assert replay.status_code == 401
         snapshot_payload = PeerArtifactSnapshotManifest.model_validate_json(
             snapshot_response.content
         )
@@ -172,37 +203,92 @@ async def test_authenticated_routes_serve_confined_manifests_and_ranges(
         assert snapshot_payload.files[0].artifact_path == "snapshot/config.json"
         assert snapshot_payload.files[0].size_bytes == 8
 
+        pinned_file = snapshot_payload.files[0]
+        manifest_parameters = {
+            "snapshot_id": snapshot_payload.snapshot_id,
+            "artifact_path": pinned_file.artifact_path,
+            "manifest_sha256": pinned_file.manifest_sha256,
+        }
         manifest_response = await client.get(
             PEER_ARTIFACT_MANIFEST_PATH,
-            params={"artifact_path": "snapshot/config.json"},
-            headers=headers,
+            params=manifest_parameters,
+            headers=_headers(
+                PEER_ARTIFACT_MANIFEST_PATH,
+                manifest_parameters,
+            ),
         )
         assert manifest_response.status_code == 200
         assert manifest_response.json()["sha256"] == hashlib.sha256(
             b"abcdefgh"
         ).hexdigest()
 
+        range_parameters = {
+            "snapshot_id": snapshot_payload.snapshot_id,
+            "artifact_sha256": pinned_file.sha256,
+            "artifact_path": pinned_file.artifact_path,
+            "offset_bytes": 2,
+            "size_bytes": 4,
+        }
         range_response = await client.get(
             PEER_ARTIFACT_RANGE_PATH,
-            params={
-                "artifact_path": "snapshot/config.json",
-                "offset_bytes": 2,
-                "size_bytes": 4,
-            },
-            headers=headers,
+            params=range_parameters,
+            headers=_headers(PEER_ARTIFACT_RANGE_PATH, range_parameters),
         )
         assert range_response.status_code == 200
         assert range_response.content == b"cdef"
+        oversized_parameters = {
+            **range_parameters,
+            "offset_bytes": 0,
+            "size_bytes": 5,
+        }
         oversized = await client.get(
             PEER_ARTIFACT_RANGE_PATH,
-            params={
-                "artifact_path": "snapshot/config.json",
-                "offset_bytes": 0,
-                "size_bytes": 5,
-            },
-            headers=headers,
+            params=oversized_parameters,
+            headers=_headers(
+                PEER_ARTIFACT_RANGE_PATH,
+                oversized_parameters,
+            ),
         )
         assert oversized.status_code == 416
+        assert tuple(
+            (model_root.parent / "manifest-cache" / "manifests").glob("*.json")
+        )
+        assert (
+            model_root.parent
+            / "manifest-cache"
+            / "snapshots"
+            / f"{snapshot_payload.snapshot_id}.json"
+        ).is_file()
+        deployment = _deployment(model_root)
+        assert deployment.server is not None
+        fresh_source = PeerArtifactHttpSource(deployment.server)
+
+        def unexpected_manifest_rebuild(
+            descriptor: int,
+            artifact_path: str,
+            chunk_size_bytes: int,
+        ) -> PeerArtifactManifest:
+            del descriptor, artifact_path, chunk_size_bytes
+            raise AssertionError("persistent manifest cache was not reused")
+
+        monkeypatch.setattr(
+            "exo.download.peer_artifact_http._manifest_from_descriptor",
+            unexpected_manifest_rebuild,
+        )
+        try:
+            fresh_snapshot = await fresh_source.snapshot_manifest(
+                ModelId("example/model"), "main"
+            )
+        finally:
+            fresh_source.close()
+        assert fresh_snapshot.snapshot_id == snapshot_payload.snapshot_id
+        (snapshot / "config.json").write_bytes(b"ijklmnop")
+        drifted = await client.get(
+            PEER_ARTIFACT_RANGE_PATH,
+            params=range_parameters,
+            headers=_headers(PEER_ARTIFACT_RANGE_PATH, range_parameters),
+        )
+        assert drifted.status_code == 404
 
 
 async def test_http_client_pins_outbound_connection_to_link_local_address() -> None:
@@ -224,15 +310,17 @@ async def test_http_client_pins_outbound_connection_to_link_local_address() -> N
     site = web.SockSite(runner, server_socket)
     await site.start()
     try:
-        async with PeerArtifactHttpClient(_TOKEN, 30) as client:
+        async with PeerArtifactHttpClient(_SECRET, 30) as client:
             contents = await client.read_artifact_range(
-                link=_link(port, local_ip_address="127.0.0.2"),
+                link=_link(port, local_ip_address="127.0.0.1"),
+                snapshot_id=PeerArtifactSnapshotId("a" * 64),
+                artifact_sha256=cast(Sha256Digest, "b" * 64),
                 artifact_path="snapshot/config.json",
                 offset_bytes=0,
                 size_bytes=5,
             )
         assert contents == b"bound"
-        assert observed_source_addresses == ["127.0.0.2"]
+        assert observed_source_addresses == ["127.0.0.1"]
     finally:
         await runner.cleanup()
 
@@ -245,7 +333,7 @@ def test_config_loader_is_disabled_when_absent_and_requires_private_file(
     model_root.mkdir()
     config_path = tmp_path / "peer-artifacts.json"
     payload = _deployment(model_root).model_dump(mode="json")
-    payload["bearer_token"] = _TOKEN.get_secret_value()
+    payload["authentication_secret"] = _SECRET.get_secret_value()
     config_path.write_text(
         json.dumps(payload),
         encoding="utf-8",

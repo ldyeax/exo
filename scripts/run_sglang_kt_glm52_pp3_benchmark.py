@@ -24,7 +24,7 @@ import sys
 import threading
 import time
 import uuid
-from collections.abc import Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -60,6 +60,8 @@ type JsonScalar = str | int | float | bool | None
 type JsonValue = JsonScalar | list[JsonValue] | dict[str, JsonValue]
 type JsonObject = dict[str, JsonValue]
 type EnvironmentVariable = tuple[str, str]
+type StreamMetaInfoObserver = Callable[[Mapping[str, JsonValue]], None]
+type IndexedStreamMetaInfoObserver = Callable[[int, Mapping[str, JsonValue]], None]
 
 DWAGON_NODE_ID: Final = NodeId("dwagon")
 FWUFF_NODE_ID: Final = NodeId("fwuff")
@@ -735,6 +737,8 @@ def run_long_context_benchmark(
     tokenizer: BenchmarkTokenizer,
     prepared: PreparedPrompt,
     output_token_count: int,
+    *,
+    stream_meta_info_observer: StreamMetaInfoObserver | None = None,
 ) -> BenchmarkObservation:
     request = _native_request(
         prepared,
@@ -799,6 +803,8 @@ def run_long_context_benchmark(
                 prompt_tokens != raw_prompt_tokens or cached_tokens != raw_cached_tokens
             ):
                 raise Glm52Pp3BenchmarkError("benchmark stream token metadata changed")
+            if stream_meta_info_observer is not None:
+                stream_meta_info_observer(cast(Mapping[str, JsonValue], raw_meta))
 
             if event_output_ids:
                 previous_count = len(output_ids)
@@ -874,6 +880,8 @@ def run_concurrency_case(
     tokenizer: BenchmarkTokenizer,
     prepared_prompts: Sequence[PreparedPrompt],
     output_token_count: int,
+    *,
+    stream_meta_info_observer: IndexedStreamMetaInfoObserver | None = None,
 ) -> BenchmarkCaseObservation:
     concurrency = len(prepared_prompts)
     if concurrency <= 0:
@@ -904,6 +912,14 @@ def run_concurrency_case(
                 tokenizer,
                 prepared,
                 output_token_count,
+                stream_meta_info_observer=(
+                    None
+                    if stream_meta_info_observer is None
+                    else lambda meta_info: stream_meta_info_observer(
+                        request_index,
+                        meta_info,
+                    )
+                ),
             ),
         )
 

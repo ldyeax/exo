@@ -30,6 +30,7 @@ from pydantic import (
 from exo.shared.types.common import Host, NodeId
 
 DEFAULT_ARTIFACT_CHUNK_SIZE_BYTES = 64 * 1024 * 1024
+PEER_ARTIFACT_SNAPSHOT_RECEIPT_FILENAME = ".exo-peer-snapshot.json"
 PEER_ARTIFACT_MANIFEST_SCHEMA_VERSION = 1
 _PEER_ARTIFACT_MANIFEST_CANONICALIZATION = "exo-peer-artifact-manifest-v1"
 _RESUME_JOURNAL_SCHEMA_VERSION = 1
@@ -248,6 +249,20 @@ def _ensure_secure_cache_directory(directory: Path) -> None:
     try:
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         directory_stat = directory.lstat()
+        descriptor = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            for component in directory.parts[1:]:
+                next_descriptor = os.open(
+                    component,
+                    os.O_RDONLY
+                    | os.O_DIRECTORY
+                    | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=descriptor,
+                )
+                os.close(descriptor)
+                descriptor = next_descriptor
+        finally:
+            os.close(descriptor)
     except OSError as error:
         raise PeerArtifactStorageConfigurationError(
             f"cannot prepare peer artifact cache root {directory}"
@@ -806,7 +821,6 @@ async def execute_peer_artifact_transfer(
             else ()
         )
         capacity_lock = storage.disk_cache_directory / ".capacity.lock"
-        reservation_path: Path | None = None
         async with AsyncFileLock(capacity_lock, run_in_executor=False):
             adjusted_availability = _availability_after_active_reservations(
                 storage, availability
@@ -873,9 +887,8 @@ async def execute_peer_artifact_transfer(
                 plan,
             )
         finally:
-            if reservation_path is not None:
-                async with AsyncFileLock(capacity_lock, run_in_executor=False):
-                    reservation_path.unlink(missing_ok=True)
+            async with AsyncFileLock(capacity_lock, run_in_executor=False):
+                reservation_path.unlink(missing_ok=True)
 
 
 def _published_result(

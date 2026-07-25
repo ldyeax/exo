@@ -33,6 +33,7 @@ from exo.download.peer_artifact_http import (
     links_by_preference,
 )
 from exo.download.peer_artifact_transfer import (
+    PEER_ARTIFACT_SNAPSHOT_RECEIPT_FILENAME,
     PeerArtifactIntegrityError,
     PeerArtifactLink,
     PeerArtifactManifest,
@@ -45,7 +46,7 @@ from exo.download.peer_artifact_transfer import (
 )
 from exo.download.shard_downloader import ShardDownloader
 from exo.shared.models.model_cards import HuggingFaceRevision
-from exo.shared.types.common import ModelId
+from exo.shared.types.common import ModelId, NodeId
 from exo.shared.types.memory import Memory
 from exo.shared.types.worker.downloads import (
     RepoDownloadProgress,
@@ -91,14 +92,44 @@ def _fsync_directory(directory: Path) -> None:
         os.close(descriptor)
 
 
-def _materialize_published_artifact(source: Path, destination: Path) -> None:
+def _materialize_published_artifact(
+    source: Path,
+    destination: Path,
+    *,
+    destination_root: Path,
+) -> None:
     """Atomically expose a verified cache file at the worker's model path.
 
     A hard link is preferred.  Cross-filesystem artifacts (notably tmpfs cache
     entries) are exposed through an absolute symlink so model loaders read the
     RAM-backed file directly without duplicating it onto disk.
     """
-    destination.parent.mkdir(parents=True, exist_ok=True)
+    if not destination.is_relative_to(destination_root):
+        raise ValueError("peer artifact destination escaped its snapshot root")
+    destination_root_stat = destination_root.lstat()
+    if (
+        stat.S_ISLNK(destination_root_stat.st_mode)
+        or not stat.S_ISDIR(destination_root_stat.st_mode)
+        or destination_root_stat.st_uid != os.geteuid()
+        or destination_root_stat.st_mode & 0o022
+    ):
+        raise PermissionError(
+            f"unsafe peer artifact materialization root {destination_root}"
+        )
+    current = destination_root
+    for component in destination.parent.relative_to(destination_root).parts:
+        current /= component
+        current.mkdir(mode=0o755, exist_ok=True)
+        current_stat = current.lstat()
+        if (
+            stat.S_ISLNK(current_stat.st_mode)
+            or not stat.S_ISDIR(current_stat.st_mode)
+            or current_stat.st_uid != os.geteuid()
+            or current_stat.st_mode & 0o022
+        ):
+            raise PermissionError(
+                f"unsafe peer artifact materialization directory {current}"
+            )
     descriptor, temporary_name = tempfile.mkstemp(
         prefix=f".{destination.name}.peer-", dir=destination.parent
     )
@@ -420,7 +451,11 @@ class PeerArtifactShardDownloader(ShardDownloader):
                         client,
                         self._storage,
                     )
-                    _materialize_published_artifact(published.path, target_path)
+                    _materialize_published_artifact(
+                        published.path,
+                        target_path,
+                        destination_root=target_directory,
+                    )
                     session_bytes[snapshot_file.file_path] = int(
                         published.transferred_bytes
                     )
@@ -536,3 +571,119 @@ class PeerArtifactShardDownloader(ShardDownloader):
         return await self._origin_downloader.get_shard_download_status_for_shard(
             shard
         )
+
+
+def _prepare_materialization_directory(destination: Path) -> None:
+    if not destination.is_absolute():
+        raise ValueError("peer snapshot materialization destinations must be absolute")
+    destination.mkdir(mode=0o755, parents=True, exist_ok=True)
+    destination_stat = destination.lstat()
+    if (
+        stat.S_ISLNK(destination_stat.st_mode)
+        or not stat.S_ISDIR(destination_stat.st_mode)
+        or destination_stat.st_uid != os.geteuid()
+        or destination_stat.st_mode & 0o022
+    ):
+        raise PermissionError(
+            "peer snapshot destinations must be owner-controlled, non-symlink "
+            "directories without group/world write permission"
+        )
+
+
+def _write_snapshot_receipt(
+    destination: Path, snapshot: PeerArtifactSnapshotManifest
+) -> None:
+    receipt_path = destination / PEER_ARTIFACT_SNAPSHOT_RECEIPT_FILENAME
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{receipt_path.name}.",
+        dir=destination,
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as receipt_file:
+            receipt_file.write(snapshot.model_dump_json(by_alias=True).encode())
+            receipt_file.flush()
+            os.fsync(receipt_file.fileno())
+        os.chmod(temporary_path, 0o444)
+        os.replace(temporary_path, receipt_path)
+        _fsync_directory(destination)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
+async def materialize_peer_artifact_snapshot(
+    config: PeerArtifactDeploymentConfig,
+    *,
+    peer_node_id: NodeId,
+    model_id: ModelId,
+    revision: HuggingFaceRevision,
+    destination: Path,
+    client_factory: PeerArtifactClientFactory | None = None,
+) -> PeerArtifactSnapshotManifest:
+    """Fetch one pinned peer snapshot into an explicit SGLang/KT view directory."""
+    if config.disk_cache_directory is None:
+        raise ValueError("peer snapshot materialization requires a disk cache")
+    peer = next(
+        (
+            configured_peer
+            for configured_peer in config.peers
+            if configured_peer.peer_node_id == peer_node_id
+        ),
+        None,
+    )
+    if peer is None:
+        raise ValueError(f"peer {peer_node_id} is not configured")
+    _prepare_materialization_directory(destination)
+    storage = PeerArtifactStorage(
+        disk_cache_directory=config.disk_cache_directory,
+        memory_cache_directory=config.memory_cache_directory,
+        disk_reserve_bytes=config.disk_reserve_bytes,
+        memory_reserve_bytes=config.memory_reserve_bytes,
+    )
+    client = (
+        PeerArtifactHttpClient(
+            config.authentication_secret,
+            int(config.request_timeout_seconds),
+        )
+        if client_factory is None
+        else client_factory(peer)
+    )
+    async with client:
+        snapshot, active_links = await _fetch_snapshot_from_links(
+            client, peer, model_id, revision
+        )
+        for snapshot_file in snapshot.files:
+            manifest, active_links = await _fetch_manifest_from_links(
+                client,
+                active_links,
+                snapshot.snapshot_id,
+                snapshot_file,
+            )
+            destination_path = destination / snapshot_file.file_path
+            local_sha256 = await _sha256_regular_file(
+                destination_path, int(manifest.size_bytes)
+            )
+            if local_sha256 == manifest.sha256:
+                continue
+            published, active_links = await _execute_with_link_failover(
+                manifest,
+                snapshot.snapshot_id,
+                active_links,
+                client,
+                storage,
+            )
+            _materialize_published_artifact(
+                published.path,
+                destination_path,
+                destination_root=destination,
+            )
+            logger.info(
+                "Peer snapshot rail bytes for "
+                f"{snapshot_file.file_path}: "
+                + ", ".join(
+                    f"{transfer.link_id}={transfer.transferred_bytes}"
+                    for transfer in published.link_transfers
+                )
+            )
+    _write_snapshot_receipt(destination, snapshot)
+    return snapshot

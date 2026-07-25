@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Build Exo's pinned GLM-4.7 SGLang-KTransformers wheels per host.
+"""Build Exo's pinned SGLang-KTransformers wheels per host.
 
 The default action is a read-only preflight. Pass ``--build`` only after the
 JSON plan has been reviewed. Native compilation is performed from tracked Git
 archives in an isolated build directory; the prepared source checkout is never
-used as a build directory.
+used as a build directory. By default the admitted GLM-4.7 revisions are used;
+an experimental runtime must provide both exact 40-character revisions.
 """
 
 from __future__ import annotations
@@ -1130,6 +1131,7 @@ def inspect_wheel(
     receipt_root: Path,
     *,
     expected_provenance: bytes | None = None,
+    exact_sglang_entry_count: int | None = EXPECTED_SGLANG_WHEEL_ENTRY_COUNT,
 ) -> WheelArtifact:
     try:
         with zipfile.ZipFile(wheel_path) as wheel:
@@ -1221,11 +1223,25 @@ def inspect_wheel(
         if not any(tag.startswith("cp312-cp312-") for tag in tags):
             raise RuntimeBuildError("kt-kernel wheel is not tagged for CPython 3.12")
     if expected_distribution == "sglang-kt":
-        if len(wheel_names) != EXPECTED_SGLANG_WHEEL_ENTRY_COUNT:
+        if (
+            exact_sglang_entry_count is not None
+            and len(wheel_names) != exact_sglang_entry_count
+        ):
             raise RuntimeBuildError(
                 f"sglang-kt wheel contains {len(wheel_names)} entries, expected "
-                f"{EXPECTED_SGLANG_WHEEL_ENTRY_COUNT}; the source tree may contain "
+                f"{exact_sglang_entry_count}; the source tree may contain "
                 "ignored build output"
+            )
+        if (
+            exact_sglang_entry_count is None
+            and not EXPECTED_SGLANG_WHEEL_ENTRY_COUNT
+            <= len(wheel_names)
+            <= EXPECTED_SGLANG_WHEEL_ENTRY_COUNT + 64
+        ):
+            raise RuntimeBuildError(
+                "experimental sglang-kt wheel entry count is outside the "
+                f"bounded range {EXPECTED_SGLANG_WHEEL_ENTRY_COUNT}.."
+                f"{EXPECTED_SGLANG_WHEEL_ENTRY_COUNT + 64}: {len(wheel_names)}"
             )
         forbidden_prefixes = ("build/", "python/build/", "sglang/build/")
         if any(name.startswith(forbidden_prefixes) for name in wheel_names):
@@ -1319,6 +1335,15 @@ def _collect_runtime_wheels(plan: RuntimeBuildPlan) -> tuple[WheelArtifact, ...]
                 expected_provenance=(
                     _embedded_provenance_contents(plan.source)
                     if distribution in PROVENANCE_DISTRIBUTIONS
+                    else None
+                ),
+                exact_sglang_entry_count=(
+                    EXPECTED_SGLANG_WHEEL_ENTRY_COUNT
+                    if (
+                        distribution != "sglang-kt"
+                        or plan.pins.sglang_revision
+                        == GLM_4_7_FLASH_SGLANG_REVISION
+                    )
                     else None
                 ),
             )
@@ -1448,6 +1473,8 @@ def execute_runtime_build(
 
 class _CliArguments(argparse.Namespace):
     ktransformers_source: Path
+    ktransformers_revision: str | None
+    sglang_revision: str | None
     output_root: Path
     host_profile: HostProfileName | None
     python: Path | None
@@ -1461,6 +1488,22 @@ def _parse_arguments() -> _CliArguments:
         required=True,
         type=Path,
         help="Prepared KTransformers checkout at Exo's exact integrated revision",
+    )
+    parser.add_argument(
+        "--ktransformers-revision",
+        type=_git_revision_argument,
+        help=(
+            "Exact experimental KTransformers commit. Must be supplied together "
+            "with --sglang-revision; otherwise the admitted GLM-4.7 pin is used."
+        ),
+    )
+    parser.add_argument(
+        "--sglang-revision",
+        type=_git_revision_argument,
+        help=(
+            "Exact experimental SGLang submodule commit. Must be supplied "
+            "together with --ktransformers-revision."
+        ),
     )
     parser.add_argument(
         "--output-root",
@@ -1488,6 +1531,33 @@ def _parse_arguments() -> _CliArguments:
     return arguments
 
 
+def _git_revision_argument(raw: str) -> str:
+    if re.fullmatch(r"[0-9a-f]{40}", raw) is None:
+        raise argparse.ArgumentTypeError(
+            "revision must be an exact lowercase 40-character Git object ID"
+        )
+    return raw
+
+
+def _selected_pins(
+    ktransformers_revision: str | None,
+    sglang_revision: str | None,
+) -> RuntimeSourcePins:
+    if (ktransformers_revision is None) != (sglang_revision is None):
+        raise RuntimeBuildError(
+            "experimental runtime selection requires both exact "
+            "KTransformers and SGLang revisions"
+        )
+    if ktransformers_revision is None:
+        return RuntimeSourcePins.admitted()
+    assert sglang_revision is not None
+    return RuntimeSourcePins(
+        ktransformers_revision=ktransformers_revision,
+        sglang_revision=sglang_revision,
+        sglang_submodule_path=Path("third_party/sglang"),
+    )
+
+
 def _selected_profile(name: HostProfileName | None) -> HostBuildProfile:
     if name is not None:
         return HOST_BUILD_PROFILES[name]
@@ -1505,15 +1575,20 @@ def main() -> int:
     arguments = _parse_arguments()
     try:
         profile = _selected_profile(arguments.host_profile)
+        pins = _selected_pins(
+            arguments.ktransformers_revision,
+            arguments.sglang_revision,
+        )
         plan = plan_runtime_build(
             arguments.ktransformers_source,
             arguments.output_root,
             profile,
             arguments.python,
+            pins=pins,
         )
         receipt = execute_runtime_build(plan, build=arguments.build)
     except (OSError, RuntimeBuildError) as error:
-        raise SystemExit(f"GLM-4.7 runtime build failed: {error}") from error
+        raise SystemExit(f"SGLang-KTransformers runtime build failed: {error}") from error
     print(json.dumps(asdict(receipt), indent=2, sort_keys=True))
     return 0
 

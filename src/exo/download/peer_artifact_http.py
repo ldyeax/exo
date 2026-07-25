@@ -12,7 +12,7 @@ import time
 from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Annotated, Literal, NoReturn, Protocol, Self, cast, final
+from typing import Annotated, Literal, NoReturn, Protocol, Self, final
 from urllib.parse import urlencode
 
 import aiohttp
@@ -32,6 +32,7 @@ from pydantic import (
 
 from exo.download.peer_artifact_transfer import (
     DEFAULT_ARTIFACT_CHUNK_SIZE_BYTES,
+    PEER_ARTIFACT_SNAPSHOT_RECEIPT_FILENAME,
     PeerArtifactChunk,
     PeerArtifactIntegrityError,
     PeerArtifactLink,
@@ -465,20 +466,38 @@ def _validate_link_interface(link: PeerArtifactLink) -> None:
 
 def _bound_socket_factory(
     interface_name: str,
-) -> Callable[[aiohttp.AddrInfoType], socket.socket]:
-    bind_to_device = getattr(socket, "SO_BINDTODEVICE", None)
-    if bind_to_device is None:
+) -> Callable[
+    [
+        tuple[
+            int | socket.AddressFamily,
+            int | socket.SocketKind,
+            int,
+            str,
+            tuple[object, ...],
+        ]
+    ],
+    socket.socket,
+]:
+    if not hasattr(socket, "SO_BINDTODEVICE"):
         raise PeerArtifactConfigurationError(
             "peer artifact rail pinning requires SO_BINDTODEVICE"
         )
 
-    def create_socket(address_info: aiohttp.AddrInfoType) -> socket.socket:
-        family, socket_type, protocol, _, _ = address_info
+    def create_socket(
+        address_info: tuple[
+            int | socket.AddressFamily,
+            int | socket.SocketKind,
+            int,
+            str,
+            tuple[object, ...],
+        ],
+    ) -> socket.socket:
+        family, socket_type, protocol, _canonical_name, _address = address_info
         result = socket.socket(family, socket_type, protocol)
         try:
             result.setsockopt(
                 socket.SOL_SOCKET,
-                bind_to_device,
+                25,
                 interface_name.encode() + b"\0",
             )
         except BaseException:
@@ -604,7 +623,7 @@ class PeerArtifactHttpClient(PeerArtifactPeerClient):
                         )
                     contents.extend(chunk)
         except (
-            aiohttp.ClientConnectionError,
+            aiohttp.ClientError,
             aiohttp.ServerTimeoutError,
             asyncio.TimeoutError,
             OSError,
@@ -898,6 +917,10 @@ class PeerArtifactHttpSource:
         config.manifest_cache_directory.mkdir(
             mode=0o700, parents=True, exist_ok=True
         )
+        cache_descriptor = _open_absolute_directory_without_symlinks(
+            config.manifest_cache_directory
+        )
+        os.close(cache_descriptor)
         cache_stat = config.manifest_cache_directory.lstat()
         if (
             stat.S_ISLNK(cache_stat.st_mode)
@@ -974,8 +997,16 @@ class PeerArtifactHttpSource:
             if os.write(descriptor, contents) != len(contents):
                 raise OSError("short immutable peer manifest cache write")
             os.fsync(descriptor)
+        except BaseException:
+            path.unlink(missing_ok=True)
+            raise
         finally:
             os.close(descriptor)
+        directory_descriptor = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
 
     async def _artifact_record(
         self, descriptor: int, artifact_path: str
@@ -1057,7 +1088,11 @@ class PeerArtifactHttpSource:
             relative_directory = PurePosixPath(directory)
             for file_name in file_names:
                 if (
-                    file_name == MODEL_REVISION_RECEIPT_FILENAME
+                    file_name
+                    in (
+                        MODEL_REVISION_RECEIPT_FILENAME,
+                        PEER_ARTIFACT_SNAPSHOT_RECEIPT_FILENAME,
+                    )
                     or file_name.endswith(".partial")
                 ):
                     continue
@@ -1319,7 +1354,7 @@ def install_peer_artifact_http_routes(
             return source.artifact_manifest(
                 PeerArtifactSnapshotId(snapshot_id),
                 artifact_path,
-                cast(Sha256Digest, manifest_sha256),
+                manifest_sha256,
             )
         except PeerArtifactUnavailableError as error:
             raise HTTPException(status_code=404, detail=str(error)) from error
@@ -1339,7 +1374,7 @@ def install_peer_artifact_http_routes(
             descriptor = source.open_range(
                 PeerArtifactSnapshotId(snapshot_id),
                 artifact_path,
-                cast(Sha256Digest, artifact_sha256),
+                artifact_sha256,
                 offset_bytes,
                 size_bytes,
             )

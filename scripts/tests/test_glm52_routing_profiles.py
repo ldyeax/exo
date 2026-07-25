@@ -88,7 +88,9 @@ def test_prompt_manifest_is_fixed_coding_and_agent_corpus() -> None:
     assert first["prompt_count"] == 8
     prompt_rows = cast(list[dict[str, object]], first["prompts"])
     assert {row["category"] for row in prompt_rows} == {"coding", "agent"}
-    assert cast(dict[str, object], first["sampling"])["max_new_tokens"] == 16
+    sampling = cast(dict[str, object], first["sampling"])
+    assert sampling["max_new_tokens"] == 16
+    assert "seed" not in sampling
     manifest_hash = cast(str, first.pop("manifest_content_sha256"))
     assert manifest_hash == profiles._canonical_sha256(first)
 
@@ -175,9 +177,7 @@ def test_budget_rejects_16k_and_admits_sparse_short_lane(
 def test_plan_emits_matched_chunk_placement_profiles_and_rejections(
     tmp_path: Path,
 ) -> None:
-    artifact, artifact_hash, receipt, receipt_hash = _write_placement_receipt(
-        tmp_path
-    )
+    artifact, artifact_hash, receipt, receipt_hash = _write_placement_receipt(tmp_path)
     plan = profiles.build_profile_plan(
         baseline=_baseline(tmp_path),
         inventory=_inventory(),
@@ -196,9 +196,7 @@ def test_plan_emits_matched_chunk_placement_profiles_and_rejections(
         4_096,
         8_192,
     }
-    matched = [
-        item for item in emitted if item["lane"] == "matched_short_resident_ab"
-    ]
+    matched = [item for item in emitted if item["lane"] == "matched_short_resident_ab"]
     assert len(matched) == 9
     assert {item["placement_strategy"] for item in matched} == {
         "uniform",

@@ -61,6 +61,34 @@ class InMemoryPeerArtifactReader(PeerArtifactRangeReader):
         return contents
 
 
+class PausingPeerArtifactReader(InMemoryPeerArtifactReader):
+    def __init__(self, contents: bytes) -> None:
+        super().__init__(contents)
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def read_artifact_range(
+        self,
+        *,
+        link: PeerArtifactLink,
+        snapshot_id: PeerArtifactSnapshotId,
+        artifact_sha256: Sha256Digest,
+        artifact_path: RelativeArtifactPath,
+        offset_bytes: int,
+        size_bytes: int,
+    ) -> bytes:
+        self.started.set()
+        await self.release.wait()
+        return await super().read_artifact_range(
+            link=link,
+            snapshot_id=snapshot_id,
+            artifact_sha256=artifact_sha256,
+            artifact_path=artifact_path,
+            offset_bytes=offset_bytes,
+            size_bytes=size_bytes,
+        )
+
+
 def _manifest(tmp_path: Path, contents: bytes, chunk_size_bytes: int = 4):
     source = tmp_path / "source.bin"
     source.write_bytes(contents)
@@ -314,6 +342,45 @@ async def test_rejects_transfer_when_disk_and_memory_are_insufficient(
                 memory_available_bytes=len(contents) - 1,
             ),
         )
+
+
+async def test_capacity_reservations_prevent_concurrent_overcommit(
+    tmp_path: Path,
+) -> None:
+    first_contents = bytes(range(64))
+    second_contents = bytes(reversed(range(64)))
+    first_manifest = _manifest(tmp_path, first_contents)
+    second_manifest = _manifest(tmp_path, second_contents)
+    storage = PeerArtifactStorage(disk_cache_directory=tmp_path / "disk-cache")
+    availability = PeerArtifactStorageAvailability(disk_available_bytes=64)
+    first_reader = PausingPeerArtifactReader(first_contents)
+    first_transfer = asyncio.create_task(
+        execute_peer_artifact_transfer(
+            first_manifest,
+            _SNAPSHOT_ID,
+            _links(),
+            first_reader,
+            storage,
+            availability,
+        )
+    )
+    await first_reader.started.wait()
+    try:
+        with pytest.raises(InsufficientPeerArtifactStorageError):
+            await execute_peer_artifact_transfer(
+                second_manifest,
+                PeerArtifactSnapshotId("b" * 64),
+                _links(),
+                InMemoryPeerArtifactReader(second_contents),
+                storage,
+                availability,
+            )
+    finally:
+        first_reader.release.set()
+    assert (await first_transfer).path.read_bytes() == first_contents
+    assert not tuple(
+        (storage.disk_cache_directory / ".capacity-reservations").glob("*.json")
+    )
 
 
 def test_manifest_rejects_noncontiguous_chunks(tmp_path: Path) -> None:
