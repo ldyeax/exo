@@ -1,0 +1,155 @@
+{
+  "command": [
+    "/root/exo/.venv/bin/python",
+    "/var/lib/exo/deployments/linux-cuda-nccl-6da455c8e3eb5e21d09812f10e44a31712545816/scripts/tp1_oracle_capture.py",
+    "--config",
+    "/root/exo/.bench/tp1-glm47flash-20260719-v1.config.json",
+    "--lease-path",
+    "/var/lib/exo/coordination/benchmark-lease.json",
+    "--lock-path",
+    "/run/lock/fwuffydwagon-benchmark.lock",
+    "--result-dir",
+    "/var/lib/exo/benchmarks/tp1-glm47flash-20260719-v1"
+  ],
+  "correctness_oracle": {
+    "capture_mode": "repetition_consensus",
+    "expected_content_sha256": null,
+    "model_id": "mlx-community/GLM-4.7-Flash-4bit",
+    "prompt_sha256": "5acfb781684c00d3313c5a4990dec4a7a3ebec7ffc2b014275fea69214348e45",
+    "revision": "1454cffb1a21737e162f508e5bc70be9def89276"
+  },
+  "cpu_bindings": {
+    "dwagon": {
+      "cpu_set": "0,1,2,3,4,5,6,7,112,113,114,115,116,117,118,119",
+      "memory_policy": "bind:0",
+      "numa_nodes": [
+        0
+      ]
+    }
+  },
+  "execution_contracts": {
+    "dwagon": {
+      "launch_argv": [
+        "/usr/bin/numactl",
+        "--physcpubind=0,1,2,3,4,5,6,7,112,113,114,115,116,117,118,119",
+        "--membind=0",
+        "/root/exo/.venv/bin/python",
+        "-m",
+        "exo",
+        "--namespace",
+        "exo-tp1-glm47flash-20260719-v1",
+        "--api-port",
+        "22110",
+        "--zenoh-port",
+        "22111",
+        "--discovery-port",
+        "22112",
+        "--offline",
+        "--no-downloads",
+        "--force-master",
+        "--no-batch"
+      ],
+      "probe_environment": {
+        "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+        "CUDA_VISIBLE_DEVICES": "GPU-a442b72e-6727-6322-ba5d-5a9512b79886",
+        "ENABLE_DISAGGREGATION": "false",
+        "EXO_CHAT_TEMPLATE_DATE": "18 Jul 2026",
+        "EXO_DASHBOARD_DIR": "/root/exo/dashboard/build",
+        "EXO_HOME": "/tmp/exo-tp1-glm47flash-20260719-v1",
+        "EXO_MAX_CONCURRENT_REQUESTS": "1",
+        "EXO_MLX_VISION_LOADING": "disabled",
+        "EXO_MODELS_READ_ONLY_DIRS": "/var/lib/exo/models",
+        "EXO_OFFLINE": "true",
+        "HOME": "/root",
+        "LD_LIBRARY_PATH": "/root/exo/.venv/lib/python3.13/site-packages/mlx/lib:/root/exo/.venv/lib/python3.13/site-packages/nvidia/cu13/lib:/root/exo/.venv/lib/python3.13/site-packages/nvidia/cudnn/lib:/root/exo/.venv/lib/python3.13/site-packages/nvidia/nccl/lib:/opt/cuda/lib64:/usr/lib64:/usr/lib",
+        "PATH": "/root/exo/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/bin:/opt/bin:/opt/cuda/bin",
+        "PYTHONHASHSEED": "42",
+        "PYTHONPATH": "/var/lib/exo/deployments/linux-cuda-nccl-6da455c8e3eb5e21d09812f10e44a31712545816/src"
+      }
+    }
+  },
+  "generated_at": "2026-07-19T02:01:13+00:00",
+  "git": {
+    "commit": "6da455c8e3eb5e21d09812f10e44a31712545816",
+    "dirty": false,
+    "dirty_file_hashes": {}
+  },
+  "gpu_bindings": {
+    "dwagon": [
+      {
+        "pci_address": "00000000:16:00.0",
+        "uuid": "GPU-a442b72e-6727-6322-ba5d-5a9512b79886"
+      }
+    ]
+  },
+  "hca_bindings": {
+    "dwagon": [
+      {
+        "device": "mlx4_0",
+        "gid": "fe80::10:e000:166:3a19",
+        "port": 1
+      },
+      {
+        "device": "mlx4_0",
+        "gid": "fe80::10:e000:166:3a1a",
+        "port": 2
+      }
+    ]
+  },
+  "hosts": [
+    "dwagon"
+  ],
+  "models": [
+    {
+      "model_id": "mlx-community/GLM-4.7-Flash-4bit",
+      "paths": {
+        "dwagon": "/var/lib/exo/models/mlx-community--GLM-4.7-Flash-4bit--1454cffb1a21737e162f508e5bc70be9def89276"
+      },
+      "revision": "1454cffb1a21737e162f508e5bc70be9def89276"
+    }
+  ],
+  "namespace": "exo-tp1-glm47flash-20260719-v1",
+  "owner_pids": {
+    "dwagon": []
+  },
+  "reserved_ports": [
+    22110,
+    22111,
+    22112,
+    22113
+  ],
+  "result_directory": "/var/lib/exo/benchmarks/tp1-glm47flash-20260719-v1",
+  "run_id": "tp1-glm47flash-20260719-v1",
+  "schema_version": 1,
+  "source_deployments": {
+    "dwagon": {
+      "commit": "6da455c8e3eb5e21d09812f10e44a31712545816",
+      "dirty_file_hashes": {},
+      "path": "/var/lib/exo/deployments/linux-cuda-nccl-6da455c8e3eb5e21d09812f10e44a31712545816"
+    }
+  },
+  "tp1_oracle_contract": {
+    "config_sha256": "86159c2e48079c3c4d9d9130df6f64a52095d3d13d96856c133077b30ef148b4",
+    "expected_model_manifest_sha256": "c9de2620a4cd99025abfc4758555637f3a8dbedb8cb69daf198be5edb3e6d64e",
+    "request": {
+      "body": {
+        "enable_thinking": false,
+        "logprobs": false,
+        "max_tokens": 32,
+        "messages": [
+          {
+            "content": "Reply with exactly: NCCL proof complete.",
+            "role": "user"
+          }
+        ],
+        "model": "mlx-community/GLM-4.7-Flash-4bit",
+        "seed": 42,
+        "stream": false,
+        "temperature": 0.0,
+        "use_prefix_cache": false
+      },
+      "repetitions": 3
+    },
+    "request_sha256": "74b6b0a06170e31438d9ec798773437e02da85909385ac2d07e789f65c4ebd6e"
+  }
+}

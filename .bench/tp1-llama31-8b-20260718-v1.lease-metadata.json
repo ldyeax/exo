@@ -1,0 +1,154 @@
+{
+  "command": [
+    "/root/exo/.venv/bin/python",
+    "/var/lib/exo/deployments/linux-cuda-nccl-a7711e4ed6f3c106772c51e354697335ad2e1c22/scripts/tp1_oracle_capture.py",
+    "--config",
+    "/root/exo/.bench/tp1-llama31-8b-20260718-v1.config.json",
+    "--lease-path",
+    "/var/lib/exo/coordination/benchmark-lease.json",
+    "--lock-path",
+    "/run/lock/fwuffydwagon-benchmark.lock",
+    "--result-dir",
+    "/var/lib/exo/benchmarks/tp1-llama31-8b-20260718-v1"
+  ],
+  "correctness_oracle": {
+    "capture_mode": "repetition_consensus",
+    "expected_content_sha256": null,
+    "model_id": "mlx-community/Llama-3.1-8B-Instruct-4bit",
+    "prompt_sha256": "5acfb781684c00d3313c5a4990dec4a7a3ebec7ffc2b014275fea69214348e45",
+    "revision": "90215b22ec18e72f623dde2ea7af4097025160e2"
+  },
+  "cpu_bindings": {
+    "dwagon": {
+      "cpu_set": "0,1,2,3,4,5,6,7,112,113,114,115,116,117,118,119",
+      "memory_policy": "bind:0",
+      "numa_nodes": [
+        0
+      ]
+    }
+  },
+  "execution_contracts": {
+    "dwagon": {
+      "launch_argv": [
+        "/usr/bin/numactl",
+        "--physcpubind=0,1,2,3,4,5,6,7,112,113,114,115,116,117,118,119",
+        "--membind=0",
+        "/root/exo/.venv/bin/python",
+        "-m",
+        "exo",
+        "--namespace",
+        "exo-tp1-llama31-8b-20260718-v1",
+        "--api-port",
+        "21600",
+        "--zenoh-port",
+        "21601",
+        "--discovery-port",
+        "21602",
+        "--offline",
+        "--no-downloads",
+        "--force-master",
+        "--no-batch"
+      ],
+      "probe_environment": {
+        "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+        "CUDA_VISIBLE_DEVICES": "GPU-a442b72e-6727-6322-ba5d-5a9512b79886",
+        "ENABLE_DISAGGREGATION": "false",
+        "EXO_CHAT_TEMPLATE_DATE": "18 Jul 2026",
+        "EXO_DASHBOARD_DIR": "/root/exo/dashboard/build",
+        "EXO_HOME": "/tmp/exo-tp1-llama31-8b-20260718-v1",
+        "EXO_MAX_CONCURRENT_REQUESTS": "1",
+        "EXO_MLX_VISION_LOADING": "disabled",
+        "EXO_MODELS_READ_ONLY_DIRS": "/var/lib/exo/models",
+        "EXO_OFFLINE": "true",
+        "HOME": "/root",
+        "LD_LIBRARY_PATH": "/root/exo/.venv/lib/python3.13/site-packages/mlx/lib:/root/exo/.venv/lib/python3.13/site-packages/nvidia/cu13/lib:/root/exo/.venv/lib/python3.13/site-packages/nvidia/cudnn/lib:/root/exo/.venv/lib/python3.13/site-packages/nvidia/nccl/lib:/opt/cuda/lib64:/usr/lib64:/usr/lib",
+        "PATH": "/root/exo/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/bin:/opt/bin:/opt/cuda/bin",
+        "PYTHONHASHSEED": "42",
+        "PYTHONPATH": "/var/lib/exo/deployments/linux-cuda-nccl-a7711e4ed6f3c106772c51e354697335ad2e1c22/src"
+      }
+    }
+  },
+  "generated_at": "2026-07-19T00:45:00+00:00",
+  "git": {
+    "commit": "a7711e4ed6f3c106772c51e354697335ad2e1c22",
+    "dirty": false,
+    "dirty_file_hashes": {}
+  },
+  "gpu_bindings": {
+    "dwagon": [
+      {
+        "pci_address": "00000000:16:00.0",
+        "uuid": "GPU-a442b72e-6727-6322-ba5d-5a9512b79886"
+      }
+    ]
+  },
+  "hca_bindings": {
+    "dwagon": [
+      {
+        "device": "mlx4_0",
+        "gid": "fe80::10:e000:166:3a19",
+        "port": 1
+      },
+      {
+        "device": "mlx4_0",
+        "gid": "fe80::10:e000:166:3a1a",
+        "port": 2
+      }
+    ]
+  },
+  "hosts": [
+    "dwagon"
+  ],
+  "models": [
+    {
+      "model_id": "mlx-community/Llama-3.1-8B-Instruct-4bit",
+      "paths": {
+        "dwagon": "/var/lib/exo/models/mlx-community--Llama-3.1-8B-Instruct-4bit--90215b22ec18e72f623dde2ea7af4097025160e2"
+      },
+      "revision": "90215b22ec18e72f623dde2ea7af4097025160e2"
+    }
+  ],
+  "namespace": "exo-tp1-llama31-8b-20260718-v1",
+  "owner_pids": {
+    "dwagon": []
+  },
+  "reserved_ports": [
+    21600,
+    21601,
+    21602,
+    21603
+  ],
+  "result_directory": "/var/lib/exo/benchmarks/tp1-llama31-8b-20260718-v1",
+  "run_id": "tp1-llama31-8b-20260718-v1",
+  "schema_version": 1,
+  "source_deployments": {
+    "dwagon": {
+      "commit": "a7711e4ed6f3c106772c51e354697335ad2e1c22",
+      "dirty_file_hashes": {},
+      "path": "/var/lib/exo/deployments/linux-cuda-nccl-a7711e4ed6f3c106772c51e354697335ad2e1c22"
+    }
+  },
+  "tp1_oracle_contract": {
+    "config_sha256": "153a4055ffd3e93bb3d7fc75af54a8384c6bf17abcbdf33f07f1f1c345b1ed4b",
+    "expected_model_manifest_sha256": "39df1f70f021e6f2852549a1d43c8120eb305993a796d077d0d3ed396a63cc7d",
+    "request": {
+      "body": {
+        "logprobs": false,
+        "max_tokens": 32,
+        "messages": [
+          {
+            "content": "Reply with exactly: NCCL proof complete.",
+            "role": "user"
+          }
+        ],
+        "model": "mlx-community/Llama-3.1-8B-Instruct-4bit",
+        "seed": 42,
+        "stream": false,
+        "temperature": 0.0,
+        "use_prefix_cache": false
+      },
+      "repetitions": 3
+    },
+    "request_sha256": "7d8dcc78ce649526aadcdbdc51b38a2b90e966975f09ec039d7cd98aa87ebee6"
+  }
+}

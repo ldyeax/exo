@@ -1,0 +1,291 @@
+{
+  "benchmark_contract": {
+    "hca_counter_match_absolute_tolerance_bytes": 65536,
+    "hca_counter_match_relative_tolerance": 0.001,
+    "max_tokens": 32,
+    "minimum_hca_data_bytes_per_rail": 1048576,
+    "sample_count": 3,
+    "seed": 42,
+    "temperature": 0.0,
+    "warmup_count": 2
+  },
+  "command": [
+    "/root/exo/.venv/bin/python",
+    "/var/lib/exo/deployments/linux-cuda-nccl-a7711e4ed6f3c106772c51e354697335ad2e1c22/scripts/two_host_mlx_nccl_poc.py",
+    "--config",
+    "/root/exo/.bench/tp2-llama31-8b-20260718-v1.config.json",
+    "--lease-path",
+    "/var/lib/exo/coordination/benchmark-lease.json",
+    "--lock-path",
+    "/run/lock/fwuffydwagon-benchmark.lock",
+    "--result-dir",
+    "/var/lib/exo/benchmarks/tp2-llama31-8b-20260718-v1"
+  ],
+  "correctness_oracle": {
+    "expected_completion_tokens": 32,
+    "expected_content_sha256": "09b309bfc50e29dd9ceb2f192dc1f798150b0867530fc8fe6a0b919fcb87fe21",
+    "expected_finish_reason": "length",
+    "expected_prompt_tokens": 45,
+    "model_id": "mlx-community/Llama-3.1-8B-Instruct-4bit",
+    "prompt_sha256": "5acfb781684c00d3313c5a4990dec4a7a3ebec7ffc2b014275fea69214348e45",
+    "revision": "90215b22ec18e72f623dde2ea7af4097025160e2"
+  },
+  "cpu_bindings": {
+    "dwagon": {
+      "cpu_set": "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,112,113,114,115,116,117,118,119,120,121,122,123,124,125,126,127",
+      "memory_policy": "bind:0",
+      "numa_nodes": [
+        0
+      ]
+    },
+    "fwuff": {
+      "cpu_set": "8,9,10,11,12,13,14,15,68,69,70,71,72,73,74,75",
+      "memory_policy": "bind:0",
+      "numa_nodes": [
+        0
+      ]
+    }
+  },
+  "execution_contracts": {
+    "dwagon": {
+      "launch_argv": [
+        "/usr/bin/numactl",
+        "--physcpubind=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,112,113,114,115,116,117,118,119,120,121,122,123,124,125,126,127",
+        "--membind=0",
+        "/root/exo/.venv/bin/python",
+        "-m",
+        "exo",
+        "--namespace",
+        "fwuffydwagon-tp2-llama31-8b-20260718-v1",
+        "--zenoh-port",
+        "21701",
+        "--discovery-port",
+        "21702",
+        "--offline",
+        "--no-downloads",
+        "--force-master",
+        "--api-port",
+        "21700",
+        "--no-batch"
+      ],
+      "probe_environment": {
+        "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+        "CUDA_VISIBLE_DEVICES": "GPU-a442b72e-6727-6322-ba5d-5a9512b79886,GPU-63a7760a-6164-0758-9228-03dbf35d721c",
+        "ENABLE_DISAGGREGATION": "false",
+        "EXO_CHAT_TEMPLATE_DATE": "18 Jul 2026",
+        "EXO_DASHBOARD_DIR": "/root/exo/dashboard/build",
+        "EXO_HOME": "/tmp/exo-tp2-llama31-8b-20260718-v1-dwagon",
+        "EXO_MAX_CONCURRENT_REQUESTS": "1",
+        "EXO_MLX_VISION_LOADING": "disabled",
+        "EXO_MODELS_READ_ONLY_DIRS": "/var/lib/exo/models",
+        "EXO_OFFLINE": "true",
+        "HOME": "/root",
+        "LD_LIBRARY_PATH": "/root/exo/.venv/lib/python3.13/site-packages/mlx/lib:/root/exo/.venv/lib/python3.13/site-packages/nvidia/cu13/lib:/root/exo/.venv/lib/python3.13/site-packages/nvidia/cudnn/lib:/root/exo/.venv/lib/python3.13/site-packages/nvidia/nccl/lib:/opt/cuda/lib64:/usr/lib64:/usr/lib",
+        "NCCL_DEBUG": "INFO",
+        "NCCL_DEBUG_SUBSYS": "INIT,NET",
+        "NCCL_GIN_ENABLE": "0",
+        "NCCL_GIN_TYPE": "0",
+        "NCCL_IB_GID_INDEX": "0",
+        "NCCL_IB_HCA": "=mlx4_0:1,mlx4_0:2",
+        "NCCL_IB_MERGE_NICS": "1",
+        "NCCL_NET": "IB",
+        "NCCL_NET_GDR_LEVEL": "LOC",
+        "PATH": "/root/exo/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/bin:/opt/bin:/opt/cuda/bin",
+        "PYTHONHASHSEED": "42",
+        "PYTHONPATH": "/var/lib/exo/deployments/linux-cuda-nccl-a7711e4ed6f3c106772c51e354697335ad2e1c22/src"
+      }
+    },
+    "fwuff": {
+      "launch_argv": [
+        "/usr/bin/numactl",
+        "--physcpubind=8,9,10,11,12,13,14,15,68,69,70,71,72,73,74,75",
+        "--membind=0",
+        "/root/exo/.venv/bin/python",
+        "-m",
+        "exo",
+        "--namespace",
+        "fwuffydwagon-tp2-llama31-8b-20260718-v1",
+        "--zenoh-port",
+        "21703",
+        "--discovery-port",
+        "21702",
+        "--offline",
+        "--no-downloads",
+        "--api-port",
+        "21700",
+        "--no-batch"
+      ],
+      "probe_environment": {
+        "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+        "CUDA_VISIBLE_DEVICES": "GPU-93e47864-13c3-0211-f3a9-ccee1a00d618",
+        "ENABLE_DISAGGREGATION": "false",
+        "EXO_CHAT_TEMPLATE_DATE": "18 Jul 2026",
+        "EXO_DASHBOARD_DIR": "/root/exo/dashboard/build",
+        "EXO_HOME": "/tmp/exo-tp2-llama31-8b-20260718-v1-fwuff",
+        "EXO_MAX_CONCURRENT_REQUESTS": "1",
+        "EXO_MLX_VISION_LOADING": "disabled",
+        "EXO_MODELS_READ_ONLY_DIRS": "/mnt/sanic/exo/models",
+        "EXO_OFFLINE": "true",
+        "HOME": "/root",
+        "LD_LIBRARY_PATH": "/root/exo/.venv/lib/python3.13/site-packages/mlx/lib:/root/exo/.venv/lib/python3.13/site-packages/nvidia/cu13/lib:/root/exo/.venv/lib/python3.13/site-packages/nvidia/cudnn/lib:/root/exo/.venv/lib/python3.13/site-packages/nvidia/nccl/lib:/opt/cuda/lib64:/usr/lib64:/usr/lib",
+        "NCCL_DEBUG": "INFO",
+        "NCCL_DEBUG_SUBSYS": "INIT,NET",
+        "NCCL_GIN_ENABLE": "0",
+        "NCCL_GIN_TYPE": "0",
+        "NCCL_IB_GID_INDEX": "0",
+        "NCCL_IB_HCA": "=mlx4_0:1,mlx4_0:2",
+        "NCCL_IB_MERGE_NICS": "1",
+        "NCCL_NET": "IB",
+        "NCCL_NET_GDR_LEVEL": "LOC",
+        "PATH": "/root/exo/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/bin:/opt/bin:/opt/cuda/bin",
+        "PYTHONHASHSEED": "42",
+        "PYTHONPATH": "/var/lib/exo/deployments/linux-cuda-nccl-a7711e4ed6f3c106772c51e354697335ad2e1c22/src"
+      }
+    }
+  },
+  "generated_at": "2026-07-19T00:50:00+00:00",
+  "git": {
+    "commit": "a7711e4ed6f3c106772c51e354697335ad2e1c22",
+    "dirty": false,
+    "dirty_file_hashes": {}
+  },
+  "gpu_bindings": {
+    "dwagon": [
+      {
+        "pci_address": "00000000:16:00.0",
+        "uuid": "GPU-a442b72e-6727-6322-ba5d-5a9512b79886"
+      }
+    ],
+    "fwuff": [
+      {
+        "pci_address": "00000000:6A:00.0",
+        "uuid": "GPU-93e47864-13c3-0211-f3a9-ccee1a00d618"
+      }
+    ]
+  },
+  "hca_bindings": {
+    "dwagon": [
+      {
+        "device": "mlx4_0",
+        "gid": "fe80::10:e000:166:3a19",
+        "port": 1,
+        "rail_id": "qdr-a"
+      },
+      {
+        "device": "mlx4_0",
+        "gid": "fe80::10:e000:166:3a1a",
+        "port": 2,
+        "rail_id": "qdr-b"
+      }
+    ],
+    "fwuff": [
+      {
+        "device": "mlx4_0",
+        "gid": "fe80::e41d:2d03:4d:32e1",
+        "port": 1,
+        "rail_id": "qdr-a"
+      },
+      {
+        "device": "mlx4_0",
+        "gid": "fe80::e41d:2d03:4d:32e2",
+        "port": 2,
+        "rail_id": "qdr-b"
+      }
+    ]
+  },
+  "hosts": [
+    "dwagon",
+    "fwuff"
+  ],
+  "models": [
+    {
+      "expected_manifest_sha256": "39df1f70f021e6f2852549a1d43c8120eb305993a796d077d0d3ed396a63cc7d",
+      "model_id": "mlx-community/Llama-3.1-8B-Instruct-4bit",
+      "paths": {
+        "dwagon": "/var/lib/exo/models/mlx-community--Llama-3.1-8B-Instruct-4bit--90215b22ec18e72f623dde2ea7af4097025160e2",
+        "fwuff": "/mnt/sanic/exo/models/mlx-community--Llama-3.1-8B-Instruct-4bit--90215b22ec18e72f623dde2ea7af4097025160e2"
+      },
+      "revision": "90215b22ec18e72f623dde2ea7af4097025160e2"
+    }
+  ],
+  "namespace": "fwuffydwagon-tp2-llama31-8b-20260718-v1",
+  "owner_pids": {
+    "dwagon": [],
+    "fwuff": []
+  },
+  "physical_gpu_inventory": {
+    "dwagon": [
+      {
+        "pci_address": "00000000:16:00.0",
+        "uuid": "GPU-a442b72e-6727-6322-ba5d-5a9512b79886"
+      },
+      {
+        "pci_address": "00000000:27:00.0",
+        "uuid": "GPU-63a7760a-6164-0758-9228-03dbf35d721c"
+      }
+    ],
+    "fwuff": [
+      {
+        "pci_address": "00000000:6A:00.0",
+        "uuid": "GPU-93e47864-13c3-0211-f3a9-ccee1a00d618"
+      }
+    ]
+  },
+  "requested_compute_resource_ids": [
+    "nvidia-gpu:GPU-a442b72e-6727-6322-ba5d-5a9512b79886",
+    "nvidia-gpu:GPU-93e47864-13c3-0211-f3a9-ccee1a00d618"
+  ],
+  "reserved_ports": [
+    21700,
+    21701,
+    21702,
+    21703,
+    21704
+  ],
+  "result_directory": "/var/lib/exo/benchmarks/tp2-llama31-8b-20260718-v1",
+  "run_id": "tp2-llama31-8b-20260718-v1",
+  "runtime_requirements": {
+    "cuda_major": 13,
+    "distribution_versions": {
+      "exo": "0.3.70",
+      "huggingface-hub": "1.8.0",
+      "mlx": "0.32.0",
+      "mlx-cuda-13": "0.32.0",
+      "mlx-lm": "0.31.3",
+      "nvidia-nccl-cu13": "2.28.9",
+      "safetensors": "0.7.0",
+      "tokenizers": "0.22.2",
+      "transformers": "5.6.2"
+    },
+    "host_pins": {
+      "dwagon": {
+        "exo_rs_native_sha256": "4725a8d47f1c92e7906426fc85482e65a6afa2db275bd16ac6d9112a7a642bcf"
+      },
+      "fwuff": {
+        "exo_rs_native_sha256": "fca25d7ebdace502bd0ba9eb30a4c1a8120fd516ae914e2604284d13aaba6540"
+      }
+    },
+    "minimum_nvidia_driver_version": "580.0",
+    "python_abi": {
+      "abiflags": "",
+      "cache_tag": "cpython-313",
+      "implementation": "cpython",
+      "major": 3,
+      "minor": 13,
+      "soabi": "cpython-313-x86_64-linux-gnu"
+    }
+  },
+  "schema_version": 1,
+  "source_deployments": {
+    "dwagon": {
+      "commit": "a7711e4ed6f3c106772c51e354697335ad2e1c22",
+      "dirty_file_hashes": {},
+      "path": "/var/lib/exo/deployments/linux-cuda-nccl-a7711e4ed6f3c106772c51e354697335ad2e1c22"
+    },
+    "fwuff": {
+      "commit": "a7711e4ed6f3c106772c51e354697335ad2e1c22",
+      "dirty_file_hashes": {},
+      "path": "/var/lib/exo/deployments/linux-cuda-nccl-a7711e4ed6f3c106772c51e354697335ad2e1c22"
+    }
+  }
+}

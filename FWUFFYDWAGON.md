@@ -320,7 +320,40 @@ If three logical resources cannot be launched reliably, design a separate fail-c
 - The pinned GLM-4.7 Flash 4-bit stage completed cleanly at `/var/lib/exo/benchmarks/glm47flash-stage-20260719-v1`, using revision `1454cffb1a21737e162f508e5bc70be9def89276` and exact clean source commit `6da455c8e3eb5e21d09812f10e44a31712545816`. Both hosts have the same complete 26-file snapshot with four weight shards, 16,852,202,496 indexed weight bytes, and canonical model-manifest SHA-256 `c9de2620a4cd99025abfc4758555637f3a8dbedb8cb69daf198be5edb3e6d64e`. Verified locations are `dwagon:/var/lib/exo/models/mlx-community--GLM-4.7-Flash-4bit--1454cffb1a21737e162f508e5bc70be9def89276` and `fwuff:/mnt/sanic/exo/models/mlx-community--GLM-4.7-Flash-4bit--1454cffb1a21737e162f508e5bc70be9def89276`. Result/manifest/runtime/config SHA-256 values are `d3eb9fd0e854b13494a115c872dc127fa569e525a14e115054283284f271fdec`, `f6360fd6eac23adf709fa109eee0dd45122ff5d09b706c7ae3e94f87e29d1a8b`, `b7cd82896c65af0bd4cee5a6417cfe34c845c669af096e17d274d5bdb1766ca8`, and `538831b0a93226c70d4d808d3331555a99bcb1a998feb8e91777efdcf3c05c58`.
 - The matching deterministic GLM-4.7 Flash TP1 oracle is reportable and clean at `/var/lib/exo/benchmarks/tp1-glm47flash-20260719-v1`. With `enable_thinking=false`, three repetitions each produced 16 prompt tokens, 32 completion tokens, `finish_reason=length`, 32 UTF-8 content bytes, prompt SHA-256 `5acfb781684c00d3313c5a4990dec4a7a3ebec7ffc2b014275fea69214348e45`, and completion SHA-256 `de1349c105ffe29ab10b68492986aa6c081672d045b02d474570fbf5bda3a40d`. Result/manifest/runtime/log/raw-config SHA-256 values are `0064768cb29f20072b22a6ac7fff5b9b947c0da70dcd0e446e0e25c820eaa890`, `2fbe883160900818e4d9cf46ab7c5c9a12d2a2d755996fee114d9e8def65ca53`, `c689c0358e802a00b6dc584c54750431f229ff283c614e5ac3975b274f0dbde3`, `6fffc3286c57a6b9da6408ffe916c52dacc9fac3fccdacddf56cf3dee048ba38`, and `719a89b29bb51fa8a8936d4f8fc03c9d4c251103ccc2cf77088abb4fc23a23ca`; the receipt-canonical config SHA-256 is `86159c2e48079c3c4d9d9130df6f64a52095d3d13d96856c133077b30ef148b4` and request digest is `74b6b0a06170e31438d9ec798773437e02da85909385ac2d07e789f65c4ebd6e`.
 - The strict GLM-4.7 Flash Tensor=2 proof is reportable and clean at `/var/lib/exo/benchmarks/tp2-glm47flash-20260719-v1`, using exact clean commit `6da455c8e3eb5e21d09812f10e44a31712545816`. One selected RTX 3090 on each host completed two warmups and three measured requests, all exactly matching the TP1 oracle; dwagon's second GPU remained observed but unowned. The run reported 9,380,021,417 bytes of peak memory usage. Diagnostic mean/median latency was 2.374/2.311 seconds, with mean prefill/decode rates of 45.31/19.57 tokens/s. Both ranks initialized, NCCL selected `mlx4_0:1` and `mlx4_0:2`, formed merged `NET/IB/2`, and showed no socket fallback or fatal marker. Bracketed HCA counters proved matched bidirectional payload with matching packet counters and zero selected health/error deltas: 199,084,700 PMA data bytes on `qdr-a` and 199,080,292 on `qdr-b`. The receipt has `dual_rail_payload_verified=true` and `performance_comparable=false` because ConnectX-3 GPUDirect RDMA and GIN were disabled and transport was host-staged. Instance and process cleanup were ownership-confirmed and unforced; independent post-run checks found no lease, held lock, reserved port, owned PID, log failure marker, or GPU compute process on either host. Result/manifest/runtime/dwagon-log/fwuff-log/config SHA-256 values are `503ac516604293c9e41e7fb7b7c2fa2805fbdaa8827c2053d4caae2c1c7bfc91`, `7f1ca0a897d1ec85c858a6cbf8504c4de522fd3ef62d96b75b8f1ad56082f568`, `f0bdf0541d7ae67c808dbd4fde03d3819c85bcf1ad040ed7b80b7a98edb91240`, `feaffc4148da1578b60dd48e2293800bec4e4290b7fab6c180f02f5147df33a8`, `f8c3ebda6bba21fd27cd4eb10e1125916a00bd6aaaa388a6f0b8f379ff9c2232`, and `7b3ff5a572c6319fc2f65632b1dd710f7f4e365929fee1ab6bb2710dec201a4f`.
-- Operational conflicts removed for shared testing: dwagon containers `/voice-backend` and `/voice-speaker-embedding` are stopped with restart policy `no`; fwuff `ollama.service` is stopped/inactive but remains enabled.
+- Operational conflicts removed for shared testing: dwagon containers `/voice-backend` and `/voice-speaker-embedding` are stopped with restart policy `no`; fwuff `ollama.service` is disabled and inactive.
+- The guarded serving release is published as commit `83e9e2e5`; its exact
+  five-file slice passed `177` focused tests, Ruff lint/format, repository-wide
+  Basedpyright, and independent final review. The hardened two-host staging
+  release is published as `1b7e19a0`; its exact two-file slice passed `145`
+  focused tests plus the same static gates and independent review. Identical
+  frozen clean deployments of full commit
+  `1b7e19a05809a4ea252237e28f1448c25502c364` exist on dwagon and fwuff at
+  `/var/lib/exo/deployments/linux-cuda-nccl-1b7e19a05809a4ea252237e28f1448c25502c364`.
+- The official GLM-4.7-Flash BF16 snapshot is now staged on dwagon-local NVMe
+  at `/var/lib/exo/models/zai-org--GLM-4.7-Flash--7dd20894a642a0aa287e9827cb1a1f7f91386b67`.
+  The leased receipt is
+  `/var/lib/exo/benchmarks/glm47-bf16-local-stage-dwagon-20260719-v1`.
+  It completed in 16m53s with exit code 0, unforced confirmed cleanup, no
+  remaining lease/lock/temp path, and identical source/local/remote manifests:
+  48 shards, 31,221,488,576 indexed bytes, 62,465,293,519 bytes in the installed
+  117-file tree, and contract SHA-256
+  `4e7333f341ddc5855aa4253d454e3210d84427fae0159eb956104ff00c437479`.
+  Result/manifest/runtime SHA-256 values are
+  `4402e93021291b8138660008b1bd7d27cf77c8dc9c31ca29ac1b51d083ae49d8`,
+  `a60105f975aa667e9372205f53345c4571f4c11c42bb2829aaf3258c97dce0b6`,
+  and `d82b90508b00ef0a1399e960a43de51f4a979a695426fe58b14dd98d2d561344`.
+  This is artifact correctness only and intentionally makes no performance
+  claim. Fresh local-path admission remains required before serving.
+- Add a placement-aware artifact-distribution track after the first local
+  baseline. The near-term transport should assign IPoIB addresses to both
+  rails, stripe content-addressed safetensors shards across them, retain 10 GbE
+  for control/overflow, resume missing chunks, and verify each chunk before
+  publication. Exo should ultimately derive the shared tensors, layers, and
+  experts required by each placement and send only that set. Because existing
+  safetensors files can mix placements, support byte-range loading or repack
+  once into placement-aligned chunks. Use RDMA into registered host buffers and
+  pinned-host GPU staging first; RTX 3090/ConnectX-3 GPUDirect remains an
+  unsupported A/B experiment rather than a dependency.
 - Remaining limitations before general NVIDIA support: ordered explicit GPU subsets and TP2/TP3 live proof contracts are supported for NCCL Tensor placement, but the current harness still requires exactly two hosts with the observed physical 2+1 GPU inventory; KV/workspace/prefix-cache VRAM is not modeled; GPU enumeration still requires NVML even though locality now comes from sysfs; port-wide HCA counter attribution depends on the exclusive lease, strict process preflight, and validated NCCL logs; the SGLang supervisor is not wired into Worker/API lifecycle and proxying; file-backed model-level capability collection and live SM86 GLM/NSA validation remain pending; and live multi-GPU dashboard validation plus broader post-upgrade hardware validation remain pending.
 
 1. **Resource model and discovery**
@@ -338,6 +371,12 @@ If three logical resources cannot be launched reliably, design a separate fail-c
    - Replace host-RAM-only proportional placement with GPU VRAM, host RAM, KV cache, workspace, expert residency, and configurable headroom accounting.
    - Add model-declared legal pipeline boundaries and reject invalid partitions.
    - Parse the Safetensors index and download only each stage's required layer shards plus shared configuration/tokenizer tensors.
+   - Add a content-addressed artifact planner and multi-link transfer scheduler.
+     Stripe independent chunks over both IPoIB/RDMA rails, use 10 GbE only for
+     control or overflow, resume verified chunks, and bind the final placement
+     manifest into launch admission. Do not transfer the full checkpoint to a
+     node when its assigned shared tensors, layers, and experts form a smaller
+     closed set.
    - Initially expose GLM-5.2 only through `SglangKt`, with exact minimum runtime versions and cache rules.
 
 4. **KTransformers/SGLang pipeline fixes**

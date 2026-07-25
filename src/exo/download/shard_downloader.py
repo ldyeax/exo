@@ -17,6 +17,11 @@ from exo.shared.types.worker.shards import (
 
 # TODO: the PipelineShardMetadata getting reinstantiated is a bit messy. Should this be a classmethod?
 class ShardDownloader(ABC):
+    @property
+    def supports_offline_download(self) -> bool:
+        """Whether this downloader has an explicitly configured non-origin source."""
+        return False
+
     @abstractmethod
     async def ensure_shard(
         self, shard: ShardMetadata, config_only: bool = False

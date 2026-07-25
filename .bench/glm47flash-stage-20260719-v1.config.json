@@ -1,0 +1,121 @@
+{
+  "schema_version": 1,
+  "run_id": "glm47flash-stage-20260719-v1",
+  "namespace": "exo-glm47flash-stage-20260719-v1",
+  "result_directory": "/var/lib/exo/benchmarks/glm47flash-stage-20260719-v1",
+  "local_host_name": "dwagon",
+  "remote_host_name": "fwuff",
+  "model": {
+    "model_id": "mlx-community/GLM-4.7-Flash-4bit",
+    "revision": "1454cffb1a21737e162f508e5bc70be9def89276",
+    "expected_indexed_bytes": 16852202496
+  },
+  "local_destination": "/var/lib/exo/models/mlx-community--GLM-4.7-Flash-4bit--1454cffb1a21737e162f508e5bc70be9def89276",
+  "remote_destination": "/mnt/sanic/exo/models/mlx-community--GLM-4.7-Flash-4bit--1454cffb1a21737e162f508e5bc70be9def89276",
+  "ssh": {
+    "target": "fwuff",
+    "executable": "/usr/bin/ssh",
+    "remote_python_executable": "/usr/bin/python3",
+    "options": [
+      "-oBatchMode=yes",
+      "-oStrictHostKeyChecking=yes",
+      "-oUserKnownHostsFile=/root/.ssh/known_hosts",
+      "-oConnectTimeout=10",
+      "-oServerAliveInterval=10",
+      "-oServerAliveCountMax=3",
+      "-oControlMaster=no",
+      "-oControlPath=none",
+      "-oControlPersist=no",
+      "-oRequestTTY=no"
+    ]
+  },
+  "acquisition": {
+    "hf_executable": "/usr/bin/hf",
+    "source_snapshot": null,
+    "environment": {
+      "HOME": "/root",
+      "HF_HUB_DISABLE_TELEMETRY": "1"
+    }
+  },
+  "timeouts": {
+    "lease_bind_seconds": 5.0,
+    "local_stage_seconds": 3600.0,
+    "remote_probe_seconds": 30.0,
+    "remote_transfer_seconds": 900.0,
+    "cleanup_seconds": 30.0,
+    "poll_seconds": 0.25
+  },
+  "lease_metadata": {
+    "reserved_ports": [
+      22100
+    ],
+    "git": {
+      "commit": "6da455c8e3eb5e21d09812f10e44a31712545816",
+      "dirty": false,
+      "dirty_file_hashes": {}
+    },
+    "staging_script_sha256": "e8aa0cb17722ac7a48a73fda4aee2f4b118a9f14340b6c9b0a34167b61a8b74e",
+    "gpu_bindings": {
+      "dwagon": [],
+      "fwuff": []
+    },
+    "cpu_bindings": {
+      "dwagon": {
+        "cpu_set": "64,65,66,67,68,69,70,71,176,177,178,179,180,181,182,183",
+        "numa_nodes": [
+          1
+        ],
+        "memory_policy": "bind:1"
+      },
+      "fwuff": {
+        "cpu_set": "8,9,10,11,12,13,14,15,68,69,70,71,72,73,74,75",
+        "numa_nodes": [
+          0
+        ],
+        "memory_policy": "bind:0"
+      }
+    },
+    "hca_bindings": {
+      "dwagon": [
+        {
+          "device": "mlx4_0",
+          "port": 1,
+          "gid": "fe80::10:e000:166:3a19"
+        },
+        {
+          "device": "mlx4_0",
+          "port": 2,
+          "gid": "fe80::10:e000:166:3a1a"
+        }
+      ],
+      "fwuff": [
+        {
+          "device": "mlx4_0",
+          "port": 1,
+          "gid": "fe80::e41d:2d03:4d:32e1"
+        },
+        {
+          "device": "mlx4_0",
+          "port": 2,
+          "gid": "fe80::e41d:2d03:4d:32e2"
+        }
+      ]
+    },
+    "source_deployments": {
+      "dwagon": {
+        "path": "/var/lib/exo/deployments/linux-cuda-nccl-6da455c8e3eb5e21d09812f10e44a31712545816",
+        "commit": "6da455c8e3eb5e21d09812f10e44a31712545816",
+        "dirty_file_hashes": {}
+      },
+      "fwuff": {
+        "path": "/var/lib/exo/deployments/linux-cuda-nccl-6da455c8e3eb5e21d09812f10e44a31712545816",
+        "commit": "6da455c8e3eb5e21d09812f10e44a31712545816",
+        "dirty_file_hashes": {}
+      }
+    },
+    "owner_pids": {
+      "dwagon": [],
+      "fwuff": []
+    }
+  }
+}

@@ -1,0 +1,147 @@
+{
+  "schema_version": 1,
+  "run_id": "tp1-llama31-8b-20260718-v1",
+  "namespace": "exo-tp1-llama31-8b-20260718-v1",
+  "result_directory": "/var/lib/exo/benchmarks/tp1-llama31-8b-20260718-v1",
+  "host_name": "dwagon",
+  "source_directory": "/var/lib/exo/deployments/linux-cuda-nccl-a7711e4ed6f3c106772c51e354697335ad2e1c22",
+  "python_executable": "/root/exo/.venv/bin/python",
+  "source": {
+    "commit": "a7711e4ed6f3c106772c51e354697335ad2e1c22",
+    "dirty_file_hashes": {}
+  },
+  "model": {
+    "model_id": "mlx-community/Llama-3.1-8B-Instruct-4bit",
+    "revision": "90215b22ec18e72f623dde2ea7af4097025160e2",
+    "local_path": "/var/lib/exo/models/mlx-community--Llama-3.1-8B-Instruct-4bit--90215b22ec18e72f623dde2ea7af4097025160e2",
+    "expected_weight_bytes": 4517404672,
+    "expected_sha256_manifest": {
+      ".cache/huggingface/.gitignore": "684888c0ebb17f374298b65ee2807526c066094c701bcc7ebbe1c1095f494fc1",
+      ".cache/huggingface/download/.gitattributes.metadata": "a2ab9ff6a16529284b494b69a70a849c8936c185ac571942ffa0146b2579b51e",
+      ".cache/huggingface/download/README.md.metadata": "0162a1d40bf4867e6f1a39bece6e596693c3b54c9ee5060adeb6ffd385e3aac4",
+      ".cache/huggingface/download/config.json.metadata": "3b3fe5d95fd043ce1e9b7854c552e01a099918b10e4445e8e5881e29ce12e789",
+      ".cache/huggingface/download/model.safetensors.index.json.metadata": "be9d79b0551861bedc10b8e948acaeaec904f6a8bef0fe6b950471c105e47910",
+      ".cache/huggingface/download/model.safetensors.metadata": "60adaf61c8d5e6817ad8e03e6019e2031bd334279cbaca8598227f2088dee8ee",
+      ".cache/huggingface/download/special_tokens_map.json.metadata": "13a23c4de99de59e62dec7eea49dd5b78f8ebe16c297ab9c2442b0be453cec15",
+      ".cache/huggingface/download/tokenizer.json.metadata": "c1da6ab35b313fe746b9f050c4b3b30f12e10ba9f2ed5434386041f174125900",
+      ".cache/huggingface/download/tokenizer_config.json.metadata": "6a776166ad080db5c0217446348d45adef7b67162225fecaca44c8e266f2e11c",
+      ".exo-huggingface-revision.json": "2f18ffaf5ba323348b0d150a89e2ed8d70a7930b044700da756ddb1179049f72",
+      ".gitattributes": "34448b82c17d60fec9b65b1f093c115ddbaadc04beb1b0140b6bfed2e012a930",
+      "README.md": "df2b6fd835306d188b6193fa3dd075c72f4d52140f11e480fffb0f2e19c38cfd",
+      "config.json": "88804b1a541a86ce1b5b21dd0b38d95ee99006ef656a0b59ab267ecb0bce8b22",
+      "model.safetensors": "192065799d1621df78b68274137974d3258c5dadce9ca71305ed014d997d67c4",
+      "model.safetensors.index.json": "9a76e05055778bb04cacb7aff616b378da0e57c87a181c932037a943efba5997",
+      "special_tokens_map.json": "6f38c73729248f6c127296386e3cdde96e254636cc58b4169d3fd32328d9a8ec",
+      "tokenizer.json": "6b9e4e7fb171f92fd137b777cc2714bf87d11576700a1dcd7a399e7bbe39537b",
+      "tokenizer_config.json": "f0f2d5fa9caf736f4184e3fe3316378290696f9ebd9f11ac431d48fbda92a11c"
+    }
+  },
+  "gpu": {
+    "device_uuid": "GPU-a442b72e-6727-6322-ba5d-5a9512b79886",
+    "pci_bus_id": "00000000:16:00.0",
+    "model_name": "NVIDIA GeForce RTX 3090"
+  },
+  "hca_ports": [
+    {
+      "device": "mlx4_0",
+      "port": 1,
+      "gid": "fe80::10:e000:166:3a19"
+    },
+    {
+      "device": "mlx4_0",
+      "port": 2,
+      "gid": "fe80::10:e000:166:3a1a"
+    }
+  ],
+  "cpu": {
+    "cpu_set": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      112,
+      113,
+      114,
+      115,
+      116,
+      117,
+      118,
+      119
+    ],
+    "numa_nodes": [
+      0
+    ]
+  },
+  "ports": {
+    "api": 21600,
+    "zenoh": 21601,
+    "discovery": 21602,
+    "ring": 21603
+  },
+  "environment": {
+    "CUDA_VISIBLE_DEVICES": "GPU-a442b72e-6727-6322-ba5d-5a9512b79886",
+    "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+    "EXO_MODELS_READ_ONLY_DIRS": "/var/lib/exo/models",
+    "EXO_OFFLINE": "true",
+    "EXO_MAX_CONCURRENT_REQUESTS": "1",
+    "ENABLE_DISAGGREGATION": "false",
+    "EXO_MLX_VISION_LOADING": "disabled",
+    "EXO_CHAT_TEMPLATE_DATE": "18 Jul 2026",
+    "EXO_DASHBOARD_DIR": "/root/exo/dashboard/build",
+    "PYTHONHASHSEED": "42",
+    "EXO_HOME": "/tmp/exo-tp1-llama31-8b-20260718-v1",
+    "PATH": "/root/exo/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/bin:/opt/bin:/opt/cuda/bin",
+    "HOME": "/root",
+    "LD_LIBRARY_PATH": "/root/exo/.venv/lib/python3.13/site-packages/mlx/lib:/root/exo/.venv/lib/python3.13/site-packages/nvidia/cu13/lib:/root/exo/.venv/lib/python3.13/site-packages/nvidia/cudnn/lib:/root/exo/.venv/lib/python3.13/site-packages/nvidia/nccl/lib:/opt/cuda/lib64:/usr/lib64:/usr/lib",
+    "PYTHONPATH": "/var/lib/exo/deployments/linux-cuda-nccl-a7711e4ed6f3c106772c51e354697335ad2e1c22/src"
+  },
+  "launch_argv": [
+    "/usr/bin/numactl",
+    "--physcpubind=0,1,2,3,4,5,6,7,112,113,114,115,116,117,118,119",
+    "--membind=0",
+    "/root/exo/.venv/bin/python",
+    "-m",
+    "exo",
+    "--namespace",
+    "exo-tp1-llama31-8b-20260718-v1",
+    "--api-port",
+    "21600",
+    "--zenoh-port",
+    "21601",
+    "--discovery-port",
+    "21602",
+    "--offline",
+    "--no-downloads",
+    "--force-master",
+    "--no-batch"
+  ],
+  "request": {
+    "prompt": "Reply with exactly: NCCL proof complete.",
+    "repetitions": 3,
+    "max_tokens": 32,
+    "seed": 42,
+    "temperature": 0.0,
+    "stream": false,
+    "use_prefix_cache": false,
+    "logprobs": false
+  },
+  "timeouts": {
+    "preflight_seconds": 120.0,
+    "process_start_seconds": 20.0,
+    "api_start_seconds": 120.0,
+    "cluster_seconds": 120.0,
+    "runner_ready_seconds": 600.0,
+    "request_seconds": 180.0,
+    "cleanup_seconds": 45.0,
+    "poll_seconds": 0.25
+  },
+  "runtime": {
+    "cuda_major": 13,
+    "minimum_nvidia_driver_version": "580.0",
+    "exo_rs_sha256": "3d5db193d4765d8919357f3ceb0699eaea26fbb968a52c2a907e16381d9894ac"
+  }
+}

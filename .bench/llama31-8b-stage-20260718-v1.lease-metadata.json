@@ -1,0 +1,223 @@
+{
+  "command": [
+    "/root/exo/.venv/bin/python",
+    "/var/lib/exo/deployments/linux-cuda-nccl-a7711e4ed6f3c106772c51e354697335ad2e1c22/scripts/two_host_model_stage.py",
+    "--config",
+    "/root/exo/.bench/llama31-8b-stage-20260718-v1.config.json",
+    "--lease-path",
+    "/var/lib/exo/coordination/benchmark-lease.json",
+    "--lock-path",
+    "/run/lock/fwuffydwagon-benchmark.lock",
+    "--result-dir",
+    "/var/lib/exo/benchmarks/llama31-8b-stage-20260718-v1"
+  ],
+  "cpu_bindings": {
+    "dwagon": {
+      "cpu_set": "64,65,66,67,68,69,70,71,176,177,178,179,180,181,182,183",
+      "memory_policy": "bind:1",
+      "numa_nodes": [
+        1
+      ]
+    },
+    "fwuff": {
+      "cpu_set": "8,9,10,11,12,13,14,15,68,69,70,71,72,73,74,75",
+      "memory_policy": "bind:0",
+      "numa_nodes": [
+        0
+      ]
+    }
+  },
+  "generated_at": "2026-07-19T00:41:10+00:00",
+  "git": {
+    "commit": "a7711e4ed6f3c106772c51e354697335ad2e1c22",
+    "dirty": false,
+    "dirty_file_hashes": {}
+  },
+  "gpu_bindings": {
+    "dwagon": [],
+    "fwuff": []
+  },
+  "hca_bindings": {
+    "dwagon": [
+      {
+        "device": "mlx4_0",
+        "gid": "fe80::10:e000:166:3a19",
+        "port": 1
+      },
+      {
+        "device": "mlx4_0",
+        "gid": "fe80::10:e000:166:3a1a",
+        "port": 2
+      }
+    ],
+    "fwuff": [
+      {
+        "device": "mlx4_0",
+        "gid": "fe80::e41d:2d03:4d:32e1",
+        "port": 1
+      },
+      {
+        "device": "mlx4_0",
+        "gid": "fe80::e41d:2d03:4d:32e2",
+        "port": 2
+      }
+    ]
+  },
+  "hosts": [
+    "dwagon",
+    "fwuff"
+  ],
+  "model_staging": {
+    "acquisition": {
+      "environment": {
+        "HF_HUB_DISABLE_TELEMETRY": "1",
+        "HOME": "/root"
+      },
+      "hf_executable": "/usr/bin/hf"
+    },
+    "lease_metadata": {
+      "cpu_bindings": {
+        "dwagon": {
+          "cpu_set": "64,65,66,67,68,69,70,71,176,177,178,179,180,181,182,183",
+          "memory_policy": "bind:1",
+          "numa_nodes": [
+            1
+          ]
+        },
+        "fwuff": {
+          "cpu_set": "8,9,10,11,12,13,14,15,68,69,70,71,72,73,74,75",
+          "memory_policy": "bind:0",
+          "numa_nodes": [
+            0
+          ]
+        }
+      },
+      "git": {
+        "commit": "a7711e4ed6f3c106772c51e354697335ad2e1c22",
+        "dirty": false,
+        "dirty_file_hashes": {}
+      },
+      "gpu_bindings": {
+        "dwagon": [],
+        "fwuff": []
+      },
+      "hca_bindings": {
+        "dwagon": [
+          {
+            "device": "mlx4_0",
+            "gid": "fe80::10:e000:166:3a19",
+            "port": 1
+          },
+          {
+            "device": "mlx4_0",
+            "gid": "fe80::10:e000:166:3a1a",
+            "port": 2
+          }
+        ],
+        "fwuff": [
+          {
+            "device": "mlx4_0",
+            "gid": "fe80::e41d:2d03:4d:32e1",
+            "port": 1
+          },
+          {
+            "device": "mlx4_0",
+            "gid": "fe80::e41d:2d03:4d:32e2",
+            "port": 2
+          }
+        ]
+      },
+      "owner_pids": {
+        "dwagon": [],
+        "fwuff": []
+      },
+      "reserved_ports": [
+        21500
+      ],
+      "source_deployments": {
+        "dwagon": {
+          "commit": "a7711e4ed6f3c106772c51e354697335ad2e1c22",
+          "dirty_file_hashes": {},
+          "path": "/var/lib/exo/deployments/linux-cuda-nccl-a7711e4ed6f3c106772c51e354697335ad2e1c22"
+        },
+        "fwuff": {
+          "commit": "a7711e4ed6f3c106772c51e354697335ad2e1c22",
+          "dirty_file_hashes": {},
+          "path": "/var/lib/exo/deployments/linux-cuda-nccl-a7711e4ed6f3c106772c51e354697335ad2e1c22"
+        }
+      },
+      "staging_script_sha256": "e8aa0cb17722ac7a48a73fda4aee2f4b118a9f14340b6c9b0a34167b61a8b74e"
+    },
+    "local_destination": "/var/lib/exo/models/mlx-community--Llama-3.1-8B-Instruct-4bit--90215b22ec18e72f623dde2ea7af4097025160e2",
+    "local_host_name": "dwagon",
+    "model": {
+      "expected_indexed_bytes": 4517404672,
+      "model_id": "mlx-community/Llama-3.1-8B-Instruct-4bit",
+      "revision": "90215b22ec18e72f623dde2ea7af4097025160e2"
+    },
+    "namespace": "exo-llama31-8b-stage-20260718-v1",
+    "remote_destination": "/mnt/sanic/exo/models/mlx-community--Llama-3.1-8B-Instruct-4bit--90215b22ec18e72f623dde2ea7af4097025160e2",
+    "remote_host_name": "fwuff",
+    "result_directory": "/var/lib/exo/benchmarks/llama31-8b-stage-20260718-v1",
+    "run_id": "llama31-8b-stage-20260718-v1",
+    "schema_version": 1,
+    "ssh": {
+      "executable": "/usr/bin/ssh",
+      "options": [
+        "-oBatchMode=yes",
+        "-oStrictHostKeyChecking=yes",
+        "-oUserKnownHostsFile=/root/.ssh/known_hosts",
+        "-oConnectTimeout=10",
+        "-oServerAliveInterval=10",
+        "-oServerAliveCountMax=3",
+        "-oControlMaster=no",
+        "-oControlPath=none",
+        "-oControlPersist=no",
+        "-oRequestTTY=no"
+      ],
+      "remote_python_executable": "/usr/bin/python3",
+      "target": "fwuff"
+    },
+    "timeouts": {
+      "cleanup_seconds": 30.0,
+      "lease_bind_seconds": 5.0,
+      "local_stage_seconds": 3600.0,
+      "poll_seconds": 0.25,
+      "remote_probe_seconds": 30.0,
+      "remote_transfer_seconds": 900.0
+    }
+  },
+  "models": [
+    {
+      "model_id": "mlx-community/Llama-3.1-8B-Instruct-4bit",
+      "paths": {
+        "dwagon": "/var/lib/exo/models/mlx-community--Llama-3.1-8B-Instruct-4bit--90215b22ec18e72f623dde2ea7af4097025160e2",
+        "fwuff": "/mnt/sanic/exo/models/mlx-community--Llama-3.1-8B-Instruct-4bit--90215b22ec18e72f623dde2ea7af4097025160e2"
+      },
+      "revision": "90215b22ec18e72f623dde2ea7af4097025160e2"
+    }
+  ],
+  "namespace": "exo-llama31-8b-stage-20260718-v1",
+  "owner_pids": {
+    "dwagon": [],
+    "fwuff": []
+  },
+  "reserved_ports": [
+    21500
+  ],
+  "result_directory": "/var/lib/exo/benchmarks/llama31-8b-stage-20260718-v1",
+  "run_id": "llama31-8b-stage-20260718-v1",
+  "schema_version": 1,
+  "source_deployments": {
+    "dwagon": {
+      "commit": "a7711e4ed6f3c106772c51e354697335ad2e1c22",
+      "dirty_file_hashes": {},
+      "path": "/var/lib/exo/deployments/linux-cuda-nccl-a7711e4ed6f3c106772c51e354697335ad2e1c22"
+    },
+    "fwuff": {
+      "commit": "a7711e4ed6f3c106772c51e354697335ad2e1c22",
+      "dirty_file_hashes": {},
+      "path": "/var/lib/exo/deployments/linux-cuda-nccl-a7711e4ed6f3c106772c51e354697335ad2e1c22"
+    }
+  }
+}

@@ -10,6 +10,8 @@ from exo.download.download_utils import (
     RepoDownloadProgress,
     download_shard,
 )
+from exo.download.peer_artifact_downloader import PeerArtifactShardDownloader
+from exo.download.peer_artifact_http import PeerArtifactDeploymentConfig
 from exo.download.shard_downloader import ShardDownloader
 from exo.shared.models import model_cards
 from exo.shared.models.model_cards import (
@@ -26,11 +28,20 @@ from exo.shared.types.worker.shards import (
 
 
 def exo_shard_downloader(
-    max_parallel_downloads: int = 8, offline: bool = False
+    max_parallel_downloads: int = 8,
+    offline: bool = False,
+    peer_artifact_config: PeerArtifactDeploymentConfig | None = None,
 ) -> ShardDownloader:
-    return SingletonShardDownloader(
-        ResumableShardDownloader(max_parallel_downloads, offline=offline)
+    downloader: ShardDownloader = ResumableShardDownloader(
+        max_parallel_downloads, offline=offline
     )
+    if peer_artifact_config is not None and peer_artifact_config.peers:
+        downloader = PeerArtifactShardDownloader(
+            downloader,
+            peer_artifact_config,
+            origin_offline=offline,
+        )
+    return SingletonShardDownloader(downloader)
 
 
 async def build_base_shard(
@@ -65,6 +76,10 @@ class SingletonShardDownloader(ShardDownloader):
     def __init__(self, shard_downloader: ShardDownloader):
         self.shard_downloader = shard_downloader
         self.active_downloads: dict[ShardMetadata, asyncio.Task[Path]] = {}
+
+    @property
+    def supports_offline_download(self) -> bool:
+        return self.shard_downloader.supports_offline_download
 
     def on_progress(
         self,

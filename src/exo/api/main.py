@@ -123,6 +123,10 @@ from exo.api.types.openai_responses import (
     ResponsesRequest,
     ResponsesResponse,
 )
+from exo.download.peer_artifact_http import (
+    PeerArtifactDeploymentConfig,
+    install_peer_artifact_http_routes,
+)
 from exo.master.image_store import ImageStore
 from exo.master.placement import (
     place_instance as get_instance_placements,
@@ -252,6 +256,7 @@ class API:
         download_command_sender: Sender[ForwarderDownloadCommand],
         # This lets us pause the API if an election is running
         election_receiver: Receiver[ElectionMessage],
+        peer_artifact_config: PeerArtifactDeploymentConfig | None = None,
     ) -> None:
         self.state = State()
         self._event_log = DiskEventLog(_API_EVENT_LOG_DIR)
@@ -281,6 +286,7 @@ class API:
         self._setup_exception_handlers()
         self._setup_cors()
         self._setup_routes()
+        install_peer_artifact_http_routes(self.app, peer_artifact_config)
 
         self.app.mount(
             "/",

@@ -1,0 +1,191 @@
+{
+  "schema_version": 1,
+  "run_id": "ib-qdr-x8x8-20260718-v2",
+  "namespace": "exo-ib-qdr-x8x8-20260718-v2",
+  "result_directory": "/var/lib/exo/benchmarks/ib-qdr-x8x8-20260718-v2",
+  "ssh": {
+    "executable": "/usr/bin/ssh",
+    "known_hosts_file": "/root/.ssh/known_hosts",
+    "identity_file": "/root/.ssh/id_ed25519",
+    "user": "root",
+    "port": 22,
+    "connect_timeout_seconds": 10,
+    "server_alive_interval_seconds": 10,
+    "server_alive_count_max": 3
+  },
+  "local_host": {
+    "name": "dwagon",
+    "management_address": "192.168.40.24",
+    "transport": "local",
+    "source_directory": "/var/lib/exo/deployments/linux-cuda-nccl-11a9ef41d3c7a138e5186db50d4a4c4fe30876fa",
+    "source": {
+      "commit": "11a9ef41d3c7a138e5186db50d4a4c4fe30876fa",
+      "dirty_file_hashes": {}
+    },
+    "preflight": {
+      "maximum_load_1m_per_online_cpu": 0.5,
+      "minimum_available_memory_bytes": 17179869184,
+      "allowed_cpu_frequency_governors": [
+        "powersave"
+      ]
+    },
+    "cpu_set": [
+      64,
+      65,
+      66,
+      67,
+      68,
+      69,
+      70,
+      71,
+      176,
+      177,
+      178,
+      179,
+      180,
+      181,
+      182,
+      183
+    ],
+    "numa_nodes": [
+      1
+    ],
+    "hca": {
+      "device": "mlx4_0",
+      "node_guid": "0010:e000:0166:3a18",
+      "pci": {
+        "bdf": "0000:d8:00.0",
+        "vendor_id": "0x15b3",
+        "device_id": "0x1003",
+        "driver": "mlx4_core",
+        "current_width": 8,
+        "maximum_width": 8,
+        "current_speed_gtps": 8.0,
+        "maximum_speed_gtps": 8.0,
+        "numa_node": 1
+      },
+      "ports": [
+        {
+          "port": 1,
+          "port_guid": "0010:e000:0166:3a19",
+          "gid_index": 0,
+          "gid": "fe80::10:e000:166:3a19",
+          "expected_rate": "40 Gb/sec (4X QDR)"
+        },
+        {
+          "port": 2,
+          "port_guid": "0010:e000:0166:3a1a",
+          "gid_index": 0,
+          "gid": "fe80::10:e000:166:3a1a",
+          "expected_rate": "40 Gb/sec (4X QDR)"
+        }
+      ]
+    },
+    "tools": {
+      "python": "/root/exo/.venv/bin/python",
+      "harness_script": "/var/lib/exo/deployments/linux-cuda-nccl-11a9ef41d3c7a138e5186db50d4a4c4fe30876fa/scripts/two_host_ib_baseline.py",
+      "numactl": "/usr/bin/numactl",
+      "ib_write_bw": "/tmp/exo-benchmark-tools/60cf23a301b14d2a789fa5ea0776343c3081062d4baa46b0353800f98ae72d3a/ib_write_bw",
+      "ib_write_bw_sha256": "60cf23a301b14d2a789fa5ea0776343c3081062d4baa46b0353800f98ae72d3a",
+      "opensm": "/usr/bin/opensm"
+    }
+  },
+  "remote_host": {
+    "name": "fwuff",
+    "management_address": "192.168.40.248",
+    "transport": "ssh",
+    "ssh_target": "fwuff",
+    "source_directory": "/var/lib/exo/deployments/linux-cuda-nccl-11a9ef41d3c7a138e5186db50d4a4c4fe30876fa",
+    "source": {
+      "commit": "11a9ef41d3c7a138e5186db50d4a4c4fe30876fa",
+      "dirty_file_hashes": {}
+    },
+    "preflight": {
+      "maximum_load_1m_per_online_cpu": 0.5,
+      "minimum_available_memory_bytes": 17179869184,
+      "allowed_cpu_frequency_governors": [
+        "performance"
+      ]
+    },
+    "cpu_set": [
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      68,
+      69,
+      70,
+      71,
+      72,
+      73,
+      74,
+      75
+    ],
+    "numa_nodes": [
+      0
+    ],
+    "hca": {
+      "device": "mlx4_0",
+      "node_guid": "e41d:2d03:004d:32e0",
+      "pci": {
+        "bdf": "0000:16:00.0",
+        "vendor_id": "0x15b3",
+        "device_id": "0x1003",
+        "driver": "mlx4_core",
+        "current_width": 8,
+        "maximum_width": 8,
+        "current_speed_gtps": 8.0,
+        "maximum_speed_gtps": 8.0,
+        "numa_node": 0
+      },
+      "ports": [
+        {
+          "port": 1,
+          "port_guid": "e41d:2d03:004d:32e1",
+          "gid_index": 0,
+          "gid": "fe80::e41d:2d03:4d:32e1",
+          "expected_rate": "40 Gb/sec (4X QDR)"
+        },
+        {
+          "port": 2,
+          "port_guid": "e41d:2d03:004d:32e2",
+          "gid_index": 0,
+          "gid": "fe80::e41d:2d03:4d:32e2",
+          "expected_rate": "40 Gb/sec (4X QDR)"
+        }
+      ]
+    },
+    "tools": {
+      "python": "/root/exo/.venv/bin/python",
+      "harness_script": "/var/lib/exo/deployments/linux-cuda-nccl-11a9ef41d3c7a138e5186db50d4a4c4fe30876fa/scripts/two_host_ib_baseline.py",
+      "numactl": "/usr/bin/numactl",
+      "ib_write_bw": "/usr/bin/ib_write_bw",
+      "ib_write_bw_sha256": "60cf23a301b14d2a789fa5ea0776343c3081062d4baa46b0353800f98ae72d3a"
+    }
+  },
+  "benchmark_artifact_revision": "60cf23a301b14d2a789fa5ea0776343c3081062d4baa46b0353800f98ae72d3a",
+  "benchmark": {
+    "duration_seconds": 10,
+    "margin_seconds": 1,
+    "message_bytes": 8388608,
+    "tx_depth": 128,
+    "queue_pairs": 1,
+    "mtu": 4096,
+    "single_port_1_control_port": 20040,
+    "single_port_2_control_port": 20041,
+    "dual_port_control_port": 20042
+  },
+  "timeouts": {
+    "probe_seconds": 30.0,
+    "opensm_start_seconds": 5.0,
+    "rail_active_seconds": 30.0,
+    "server_start_seconds": 15.0,
+    "benchmark_seconds": 60.0,
+    "cleanup_seconds": 15.0,
+    "poll_seconds": 0.1
+  }
+}

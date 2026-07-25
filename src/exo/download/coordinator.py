@@ -282,7 +282,7 @@ class DownloadCoordinator:
             )
             return
 
-        if self.offline:
+        if self.offline and not self.shard_downloader.supports_offline_download:
             logger.warning(
                 f"Offline mode: model {model_id} is not fully available locally, cannot download"
             )

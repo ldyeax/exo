@@ -5,6 +5,7 @@ import resource
 import signal
 import sys
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Self
 
 import anyio
@@ -19,6 +20,11 @@ from exo import __version__
 from exo.api.main import API
 from exo.download.coordinator import DownloadCoordinator
 from exo.download.impl_shard_downloader import exo_shard_downloader
+from exo.download.peer_artifact_http import (
+    PEER_ARTIFACT_CONFIG_ENVIRONMENT_VARIABLE,
+    PeerArtifactDeploymentConfig,
+    load_peer_artifact_deployment_config,
+)
 from exo.master.main import Master
 from exo.routing.event_router import EventRouter
 from exo.routing.router import Router, get_node_zid
@@ -47,6 +53,7 @@ class Node:
     node_id: NodeId
     offline: bool
     _api_port: int
+    peer_artifact_config: PeerArtifactDeploymentConfig | None
     _tg: TaskGroup = field(init=False, default_factory=TaskGroup)
 
     @classmethod
@@ -73,6 +80,19 @@ class Node:
         )
 
         logger.info(f"Starting node {node_id}")
+        peer_artifact_config = load_peer_artifact_deployment_config(
+            Path(args.peer_artifact_config)
+            if args.peer_artifact_config is not None
+            else None
+        )
+        if (
+            peer_artifact_config is not None
+            and peer_artifact_config.server is not None
+            and not args.spawn_api
+        ):
+            raise ValueError(
+                "peer artifact serving requires Exo's API listener to be enabled"
+            )
 
         # Errors the very first time exo is run as dir doesn't exist
         EXO_DEFAULT_MODELS_DIR.mkdir(parents=True, exist_ok=True)
@@ -81,7 +101,10 @@ class Node:
         if not args.no_downloads:
             download_coordinator = DownloadCoordinator(
                 node_id,
-                exo_shard_downloader(offline=args.offline),
+                exo_shard_downloader(
+                    offline=args.offline,
+                    peer_artifact_config=peer_artifact_config,
+                ),
                 event_sender=event_router.sender(),
                 download_command_receiver=router.receiver(topics.DOWNLOAD_COMMANDS),
                 offline=args.offline,
@@ -97,6 +120,7 @@ class Node:
                 command_sender=router.sender(topics.COMMANDS),
                 download_command_sender=router.sender(topics.DOWNLOAD_COMMANDS),
                 election_receiver=router.receiver(topics.ELECTION_MESSAGES),
+                peer_artifact_config=peer_artifact_config,
             )
         else:
             api = None
@@ -150,6 +174,7 @@ class Node:
             node_id,
             args.offline,
             args.api_port,
+            peer_artifact_config,
         )
 
     async def run(self):
@@ -245,7 +270,10 @@ class Node:
                         await self.download_coordinator.shutdown()
                         self.download_coordinator = DownloadCoordinator(
                             self.node_id,
-                            exo_shard_downloader(offline=self.offline),
+                            exo_shard_downloader(
+                                offline=self.offline,
+                                peer_artifact_config=self.peer_artifact_config,
+                            ),
                             event_sender=self.event_router.sender(),
                             download_command_receiver=self.router.receiver(
                                 topics.DOWNLOAD_COMMANDS
@@ -390,6 +418,9 @@ class Args(FrozenModel):
     fast_synch: bool | None = None  # None = auto, True = force on, False = force off
     legacy_daemon: bool = False
     bootstrap_peers: list[str] = []
+    peer_artifact_config: str | None = os.getenv(
+        PEER_ARTIFACT_CONFIG_ENVIRONMENT_VARIABLE
+    )
     namespace: str
     zenoh_port: int
     discovery_port: int
@@ -463,6 +494,14 @@ class Args(FrozenModel):
             else [],
             dest="bootstrap_peers",
             help="Comma-separated libp2p multiaddrs to dial on startup (env: EXO_BOOTSTRAP_PEERS)",
+        )
+        parser.add_argument(
+            "--peer-artifact-config",
+            default=os.getenv(PEER_ARTIFACT_CONFIG_ENVIRONMENT_VARIABLE),
+            help=(
+                "Owner-only JSON configuration for authenticated peer model "
+                f"transfer (env: {PEER_ARTIFACT_CONFIG_ENVIRONMENT_VARIABLE})"
+            ),
         )
         parser.add_argument(
             "--namespace",
