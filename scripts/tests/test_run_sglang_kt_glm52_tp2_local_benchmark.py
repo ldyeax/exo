@@ -41,6 +41,7 @@ def make_config(tmp_path: Path) -> benchmark.BenchmarkConfig:
         init_expert_location=None,
         init_expert_location_sha256=None,
         kv_cache_dtype=benchmark.DEFAULT_KV_CACHE_DTYPE,
+        mla_kv_b_w8_backend="marlin",
         enable_two_batch_overlap=False,
         enable_amx_fine_grained_decode=False,
         enable_stream_prefill=False,
@@ -178,6 +179,8 @@ def test_process_spec_pins_fresh_topology_and_low_capacity(tmp_path: Path) -> No
         "--max-total-tokens": "16000",
         "--max-running-requests": "2",
         "--kv-cache-dtype": "bfloat16",
+        "--load-format": "safetensors",
+        "--random-seed": str(benchmark.DEFAULT_SERVER_RANDOM_SEED),
     }
     for flag, expected_value in expected_pairs.items():
         assert command[command.index(flag) + 1] == expected_value
@@ -187,9 +190,156 @@ def test_process_spec_pins_fresh_topology_and_low_capacity(tmp_path: Path) -> No
     assert "--disable-custom-all-reduce" in command
     assert "--enable-two-batch-overlap" not in command
     assert ("KT_AMX_FINE_GRAINED_DECODE", "1") not in spec.environment
+    assert dict(spec.environment)["SGLANG_MLA_KV_B_W8_BACKEND"] == "marlin"
 
     receipt = spec.receipt()
-    assert receipt["model"]["kv_cache_dtype"] == "bfloat16"
+    model_receipt = cast(benchmark.JsonObject, receipt["model"])
+    environment_receipt = cast(benchmark.JsonObject, receipt["environment"])
+    assert model_receipt["kv_cache_dtype"] == "bfloat16"
+    assert model_receipt["mla_kv_b_w8_backend"] == "marlin"
+    assert environment_receipt["SGLANG_MLA_KV_B_W8_BACKEND"] == "marlin"
+
+
+def test_process_spec_records_required_marlin_backend(tmp_path: Path) -> None:
+    spec = benchmark.build_process_spec(make_config(tmp_path))
+    receipt = spec.receipt()
+    model_receipt = cast(benchmark.JsonObject, receipt["model"])
+    environment_receipt = cast(benchmark.JsonObject, receipt["environment"])
+
+    assert dict(spec.environment)["SGLANG_MLA_KV_B_W8_BACKEND"] == "marlin"
+    assert model_receipt["mla_kv_b_w8_backend"] == "marlin"
+    assert environment_receipt["SGLANG_MLA_KV_B_W8_BACKEND"] == "marlin"
+
+
+def test_parser_propagates_compact_mla_backend(tmp_path: Path) -> None:
+    common_arguments = (
+        "--run-id",
+        "parser-test",
+        "--result-directory",
+        str(tmp_path),
+    )
+
+    default_config = benchmark._config_from_arguments(
+        benchmark._parser().parse_args(common_arguments)
+    )
+    marlin_config = benchmark._config_from_arguments(
+        benchmark._parser().parse_args(
+            (*common_arguments, "--mla-kv-b-w8-backend", "marlin")
+        )
+    )
+
+    assert default_config.mla_kv_b_w8_backend == "marlin"
+    assert marlin_config.mla_kv_b_w8_backend == "marlin"
+    with pytest.raises(SystemExit):
+        benchmark._parser().parse_args(
+            (*common_arguments, "--mla-kv-b-w8-backend", "triton")
+        )
+    with pytest.raises(SystemExit):
+        benchmark._parser().parse_args(
+            (*common_arguments, "--mla-kv-b-w8-backend", "auto")
+        )
+
+
+def test_process_spec_rejects_unknown_compact_mla_backend(tmp_path: Path) -> None:
+    config = replace(
+        make_config(tmp_path),
+        mla_kv_b_w8_backend=cast(
+            benchmark.MlaKvBW8Backend,
+            cast(object, "cutlass"),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="requires the Marlin"):
+        benchmark.build_process_spec(config)
+
+
+def test_compact_mla_backend_attestation_counts_both_mtp_ranks(
+    tmp_path: Path,
+) -> None:
+    spec = benchmark.build_process_spec(
+        replace(
+            make_config(tmp_path),
+            mla_kv_b_w8_backend="marlin",
+            enable_mtp=True,
+        )
+    )
+    log_path = tmp_path / "rank-0.log"
+    marker_lines = [
+        (
+            f"[2026-07-25 TP{rank}] Loaded compact MLA kv_b W8 "
+            "backend=marlin local_heads=32"
+        )
+        for rank in range(2)
+        for _ in range(benchmark.MODEL_LAYER_COUNT + 1)
+    ]
+    log_path.write_text("\n".join(marker_lines), encoding="utf-8")
+
+    receipt = benchmark.validate_compact_mla_backend_attestation(log_path, spec)
+
+    assert receipt["passed"] is True
+    assert receipt["requested_backend"] == "marlin"
+    assert receipt["expected_runtime_backend"] == "marlin"
+    assert receipt["expected_module_count_per_tp_rank"] == 79
+    assert receipt["observations"] == [
+        {
+            "tensor_parallel_rank": 0,
+            "backend": "marlin",
+            "module_count": 79,
+            "local_heads_per_module": 32,
+        },
+        {
+            "tensor_parallel_rank": 1,
+            "backend": "marlin",
+            "module_count": 79,
+            "local_heads_per_module": 32,
+        },
+    ]
+
+
+def test_compact_mla_backend_attestation_counts_non_mtp_marlin_modules(
+    tmp_path: Path,
+) -> None:
+    spec = benchmark.build_process_spec(make_config(tmp_path))
+    log_path = tmp_path / "rank-0.log"
+    marker_lines = [
+        (
+            f"[2026-07-25 TP{rank}] Loaded compact MLA kv_b W8 "
+            "backend=marlin local_heads=32"
+        )
+        for rank in range(2)
+        for _ in range(benchmark.MODEL_LAYER_COUNT)
+    ]
+    log_path.write_text("\n".join(marker_lines), encoding="utf-8")
+
+    receipt = benchmark.validate_compact_mla_backend_attestation(log_path, spec)
+
+    assert receipt["requested_backend"] == "marlin"
+    assert receipt["expected_runtime_backend"] == "marlin"
+    assert receipt["expected_module_count_per_tp_rank"] == 78
+
+
+def test_compact_mla_backend_attestation_rejects_backend_mismatch(
+    tmp_path: Path,
+) -> None:
+    spec = benchmark.build_process_spec(
+        replace(make_config(tmp_path), mla_kv_b_w8_backend="marlin")
+    )
+    log_path = tmp_path / "rank-0.log"
+    marker_lines = [
+        (
+            f"[2026-07-25 TP{rank}] Loaded compact MLA kv_b W8 "
+            "backend=triton local_heads=32"
+        )
+        for rank in range(2)
+        for _ in range(benchmark.MODEL_LAYER_COUNT)
+    ]
+    log_path.write_text("\n".join(marker_lines), encoding="utf-8")
+
+    with pytest.raises(
+        benchmark.Glm52Tp2BenchmarkError,
+        match="attestation differs",
+    ):
+        benchmark.validate_compact_mla_backend_attestation(log_path, spec)
 
 
 def test_process_spec_enables_exact_paper_overlap_contract(tmp_path: Path) -> None:
@@ -633,6 +783,48 @@ def test_parser_admits_exact_c1_only_budget(tmp_path: Path) -> None:
     }
 
 
+def test_parser_admits_exact_c3_tbo_on_capacity(tmp_path: Path) -> None:
+    arguments = benchmark._parser().parse_args(
+        [
+            "--run-id",
+            "c3-tbo-on-capacity",
+            "--result-directory",
+            str(tmp_path / "result"),
+            "--benchmark-concurrencies",
+            "3",
+            "--enable-two-batch-overlap",
+        ]
+    )
+
+    config = benchmark._config_from_arguments(arguments)
+    spec = benchmark.build_process_spec(config)
+
+    assert config.benchmark_concurrencies == (3,)
+    assert config.maximum_total_tokens == (
+        3 * (7_744 + 128) + benchmark.DEFAULT_SCHEDULER_TOKEN_HEADROOM
+    )
+    assert spec.maximum_running_requests == 3
+    assert spec.enable_two_batch_overlap is True
+    assert spec.command[spec.command.index("--max-running-requests") + 1] == "3"
+    assert "--enable-two-batch-overlap" in spec.command
+    receipt = spec.receipt()
+    receipt_capacity = cast(dict[str, object], receipt["capacity"])
+    paper_optimizations = cast(dict[str, object], receipt["paper_optimizations"])
+    assert receipt_capacity["maximum_running_requests"] == 3
+    assert paper_optimizations["two_batch_attention_moe_overlap"] is True
+
+    capacity = benchmark.validate_server_capacity(
+        make_server_info(config, spec),
+        config,
+        spec,
+    )
+    assert capacity["scheduler_state"] == {
+        "effective_max_running_requests_per_dp": 3,
+        "max_total_tokens": 23_872,
+        "pp_max_micro_batch_size": 3,
+    }
+
+
 @pytest.mark.parametrize(
     "concurrencies",
     (("2", "1"), ("1", "1")),
@@ -1003,6 +1195,65 @@ def test_runtime_checkpoint_contract_records_78_plus_1_without_hashing_shards(
     }
 
 
+def test_hybrid_checkpoint_manifest_receipt_binds_compact_storage(
+    tmp_path: Path,
+) -> None:
+    model_root = tmp_path / "hybrid"
+    model_root.mkdir()
+    config_path = model_root / "config.json"
+    index_path = model_root / "model.safetensors.index.json"
+    config_path.write_text('{"model_type":"glm_moe_dsa"}\n', encoding="utf-8")
+    index_path.write_text('{"weight_map":{}}\n', encoding="utf-8")
+    file_entries = [
+        {
+            "path": path.name,
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            "size_bytes": path.stat().st_size,
+        }
+        for path in (config_path, index_path)
+    ]
+    manifest_path = model_root / benchmark.HYBRID_CHECKPOINT_MANIFEST_NAME
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "kind": benchmark.HYBRID_CHECKPOINT_MANIFEST_KIND,
+                "content_id": "a" * 64,
+                "quantization": {
+                    "activation_dtype": "BF16",
+                    "serialized_weight_dtype": ("INT8_biased_by_128_packed_in_INT32"),
+                    "temporary_bf16_expansion_at_load": False,
+                    "mla_kv_b_compact_to_compact_marlin_repack_at_load": True,
+                },
+                "expert_checkpoint": {
+                    "method": "AMXINT4",
+                    "weight_path": "/mnt/sanic/glm52-AMXINT4",
+                    "content_id": "b" * 64,
+                },
+                "output": {
+                    "payload_bytes": 123,
+                    "shard_count": 1,
+                    "tensor_count": 2,
+                },
+                "files": file_entries,
+            }
+        ),
+        encoding="utf-8",
+    )
+    for path in (config_path, index_path, manifest_path):
+        path.chmod(0o444)
+    model_root.chmod(0o555)
+    config = replace(make_config(tmp_path), model_path=str(model_root))
+
+    receipt = benchmark._hybrid_checkpoint_manifest_receipt(config, model_root)
+
+    assert receipt is not None
+    assert receipt["content_id"] == "a" * 64
+    assert receipt["storage"] == ("persistent_compact_w8_with_bf16_sensitive_tensors")
+    assert receipt["temporary_bf16_expansion_at_load"] is False
+    assert receipt["file_count"] == 2
+
+
 def test_prelaunch_failure_writes_receipt_without_starting_parent(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1051,5 +1302,6 @@ def test_prelaunch_failure_writes_receipt_without_starting_parent(
     payload = json.loads(receipt_path.read_text())
     assert payload["status"] == "failed"
     assert payload["started_parent_process_count"] == 0
+    assert payload["configuration"]["mla_kv_b_w8_backend"] == "marlin"
     assert payload["capacity_and_vram"]["prelaunch_snapshot"] is not None
     assert payload["capacity_and_vram"]["prelaunch_gate"] is None

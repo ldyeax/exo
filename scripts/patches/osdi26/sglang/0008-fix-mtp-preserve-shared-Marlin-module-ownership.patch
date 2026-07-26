@@ -1,0 +1,529 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jimm <jimm@jimm.horse>
+Date: Sat, 25 Jul 2026 16:30:29 -0400
+Subject: [PATCH 8/8] fix(mtp): preserve shared Marlin module ownership
+
+---
+ .../checkpoint_engine_worker.py               |   8 +
+ python/sglang/srt/model_loader/loader.py      |   6 +
+ python/sglang/srt/models/deepseek_nextn.py    |   5 +
+ python/sglang/srt/speculative/eagle_worker.py |  51 +++---
+ .../sglang/srt/speculative/eagle_worker_v2.py |   9 +-
+ python/sglang/srt/speculative/kt_mtp.py       |  73 ++++++++-
+ test/unit/test_glm52_kt_mtp.py                | 145 +++++++++++++++++-
+ 7 files changed, 263 insertions(+), 34 deletions(-)
+
+diff --git a/python/sglang/srt/checkpoint_engine/checkpoint_engine_worker.py b/python/sglang/srt/checkpoint_engine/checkpoint_engine_worker.py
+index 6f11c7872540f3dd8235d9e04b61bed48df523f3..f9db1830000e60467fde516e72c33b1913be3f9a 100644
+--- a/python/sglang/srt/checkpoint_engine/checkpoint_engine_worker.py
++++ b/python/sglang/srt/checkpoint_engine/checkpoint_engine_worker.py
+@@ -123,9 +123,17 @@ class SGLangCheckpointEngineWorkerExtensionImpl(SGLangCheckpointEngineWorkerExte
+             # Perform post-processing after weight loading similar to DefaultModelLoader
+             try:
+                 from sglang.srt.model_loader.loader import device_loading_context
++                from sglang.srt.speculative.kt_mtp import (
++                    is_glm52_kt_mtp_shared_module,
++                )
+ 
+                 # Process quantization methods after loading weights
+                 for _, module in self.model_runner.model.named_modules():
++                    if is_glm52_kt_mtp_shared_module(
++                        module,
++                        owner_model=self.model_runner.model,
++                    ):
++                        continue
+                     quant_method = getattr(module, "quant_method", None)
+                     if quant_method is not None:
+                         # Move parameters to device if needed for quantization processing
+diff --git a/python/sglang/srt/model_loader/loader.py b/python/sglang/srt/model_loader/loader.py
+index d762f884e9f29ebf5af57f1de29096b4cbd79ce0..b615b0899831e408c234fec5dfa9509c391d65f1 100644
+--- a/python/sglang/srt/model_loader/loader.py
++++ b/python/sglang/srt/model_loader/loader.py
+@@ -783,9 +783,15 @@ class DefaultModelLoader(BaseModelLoader):
+ 
+     @staticmethod
+     def load_weights_and_postprocess(model, weights, target_device):
++        from sglang.srt.speculative.kt_mtp import (
++            is_glm52_kt_mtp_shared_module,
++        )
++
+         model.load_weights(weights)
+ 
+         for _, module in model.named_modules():
++            if is_glm52_kt_mtp_shared_module(module, owner_model=model):
++                continue
+             quant_method = getattr(module, "quant_method", None)
+             if quant_method is not None:
+                 # When quant methods need to process weights after loading
+diff --git a/python/sglang/srt/models/deepseek_nextn.py b/python/sglang/srt/models/deepseek_nextn.py
+index a007efc94ff8381e124cb66a071daf8c8f9866ff..1674e1cc83f17e60466bf6fc21ddc56290dfdbcf 100644
+--- a/python/sglang/srt/models/deepseek_nextn.py
++++ b/python/sglang/srt/models/deepseek_nextn.py
+@@ -234,6 +234,11 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
+         self.kt_mtp_shared_embed_and_head_at_construction = (
+             kt_mtp_shared_modules is not None
+         )
++        self.kt_mtp_borrowed_module_ids_at_construction = (
++            kt_mtp_shared_modules.borrowed_module_ids
++            if kt_mtp_shared_modules is not None
++            else frozenset()
++        )
+         self.logits_processor = LogitsProcessor(config)
+ 
+     @torch.no_grad()
+diff --git a/python/sglang/srt/speculative/eagle_worker.py b/python/sglang/srt/speculative/eagle_worker.py
+index bb71dd81aeefea8d1574b6586d5984a6b770802c..d84e6edbe4ec74ebbe29d749bfd38250d159bfa0 100644
+--- a/python/sglang/srt/speculative/eagle_worker.py
++++ b/python/sglang/srt/speculative/eagle_worker.py
+@@ -175,38 +175,41 @@ class EAGLEWorker(TpModelWorker):
+             )
+         if self.kt_mtp_admission.enabled:
+             kt_mtp_receipt = validate_loaded_glm52_kt_mtp(
+-                self.draft_model_runner.model, self.kt_mtp_admission
++                self.draft_model_runner.model,
++                self.kt_mtp_admission,
++                target_model=self.target_worker.model_runner.model,
+             )
+             if tp_rank == 0:
+                 logger.info("GLM52_KT_MTP_LOADED %s", kt_mtp_receipt)
+ 
+-        embed, head = self.target_worker.model_runner.model.get_embed_and_head()
++        if not self.kt_mtp_admission.enabled:
++            embed, head = self.target_worker.model_runner.model.get_embed_and_head()
+ 
+-        if self.speculative_algorithm.is_eagle3():
+-            # most cases EAGLE3 models don't share lm_head
+-            # but some models (e.g. nvidia/gpt-oss-120b-Eagle3) shares
+-            if (
+-                hasattr(self.draft_model_runner.model, "load_lm_head_from_target")
+-                and self.draft_model_runner.model.load_lm_head_from_target
+-            ):
+-                self.draft_model_runner.model.set_embed_and_head(embed, head)
+-            else:
+-                self.draft_model_runner.model.set_embed(embed)
++            if self.speculative_algorithm.is_eagle3():
++                # most cases EAGLE3 models don't share lm_head
++                # but some models (e.g. nvidia/gpt-oss-120b-Eagle3) shares
++                if (
++                    hasattr(self.draft_model_runner.model, "load_lm_head_from_target")
++                    and self.draft_model_runner.model.load_lm_head_from_target
++                ):
++                    self.draft_model_runner.model.set_embed_and_head(embed, head)
++                else:
++                    self.draft_model_runner.model.set_embed(embed)
+ 
+-            # grab hot token ids
+-            if self.draft_model_runner.model.hot_token_id is not None:
+-                self.hot_token_id = self.draft_model_runner.model.hot_token_id.to(
+-                    embed.device
+-                )
++                # grab hot token ids
++                if self.draft_model_runner.model.hot_token_id is not None:
++                    self.hot_token_id = self.draft_model_runner.model.hot_token_id.to(
++                        embed.device
++                    )
+ 
+-        else:
+-            if self.hot_token_id is not None:
+-                head = head.clone()
+-                self.hot_token_id = self.hot_token_id.to(head.device)
+-                head.data = head.data[self.hot_token_id]
++            else:
++                if self.hot_token_id is not None:
++                    head = head.clone()
++                    self.hot_token_id = self.hot_token_id.to(head.device)
++                    head.data = head.data[self.hot_token_id]
+ 
+-            # Share the embedding and lm_head
+-            self.draft_model_runner.model.set_embed_and_head(embed, head)
++                # Share the embedding and lm_head
++                self.draft_model_runner.model.set_embed_and_head(embed, head)
+ 
+         # Init attention backend and cuda graphs
+         self.draft_model_runner.server_args.disable_cuda_graph = (
+diff --git a/python/sglang/srt/speculative/eagle_worker_v2.py b/python/sglang/srt/speculative/eagle_worker_v2.py
+index 538c57967e18201b8fdc2f5f2de7e99f04f3c6cc..3da3cbb83d8d456d105f95d4fa4906fcc217a914 100644
+--- a/python/sglang/srt/speculative/eagle_worker_v2.py
++++ b/python/sglang/srt/speculative/eagle_worker_v2.py
+@@ -171,7 +171,9 @@ class EagleDraftWorker(BaseDraftWorker):
+         self.draft_runner = self.draft_worker.model_runner
+         if self.kt_mtp_admission.enabled:
+             kt_mtp_receipt = validate_loaded_glm52_kt_mtp(
+-                self.draft_runner.model, self.kt_mtp_admission
++                self.draft_runner.model,
++                self.kt_mtp_admission,
++                target_model=self.target_worker.model_runner.model,
+             )
+             if tp_rank == 0:
+                 logger.info("GLM52_KT_MTP_LOADED %s", kt_mtp_receipt)
+@@ -241,6 +243,11 @@ class EagleDraftWorker(BaseDraftWorker):
+             self.hot_token_id = None
+ 
+     def init_lm_head(self):
++        if self.kt_mtp_admission.enabled:
++            # The admitted GLM-5.2 path installed the exact target modules
++            # during construction and proved their identities after loading.
++            return
++
+         embed, head = self.target_worker.model_runner.model.get_embed_and_head()
+         if self.speculative_algorithm.is_eagle3():
+             # most cases EAGLE3 models don't share lm_head
+diff --git a/python/sglang/srt/speculative/kt_mtp.py b/python/sglang/srt/speculative/kt_mtp.py
+index da929b5ff5d6ed8fae3a6467c292b98e39f055a2..7b96d9fad914ee8500340bec95da6c9508077e2c 100644
+--- a/python/sglang/srt/speculative/kt_mtp.py
++++ b/python/sglang/srt/speculative/kt_mtp.py
+@@ -150,6 +150,7 @@ class KTMTPSharedModules:
+ 
+     embed_tokens: Any
+     lm_head: Any
++    borrowed_module_ids: frozenset[int]
+ 
+ 
+ _ACTIVE_SHARED_MODULES: ContextVar[KTMTPSharedModules | None] = ContextVar(
+@@ -177,7 +178,16 @@ def glm52_kt_mtp_shared_modules(
+         raise KTMTPAdmissionError(
+             "GLM-5.2 KT MTP shared modules must provide embedding and LM head"
+         )
+-    shared = KTMTPSharedModules(embed_tokens=embed_tokens, lm_head=lm_head)
++    borrowed_module_ids = {id(embed_tokens), id(lm_head)}
++    for root in (embed_tokens, lm_head):
++        iter_modules = getattr(root, "modules", None)
++        if callable(iter_modules):
++            borrowed_module_ids.update(id(module) for module in iter_modules())
++    shared = KTMTPSharedModules(
++        embed_tokens=embed_tokens,
++        lm_head=lm_head,
++        borrowed_module_ids=frozenset(borrowed_module_ids),
++    )
+     token: Token[KTMTPSharedModules | None] = _ACTIVE_SHARED_MODULES.set(shared)
+     try:
+         yield shared
+@@ -191,6 +201,34 @@ def get_glm52_kt_mtp_shared_modules() -> KTMTPSharedModules | None:
+     return _ACTIVE_SHARED_MODULES.get()
+ 
+ 
++def is_glm52_kt_mtp_shared_module(
++    module: Any,
++    *,
++    owner_model: Any | None = None,
++) -> bool:
++    """Return whether ``module`` is borrowed from the target in this context.
++
++    The identity set includes the two shared roots and their module subtrees.
++    Draft models persist the same set so later reload/checkpoint hooks retain
++    the ownership boundary.  Target models are never marked, so their ordinary
++    post-processing behavior is unchanged.
++    """
++
++    shared = _ACTIVE_SHARED_MODULES.get()
++    if shared is not None and id(module) in shared.borrowed_module_ids:
++        return True
++    if owner_model is None:
++        return False
++    borrowed_module_ids = getattr(
++        owner_model,
++        "kt_mtp_borrowed_module_ids_at_construction",
++        None,
++    )
++    return isinstance(borrowed_module_ids, frozenset) and (
++        id(module) in borrowed_module_ids
++    )
++
++
+ def _get(config: Any, name: str, default: Any = None) -> Any:
+     if isinstance(config, Mapping):
+         return config.get(name, default)
+@@ -1107,6 +1145,7 @@ def admit_glm52_kt_mtp(
+         "kt_gpu_prefill_token_threshold": (None, 0),
+         "kt_expert_lora_path": (None,),
+         "kt_lora_path": (None,),
++        "speculative_token_map": (None,),
+         "speculative_draft_model_quantization": (None,),
+         "init_expert_location": (None, "trivial"),
+     }
+@@ -1194,7 +1233,10 @@ def admit_glm52_kt_mtp(
+ 
+ 
+ def validate_loaded_glm52_kt_mtp(
+-    draft_model: Any, admission: KTMTPAdmission
++    draft_model: Any,
++    admission: KTMTPAdmission,
++    *,
++    target_model: Any | None = None,
+ ) -> dict[str, Any]:
+     """Prove that the loaded one-layer draft actually received the KT wrapper."""
+     if not admission.enabled or admission.physical_layer_index is None:
+@@ -1233,6 +1275,33 @@ def validate_loaded_glm52_kt_mtp(
+     )
+     if shared_at_construction is not True:
+         errors.append("embed/head modules were not shared at draft construction")
++    borrowed_module_ids = getattr(
++        draft_model,
++        "kt_mtp_borrowed_module_ids_at_construction",
++        None,
++    )
++    if not isinstance(borrowed_module_ids, frozenset):
++        errors.append("draft model did not retain borrowed module ownership")
++    if target_model is None:
++        errors.append("target model was not provided for shared-module proof")
++    else:
++        try:
++            draft_embed_tokens = draft_model.model.embed_tokens
++            draft_lm_head = draft_model.lm_head
++            target_embed_tokens = target_model.model.embed_tokens
++            target_lm_head = target_model.lm_head
++        except AttributeError:
++            errors.append("draft/target models do not expose shared embed/head modules")
++        else:
++            if draft_embed_tokens is not target_embed_tokens:
++                errors.append("draft embedding is not the target embedding module")
++            if draft_lm_head is not target_lm_head:
++                errors.append("draft LM head is not the target LM head module")
++            if isinstance(borrowed_module_ids, frozenset) and (
++                id(draft_embed_tokens) not in borrowed_module_ids
++                or id(draft_lm_head) not in borrowed_module_ids
++            ):
++                errors.append("borrowed module ownership omits the shared roots")
+     if admission.compact_mla_kv_b_w8:
+         try:
+             kv_b_projection = decoder.self_attn.kv_b_proj
+diff --git a/test/unit/test_glm52_kt_mtp.py b/test/unit/test_glm52_kt_mtp.py
+index f8c740c0629ffa135f758d32ff5948e85b9b96bf..34da24053c4aca0197ba976c7e7d0aa2590aaab6 100644
+--- a/test/unit/test_glm52_kt_mtp.py
++++ b/test/unit/test_glm52_kt_mtp.py
+@@ -8,6 +8,7 @@ from types import SimpleNamespace
+ 
+ import pytest
+ import sglang.srt.speculative.kt_mtp as kt_mtp_module
++import torch
+ from sglang.srt.layers.moe.utils import (
+     get_kt_ep_weight_layer_index,
+     speculative_kt_ep_context,
+@@ -18,6 +19,7 @@ from sglang.srt.speculative.kt_mtp import (
+     admit_glm52_kt_mtp,
+     get_glm52_kt_mtp_shared_modules,
+     glm52_kt_mtp_shared_modules,
++    is_glm52_kt_mtp_shared_module,
+     select_glm52_mtp_nonexpert_weights,
+     validate_loaded_glm52_kt_mtp,
+ )
+@@ -75,6 +77,7 @@ def _server_args(model_path: str = "/models/glm52") -> SimpleNamespace:
+         chunked_prefill_size=8192,
+         kt_expert_placement_strategy="uniform",
+         kt_lora_path=None,
++        speculative_token_map=None,
+     )
+ 
+ 
+@@ -111,6 +114,7 @@ def test_non_glm_draft_retains_gpu_only_behavior():
+         ("speculative_draft_load_format", None),
+         ("kt_threadpool_count", True),
+         ("kt_numa_nodes", [0, -1]),
++        ("speculative_token_map", "/models/hot-token-map.json"),
+     ],
+ )
+ def test_glm52_candidate_rejects_unsupported_runtime_values(field: str, value):
+@@ -141,16 +145,102 @@ def test_speculative_context_maps_only_local_layer_zero_and_restores():
+ 
+ 
+ def test_shared_module_context_exposes_exact_target_modules_and_restores():
+-    embed_tokens = object()
+-    lm_head = object()
++    embed_tokens = torch.nn.Module()
++    lm_head = torch.nn.Sequential(torch.nn.Module())
++    lm_head_child = next(lm_head.children())
++    unrelated = torch.nn.Module()
+     assert get_glm52_kt_mtp_shared_modules() is None
++    assert not is_glm52_kt_mtp_shared_module(embed_tokens)
+ 
+     with glm52_kt_mtp_shared_modules(embed_tokens, lm_head) as shared:
+         assert shared.embed_tokens is embed_tokens
+         assert shared.lm_head is lm_head
+         assert get_glm52_kt_mtp_shared_modules() is shared
++        assert is_glm52_kt_mtp_shared_module(embed_tokens)
++        assert is_glm52_kt_mtp_shared_module(lm_head)
++        assert is_glm52_kt_mtp_shared_module(lm_head_child)
++        assert not is_glm52_kt_mtp_shared_module(unrelated)
+ 
+     assert get_glm52_kt_mtp_shared_modules() is None
++    assert not is_glm52_kt_mtp_shared_module(lm_head)
++
++
++class _CountingQuantMethod:
++    def __init__(self) -> None:
++        self.calls = 0
++
++    def process_weights_after_loading(self, module: torch.nn.Module) -> None:
++        del module
++        self.calls += 1
++
++
++class _QuantizedLeaf(torch.nn.Module):
++    def __init__(self) -> None:
++        super().__init__()
++        self.quant_method = _CountingQuantMethod()
++
++
++class _LoaderModel(torch.nn.Module):
++    def __init__(
++        self,
++        borrowed_head: torch.nn.Module,
++        owned_leaf: _QuantizedLeaf,
++    ) -> None:
++        super().__init__()
++        self.borrowed_head = borrowed_head
++        self.owned_leaf = owned_leaf
++        self.load_calls = 0
++
++    def load_weights(self, weights) -> None:
++        tuple(weights)
++        self.load_calls += 1
++
++
++def test_default_loader_skips_only_context_borrowed_module_subtrees():
++    if not torch.cuda.is_available():
++        pytest.skip("SGLang model-loader imports require a visible CUDA device")
++    from sglang.srt.model_loader.loader import DefaultModelLoader
++
++    embed_tokens = torch.nn.Module()
++    borrowed_leaf = _QuantizedLeaf()
++    borrowed_head = torch.nn.Sequential(borrowed_leaf)
++    owned_leaf = _QuantizedLeaf()
++    model = _LoaderModel(borrowed_head, owned_leaf)
++
++    with glm52_kt_mtp_shared_modules(embed_tokens, borrowed_head) as shared:
++        model.kt_mtp_borrowed_module_ids_at_construction = (
++            shared.borrowed_module_ids
++        )
++        DefaultModelLoader.load_weights_and_postprocess(
++            model,
++            (),
++            torch.device("cpu"),
++        )
++
++    assert model.load_calls == 1
++    assert borrowed_leaf.quant_method.calls == 0
++    assert owned_leaf.quant_method.calls == 1
++
++    DefaultModelLoader.load_weights_and_postprocess(
++        model,
++        (),
++        torch.device("cpu"),
++    )
++
++    assert model.load_calls == 2
++    assert borrowed_leaf.quant_method.calls == 0
++    assert owned_leaf.quant_method.calls == 2
++
++    del model.kt_mtp_borrowed_module_ids_at_construction
++    DefaultModelLoader.load_weights_and_postprocess(
++        model,
++        (),
++        torch.device("cpu"),
++    )
++
++    assert model.load_calls == 3
++    assert borrowed_leaf.quant_method.calls == 1
++    assert owned_leaf.quant_method.calls == 3
+ 
+ 
+ class _Scalar:
+@@ -175,6 +265,8 @@ def _loaded_draft(
+     gpu_expert_count: int = 0,
+     shared_at_construction: bool = True,
+     compact_mla_kv_b_w8: bool = False,
++    embed_tokens: object,
++    lm_head: object,
+ ):
+     kt_config = SimpleNamespace(
+         layer_idx=layer_index,
+@@ -195,15 +287,36 @@ def _loaded_draft(
+             )
+         )
+     return SimpleNamespace(
+-        model=SimpleNamespace(decoder=decoder),
++        model=SimpleNamespace(decoder=decoder, embed_tokens=embed_tokens),
++        lm_head=lm_head,
+         kt_mtp_shared_embed_and_head_at_construction=shared_at_construction,
++        kt_mtp_borrowed_module_ids_at_construction=frozenset(
++            (id(embed_tokens), id(lm_head))
++        ),
++    )
++
++
++def _loaded_models(**kwargs):
++    embed_tokens = object()
++    lm_head = object()
++    draft_model = _loaded_draft(
++        embed_tokens=embed_tokens,
++        lm_head=lm_head,
++        **kwargs,
++    )
++    target_model = SimpleNamespace(
++        model=SimpleNamespace(embed_tokens=embed_tokens),
++        lm_head=lm_head,
+     )
++    return draft_model, target_model
+ 
+ 
+ def test_loaded_draft_receipt_proves_physical_layer_and_cpu_ownership():
++    draft_model, target_model = _loaded_models()
+     receipt = validate_loaded_glm52_kt_mtp(
+-        _loaded_draft(),
++        draft_model,
+         KTMTPAdmission(enabled=True, physical_layer_index=78),
++        target_model=target_model,
+     )
+ 
+     assert receipt == {
+@@ -216,29 +329,47 @@ def test_loaded_draft_receipt_proves_physical_layer_and_cpu_ownership():
+ 
+ 
+ def test_loaded_draft_receipt_rejects_local_layer_zero_mapping():
++    draft_model, target_model = _loaded_models(layer_index=0)
+     with pytest.raises(KTMTPAdmissionError, match="physical_layer_index=0"):
+         validate_loaded_glm52_kt_mtp(
+-            _loaded_draft(layer_index=0),
++            draft_model,
+             KTMTPAdmission(enabled=True, physical_layer_index=78),
++            target_model=target_model,
+         )
+ 
+ 
+ def test_loaded_draft_receipt_requires_construction_time_weight_sharing():
++    draft_model, target_model = _loaded_models(shared_at_construction=False)
+     with pytest.raises(KTMTPAdmissionError, match="not shared at draft construction"):
+         validate_loaded_glm52_kt_mtp(
+-            _loaded_draft(shared_at_construction=False),
++            draft_model,
++            KTMTPAdmission(enabled=True, physical_layer_index=78),
++            target_model=target_model,
++        )
++
++
++def test_loaded_draft_receipt_requires_exact_target_module_identities():
++    draft_model, target_model = _loaded_models()
++    draft_model.lm_head = object()
++
++    with pytest.raises(KTMTPAdmissionError, match="not the target LM head module"):
++        validate_loaded_glm52_kt_mtp(
++            draft_model,
+             KTMTPAdmission(enabled=True, physical_layer_index=78),
++            target_model=target_model,
+         )
+ 
+ 
+ def test_loaded_draft_receipt_proves_direct_compact_kv_b_consumption():
++    draft_model, target_model = _loaded_models(compact_mla_kv_b_w8=True)
+     receipt = validate_loaded_glm52_kt_mtp(
+-        _loaded_draft(compact_mla_kv_b_w8=True),
++        draft_model,
+         KTMTPAdmission(
+             enabled=True,
+             physical_layer_index=78,
+             compact_mla_kv_b_w8=True,
+         ),
++        target_model=target_model,
+     )
+ 
+     assert receipt["compact_mla_kv_b_w8"] is True

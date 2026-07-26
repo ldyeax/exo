@@ -1,0 +1,75 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jimm <jimm@jimm.horse>
+Date: Sat, 25 Jul 2026 15:06:38 -0400
+Subject: [PATCH 2/8] fix(mla): admit compact W8 fused-rope path
+
+---
+ python/sglang/srt/models/deepseek_v2.py           | 11 ++++++++---
+ .../test/test_deepseek_mla_kv_b_w8_dispatch.py    | 15 +++++++++++----
+ 2 files changed, 19 insertions(+), 7 deletions(-)
+
+diff --git a/python/sglang/srt/models/deepseek_v2.py b/python/sglang/srt/models/deepseek_v2.py
+index 9638b04178ee5d281fcbe7dfbc418a8aef7f97b1..a82be84bd30d13d7fa43516956b1d4a22d140ed2 100644
+--- a/python/sglang/srt/models/deepseek_v2.py
++++ b/python/sglang/srt/models/deepseek_v2.py
+@@ -1797,11 +1797,16 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
+ 
+         handler = AttentionBackendRegistry.get_handler(attention_backend)
+         attn_forward_method = handler(self, forward_batch)
+-        # The compact layout has no ordinary Linear orientation.  Fail closed
+-        # on MHA and fused-RoPE variants; Ampere must stay on plain absorbed MLA.
++        # The compact layout has no ordinary Linear orientation.  Both GPU
++        # absorbed-MLA paths call the compact KC/VC specialists directly;
++        # MHA and the CPU fused-RoPE path still dereference legacy weights.
++        compact_kv_b_supported_methods = {
++            AttnForwardMethod.MLA,
++            AttnForwardMethod.MLA_FUSED_ROPE,
++        }
+         if (
+             self._get_mla_kv_b_w8_method() is not None
+-            and attn_forward_method != AttnForwardMethod.MLA
++            and attn_forward_method not in compact_kv_b_supported_methods
+         ):
+             raise RuntimeError(
+                 "compact MLA kv_b W8 requires the absorbed MLA attention "
+diff --git a/python/sglang/test/test_deepseek_mla_kv_b_w8_dispatch.py b/python/sglang/test/test_deepseek_mla_kv_b_w8_dispatch.py
+index 789b75f2621c13cbebfc948f871486c64f48f11f..888ecfa860acfa00274539b7e88127adb1e14efc 100644
+--- a/python/sglang/test/test_deepseek_mla_kv_b_w8_dispatch.py
++++ b/python/sglang/test/test_deepseek_mla_kv_b_w8_dispatch.py
+@@ -69,17 +69,25 @@ def test_gptq_body_linears_are_recognized_as_packed(
+     assert not hasattr(layer, "weight")
+ 
+ 
+-def test_compact_w8_dispatch_allows_absorbed_mla(
++@pytest.mark.parametrize(
++    "selected_method",
++    [
++        AttnForwardMethod.MLA,
++        AttnForwardMethod.MLA_FUSED_ROPE,
++    ],
++)
++def test_compact_w8_dispatch_allows_gpu_absorbed_mla(
+     monkeypatch: pytest.MonkeyPatch,
++    selected_method: AttnForwardMethod,
+ ) -> None:
+     attention = _attention(compact_w8=True)
+-    _select_method(monkeypatch, AttnForwardMethod.MLA)
++    _select_method(monkeypatch, selected_method)
+ 
+     selected = attention.dispatch_attn_forward_method(
+         SimpleNamespace(forward_mode=_DecodeForwardMode())
+     )
+ 
+-    assert selected == AttnForwardMethod.MLA
++    assert selected == selected_method
+     assert attention.current_attention_backend == "test_decode"
+ 
+ 
+@@ -87,7 +95,6 @@ def test_compact_w8_dispatch_allows_absorbed_mla(
+     "selected_method",
+     [
+         AttnForwardMethod.MHA,
+-        AttnForwardMethod.MLA_FUSED_ROPE,
+         AttnForwardMethod.MLA_FUSED_ROPE_CPU,
+     ],
+ )

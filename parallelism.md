@@ -1,6 +1,7 @@
 # Parallelism Findings for Dwagon and Fwuff
 
 Date: 2026-07-19
+Updated: 2026-07-25
 
 This document summarizes the discussion and source inspection concerning tensor
 parallelism (TP), pipeline parallelism (PP), expert parallelism (EP), CPU/GPU
@@ -32,9 +33,15 @@ offload, NUMA placement, NVLink, and InfiniBand for the dwagon/fwuff Exo work.
   combine the two VRAM pools automatically.
 - Current network traffic is deliberately host-staged. The launch profile sets
   `NCCL_NET_GDR_LEVEL=LOC`, which disables GPUDirect RDMA.
-- Fwuff's RTX 3090 reports both the GPUDirect RDMA and DMA-BUF CUDA capability
-  attributes as zero. GPUDirect on the 3090s should remain an unsupported A/B
-  experiment, even after the ConnectX-5 upgrade.
+- The matched ConnectX-5 pair is installed and active at EDR/100G; the
+  ConnectX-3 QDR path remains available. That receipt proves line state, not
+  application throughput or latency.
+- Fwuff's RTX 3090 still reports both the GPUDirect RDMA and DMA-BUF CUDA
+  capability attributes as zero on driver 595.71.05 with the open kernel module,
+  and its installed `perftest` lacks CUDA options. Current NVIDIA documentation
+  is mixed on RTX eligibility, so GPUDirect is unproven and not admitted rather
+  than categorically impossible. Keep pinned-host staging until an explicit A/B
+  proves otherwise.
 
 ## What Has Been Explored
 
@@ -341,22 +348,33 @@ over verbs or GPU-to-GPU NVLink.
 
 Read-only hardware checks found:
 
-- `nvidia-peermem` kernel modules are installed on both systems but not loaded.
-- Fwuff's RTX 3090 reports
-  `CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_SUPPORTED` (116) as zero.
-- It also reports `CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED` (124) as zero.
-- Dwagon's current ConnectX-3 is NUMA 1 while both GPUs are NUMA 0, requiring a
-  cross-socket peer path.
-- Fwuff's GPU and HCA both report NUMA 0, but the GPU capability result still
-  rejects the supported GPUDirect paths.
+- ConnectX-5 `mlx5_0` is installed and active at 100 Gb/s; it is HCA-capable for
+  GPUDirect. The legacy ConnectX-3 `mlx4_0` QDR/40G path remains present.
+- Fwuff uses NVIDIA driver 595.71.05 with the open kernel module. Its RTX 3090
+  reports `CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_SUPPORTED` (116) and
+  `CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED` (124) as zero.
+- The installed `perftest` build has no `--use_cuda` or
+  `--use_cuda_dmabuf` options, so it cannot yet produce a GPU-memory transport
+  receipt.
+- Fwuff's GPU and HCAs share its sole NUMA node. This is favorable but does not
+  prove a common PCIe root; the root tree, ACS, IOMMU mode, BAR, and negotiated
+  link widths still need an explicit audit.
 
-The ConnectX-3 HCA generation is technically new enough for `nvidia-peermem`.
-The primary limitation is the GeForce RTX 3090 support boundary and platform
-topology, not simply the current HCA generation.
+NVIDIA's current GPU Operator prerequisites list Quadro RTX and RTX GPUs for the
+DMA-BUF and legacy `nvidia-peermem` paths, while the general CUDA GPUDirect guide
+describes Tesla and Quadro availability. The documentation therefore does not
+support a blanket “all GeForce RTX 3090 is unsupported” conclusion. Conversely,
+the installed ConnectX-5 and open kernel module do not override fwuff's observed
+zero capability attributes or prove GPU-memory registration and data movement.
+The current path is unproven and not admitted; pinned-host staging remains the
+baseline.
 
-The planned ConnectX-5 cards improve bandwidth, latency, software support, and
-the HCA side of GPUDirect/GIN. They do not change the 3090 CUDA capability
-result. Treat GPUDirect as an unsupported experiment, not a design dependency.
+Later proof first requires a CUDA-capable `perftest` build, then bracketed host
+memory versus `ib_write_bw --use_cuda` and `--use_cuda_dmabuf` runs in both
+directions with payload validation and clean counters. Follow that with explicit
+NCCL GDR logs/counters and the exact application ring A/B; adopt GPUDirect only
+for a stable, repeatable end-to-end win. The complete audit and commands are in
+[`speculative-infiniband.md`](speculative-infiniband.md#gpudirect-status-and-later-proof).
 
 GPUDirect RDMA also does not mean that the CPU disappears. It permits the HCA
 DMA engine to read and write GPU memory without a host-memory bounce buffer.
@@ -384,11 +402,12 @@ frequently.
    uses InfiniBand.
 8. Preserve local TP=2 over dwagon NVLink as a latency-oriented comparison for
    models that fit and have TP-compatible dimensions.
-9. Keep host-staged InfiniBand as the production baseline after the ConnectX-5
-   upgrade.
-10. Run GPUDirect only as a controlled A/B experiment requiring explicit NCCL
-    `GDRDMA` evidence, correct output, clean HCA counters, stability, and a
-    repeatable performance win.
+9. Keep host-staged InfiniBand as the production baseline on the installed
+   ConnectX-5 EDR path.
+10. Run GPUDirect only after installing a CUDA-capable `perftest`, and require
+    host-versus-GPU tests in both directions, explicit NCCL GDR evidence,
+    correct output, clean HCA counters, stability, and a repeatable exact-ring
+    performance win.
 
 ## Future TP+PP Work
 
@@ -420,6 +439,8 @@ be considered a separate, later feature.
   arguments, and host-staged NCCL environment.
 - `FWUFFYDWAGON.md`: full implementation plan, hardware topology, and runtime
   admission status.
+- `speculative-infiniband.md`: current ConnectX-5 link status, GPUDirect
+  capability audit, and the required host-versus-GPU proof procedure.
 - `test_results.md`: TP proofs and GLM-4.7 CPU/GPU hybrid correctness receipts.
 
 External technical references:
@@ -430,5 +451,9 @@ External technical references:
   <https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html>
 - NVIDIA CUDA GPUDirect RDMA documentation:
   <https://docs.nvidia.com/cuda/gpudirect-rdma/>
+- NVIDIA GPUDirect RDMA prerequisites:
+  <https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/latest/gpu-operator-rdma.html>
+- NVIDIA NCCL InfiniBand/GPU Direct troubleshooting and perftest procedure:
+  <https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/troubleshooting/networking_troubleshooting.html>
 - NVIDIA GA102 architecture whitepaper:
   <https://images.nvidia.com/aem-dam/en-zz/Solutions/geforce/ampere/pdf/NVIDIA-ampere-GA102-GPU-Architecture-Whitepaper-V1.pdf>

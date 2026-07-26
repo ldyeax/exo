@@ -1,0 +1,2113 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jimm <jimm@jimm.horse>
+Date: Sat, 25 Jul 2026 14:37:40 -0400
+Subject: [PATCH 1/8] feat(quant): run compact MLA kv_b W8 on Ampere
+
+---
+ python/sglang/srt/layers/quantization/gptq.py |  33 ++
+ .../layers/quantization/mla_kv_b_triton.py    | 352 ++++++++++++
+ .../srt/layers/quantization/mla_kv_b_w8.py    | 499 ++++++++++++++++++
+ .../deepseek_common/deepseek_weight_loader.py | 142 ++++-
+ python/sglang/srt/models/deepseek_v2.py       |  74 ++-
+ .../test_deepseek_mla_kv_b_w8_dispatch.py     | 120 +++++
+ python/sglang/test/test_mla_kv_b_marlin.py    | 242 +++++++++
+ python/sglang/test/test_mla_kv_b_triton.py    | 291 ++++++++++
+ .../sglang/test/test_mla_kv_b_w8_loading.py   | 163 ++++++
+ 9 files changed, 1875 insertions(+), 41 deletions(-)
+ create mode 100644 python/sglang/srt/layers/quantization/mla_kv_b_triton.py
+ create mode 100644 python/sglang/srt/layers/quantization/mla_kv_b_w8.py
+ create mode 100644 python/sglang/test/test_deepseek_mla_kv_b_w8_dispatch.py
+ create mode 100644 python/sglang/test/test_mla_kv_b_marlin.py
+ create mode 100644 python/sglang/test/test_mla_kv_b_triton.py
+ create mode 100644 python/sglang/test/test_mla_kv_b_w8_loading.py
+
+diff --git a/python/sglang/srt/layers/quantization/gptq.py b/python/sglang/srt/layers/quantization/gptq.py
+index baf4c3d941ab9ef94dd6c0e7b90bd618cd901dd3..7a041c767ebe61c3ad84910b3d31ff2da8900bc3 100644
+--- a/python/sglang/srt/layers/quantization/gptq.py
++++ b/python/sglang/srt/layers/quantization/gptq.py
+@@ -73,6 +73,8 @@ if _is_npu:
+ logger = logging.getLogger(__name__)
+ ScalarType, scalar_types = get_scalar_types()
+ 
++_EXO_MLA_KV_B_W8_CONFIG_KEY = "exo_mla_kv_b_w8"
++
+ 
+ def check_marlin_format(hf_quant_cfg: Dict[str, Any]) -> bool:
+     # compat: gptqmodel and autogptq (eol) main use checkpoint_format: str
+@@ -209,6 +211,12 @@ class GPTQConfig(QuantizationConfig):
+ 
+     @classmethod
+     def from_config(cls, config: Dict[str, Any]) -> GPTQConfig:
++        if config.get(_EXO_MLA_KV_B_W8_CONFIG_KEY) is not None:
++            raise ValueError(
++                "The compact Exo MLA kv_b W8 checkpoint cannot use the plain "
++                "GPTQ loader. Use automatic quantization selection or "
++                "--quantization gptq_marlin."
++            )
+         dynamic = cls.get_from_keys_or(config, ["dynamic"], default={})
+         dynamic = {} if dynamic is None else dynamic
+ 
+@@ -372,6 +380,14 @@ class GPTQMarlinConfig(QuantizationConfig):
+ 
+     @classmethod
+     def override_quantization_method(cls, hf_quant_cfg, user_quant) -> Optional[str]:
++        if (
++            hf_quant_cfg.get(_EXO_MLA_KV_B_W8_CONFIG_KEY) is not None
++            and user_quant == "gptq"
++        ):
++            raise ValueError(
++                "The compact Exo MLA kv_b W8 checkpoint cannot use explicit "
++                "--quantization gptq. Omit the option or select gptq_marlin."
++            )
+         is_marlin_format = check_marlin_format(hf_quant_cfg)
+ 
+         can_convert = cls.is_gptq_marlin_compatible(hf_quant_cfg)
+@@ -402,8 +418,25 @@ class GPTQMarlinConfig(QuantizationConfig):
+     ) -> Optional[QuantizeMethodBase]:
+         # Delay the import to avoid circular dependency
+         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
++        from sglang.srt.layers.quantization.utils import get_dynamic_override
++
++        mla_kv_b_format = self.full_config.get(_EXO_MLA_KV_B_W8_CONFIG_KEY)
++        if mla_kv_b_format is not None and prefix.endswith(".kv_b_proj"):
++            if not isinstance(mla_kv_b_format, dict):
++                raise ValueError(f"{_EXO_MLA_KV_B_W8_CONFIG_KEY} must be a JSON object")
++            from sglang.srt.layers.quantization.mla_kv_b_w8 import (
++                GPTQMLAKVW8Method,
++            )
++
++            return GPTQMLAKVW8Method(self, mla_kv_b_format)
+ 
+         if isinstance(layer, FusedMoE):
++            if get_dynamic_override(self, layer_name=prefix) is False:
++                from sglang.srt.layers.quantization.unquant import (
++                    UnquantizedFusedMoEMethod,
++                )
++
++                return UnquantizedFusedMoEMethod()
+             return GPTQMarlinMoEMethod(self)
+         return get_linear_quant_method(self, layer, prefix, GPTQMarlinLinearMethod)
+ 
+diff --git a/python/sglang/srt/layers/quantization/mla_kv_b_triton.py b/python/sglang/srt/layers/quantization/mla_kv_b_triton.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..7b812856898f82d786cbd7ea02f029d5243c7190
+--- /dev/null
++++ b/python/sglang/srt/layers/quantization/mla_kv_b_triton.py
+@@ -0,0 +1,352 @@
++"""Compact Triton W8A16 batched matmul for absorbed MLA ``kv_b_proj``.
++
++The preferred entry point consumes the same GPTQ row-packed checkpoint bytes
++that Marlin can repack at load time, without materializing a floating-point
++weight:
++
++* ``qweight`` is ``torch.int32`` with shape ``[H, K / 4, N]``.  Word
++  ``qweight[h, k // 4, n]`` stores four biased INT8 values along ``K`` in
++  little-endian bit fields: bits ``[8*i, 8*i+7]`` hold the byte for
++  ``k = 4 * (k // 4) + i``.
++* ``scales`` is BF16 with shape ``[H, 1, N]``.  Quantization is symmetric and
++  channelwise along ``K``.
++* ``x`` is BF16 with shape ``[M, H, K]``.
++* the result is BF16 with shape ``[H, M, N]``.
++
++Offline conversion should compute each stored scale first (rounded to BF16),
++then quantize with that stored scale into ``[-128, 127]`` and add 128.  The
++four biased bytes are packed into an INT32 along ``K``.  This is the standard
++GPTQ ``pack_rows`` W8 layout accepted by ``gptq_marlin_moe_repack``.  Thus an
++immutable checkpoint can serve both Marlin and Triton.  The serialized
++footprint is one byte per weight plus one BF16 scale per output channel.  The
++launch bit-extracts and dequantizes only a tile in registers, then feeds it
++directly to a BF16 tensor-core dot with FP32 accumulation; it never persists an
++unpacked or BF16 weight.
++
++Unlike the generic Triton MoE path, attention heads have a fixed one-to-one
++mapping and need no token sorting or padding.  The launch grid is exactly
++``(ceil(M / BLOCK_M), ceil(N / BLOCK_N), H)``.
++
++``mla_kv_b_w8a16_bmm`` remains available for raw ``torch.uint8 [H,K,N]``
++experiments.  Production checkpoints should use
++``mla_kv_b_gptq_w8a16_bmm``.
++"""
++
++from __future__ import annotations
++
++from typing import NamedTuple
++
++import torch
++import triton
++import triton.language as tl
++
++from sglang.srt.utils.custom_op import register_custom_op
++
++
++class _LaunchConfig(NamedTuple):
++    block_m: int
++    block_n: int
++    block_k: int
++    num_warps: int
++    num_stages: int
++
++
++def _select_launch_config(token_count: int) -> _LaunchConfig:
++    """Select an Ampere-oriented configuration without runtime autotuning."""
++
++    if token_count <= 4:
++        return _LaunchConfig(16, 64, 32, 4, 3)
++    if token_count <= 32:
++        return _LaunchConfig(32, 64, 32, 4, 3)
++    return _LaunchConfig(64, 64, 32, 8, 3)
++
++
++@triton.jit
++def _mla_kv_b_w8a16_bmm_kernel(
++    x_ptr,
++    qweight_ptr,
++    scales_ptr,
++    output_ptr,
++    token_count,
++    output_features: tl.constexpr,
++    input_features: tl.constexpr,
++    stride_xm,
++    stride_xh,
++    stride_xk,
++    stride_wh,
++    stride_wk,
++    stride_wn,
++    stride_sh,
++    stride_sn,
++    stride_oh,
++    stride_om,
++    stride_on,
++    BLOCK_SIZE_M: tl.constexpr,
++    BLOCK_SIZE_N: tl.constexpr,
++    BLOCK_SIZE_K: tl.constexpr,
++    GPTQ_PACKED: tl.constexpr,
++):
++    token_block = tl.program_id(axis=0)
++    output_block = tl.program_id(axis=1)
++    head = tl.program_id(axis=2)
++
++    token_offsets = token_block * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
++    output_offsets = output_block * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
++    input_offsets = tl.arange(0, BLOCK_SIZE_K)
++
++    x_ptrs = (
++        x_ptr
++        + token_offsets[:, None] * stride_xm
++        + head * stride_xh
++        + input_offsets[None, :] * stride_xk
++    )
++    if GPTQ_PACKED:
++        packed_input_offsets = tl.arange(0, BLOCK_SIZE_K // 4)
++        qweight_ptrs = (
++            qweight_ptr
++            + head * stride_wh
++            + packed_input_offsets[:, None] * stride_wk
++            + output_offsets[None, :] * stride_wn
++        )
++    else:
++        qweight_ptrs = (
++            qweight_ptr
++            + head * stride_wh
++            + input_offsets[:, None] * stride_wk
++            + output_offsets[None, :] * stride_wn
++        )
++    scale = tl.load(
++        scales_ptr + head * stride_sh + output_offsets * stride_sn,
++        mask=output_offsets < output_features,
++        other=0.0,
++    ).to(tl.float32)
++
++    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
++    for input_start in range(0, input_features, BLOCK_SIZE_K):
++        input_mask = input_offsets < input_features - input_start
++        activations = tl.load(
++            x_ptrs,
++            mask=(token_offsets[:, None] < token_count) & input_mask[None, :],
++            other=0.0,
++        )
++        if GPTQ_PACKED:
++            packed_input_mask = (
++                packed_input_offsets < (input_features - input_start) // 4
++            )
++            packed_weight = tl.load(
++                qweight_ptrs,
++                mask=packed_input_mask[:, None]
++                & (output_offsets[None, :] < output_features),
++                other=0,
++            )
++            # Repeat each packed word four times in K order, then select its
++            # little-endian byte.  The broadcast/reshape is register-only.
++            expanded_weight = tl.broadcast_to(
++                packed_weight[:, None, :],
++                (BLOCK_SIZE_K // 4, 4, BLOCK_SIZE_N),
++            )
++            expanded_weight = tl.reshape(
++                expanded_weight,
++                (BLOCK_SIZE_K, BLOCK_SIZE_N),
++            )
++            shifts = (input_offsets % 4) * 8
++            biased_weight = (expanded_weight >> shifts[:, None]) & 0xFF
++        else:
++            biased_weight = tl.load(
++                qweight_ptrs,
++                mask=input_mask[:, None] & (output_offsets[None, :] < output_features),
++                other=128,
++            )
++        signed_weight = biased_weight.to(tl.int32) - 128
++        dequantized_weight = (signed_weight.to(tl.float32) * scale[None, :]).to(
++            tl.bfloat16
++        )
++        accumulator = tl.dot(activations, dequantized_weight, acc=accumulator)
++
++        x_ptrs += BLOCK_SIZE_K * stride_xk
++        if GPTQ_PACKED:
++            qweight_ptrs += (BLOCK_SIZE_K // 4) * stride_wk
++        else:
++            qweight_ptrs += BLOCK_SIZE_K * stride_wk
++
++    output_offsets_2d = (
++        head * stride_oh
++        + token_offsets[:, None] * stride_om
++        + output_offsets[None, :] * stride_on
++    )
++    output_mask = (token_offsets[:, None] < token_count) & (
++        output_offsets[None, :] < output_features
++    )
++    tl.store(output_ptr + output_offsets_2d, accumulator, mask=output_mask)
++
++
++def _validate_inputs(
++    x: torch.Tensor,
++    qweight: torch.Tensor,
++    scales: torch.Tensor,
++    *,
++    gptq_packed: bool,
++) -> tuple[int, int, int, int]:
++    if x.ndim != 3:
++        raise ValueError(f"x must have shape [M, H, K], got {tuple(x.shape)}")
++    if qweight.ndim != 3:
++        layout = "[H, K / 4, N]" if gptq_packed else "[H, K, N]"
++        raise ValueError(
++            f"qweight must have shape {layout}, got {tuple(qweight.shape)}"
++        )
++    if scales.ndim != 3 or scales.shape[1] != 1:
++        raise ValueError(
++            f"scales must have channelwise shape [H, 1, N], got {tuple(scales.shape)}"
++        )
++    if x.dtype != torch.bfloat16:
++        raise TypeError(f"x must be BF16, got {x.dtype}")
++    expected_qweight_dtype = torch.int32 if gptq_packed else torch.uint8
++    if qweight.dtype != expected_qweight_dtype:
++        raise TypeError(
++            f"qweight must be {expected_qweight_dtype}, got {qweight.dtype}"
++        )
++    if scales.dtype != torch.bfloat16:
++        raise TypeError(f"scales must be BF16, got {scales.dtype}")
++    if not x.is_cuda or not qweight.is_cuda or not scales.is_cuda:
++        raise ValueError("x, qweight, and scales must all be CUDA tensors")
++    if x.device != qweight.device or x.device != scales.device:
++        raise ValueError(
++            "x, qweight, and scales must be on the same CUDA device, "
++            f"got x={x.device}, qweight={qweight.device}, scales={scales.device}"
++        )
++
++    token_count, head_count, input_features = x.shape
++    weight_heads, stored_input_features, output_features = qweight.shape
++    weight_input_features = (
++        stored_input_features * 4 if gptq_packed else stored_input_features
++    )
++    if gptq_packed and input_features % 4 != 0:
++        raise ValueError(
++            f"GPTQ W8 row packing requires K divisible by 4, got K={input_features}"
++        )
++    if head_count != weight_heads or input_features != weight_input_features:
++        raise ValueError(
++            "x and qweight dimensions disagree: "
++            f"x={tuple(x.shape)}, qweight={tuple(qweight.shape)}"
++        )
++    if scales.shape != (head_count, 1, output_features):
++        raise ValueError(
++            "qweight and scales dimensions disagree: "
++            f"qweight={tuple(qweight.shape)}, scales={tuple(scales.shape)}"
++        )
++    if head_count == 0 or input_features == 0 or output_features == 0:
++        raise ValueError(
++            "H, K, and N must be nonzero, "
++            f"got H={head_count}, K={input_features}, N={output_features}"
++        )
++    return token_count, head_count, input_features, output_features
++
++
++def _launch_mla_kv_b_w8a16_bmm(
++    x: torch.Tensor,
++    qweight: torch.Tensor,
++    scales: torch.Tensor,
++    *,
++    gptq_packed: bool,
++) -> torch.Tensor:
++    token_count, head_count, input_features, output_features = _validate_inputs(
++        x,
++        qweight,
++        scales,
++        gptq_packed=gptq_packed,
++    )
++    if torch.cuda.get_device_capability(x.device)[0] < 8:
++        raise RuntimeError("MLA W8A16 Triton requires an Ampere-or-newer GPU")
++
++    output = torch.empty(
++        (head_count, token_count, output_features),
++        dtype=torch.bfloat16,
++        device=x.device,
++    )
++    if token_count == 0:
++        return output
++
++    config = _select_launch_config(token_count)
++    grid = (
++        triton.cdiv(token_count, config.block_m),
++        triton.cdiv(output_features, config.block_n),
++        head_count,
++    )
++    _mla_kv_b_w8a16_bmm_kernel[grid](
++        x,
++        qweight,
++        scales,
++        output,
++        token_count=token_count,
++        output_features=output_features,
++        input_features=input_features,
++        stride_xm=x.stride(0),
++        stride_xh=x.stride(1),
++        stride_xk=x.stride(2),
++        stride_wh=qweight.stride(0),
++        stride_wk=qweight.stride(1),
++        stride_wn=qweight.stride(2),
++        stride_sh=scales.stride(0),
++        stride_sn=scales.stride(2),
++        stride_oh=output.stride(0),
++        stride_om=output.stride(1),
++        stride_on=output.stride(2),
++        BLOCK_SIZE_M=config.block_m,
++        BLOCK_SIZE_N=config.block_n,
++        BLOCK_SIZE_K=config.block_k,
++        GPTQ_PACKED=gptq_packed,
++        num_warps=config.num_warps,
++        num_stages=config.num_stages,
++    )
++    return output
++
++
++def _fake_mla_kv_b_gptq_w8a16_bmm(
++    x: torch.Tensor,
++    qweight: torch.Tensor,
++    scales: torch.Tensor,
++) -> torch.Tensor:
++    del scales
++    return x.new_empty((qweight.shape[0], x.shape[0], qweight.shape[2]))
++
++
++@register_custom_op(fake_impl=_fake_mla_kv_b_gptq_w8a16_bmm)
++def mla_kv_b_gptq_w8a16_bmm(
++    x: torch.Tensor,
++    qweight: torch.Tensor,
++    scales: torch.Tensor,
++) -> torch.Tensor:
++    """Run MLA BMM directly on GPTQ row-packed W8 checkpoint weights.
++
++    ``qweight`` must be INT32 ``[H, K / 4, N]`` with four biased uint8b128
++    values packed little-endian along ``K``.  This is the production,
++    backend-neutral layout: Marlin can repack it with
++    ``gptq_marlin_moe_repack``, while Triton bit-extracts it in registers.
++    """
++
++    return _launch_mla_kv_b_w8a16_bmm(
++        x,
++        qweight,
++        scales,
++        gptq_packed=True,
++    )
++
++
++def mla_kv_b_w8a16_bmm(
++    x: torch.Tensor,
++    qweight: torch.Tensor,
++    scales: torch.Tensor,
++) -> torch.Tensor:
++    """Run the experimental raw-uint8 ``[H,K,N]`` form of MLA W8A16 BMM.
++
++    Both forms support arbitrary positive ``M`` and the zero-token case on
++    Ampere (SM80+) with FP32 accumulation.  Prefer
++    :func:`mla_kv_b_gptq_w8a16_bmm` for persistent checkpoints.
++    """
++
++    return _launch_mla_kv_b_w8a16_bmm(
++        x,
++        qweight,
++        scales,
++        gptq_packed=False,
++    )
+diff --git a/python/sglang/srt/layers/quantization/mla_kv_b_w8.py b/python/sglang/srt/layers/quantization/mla_kv_b_w8.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..b623434c3ec8b3579a633f5618f0b66400531e04
+--- /dev/null
++++ b/python/sglang/srt/layers/quantization/mla_kv_b_w8.py
+@@ -0,0 +1,499 @@
++"""Compact W8A16 support for DeepSeek-style absorbed-MLA ``kv_b_proj``.
++
++The immutable checkpoint stores one backend-neutral representation for both
++the Triton and grouped-Marlin implementations:
++
++* ``kc_qweight``: GPTQ-packed INT32 ``[H, 192 / 4, 512]``;
++* ``kc_scales``: BF16 ``[H, 1, 512]``;
++* ``vc_qweight``: GPTQ-packed INT32 ``[H, 512 / 4, 256]``;
++* ``vc_scales``: BF16 ``[H, 1, 256]``.
++
++The four bytes in each INT32 word are biased signed-INT8 values for adjacent K
++lanes in little-endian order.  Triton bit-extracts those words directly.
++Marlin performs a compact-to-compact layout/scale permutation once at load.
++Neither backend materializes a persistent BF16 weight.
++"""
++
++from __future__ import annotations
++
++import logging
++import os
++from collections.abc import Mapping
++from typing import Any, Optional
++
++import torch
++
++from sglang.srt.layers.parameter import (
++    ChannelQuantScaleParameter,
++    PackedvLLMParameter,
++)
++from sglang.srt.layers.quantization.base_config import LinearMethodBase
++from sglang.srt.layers.quantization.marlin_utils import marlin_make_workspace
++from sglang.srt.layers.quantization.utils import replace_parameter
++from sglang.srt.utils.custom_op import register_custom_op
++
++logger = logging.getLogger(__name__)
++
++_BACKEND_ENVIRONMENT_VARIABLE = "SGLANG_MLA_KV_B_W8_BACKEND"
++_SUPPORTED_BACKENDS = frozenset({"auto", "marlin", "triton"})
++_MARLIN_WORKSPACE_SLOTS = 4
++
++
++def _fake_grouped_marlin(
++    x: torch.Tensor,
++    qweight: torch.Tensor,
++    scales: torch.Tensor,
++    workspace: torch.Tensor,
++    input_features: int,
++    output_features: int,
++    block_size_m: int,
++) -> torch.Tensor:
++    del qweight, scales, workspace, input_features, block_size_m
++    return x.new_empty((x.shape[1], x.shape[0], output_features))
++
++
++@register_custom_op(
++    op_name="mla_kv_b_grouped_marlin_w8a16",
++    mutates_args=["workspace"],
++    fake_impl=_fake_grouped_marlin,
++)
++def _grouped_marlin_w8a16(
++    x: torch.Tensor,
++    qweight: torch.Tensor,
++    scales: torch.Tensor,
++    workspace: torch.Tensor,
++    input_features: int,
++    output_features: int,
++    block_size_m: int,
++) -> torch.Tensor:
++    """Run one grouped Marlin launch, treating each head as an expert."""
++
++    if x.ndim != 3:
++        raise ValueError(
++            "grouped MLA Marlin expects [tokens, heads, channels], "
++            f"got shape={tuple(x.shape)}"
++        )
++    token_count, head_count, observed_input_features = x.shape
++    expected_qweight_shape = (
++        head_count,
++        input_features // 16,
++        output_features * 4,
++    )
++    if observed_input_features != input_features:
++        raise ValueError(
++            "grouped MLA Marlin input K mismatch: "
++            f"shape={tuple(x.shape)}, expected_k={input_features}"
++        )
++    if tuple(qweight.shape) != expected_qweight_shape:
++        raise ValueError(
++            "grouped MLA Marlin qweight shape mismatch: "
++            f"actual={tuple(qweight.shape)}, expected={expected_qweight_shape}"
++        )
++    if tuple(scales.shape) != (head_count, 1, output_features):
++        raise ValueError(
++            "grouped MLA Marlin scale shape mismatch: "
++            f"actual={tuple(scales.shape)}, "
++            f"expected={(head_count, 1, output_features)}"
++        )
++    if (
++        x.dtype != torch.bfloat16
++        or qweight.dtype != torch.int32
++        or scales.dtype != torch.bfloat16
++    ):
++        raise TypeError(
++            "grouped MLA Marlin requires BF16 activations/scales and INT32 "
++            f"qweight, got x={x.dtype}, qweight={qweight.dtype}, "
++            f"scales={scales.dtype}"
++        )
++    if not x.is_cuda or x.device != qweight.device or x.device != scales.device:
++        raise ValueError("grouped MLA Marlin tensors must share one CUDA device")
++    if workspace.device != x.device or workspace.dtype != torch.int32:
++        raise ValueError("grouped MLA Marlin workspace has the wrong device or dtype")
++    if token_count == 0:
++        return x.new_empty((head_count, 0, output_features))
++
++    from sgl_kernel.scalar_type import scalar_types
++
++    from sglang.jit_kernel.moe_wna16_marlin import moe_wna16_marlin_gemm
++    from sglang.srt.layers.moe.fused_moe_triton import moe_align_block_size
++
++    rows = x.transpose(0, 1).contiguous().view(token_count * head_count, input_features)
++    head_ids = (
++        torch.arange(head_count, dtype=torch.int32, device=x.device)
++        .repeat_interleave(token_count)
++        .reshape(-1, 1)
++        .contiguous()
++    )
++    topk_weights = torch.ones(
++        (rows.shape[0], 1),
++        dtype=torch.float32,
++        device=x.device,
++    )
++    sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
++        head_ids,
++        block_size_m,
++        head_count,
++    )
++    output = moe_wna16_marlin_gemm(
++        rows,
++        None,
++        qweight,
++        None,
++        scales,
++        None,
++        None,
++        None,
++        None,
++        workspace,
++        sorted_token_ids,
++        expert_ids,
++        num_tokens_post_padded,
++        topk_weights,
++        moe_block_size=block_size_m,
++        top_k=1,
++        mul_topk_weights=False,
++        is_ep=False,
++        b_q_type=scalar_types.uint8b128,
++        size_m=rows.shape[0],
++        size_n=output_features,
++        size_k=input_features,
++        is_k_full=True,
++        use_atomic_add=torch.cuda.get_device_capability(x.device)[0] >= 9,
++        use_fp32_reduce=True,
++        is_zp_float=False,
++    )
++    return output.view(head_count, token_count, output_features)
++
++
++class GPTQMLAKVW8Method(LinearMethodBase):
++    """Consume the backend-neutral per-head GPTQ W8 MLA checkpoint layout."""
++
++    is_mla_kv_b_w8 = True
++    requires_mla_absorb = True
++
++    def __init__(self, quant_config: Any, format_config: Mapping[str, object]) -> None:
++        self.quant_config = quant_config
++        self.format_config = dict(format_config)
++        expected = {
++            "bits": 8,
++            "block_size_m": 8,
++            "format": "gptq_packed_rows_per_head_v1",
++            "implicit_bias": 128,
++            "kv_lora_rank": 512,
++            "num_attention_heads": 64,
++            "pack_axis": "K",
++            "pack_order": "little_endian_k_lanes_0_1_2_3",
++            "qk_nope_head_dim": 192,
++            "scale_compute_dtype": "float32",
++            "scale_dtype": "bfloat16",
++            "v_head_dim": 256,
++        }
++        mismatches = {
++            key: (self.format_config.get(key), value)
++            for key, value in expected.items()
++            if self.format_config.get(key) != value
++        }
++        if mismatches:
++            raise ValueError(
++                f"invalid Exo MLA kv_b W8 format metadata: mismatches={mismatches}"
++            )
++        if (
++            quant_config.weight_bits != 8
++            or quant_config.group_size != -1
++            or quant_config.desc_act
++            or not quant_config.is_sym
++            or quant_config.pack_factor != 4
++        ):
++            raise ValueError(
++                "Exo MLA kv_b W8 requires symmetric channelwise W8, "
++                "four K lanes per INT32, and desc_act=false"
++            )
++        configured_backend = os.getenv(
++            _BACKEND_ENVIRONMENT_VARIABLE,
++            "auto",
++        ).lower()
++        if configured_backend not in _SUPPORTED_BACKENDS:
++            raise ValueError(
++                f"{_BACKEND_ENVIRONMENT_VARIABLE} must be one of "
++                f"{sorted(_SUPPORTED_BACKENDS)}, got {configured_backend!r}"
++            )
++        self.backend = "triton" if configured_backend == "auto" else configured_backend
++        self._stream_slots: dict[int, int] = {}
++
++    @property
++    def qk_nope_head_dim(self) -> int:
++        return int(self.format_config["qk_nope_head_dim"])
++
++    @property
++    def v_head_dim(self) -> int:
++        return int(self.format_config["v_head_dim"])
++
++    @property
++    def kv_lora_rank(self) -> int:
++        return int(self.format_config["kv_lora_rank"])
++
++    @property
++    def num_heads(self) -> int:
++        return int(self.format_config["num_attention_heads"])
++
++    @property
++    def block_size_m(self) -> int:
++        return int(self.format_config["block_size_m"])
++
++    def create_weights(
++        self,
++        layer: torch.nn.Module,
++        input_size_per_partition: int,
++        output_partition_sizes: list[int],
++        input_size: int,
++        output_size: int,
++        params_dtype: torch.dtype,
++        **extra_weight_attrs,
++    ) -> None:
++        del input_size
++        if params_dtype != torch.bfloat16:
++            raise ValueError(
++                "Exo MLA kv_b W8 currently requires BF16 activations/scales, "
++                f"got {params_dtype}"
++            )
++        if input_size_per_partition != self.kv_lora_rank:
++            raise ValueError(
++                "kv_b input dimension differs from format metadata: "
++                f"{input_size_per_partition} != {self.kv_lora_rank}"
++            )
++        output_size_per_partition = sum(output_partition_sizes)
++        head_width = self.qk_nope_head_dim + self.v_head_dim
++        expected_output_size = self.num_heads * head_width
++        if output_size != expected_output_size:
++            raise ValueError(
++                "kv_b global output dimension differs from format metadata: "
++                f"{output_size} != {expected_output_size}"
++            )
++        if output_size_per_partition % head_width != 0:
++            raise ValueError(
++                "kv_b local output dimension is not an integral number of "
++                f"MLA heads: local={output_size_per_partition}, "
++                f"head_width={head_width}"
++            )
++        self.num_local_heads = output_size_per_partition // head_width
++        if self.num_heads % self.num_local_heads != 0:
++            raise ValueError(
++                "MLA attention heads cannot be evenly tensor parallelized: "
++                f"global={self.num_heads}, local={self.num_local_heads}"
++            )
++        weight_loader = extra_weight_attrs["weight_loader"]
++
++        def packed_weight(
++            input_features: int,
++            output_features: int,
++        ) -> PackedvLLMParameter:
++            return PackedvLLMParameter(
++                data=torch.empty(
++                    self.num_local_heads,
++                    input_features // 4,
++                    output_features,
++                    dtype=torch.int32,
++                ),
++                input_dim=1,
++                output_dim=0,
++                packed_dim=1,
++                packed_factor=4,
++                weight_loader=weight_loader,
++            )
++
++        def scales(output_features: int) -> ChannelQuantScaleParameter:
++            return ChannelQuantScaleParameter(
++                data=torch.empty(
++                    self.num_local_heads,
++                    1,
++                    output_features,
++                    dtype=params_dtype,
++                ),
++                output_dim=0,
++                weight_loader=weight_loader,
++            )
++
++        layer.register_parameter(
++            "kc_qweight",
++            packed_weight(self.qk_nope_head_dim, self.kv_lora_rank),
++        )
++        layer.register_parameter("kc_scales", scales(self.kv_lora_rank))
++        layer.register_parameter(
++            "vc_qweight",
++            packed_weight(self.kv_lora_rank, self.v_head_dim),
++        )
++        layer.register_parameter("vc_scales", scales(self.v_head_dim))
++
++    @staticmethod
++    def _replace_contiguous(layer: torch.nn.Module, name: str) -> None:
++        value = getattr(layer, name)
++        replace_parameter(
++            layer,
++            name,
++            torch.nn.Parameter(value.data.contiguous(), requires_grad=False),
++        )
++
++    def _repack_for_marlin(self, layer: torch.nn.Module) -> None:
++        from sglang.srt.layers.quantization.gptq import (
++            gptq_marlin_moe_repack,
++        )
++        from sglang.srt.layers.quantization.marlin_utils import (
++            marlin_moe_permute_scales,
++        )
++
++        device = layer.kc_qweight.device
++        empty_permutation = torch.empty(
++            (self.num_local_heads, 0),
++            dtype=torch.int32,
++            device=device,
++        )
++        for stem, input_features, output_features in (
++            ("kc", self.qk_nope_head_dim, self.kv_lora_rank),
++            ("vc", self.kv_lora_rank, self.v_head_dim),
++        ):
++            repacked = gptq_marlin_moe_repack(
++                getattr(layer, f"{stem}_qweight").contiguous(),
++                empty_permutation,
++                input_features,
++                output_features,
++                8,
++            )
++            permuted_scales = marlin_moe_permute_scales(
++                getattr(layer, f"{stem}_scales").contiguous(),
++                input_features,
++                output_features,
++                -1,
++            )
++            replace_parameter(layer, f"{stem}_qweight", repacked)
++            replace_parameter(layer, f"{stem}_scales", permuted_scales)
++
++        for stem in ("kc", "vc"):
++            for slot in range(_MARLIN_WORKSPACE_SLOTS):
++                layer.register_buffer(
++                    f"{stem}_marlin_workspace_{slot}",
++                    marlin_make_workspace(device, max_blocks_per_sm=4),
++                    persistent=False,
++                )
++        default_stream_handle = int(torch.cuda.default_stream(device).cuda_stream)
++        self._stream_slots[default_stream_handle] = 0
++
++    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
++        device = layer.kc_qweight.device
++        if device.type != "cuda":
++            raise ValueError("Exo MLA kv_b W8 weights require a CUDA device")
++        if torch.cuda.get_device_capability(device)[0] < 8:
++            raise ValueError("Exo MLA kv_b W8 requires an Ampere-or-newer GPU")
++        for name in ("kc_qweight", "kc_scales", "vc_qweight", "vc_scales"):
++            self._replace_contiguous(layer, name)
++        if self.backend == "marlin":
++            self._repack_for_marlin(layer)
++        else:
++            from sglang.srt.layers.quantization.mla_kv_b_triton import (
++                mla_kv_b_gptq_w8a16_bmm,
++            )
++
++            del mla_kv_b_gptq_w8a16_bmm
++        logger.info(
++            "Loaded compact MLA kv_b W8 backend=%s local_heads=%d",
++            self.backend,
++            self.num_local_heads,
++        )
++
++    def _workspace_for(
++        self,
++        layer: torch.nn.Module,
++        stem: str,
++    ) -> torch.Tensor:
++        stream_handle = int(
++            torch.cuda.current_stream(layer.kc_qweight.device).cuda_stream
++        )
++        slot = self._stream_slots.get(stream_handle)
++        if slot is None:
++            used_slots = set(self._stream_slots.values())
++            available_slots = [
++                candidate
++                for candidate in range(_MARLIN_WORKSPACE_SLOTS)
++                if candidate not in used_slots
++            ]
++            if not available_slots:
++                raise RuntimeError(
++                    "compact MLA kv_b Marlin observed more concurrent CUDA "
++                    f"streams than its {_MARLIN_WORKSPACE_SLOTS}-slot workspace pool"
++                )
++            slot = available_slots[0]
++            self._stream_slots[stream_handle] = slot
++        return getattr(layer, f"{stem}_marlin_workspace_{slot}")
++
++    def _apply(
++        self,
++        layer: torch.nn.Module,
++        stem: str,
++        x: torch.Tensor,
++        *,
++        input_features: int,
++        output_features: int,
++    ) -> torch.Tensor:
++        qweight = getattr(layer, f"{stem}_qweight")
++        scales = getattr(layer, f"{stem}_scales")
++        if self.backend == "triton":
++            from sglang.srt.layers.quantization.mla_kv_b_triton import (
++                mla_kv_b_gptq_w8a16_bmm,
++            )
++
++            return mla_kv_b_gptq_w8a16_bmm(x, qweight, scales)
++        return _grouped_marlin_w8a16(
++            x,
++            qweight,
++            scales,
++            self._workspace_for(layer, stem),
++            input_features,
++            output_features,
++            self.block_size_m,
++        )
++
++    def apply_mla_k(self, layer: torch.nn.Module, q_nope: torch.Tensor) -> torch.Tensor:
++        """Return the absorbed K projection in torch.bmm's [H, M, N] layout."""
++
++        return self._apply(
++            layer,
++            "kc",
++            q_nope,
++            input_features=self.qk_nope_head_dim,
++            output_features=self.kv_lora_rank,
++        )
++
++    def apply_mla_v(
++        self,
++        layer: torch.nn.Module,
++        attn_output: torch.Tensor,
++    ) -> torch.Tensor:
++        """Return the value expansion flattened to [M, H * value_dim]."""
++
++        return self.apply_mla_v_bmm(layer, attn_output).transpose(0, 1).flatten(1, 2)
++
++    def apply_mla_v_bmm(
++        self,
++        layer: torch.nn.Module,
++        attn_output: torch.Tensor,
++    ) -> torch.Tensor:
++        """Return the value expansion in torch.bmm's [H, M, N] layout."""
++
++        return self._apply(
++            layer,
++            "vc",
++            attn_output,
++            input_features=self.kv_lora_rank,
++            output_features=self.v_head_dim,
++        )
++
++    def apply(
++        self,
++        layer: torch.nn.Module,
++        x: torch.Tensor,
++        bias: Optional[torch.Tensor] = None,
++    ) -> torch.Tensor:
++        del layer, x, bias
++        raise RuntimeError(
++            "the compact Exo MLA kv_b W8 layout has no ordinary Linear "
++            "orientation; attention dispatch must use absorbed MLA"
++        )
+diff --git a/python/sglang/srt/models/deepseek_common/deepseek_weight_loader.py b/python/sglang/srt/models/deepseek_common/deepseek_weight_loader.py
+index deda4f97e889a6cebdf8940f5eb2cd2ed2442f57..612c1d76a6efdda7b8d3de8407553338bc300bc9 100644
+--- a/python/sglang/srt/models/deepseek_common/deepseek_weight_loader.py
++++ b/python/sglang/srt/models/deepseek_common/deepseek_weight_loader.py
+@@ -67,6 +67,43 @@ logger = logging.getLogger(__name__)
+ NVFP4_CKPT_FP8_ATTN_QUANT_MODULES = ["q_b_proj"]
+ 
+ 
++def _fuse_qkv_a_projection_tensors(
++    q_a_proj_weight: torch.Tensor,
++    kv_a_proj_weight: torch.Tensor,
++    *,
++    q_a_proj_name: str,
++    kv_a_proj_name: str,
++    cat_dim: int,
++) -> torch.Tensor:
++    """Fuse one matching q_a/kv_a checkpoint tensor pair."""
++
++    q_a_suffix = q_a_proj_name.rsplit(".", maxsplit=1)[-1]
++    kv_a_suffix = kv_a_proj_name.rsplit(".", maxsplit=1)[-1]
++    if q_a_suffix != kv_a_suffix:
++        raise ValueError(
++            "cannot fuse q_a_proj and kv_a_proj_with_mqa tensors with "
++            f"different suffixes: {q_a_proj_name}, {kv_a_proj_name}"
++        )
++    if q_a_suffix == "g_idx":
++        if (
++            q_a_proj_weight.shape != kv_a_proj_weight.shape
++            or q_a_proj_weight.dtype != kv_a_proj_weight.dtype
++            or not torch.equal(q_a_proj_weight, kv_a_proj_weight)
++        ):
++            raise ValueError(
++                "cannot fuse q_a_proj and kv_a_proj_with_mqa with different "
++                f"GPTQ g_idx tensors: {q_a_proj_name}, {kv_a_proj_name}"
++            )
++        # Both projections share the fused layer's input axis, so it has
++        # exactly one g_idx rather than a concatenation along the output axis.
++        return q_a_proj_weight
++    if q_a_proj_weight.shape == torch.Size([]) and kv_a_proj_weight.shape == torch.Size(
++        []
++    ):
++        return q_a_proj_weight
++    return torch.cat([q_a_proj_weight, kv_a_proj_weight], dim=cat_dim)
++
++
+ @dataclass(frozen=True)
+ class NextNEnabledConfig:
+     num_nextn_layers: int
+@@ -287,22 +324,26 @@ class DeepseekV2WeightLoaderMixin:
+                                 q_a_proj_weight = cached_a_proj[q_a_proj_name]
+                                 kv_a_proj_weight = cached_a_proj[kv_a_proj_name]
+ 
+-                                if q_a_proj_weight.shape == torch.Size(
+-                                    []
+-                                ) and kv_a_proj_weight.shape == torch.Size([]):
+-                                    fused_weight = q_a_proj_weight
+-                                else:
+-                                    cat_dim = 0
+-                                    if self.quant_config is not None and (
+-                                        self.quant_config.get_name() == "awq"
+-                                        or self.quant_config.get_name() == "awq_marlin"
+-                                        or self.quant_config.get_name() == "moe_wna16"
+-                                    ):
+-                                        cat_dim = 1
+-
+-                                    fused_weight = torch.cat(
+-                                        [q_a_proj_weight, kv_a_proj_weight], dim=cat_dim
+-                                    )
++                                cat_dim = 0
++                                if self.quant_config is not None and (
++                                    self.quant_config.get_name()
++                                    in {
++                                        "awq",
++                                        "awq_marlin",
++                                        "gptq",
++                                        "gptq_marlin",
++                                        "moe_wna16",
++                                    }
++                                ):
++                                    cat_dim = 1
++
++                                fused_weight = _fuse_qkv_a_projection_tensors(
++                                    q_a_proj_weight,
++                                    kv_a_proj_weight,
++                                    q_a_proj_name=q_a_proj_name,
++                                    kv_a_proj_name=kv_a_proj_name,
++                                    cat_dim=cat_dim,
++                                )
+ 
+                                 param_name = (
+                                     name.replace(
+@@ -413,18 +454,37 @@ class DeepseekV2WeightLoaderMixin:
+             is_nextn: Whether processing NextN weights
+             weight_names: Optional list of loaded weight names to determine which layers to process
+         """
++        loaded_name_set = None if weight_names is None else set(weight_names)
+         if is_nextn:
+             layer_ids = [self.config.num_hidden_layers]
+         else:
+-            if weight_names is None:
+-                layer_ids = range(self.model.start_layer, self.model.end_layer)
++            local_layer_ids = range(self.model.start_layer, self.model.end_layer)
++            if loaded_name_set is None:
++                layer_ids = local_layer_ids
+             else:
+                 layer_ids = set()
+-                for name in weight_names:
+-                    if "kv_b_proj" in name:
+-                        layer_id = int(name.split(".")[2])
+-                        if layer_id < self.config.num_hidden_layers:
+-                            layer_ids.add(layer_id)
++                for name in loaded_name_set:
++                    if "kv_b_proj" not in name:
++                        continue
++                    layer_id = get_layer_id(name)
++                    if (
++                        layer_id is not None
++                        and layer_id < self.config.num_hidden_layers
++                    ):
++                        layer_ids.add(layer_id)
++
++                # The compact checkpoint has no legacy kv_b_proj.weight from
++                # which to discover a layer. Validate every local specialist
++                # even if all four of its canonical tensors were omitted.
++                for layer_id in local_layer_ids:
++                    self_attn = self.model.layers[layer_id].self_attn
++                    quant_method = getattr(
++                        self_attn.kv_b_proj,
++                        "quant_method",
++                        None,
++                    )
++                    if getattr(quant_method, "is_mla_kv_b_w8", False):
++                        layer_ids.add(layer_id)
+ 
+         for layer_id in layer_ids:
+             self_attn = (
+@@ -433,6 +493,42 @@ class DeepseekV2WeightLoaderMixin:
+                 else self.model.decoder.self_attn
+             )
+ 
++            kv_b_quant_method = getattr(self_attn.kv_b_proj, "quant_method", None)
++            if getattr(kv_b_quant_method, "is_mla_kv_b_w8", False):
++                if loaded_name_set is None:
++                    raise ValueError(
++                        "cannot verify compact MLA kv_b W8 tensors without "
++                        "the loaded checkpoint names"
++                    )
++                parameter_names = (
++                    "kc_qweight",
++                    "kc_scales",
++                    "vc_qweight",
++                    "vc_scales",
++                )
++                missing_parameters = [
++                    name
++                    for name in parameter_names
++                    if not hasattr(self_attn.kv_b_proj, name)
++                ]
++                if missing_parameters:
++                    raise ValueError(
++                        "compact MLA kv_b W8 parameters are incomplete: "
++                        f"{missing_parameters}"
++                    )
++                checkpoint_prefix = f"model.layers.{layer_id}.self_attn.kv_b_proj."
++                missing_checkpoint_names = sorted(
++                    checkpoint_prefix + name
++                    for name in parameter_names
++                    if checkpoint_prefix + name not in loaded_name_set
++                )
++                if missing_checkpoint_names:
++                    raise ValueError(
++                        "compact MLA kv_b W8 checkpoint is incomplete: "
++                        f"{missing_checkpoint_names}"
++                    )
++                continue
++
+             if hasattr(self_attn.kv_b_proj, "qweight"):
+                 # awq compatible, dequantize the weight if supported
+                 awq_dequantize_f = awq_dequantize_func()
+diff --git a/python/sglang/srt/models/deepseek_v2.py b/python/sglang/srt/models/deepseek_v2.py
+index fb9e826b87bdaf19e9f3d65767f587a97125f9ba..9638b04178ee5d281fcbe7dfbc418a8aef7f97b1 100644
+--- a/python/sglang/srt/models/deepseek_v2.py
++++ b/python/sglang/srt/models/deepseek_v2.py
+@@ -216,6 +216,19 @@ else:
+ 
+ logger = logging.getLogger(__name__)
+ 
++_PACKED_LINEAR_QUANTIZATION_METHODS = frozenset(
++    {"awq", "awq_marlin", "gptq", "gptq_marlin", "moe_wna16"}
++)
++
++
++def _uses_packed_linear_weights(layer: nn.Module) -> bool:
++    quant_method = getattr(layer, "quant_method", None)
++    quant_config = getattr(quant_method, "quant_config", None)
++    return (
++        quant_config is not None
++        and quant_config.get_name() in _PACKED_LINEAR_QUANTIZATION_METHODS
++    )
++
+ 
+ class DeepseekV2MLP(nn.Module):
+     def __init__(
+@@ -565,14 +578,8 @@ class DeepseekV2MoE(nn.Module):
+                     else {}
+                 ),
+             )
+-            is_packed_weight = (
+-                hasattr(self.shared_experts.gate_up_proj.quant_method, "quant_config")
+-                and self.shared_experts.gate_up_proj.quant_method.quant_config.get_name()
+-                in {
+-                    "awq",
+-                    "awq_marlin",
+-                    "moe_wna16",
+-                }
++            is_packed_weight = _uses_packed_linear_weights(
++                self.shared_experts.gate_up_proj
+             )
+             self.shared_experts_is_int8 = (
+                 not is_packed_weight
+@@ -1721,11 +1728,8 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
+                 weight_names=["w_kc", "w_vc"], transpose_dims=[[1, 2], [1, 2]]
+             )
+ 
+-        is_packed_weight = (
+-            has_fused_proj
+-            and hasattr(self.fused_qkv_a_proj_with_mqa.quant_method, "quant_config")
+-            and self.fused_qkv_a_proj_with_mqa.quant_method.quant_config.get_name()
+-            in {"awq", "awq_marlin", "moe_wna16"}
++        is_packed_weight = has_fused_proj and _uses_packed_linear_weights(
++            self.fused_qkv_a_proj_with_mqa
+         )
+         self.use_min_latency_fused_a_gemm = (
+             has_fused_proj
+@@ -1766,6 +1770,12 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
+ 
+         self.init_mha_forward()
+ 
++    def _get_mla_kv_b_w8_method(self):
++        quant_method = getattr(self.kv_b_proj, "quant_method", None)
++        if getattr(quant_method, "is_mla_kv_b_w8", False):
++            return quant_method
++        return None
++
+     def dispatch_attn_forward_method(
+         self, forward_batch: ForwardBatch
+     ) -> AttnForwardMethod:
+@@ -1786,7 +1796,19 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
+         self.current_attention_backend = attention_backend
+ 
+         handler = AttentionBackendRegistry.get_handler(attention_backend)
+-        return handler(self, forward_batch)
++        attn_forward_method = handler(self, forward_batch)
++        # The compact layout has no ordinary Linear orientation.  Fail closed
++        # on MHA and fused-RoPE variants; Ampere must stay on plain absorbed MLA.
++        if (
++            self._get_mla_kv_b_w8_method() is not None
++            and attn_forward_method != AttnForwardMethod.MLA
++        ):
++            raise RuntimeError(
++                "compact MLA kv_b W8 requires the absorbed MLA attention "
++                f"path, but backend {attention_backend!r} selected "
++                f"{attn_forward_method}"
++            )
++        return attn_forward_method
+ 
+     def op_prepare(self, state):
+         state.attn_intermediate_state = self.forward_prepare(
+@@ -2106,7 +2128,10 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
+         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+         k_pe = latent_cache[..., self.kv_lora_rank :].unsqueeze(1)
+ 
+-        if self.use_deep_gemm_bmm:
++        mla_kv_b_w8_method = self._get_mla_kv_b_w8_method()
++        if mla_kv_b_w8_method is not None:
++            q_nope_out = mla_kv_b_w8_method.apply_mla_k(self.kv_b_proj, q_nope)
++        elif self.use_deep_gemm_bmm:
+             q_nope_val, q_nope_scale, masked_m, expected_m, aligned_m = (
+                 per_token_group_quant_mla_deep_gemm_masked_fp8(q_nope.transpose(0, 1))
+             )
+@@ -2283,7 +2308,12 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
+             )
+         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
+ 
+-        if self.use_deep_gemm_bmm:
++        mla_kv_b_w8_method = self._get_mla_kv_b_w8_method()
++        if mla_kv_b_w8_method is not None:
++            attn_bmm_output = mla_kv_b_w8_method.apply_mla_v(
++                self.kv_b_proj, attn_output
++            )
++        elif self.use_deep_gemm_bmm:
+             attn_output_val, attn_output_scale, masked_m, expected_m, aligned_m = (
+                 per_token_group_quant_mla_deep_gemm_masked_fp8(
+                     attn_output.transpose(0, 1)
+@@ -2429,7 +2459,10 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
+             latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
+         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+ 
+-        if _is_hip:
++        mla_kv_b_w8_method = self._get_mla_kv_b_w8_method()
++        if mla_kv_b_w8_method is not None:
++            q_nope_out = mla_kv_b_w8_method.apply_mla_k(self.kv_b_proj, q_nope)
++        elif _is_hip:
+             # TODO(haishaw): add bmm_fp8 to ROCm
+             q_nope_out = torch.bmm(
+                 q_nope.to(torch.bfloat16).transpose(0, 1),
+@@ -2614,7 +2647,12 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
+ 
+         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
+ 
+-        if _is_hip:
++        mla_kv_b_w8_method = self._get_mla_kv_b_w8_method()
++        if mla_kv_b_w8_method is not None:
++            attn_bmm_output = mla_kv_b_w8_method.apply_mla_v_bmm(
++                self.kv_b_proj, attn_output
++            )
++        elif _is_hip:
+             # TODO(haishaw): add bmm_fp8 to ROCm
+             attn_bmm_output = torch.bmm(
+                 attn_output.to(torch.bfloat16).transpose(0, 1),
+diff --git a/python/sglang/test/test_deepseek_mla_kv_b_w8_dispatch.py b/python/sglang/test/test_deepseek_mla_kv_b_w8_dispatch.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..789b75f2621c13cbebfc948f871486c64f48f11f
+--- /dev/null
++++ b/python/sglang/test/test_deepseek_mla_kv_b_w8_dispatch.py
+@@ -0,0 +1,120 @@
++from types import SimpleNamespace
++
++import pytest
++import torch
++
++import sglang.srt.models.deepseek_v2 as deepseek_v2
++from sglang.srt.models.deepseek_common.attention_forward_methods import (
++    AttnForwardMethod,
++)
++from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
++from sglang.srt.models.deepseek_v2 import _uses_packed_linear_weights
++
++
++class _DecodeForwardMode:
++    @staticmethod
++    def is_decode_or_idle() -> bool:
++        return True
++
++    @staticmethod
++    def is_target_verify() -> bool:
++        return False
++
++    @staticmethod
++    def is_draft_extend() -> bool:
++        return False
++
++
++def _attention(*, compact_w8: bool) -> DeepseekV2AttentionMLA:
++    attention = object.__new__(DeepseekV2AttentionMLA)
++    torch.nn.Module.__init__(attention)
++    attention.kv_b_proj = SimpleNamespace(
++        quant_method=SimpleNamespace(is_mla_kv_b_w8=compact_w8)
++    )
++    return attention
++
++
++def _select_method(
++    monkeypatch: pytest.MonkeyPatch,
++    selected_method: AttnForwardMethod,
++) -> None:
++    server_args = SimpleNamespace(decode_attention_backend="test_decode")
++    monkeypatch.setattr(deepseek_v2, "get_global_server_args", lambda: server_args)
++    monkeypatch.setattr(
++        deepseek_v2.AttentionBackendRegistry,
++        "get_handler",
++        staticmethod(
++            lambda backend_name: (lambda attention, forward_batch: selected_method)
++        ),
++    )
++
++
++def test_compact_w8_method_detection_uses_shared_marker() -> None:
++    attention = _attention(compact_w8=True)
++
++    assert attention._get_mla_kv_b_w8_method() is attention.kv_b_proj.quant_method
++
++
++@pytest.mark.parametrize("quantization", ["gptq", "gptq_marlin"])
++def test_gptq_body_linears_are_recognized_as_packed(
++    quantization: str,
++) -> None:
++    layer = SimpleNamespace(
++        quant_method=SimpleNamespace(
++            quant_config=SimpleNamespace(get_name=lambda: quantization)
++        )
++    )
++
++    assert _uses_packed_linear_weights(layer)
++    assert not hasattr(layer, "weight")
++
++
++def test_compact_w8_dispatch_allows_absorbed_mla(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    attention = _attention(compact_w8=True)
++    _select_method(monkeypatch, AttnForwardMethod.MLA)
++
++    selected = attention.dispatch_attn_forward_method(
++        SimpleNamespace(forward_mode=_DecodeForwardMode())
++    )
++
++    assert selected == AttnForwardMethod.MLA
++    assert attention.current_attention_backend == "test_decode"
++
++
++@pytest.mark.parametrize(
++    "selected_method",
++    [
++        AttnForwardMethod.MHA,
++        AttnForwardMethod.MLA_FUSED_ROPE,
++        AttnForwardMethod.MLA_FUSED_ROPE_CPU,
++    ],
++)
++def test_compact_w8_dispatch_rejects_non_plain_mla(
++    monkeypatch: pytest.MonkeyPatch,
++    selected_method: AttnForwardMethod,
++) -> None:
++    attention = _attention(compact_w8=True)
++    _select_method(monkeypatch, selected_method)
++
++    with pytest.raises(
++        RuntimeError,
++        match="compact MLA kv_b W8 requires the absorbed MLA attention path",
++    ):
++        attention.dispatch_attn_forward_method(
++            SimpleNamespace(forward_mode=_DecodeForwardMode())
++        )
++
++
++def test_other_quant_methods_keep_fused_rope_dispatch(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    attention = _attention(compact_w8=False)
++    _select_method(monkeypatch, AttnForwardMethod.MLA_FUSED_ROPE)
++
++    selected = attention.dispatch_attn_forward_method(
++        SimpleNamespace(forward_mode=_DecodeForwardMode())
++    )
++
++    assert selected == AttnForwardMethod.MLA_FUSED_ROPE
+diff --git a/python/sglang/test/test_mla_kv_b_marlin.py b/python/sglang/test/test_mla_kv_b_marlin.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..0a79828d712aff7dc2d0c82755cdb465887915b4
+--- /dev/null
++++ b/python/sglang/test/test_mla_kv_b_marlin.py
+@@ -0,0 +1,242 @@
++from types import SimpleNamespace
++
++import pytest
++import torch
++
++from sglang.srt.layers.quantization.mla_kv_b_w8 import GPTQMLAKVW8Method
++
++
++def _format_config() -> dict[str, object]:
++    return {
++        "bits": 8,
++        "block_size_m": 8,
++        "format": "gptq_packed_rows_per_head_v1",
++        "implicit_bias": 128,
++        "kv_lora_rank": 512,
++        "num_attention_heads": 64,
++        "pack_axis": "K",
++        "pack_order": "little_endian_k_lanes_0_1_2_3",
++        "qk_nope_head_dim": 192,
++        "scale_compute_dtype": "float32",
++        "scale_dtype": "bfloat16",
++        "v_head_dim": 256,
++    }
++
++
++def _method(
++    monkeypatch: pytest.MonkeyPatch,
++    *,
++    backend: str,
++    local_heads: int,
++) -> GPTQMLAKVW8Method:
++    monkeypatch.setenv("SGLANG_MLA_KV_B_W8_BACKEND", backend)
++    config = SimpleNamespace(
++        weight_bits=8,
++        group_size=-1,
++        desc_act=False,
++        is_sym=True,
++        pack_factor=4,
++    )
++    method = GPTQMLAKVW8Method(config, _format_config())
++    method.num_local_heads = local_heads
++    return method
++
++
++def _quantize_gptq_rows(
++    weight: torch.Tensor,
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++    """Quantize logical ``[H, K, N]`` weights like the offline converter."""
++
++    maximum = weight.float().amax(dim=1, keepdim=True)
++    minimum = weight.float().amin(dim=1, keepdim=True)
++    scales = torch.maximum(maximum.abs() / 127.0, minimum.abs() / 128.0)
++    scales = scales.clamp_min(torch.finfo(torch.bfloat16).tiny).to(torch.bfloat16)
++    signed = torch.round(weight.float() / scales.float()).clamp(-128, 127)
++    raw_qweight = (signed.to(torch.int16) + 128).to(torch.uint8)
++    reference = ((raw_qweight.to(torch.int16) - 128).float() * scales.float()).to(
++        torch.bfloat16
++    )
++
++    heads, input_features, output_features = raw_qweight.shape
++    packed = torch.zeros(
++        heads,
++        input_features // 4,
++        output_features,
++        dtype=torch.int64,
++        device=weight.device,
++    )
++    for byte_index in range(4):
++        packed |= raw_qweight[:, byte_index::4, :].to(torch.int64) << (8 * byte_index)
++    return packed.to(torch.int32), scales, reference
++
++
++def _canonical_layer(
++    *,
++    local_heads: int,
++) -> tuple[torch.nn.Module, torch.Tensor, torch.Tensor]:
++    layer = torch.nn.Module()
++    references = []
++    for stem, input_features, output_features in (
++        ("kc", 192, 512),
++        ("vc", 512, 256),
++    ):
++        source = torch.randn(
++            local_heads,
++            input_features,
++            output_features,
++            dtype=torch.bfloat16,
++            device="cuda",
++        )
++        qweight, scales, reference = _quantize_gptq_rows(source)
++        layer.register_parameter(
++            f"{stem}_qweight",
++            torch.nn.Parameter(qweight, requires_grad=False),
++        )
++        layer.register_parameter(
++            f"{stem}_scales",
++            torch.nn.Parameter(scales, requires_grad=False),
++        )
++        references.append(reference)
++    return layer, references[0], references[1]
++
++
++@pytest.mark.parametrize(
++    ("tokens", "stem", "input_features", "output_features"),
++    [
++        (0, "kc", 192, 512),
++        (1, "kc", 192, 512),
++        (3, "vc", 512, 256),
++        (128, "kc", 192, 512),
++    ],
++)
++def test_canonical_checkpoint_repack_matches_quantized_bmm(
++    monkeypatch: pytest.MonkeyPatch,
++    tokens: int,
++    stem: str,
++    input_features: int,
++    output_features: int,
++) -> None:
++    if not torch.cuda.is_available():
++        pytest.skip("CUDA is required")
++    if torch.cuda.get_device_capability()[0] < 8:
++        pytest.skip("grouped W8 Marlin requires Ampere or newer")
++
++    torch.manual_seed(7)
++    local_heads = 4
++    layer, kc_reference, vc_reference = _canonical_layer(local_heads=local_heads)
++    reference_weight = kc_reference if stem == "kc" else vc_reference
++    canonical_size_bytes = sum(
++        parameter.numel() * parameter.element_size() for parameter in layer.parameters()
++    )
++    method = _method(
++        monkeypatch,
++        backend="marlin",
++        local_heads=local_heads,
++    )
++
++    method.process_weights_after_loading(layer)
++
++    # Repacking changes only the compact INT32/scale layouts. It must not
++    # materialize the logical BF16 KC or VC matrices.
++    assert not hasattr(layer, "w_kc")
++    assert not hasattr(layer, "w_vc")
++    repacked_size_bytes = sum(
++        parameter.numel() * parameter.element_size() for parameter in layer.parameters()
++    )
++    assert repacked_size_bytes == canonical_size_bytes
++
++    x = torch.randn(
++        tokens,
++        local_heads,
++        input_features,
++        dtype=torch.bfloat16,
++        device="cuda",
++    )
++    expected = torch.bmm(x.transpose(0, 1), reference_weight)
++    if stem == "kc":
++        actual = method.apply_mla_k(layer, x)
++    else:
++        actual = method.apply_mla_v_bmm(layer, x)
++
++    assert actual.shape == (local_heads, tokens, output_features)
++    error = actual.float() - expected.float()
++    if tokens:
++        relative_rms_error = (
++            error.square().mean().sqrt()
++            / expected.float().square().mean().sqrt().clamp_min(1e-12)
++        )
++        cosine_similarity = torch.nn.functional.cosine_similarity(
++            actual.float().flatten(),
++            expected.float().flatten(),
++            dim=0,
++        )
++        assert error.abs().max().item() <= 0.6
++        assert relative_rms_error.item() <= 0.004
++        assert cosine_similarity.item() >= 0.99999
++
++
++def test_rejects_ordinary_linear_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
++    method = _method(monkeypatch, backend="triton", local_heads=32)
++
++    with pytest.raises(RuntimeError, match="must use absorbed MLA"):
++        method.apply(
++            torch.nn.Module(),
++            torch.empty(1, 512, dtype=torch.bfloat16),
++        )
++
++
++def test_rejects_unknown_backend(monkeypatch: pytest.MonkeyPatch) -> None:
++    monkeypatch.setenv("SGLANG_MLA_KV_B_W8_BACKEND", "expanded-bf16")
++    config = SimpleNamespace(
++        weight_bits=8,
++        group_size=-1,
++        desc_act=False,
++        is_sym=True,
++        pack_factor=4,
++    )
++
++    with pytest.raises(ValueError, match="SGLANG_MLA_KV_B_W8_BACKEND"):
++        GPTQMLAKVW8Method(config, _format_config())
++
++
++def test_tp2_parameters_shard_complete_heads(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    local_heads = 32
++    method = _method(
++        monkeypatch,
++        backend="triton",
++        local_heads=local_heads,
++    )
++    layer = torch.nn.Module()
++    method.create_weights(
++        layer,
++        input_size_per_partition=512,
++        output_partition_sizes=[local_heads * (192 + 256)],
++        input_size=512,
++        output_size=64 * (192 + 256),
++        params_dtype=torch.bfloat16,
++        weight_loader=lambda _parameter, _loaded_weight: None,
++    )
++
++    for name, input_features, output_features, dtype in (
++        ("kc_qweight", 48, 512, torch.int32),
++        ("kc_scales", 1, 512, torch.bfloat16),
++        ("vc_qweight", 128, 256, torch.int32),
++        ("vc_scales", 1, 256, torch.bfloat16),
++    ):
++        global_weight = (
++            torch.arange(64, dtype=torch.int32)
++            .view(64, 1, 1)
++            .expand(64, input_features, output_features)
++            .to(dtype)
++        )
++        parameter = getattr(layer, name)
++        parameter.load_column_parallel_weight(global_weight, tp_rank=1)
++        expected = global_weight[local_heads:]
++        torch.testing.assert_close(parameter, expected)
++
++    assert layer.kc_qweight.shape == (32, 48, 512)
++    assert layer.kc_scales.shape == (32, 1, 512)
++    assert layer.vc_qweight.shape == (32, 128, 256)
++    assert layer.vc_scales.shape == (32, 1, 256)
+diff --git a/python/sglang/test/test_mla_kv_b_triton.py b/python/sglang/test/test_mla_kv_b_triton.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..de1730aadf61e16124b4ed3b0927d66949eecee5
+--- /dev/null
++++ b/python/sglang/test/test_mla_kv_b_triton.py
+@@ -0,0 +1,291 @@
++import pytest
++import torch
++
++from sglang.srt.layers.quantization.mla_kv_b_triton import (
++    _select_launch_config,
++    mla_kv_b_gptq_w8a16_bmm,
++    mla_kv_b_w8a16_bmm,
++)
++
++
++def _quantize_uint8b128(
++    weight: torch.Tensor,
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++    """Test-only offline quantization of logical ``[H, K, N]`` weights."""
++
++    maximum = weight.float().amax(dim=1, keepdim=True)
++    minimum = weight.float().amin(dim=1, keepdim=True)
++    scales = torch.maximum(maximum.abs() / 127.0, minimum.abs() / 128.0)
++    scales = scales.clamp_min(torch.finfo(torch.bfloat16).tiny).to(torch.bfloat16)
++    signed = torch.round(weight.float() / scales.float()).clamp(-128, 127)
++    qweight = (signed.to(torch.int16) + 128).to(torch.uint8)
++    reference = ((qweight.to(torch.int16) - 128).float() * scales.float()).to(
++        torch.bfloat16
++    )
++    return qweight, scales, reference
++
++
++def _pack_gptq_rows(qweight: torch.Tensor) -> torch.Tensor:
++    """Pack four uint8b128 K rows per INT32, matching GPTQ ``pack_rows``."""
++
++    heads, input_features, output_features = qweight.shape
++    assert input_features % 4 == 0
++    packed = torch.zeros(
++        heads,
++        input_features // 4,
++        output_features,
++        dtype=torch.int64,
++        device=qweight.device,
++    )
++    for byte_index in range(4):
++        packed |= qweight[:, byte_index::4, :].to(torch.int64) << (8 * byte_index)
++    return packed.to(torch.int32)
++
++
++@pytest.mark.parametrize(
++    ("tokens", "input_features", "output_features"),
++    [(1, 192, 512), (3, 512, 256), (128, 192, 512)],
++)
++def test_compact_triton_matches_quantized_bmm(
++    tokens: int,
++    input_features: int,
++    output_features: int,
++) -> None:
++    if not torch.cuda.is_available():
++        pytest.skip("CUDA is required")
++    if torch.cuda.get_device_capability()[0] < 8:
++        pytest.skip("BF16 tensor cores require Ampere or newer")
++
++    torch.manual_seed(17)
++    heads = 2
++    source_weight = torch.randn(
++        heads,
++        input_features,
++        output_features,
++        device="cuda",
++        dtype=torch.bfloat16,
++    )
++    raw_qweight, scales, reference_weight = _quantize_uint8b128(source_weight)
++    qweight = _pack_gptq_rows(raw_qweight)
++    # Deliberately pass a non-contiguous [M, H, K] activation to exercise the
++    # explicit input strides used by the three-dimensional launch.
++    x = torch.randn(
++        heads,
++        tokens,
++        input_features,
++        device="cuda",
++        dtype=torch.bfloat16,
++    ).transpose(0, 1)
++
++    expected = torch.bmm(x.transpose(0, 1), reference_weight)
++    actual = mla_kv_b_gptq_w8a16_bmm(x, qweight, scales)
++
++    assert actual.shape == (heads, tokens, output_features)
++    assert actual.dtype == torch.bfloat16
++    assert qweight.shape == (heads, input_features // 4, output_features)
++    assert qweight.element_size() * qweight.numel() == raw_qweight.numel()
++    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=8e-2)
++
++
++def test_launch_config_covers_decode_mtp_and_prefill_shapes() -> None:
++    assert _select_launch_config(1).block_m == 16
++    assert _select_launch_config(3).block_m == 16
++    assert _select_launch_config(32).block_m == 32
++    assert _select_launch_config(128).block_m == 64
++
++
++def test_rejects_non_uint8b128_weights_before_launch() -> None:
++    with pytest.raises(TypeError, match="qweight must be torch.uint8"):
++        mla_kv_b_w8a16_bmm(
++            torch.empty(1, 2, 192, dtype=torch.bfloat16),
++            torch.empty(2, 192, 512, dtype=torch.int8),
++            torch.empty(2, 1, 512, dtype=torch.bfloat16),
++        )
++
++
++def test_gptq_pack_rows_byte_order() -> None:
++    raw = torch.tensor(
++        [[[0, 1], [2, 3], [254, 255], [128, 129]]],
++        dtype=torch.uint8,
++    )
++    packed = _pack_gptq_rows(raw)
++    expected = (
++        raw[:, 0, :].to(torch.int64)
++        | (raw[:, 1, :].to(torch.int64) << 8)
++        | (raw[:, 2, :].to(torch.int64) << 16)
++        | (raw[:, 3, :].to(torch.int64) << 24)
++    ).to(torch.int32)
++    torch.testing.assert_close(packed[:, 0, :], expected)
++
++
++def test_zero_tokens_returns_empty_output() -> None:
++    if not torch.cuda.is_available():
++        pytest.skip("CUDA is required")
++    if torch.cuda.get_device_capability()[0] < 8:
++        pytest.skip("BF16 tensor cores require Ampere or newer")
++
++    heads = 2
++    input_features = 192
++    output_features = 512
++    output = mla_kv_b_gptq_w8a16_bmm(
++        torch.empty(
++            0,
++            heads,
++            input_features,
++            dtype=torch.bfloat16,
++            device="cuda",
++        ),
++        torch.empty(
++            heads,
++            input_features // 4,
++            output_features,
++            dtype=torch.int32,
++            device="cuda",
++        ),
++        torch.empty(
++            heads,
++            1,
++            output_features,
++            dtype=torch.bfloat16,
++            device="cuda",
++        ),
++    )
++
++    assert output.shape == (heads, 0, output_features)
++    assert output.dtype == torch.bfloat16
++    assert output.numel() == 0
++
++
++def test_cuda_graph_capture_and_replay() -> None:
++    if not torch.cuda.is_available():
++        pytest.skip("CUDA is required")
++    if torch.cuda.get_device_capability()[0] < 8:
++        pytest.skip("BF16 tensor cores require Ampere or newer")
++
++    torch.manual_seed(23)
++    heads = 2
++    tokens = 3
++    input_features = 512
++    output_features = 256
++    source_weight = torch.randn(
++        heads,
++        input_features,
++        output_features,
++        dtype=torch.bfloat16,
++        device="cuda",
++    )
++    raw_qweight, scales, reference_weight = _quantize_uint8b128(source_weight)
++    qweight = _pack_gptq_rows(raw_qweight)
++    static_x = torch.randn(
++        tokens,
++        heads,
++        input_features,
++        dtype=torch.bfloat16,
++        device="cuda",
++    )
++
++    # Triton must compile before stream capture.
++    mla_kv_b_gptq_w8a16_bmm(static_x, qweight, scales)
++    torch.cuda.synchronize()
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph):
++        graph_output = mla_kv_b_gptq_w8a16_bmm(static_x, qweight, scales)
++
++    replay_x = torch.randn_like(static_x)
++    static_x.copy_(replay_x)
++    graph.replay()
++    torch.cuda.synchronize()
++    expected = torch.bmm(replay_x.transpose(0, 1), reference_weight)
++    torch.testing.assert_close(graph_output, expected, rtol=2e-2, atol=8e-2)
++
++
++def test_two_streams_do_not_share_mutable_state() -> None:
++    if not torch.cuda.is_available():
++        pytest.skip("CUDA is required")
++    if torch.cuda.get_device_capability()[0] < 8:
++        pytest.skip("BF16 tensor cores require Ampere or newer")
++
++    torch.manual_seed(31)
++    heads = 2
++    input_features = 192
++    output_features = 512
++    source_weight = torch.randn(
++        heads,
++        input_features,
++        output_features,
++        dtype=torch.bfloat16,
++        device="cuda",
++    )
++    raw_qweight, scales, reference_weight = _quantize_uint8b128(source_weight)
++    qweight = _pack_gptq_rows(raw_qweight)
++    x_a = torch.randn(
++        1,
++        heads,
++        input_features,
++        dtype=torch.bfloat16,
++        device="cuda",
++    )
++    x_b = torch.randn(
++        3,
++        heads,
++        input_features,
++        dtype=torch.bfloat16,
++        device="cuda",
++    )
++
++    # Compile both launch shapes before dispatching on independent streams.
++    mla_kv_b_gptq_w8a16_bmm(x_a, qweight, scales)
++    mla_kv_b_gptq_w8a16_bmm(x_b, qweight, scales)
++    current_stream = torch.cuda.current_stream()
++    stream_a = torch.cuda.Stream()
++    stream_b = torch.cuda.Stream()
++    stream_a.wait_stream(current_stream)
++    stream_b.wait_stream(current_stream)
++    with torch.cuda.stream(stream_a):
++        output_a = mla_kv_b_gptq_w8a16_bmm(x_a, qweight, scales)
++    with torch.cuda.stream(stream_b):
++        output_b = mla_kv_b_gptq_w8a16_bmm(x_b, qweight, scales)
++    current_stream.wait_stream(stream_a)
++    current_stream.wait_stream(stream_b)
++
++    expected_a = torch.bmm(x_a.transpose(0, 1), reference_weight)
++    expected_b = torch.bmm(x_b.transpose(0, 1), reference_weight)
++    torch.testing.assert_close(output_a, expected_a, rtol=2e-2, atol=8e-2)
++    torch.testing.assert_close(output_b, expected_b, rtol=2e-2, atol=8e-2)
++
++
++def test_custom_op_fake_dispatch_infers_output() -> None:
++    from torch._subclasses.fake_tensor import FakeTensorMode
++
++    heads = 2
++    tokens = 3
++    input_features = 192
++    output_features = 512
++    with FakeTensorMode():
++        output = mla_kv_b_gptq_w8a16_bmm(
++            torch.empty(
++                tokens,
++                heads,
++                input_features,
++                dtype=torch.bfloat16,
++                device="cuda",
++            ),
++            torch.empty(
++                heads,
++                input_features // 4,
++                output_features,
++                dtype=torch.int32,
++                device="cuda",
++            ),
++            torch.empty(
++                heads,
++                1,
++                output_features,
++                dtype=torch.bfloat16,
++                device="cuda",
++            ),
++        )
++
++    assert output.shape == (heads, tokens, output_features)
++    assert output.dtype == torch.bfloat16
++    assert output.device.type == "cuda"
+diff --git a/python/sglang/test/test_mla_kv_b_w8_loading.py b/python/sglang/test/test_mla_kv_b_w8_loading.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..2eae8baddd29cc9cae819e48043ea6388b6689b3
+--- /dev/null
++++ b/python/sglang/test/test_mla_kv_b_w8_loading.py
+@@ -0,0 +1,163 @@
++from __future__ import annotations
++
++import sys
++from types import ModuleType, SimpleNamespace
++
++import pytest
++import torch
++
++from sglang.srt.layers.quantization.gptq import GPTQConfig, GPTQMarlinConfig
++from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
++    DeepseekV2WeightLoaderMixin,
++    _fuse_qkv_a_projection_tensors,
++)
++
++
++_CONFIG_KEY = "exo_mla_kv_b_w8"
++_PARAMETER_NAMES = ("kc_qweight", "kc_scales", "vc_qweight", "vc_scales")
++
++
++def _canonical_weight_names(layer_id: int) -> set[str]:
++    prefix = f"model.layers.{layer_id}.self_attn.kv_b_proj."
++    return {prefix + name for name in _PARAMETER_NAMES}
++
++
++def _compact_attention() -> SimpleNamespace:
++    projection = SimpleNamespace(
++        quant_method=SimpleNamespace(is_mla_kv_b_w8=True),
++        **{name: object() for name in _PARAMETER_NAMES},
++    )
++    return SimpleNamespace(kv_b_proj=projection)
++
++
++def test_plain_gptq_rejects_compact_mla_checkpoint() -> None:
++    config = {_CONFIG_KEY: {}}
++
++    with pytest.raises(ValueError, match="plain GPTQ loader"):
++        GPTQConfig.from_config(config)
++    with pytest.raises(ValueError, match="explicit --quantization gptq"):
++        GPTQMarlinConfig.override_quantization_method(config, "gptq")
++
++
++def test_gptq_marlin_selects_canonical_mla_method(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    fake_module = ModuleType("sglang.srt.layers.quantization.mla_kv_b_w8")
++
++    class FakeMLAKVW8Method:
++        def __init__(self, quant_config, format_config) -> None:
++            self.quant_config = quant_config
++            self.format_config = format_config
++
++    fake_module.GPTQMLAKVW8Method = FakeMLAKVW8Method
++    monkeypatch.setitem(
++        sys.modules,
++        "sglang.srt.layers.quantization.mla_kv_b_w8",
++        fake_module,
++    )
++    format_config = {"format": "test"}
++    config = GPTQMarlinConfig(
++        weight_bits=8,
++        group_size=-1,
++        desc_act=False,
++        is_sym=True,
++        lm_head_quantized=False,
++        dynamic={},
++        full_config={_CONFIG_KEY: format_config},
++    )
++
++    method = config.get_quant_method(
++        torch.nn.Module(),
++        "model.layers.0.self_attn.kv_b_proj",
++    )
++
++    assert isinstance(method, FakeMLAKVW8Method)
++    assert method.quant_config is config
++    assert method.format_config is format_config
++
++
++def test_fused_gptq_g_idx_is_shared_not_concatenated() -> None:
++    q_a_g_idx = torch.tensor([0, 0, 1, 1], dtype=torch.int32)
++    kv_a_g_idx = q_a_g_idx.clone()
++
++    fused = _fuse_qkv_a_projection_tensors(
++        q_a_g_idx,
++        kv_a_g_idx,
++        q_a_proj_name="model.q_a_proj.g_idx",
++        kv_a_proj_name="model.kv_a_proj_with_mqa.g_idx",
++        cat_dim=1,
++    )
++
++    assert fused is q_a_g_idx
++    with pytest.raises(ValueError, match="different GPTQ g_idx"):
++        _fuse_qkv_a_projection_tensors(
++            q_a_g_idx,
++            torch.tensor([0, 1, 1, 1], dtype=torch.int32),
++            q_a_proj_name="model.q_a_proj.g_idx",
++            kv_a_proj_name="model.kv_a_proj_with_mqa.g_idx",
++            cat_dim=1,
++        )
++
++
++def test_compact_validation_covers_whole_omitted_local_layer() -> None:
++    loader = DeepseekV2WeightLoaderMixin()
++    loader.model = SimpleNamespace(
++        start_layer=0,
++        end_layer=2,
++        layers=[
++            SimpleNamespace(self_attn=_compact_attention()),
++            SimpleNamespace(self_attn=_compact_attention()),
++        ],
++    )
++    loader.config = SimpleNamespace(num_hidden_layers=2)
++
++    with pytest.raises(ValueError, match=r"model\.layers\.1.*kc_qweight"):
++        loader.post_load_weights(weight_names=_canonical_weight_names(0))
++
++
++@pytest.mark.parametrize("missing_parameter", _PARAMETER_NAMES)
++def test_compact_validation_covers_each_missing_mtp_tensor(
++    missing_parameter: str,
++) -> None:
++    layer_id = 78
++    loader = DeepseekV2WeightLoaderMixin()
++    loader.model = SimpleNamespace(
++        decoder=SimpleNamespace(self_attn=_compact_attention()),
++    )
++    loader.config = SimpleNamespace(num_hidden_layers=layer_id)
++    names = _canonical_weight_names(layer_id)
++    names.remove(
++        f"model.layers.{layer_id}.self_attn.kv_b_proj.{missing_parameter}",
++    )
++
++    with pytest.raises(
++        ValueError,
++        match=rf"model\.layers\.78.*{missing_parameter}",
++    ):
++        loader.post_load_weights(is_nextn=True, weight_names=names)
++
++
++def test_compact_validation_accepts_complete_target_and_mtp_layers() -> None:
++    target_loader = DeepseekV2WeightLoaderMixin()
++    target_loader.model = SimpleNamespace(
++        start_layer=0,
++        end_layer=2,
++        layers=[
++            SimpleNamespace(self_attn=_compact_attention()),
++            SimpleNamespace(self_attn=_compact_attention()),
++        ],
++    )
++    target_loader.config = SimpleNamespace(num_hidden_layers=2)
++    target_loader.post_load_weights(
++        weight_names=_canonical_weight_names(0) | _canonical_weight_names(1)
++    )
++
++    mtp_loader = DeepseekV2WeightLoaderMixin()
++    mtp_loader.model = SimpleNamespace(
++        decoder=SimpleNamespace(self_attn=_compact_attention()),
++    )
++    mtp_loader.config = SimpleNamespace(num_hidden_layers=78)
++    mtp_loader.post_load_weights(
++        is_nextn=True,
++        weight_names=_canonical_weight_names(78),
++    )

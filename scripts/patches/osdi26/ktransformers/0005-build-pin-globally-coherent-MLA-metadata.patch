@@ -1,0 +1,16 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jimm <jimm@jimm.horse>
+Date: Sat, 25 Jul 2026 16:05:41 -0400
+Subject: [PATCH 5/6] build: pin globally coherent MLA metadata
+
+---
+ third_party/sglang | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/third_party/sglang b/third_party/sglang
+index 1144e67fb17c64f1dc44a8e799e89ec2fc4868b7..c7d6255e0182493d4c0495f76c2d4c375cd32e0c 160000
+--- a/third_party/sglang
++++ b/third_party/sglang
+@@ -1 +1 @@
+-Subproject commit 1144e67fb17c64f1dc44a8e799e89ec2fc4868b7
++Subproject commit c7d6255e0182493d4c0495f76c2d4c375cd32e0c

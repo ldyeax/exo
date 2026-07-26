@@ -1,0 +1,16 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jimm <jimm@jimm.horse>
+Date: Sat, 25 Jul 2026 15:18:16 -0400
+Subject: [PATCH 2/6] build: pin hybrid MLA kv_b MTP runtime
+
+---
+ third_party/sglang | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/third_party/sglang b/third_party/sglang
+index ec248edc186fd43e03a8dfae79bf30d41eab3ddc..a2c52a18fa8ea93a273678e938d9fcfdf8cad87c 160000
+--- a/third_party/sglang
++++ b/third_party/sglang
+@@ -1 +1 @@
+-Subproject commit ec248edc186fd43e03a8dfae79bf30d41eab3ddc
++Subproject commit a2c52a18fa8ea93a273678e938d9fcfdf8cad87c

@@ -1,0 +1,16 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jimm <jimm@jimm.horse>
+Date: Sat, 25 Jul 2026 16:32:54 -0400
+Subject: [PATCH 6/6] build: pin MTP Marlin ownership fix
+
+---
+ third_party/sglang | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/third_party/sglang b/third_party/sglang
+index c7d6255e0182493d4c0495f76c2d4c375cd32e0c..f3f6ccfbbcdd5ef5e650a74eecc1a233e07cec34 160000
+--- a/third_party/sglang
++++ b/third_party/sglang
+@@ -1 +1 @@
+-Subproject commit c7d6255e0182493d4c0495f76c2d4c375cd32e0c
++Subproject commit f3f6ccfbbcdd5ef5e650a74eecc1a233e07cec34

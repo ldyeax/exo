@@ -1,0 +1,248 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jimm <jimm@jimm.horse>
+Date: Sat, 25 Jul 2026 15:53:35 -0400
+Subject: [PATCH 6/8] fix(mla): align compact W8 FlashInfer metadata
+
+---
+ .../sglang/srt/model_executor/model_runner.py |  41 +++++++
+ python/sglang/srt/models/deepseek_v2.py       |  18 +--
+ .../test_deepseek_mla_kv_b_w8_dispatch.py     | 111 ++++++++++++++++--
+ 3 files changed, 148 insertions(+), 22 deletions(-)
+
+diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
+index e76ce037c40cf6ddf507db412416ce78e60f97d9..9927d1f5116307f6463966d3a69df2be8a465963 100644
+--- a/python/sglang/srt/model_executor/model_runner.py
++++ b/python/sglang/srt/model_executor/model_runner.py
+@@ -499,6 +499,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+         # Load the model
+         self.sampler = create_sampler()
+         self.load_model()
++        self.configure_compact_mla_kv_b_attention()
+         if self.server_args.kt_lora_path:
+             if not hasattr(self.model, "load_kt_lora"):
+                 raise ValueError(
+@@ -950,6 +951,46 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+                 ),
+             )
+ 
++    def configure_compact_mla_kv_b_attention(self) -> None:
++        """Keep FlashInfer metadata on absorbed MLA for compact ``kv_b``."""
++
++        compact_attention_modules: list[torch.nn.Module] = []
++        for module in self.model.modules():
++            kv_b_projection = getattr(module, "kv_b_proj", None)
++            quant_method = getattr(kv_b_projection, "quant_method", None)
++            if not getattr(quant_method, "is_mla_kv_b_w8", False):
++                continue
++            if not getattr(quant_method, "requires_mla_absorb", False):
++                raise RuntimeError(
++                    "compact MLA kv_b W8 method does not declare its absorbed-MLA "
++                    "requirement"
++                )
++            if not hasattr(module, "flashinfer_mla_disable_ragged"):
++                raise RuntimeError(
++                    "compact MLA kv_b W8 is attached outside a DeepSeek MLA "
++                    "attention module"
++                )
++            compact_attention_modules.append(module)
++
++        if not compact_attention_modules:
++            return
++
++        # FlashInfer decides between its ordinary-MHA ragged wrapper and its
++        # absorbed-MLA paged wrapper before model.forward dispatches individual
++        # attention layers.  Keep every view of this setting coherent before
++        # the attention backend is constructed or plans any batch metadata.
++        global_server_args = get_global_server_args()
++        self.server_args.flashinfer_mla_disable_ragged = True
++        global_server_args.flashinfer_mla_disable_ragged = True
++        for module in compact_attention_modules:
++            module.flashinfer_mla_disable_ragged = True
++
++        logger.info(
++            "Compact MLA kv_b W8 requires absorbed MLA; disabled FlashInfer "
++            "ragged MHA prefill for %d attention modules",
++            len(compact_attention_modules),
++        )
++
+     def load_model(self):
+         tic_total = time.perf_counter()
+         before_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
+diff --git a/python/sglang/srt/models/deepseek_v2.py b/python/sglang/srt/models/deepseek_v2.py
+index 96f9a37d8c97ed3d081a46e832596d95c10e215f..8844059459e93d2c64c28e4f984c26a1f9e78438 100644
+--- a/python/sglang/srt/models/deepseek_v2.py
++++ b/python/sglang/srt/models/deepseek_v2.py
+@@ -1797,23 +1797,11 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
+ 
+         handler = AttentionBackendRegistry.get_handler(attention_backend)
+         attn_forward_method = handler(self, forward_batch)
+-        # The compact layout has no ordinary Linear orientation.  FlashInfer's
+-        # zero-prefix prefill heuristic normally selects an MHA variant, but
+-        # that is only an optimization choice: force it back to absorbed MLA,
+-        # whose KC/VC sites call the compact specialists directly.
+-        if (
+-            self._get_mla_kv_b_w8_method() is not None
+-            and attn_forward_method
+-            in {
+-                AttnForwardMethod.MHA,
+-                AttnForwardMethod.MHA_CHUNKED_KV,
+-                AttnForwardMethod.MHA_ONE_SHOT,
+-            }
+-        ):
+-            return AttnForwardMethod.MLA
+ 
+         # Both GPU absorbed-MLA paths are specialized.  CPU/NPU variants still
+-        # dereference legacy weights, so reject those explicitly.
++        # dereference legacy weights.  Reject every incompatible selection
++        # rather than changing it after the backend has already planned batch
++        # metadata for a different tensor ABI.
+         compact_kv_b_supported_methods = {
+             AttnForwardMethod.MLA,
+             AttnForwardMethod.MLA_FUSED_ROPE,
+diff --git a/python/sglang/test/test_deepseek_mla_kv_b_w8_dispatch.py b/python/sglang/test/test_deepseek_mla_kv_b_w8_dispatch.py
+index 1c31b3e7b5263d12c6ee221fc357b2300f52ed59..a85ad0b48595cf16c9572b4336aea5e23cd0961a 100644
+--- a/python/sglang/test/test_deepseek_mla_kv_b_w8_dispatch.py
++++ b/python/sglang/test/test_deepseek_mla_kv_b_w8_dispatch.py
+@@ -3,7 +3,13 @@ from types import SimpleNamespace
+ import pytest
+ import torch
+ 
++import sglang.srt.layers.attention.flashinfer_mla_backend as flashinfer_mla_backend
++import sglang.srt.model_executor.model_runner as model_runner_module
+ import sglang.srt.models.deepseek_v2 as deepseek_v2
++from sglang.srt.layers.attention.flashinfer_mla_backend import (
++    FlashInferMLAAttnBackend,
++)
++from sglang.srt.model_executor.model_runner import ModelRunner
+ from sglang.srt.models.deepseek_common.attention_forward_methods import (
+     AttnForwardMethod,
+ )
+@@ -25,6 +31,24 @@ class _DecodeForwardMode:
+         return False
+ 
+ 
++class _ZeroPrefixExtendForwardMode:
++    @staticmethod
++    def is_decode_or_idle() -> bool:
++        return False
++
++    @staticmethod
++    def is_target_verify() -> bool:
++        return False
++
++    @staticmethod
++    def is_draft_extend() -> bool:
++        return False
++
++    @staticmethod
++    def is_extend_without_speculative() -> bool:
++        return True
++
++
+ def _attention(*, compact_w8: bool) -> DeepseekV2AttentionMLA:
+     attention = object.__new__(DeepseekV2AttentionMLA)
+     torch.nn.Module.__init__(attention)
+@@ -99,19 +123,17 @@ def test_compact_w8_dispatch_allows_gpu_absorbed_mla(
+         AttnForwardMethod.MHA_ONE_SHOT,
+     ],
+ )
+-def test_compact_w8_dispatch_forces_mha_heuristics_to_absorbed_mla(
++def test_compact_w8_dispatch_rejects_mha_after_metadata_planning(
+     monkeypatch: pytest.MonkeyPatch,
+     selected_method: AttnForwardMethod,
+ ) -> None:
+     attention = _attention(compact_w8=True)
+     _select_method(monkeypatch, selected_method)
+ 
+-    selected = attention.dispatch_attn_forward_method(
+-        SimpleNamespace(forward_mode=_DecodeForwardMode())
+-    )
+-
+-    assert selected == AttnForwardMethod.MLA
+-    assert attention.current_attention_backend == "test_decode"
++    with pytest.raises(RuntimeError, match="compact MLA kv_b W8 requires"):
++        attention.dispatch_attn_forward_method(
++            SimpleNamespace(forward_mode=_DecodeForwardMode())
++        )
+ 
+ 
+ def test_compact_w8_dispatch_rejects_cpu_fused_rope(
+@@ -137,3 +159,78 @@ def test_other_quant_methods_keep_fused_rope_dispatch(
+     )
+ 
+     assert selected == AttnForwardMethod.MLA_FUSED_ROPE
++
++
++def test_model_runner_configures_flashinfer_metadata_before_dispatch(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    attention = _attention(compact_w8=True)
++    attention.kv_b_proj.quant_method.requires_mla_absorb = True
++    attention.flashinfer_mla_disable_ragged = False
++    model = torch.nn.Module()
++    model.add_module("attention", attention)
++
++    server_args = SimpleNamespace(
++        decode_attention_backend="flashinfer",
++        flashinfer_mla_disable_ragged=False,
++        prefill_attention_backend="flashinfer",
++        speculative_attention_mode="prefill",
++    )
++    global_server_args = SimpleNamespace(
++        decode_attention_backend="flashinfer",
++        flashinfer_mla_disable_ragged=False,
++        prefill_attention_backend="flashinfer",
++        speculative_attention_mode="prefill",
++    )
++    runner = object.__new__(ModelRunner)
++    runner.model = model
++    runner.server_args = server_args
++    monkeypatch.setattr(
++        model_runner_module,
++        "get_global_server_args",
++        lambda: global_server_args,
++    )
++
++    runner.configure_compact_mla_kv_b_attention()
++
++    assert server_args.flashinfer_mla_disable_ragged
++    assert global_server_args.flashinfer_mla_disable_ragged
++    assert attention.flashinfer_mla_disable_ragged
++
++    metadata_update = {}
++
++    class _IndicesUpdater:
++        @staticmethod
++        def update(*args, **kwargs) -> None:
++            metadata_update["use_ragged"] = kwargs["use_ragged"]
++
++    backend = object.__new__(FlashInferMLAAttnBackend)
++    backend.indices_updater_prefill = _IndicesUpdater()
++    backend.prefill_wrapper_paged = object()
++    monkeypatch.setattr(
++        flashinfer_mla_backend,
++        "get_global_server_args",
++        lambda: global_server_args,
++    )
++    forward_batch = SimpleNamespace(
++        batch_size=1,
++        extend_prefix_lens=torch.tensor([0], dtype=torch.int32),
++        extend_prefix_lens_cpu=[0],
++        forward_mode=_ZeroPrefixExtendForwardMode(),
++        req_pool_indices=torch.tensor([0], dtype=torch.int32),
++        seq_lens=torch.tensor([3], dtype=torch.int32),
++        seq_lens_sum=3,
++    )
++
++    backend.init_forward_metadata(forward_batch)
++
++    assert metadata_update == {"use_ragged": False}
++    assert not backend.forward_metadata.use_ragged
++
++    monkeypatch.setattr(
++        deepseek_v2,
++        "get_global_server_args",
++        lambda: global_server_args,
++    )
++    selected = attention.dispatch_attn_forward_method(forward_batch)
++    assert selected == AttnForwardMethod.MLA

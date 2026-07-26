@@ -24,22 +24,60 @@ Bring Exo to a working, efficient Linux/NVIDIA deployment that can serve GLM-5.2
 
 - Single-socket Intel Xeon system: 60 cores/120 threads, AMX BF16/INT8 and the same relevant AVX-512 capabilities.
 - 256 GB installed DDR5-6000 RDIMM; the current CPU/firmware may train it below the DIMM rating.
-- One RTX 3090 at PCIe 4.0 x16.
+- One RTX 3090 at PCIe 4.0 x16. NVIDIA driver 595.71.05 is running the
+  open kernel module.
 - Dual-port Intel X550 10 GbE.
-- The ConnectX-3 HCA is at `0000:16:00.0`, PCIe 3.0 x8, on NUMA 0 after the slot move.
+- ConnectX-5 `mlx5_0` EDR/100G and the legacy ConnectX-3 `mlx4_0` QDR/40G
+  are installed on the host's sole NUMA node. The ConnectX-3 is at
+  `0000:16:00.0`, PCIe 3.0 x8, after the slot move.
 - `/mnt/sanic` is a 3x2 TB RAID0 model volume.
-- `ollama.service` is disabled and inactive so it cannot silently reserve the
-  fwuff GPU outside the benchmark lease. Re-enable it only when deliberately
-  using Ollama, and stop it again before Exo admission or measurement.
+- `ollama.service` is disabled at boot but is currently active; its `/api/ps`
+  model list is empty. A disabled unit can still be started manually, so every
+  benchmark lease must check both the unit state and `/api/ps`, then stop any
+  resident Ollama model before Exo admission or measurement.
 
 ### Interconnect
 
-- One MCX354A ConnectX-3 VPI QDR card is installed in each server. Both physical links train `LinkUp` at 4X QDR, 40 Gb/s raw per port. After the 2026-07-19 reboot/slot change they were `INIT` until fwuff's enabled `opensm.service` was restored by loading the in-tree `ib_umad` module and starting its existing `PORTS=ALL` configuration. Two service-owned OpenSM instances now keep both direct-connect subnets `ACTIVE`; benchmark manifests must record this persistent infrastructure and must not stop or reconfigure it.
-- Planned upgrade: a matched pair of Mellanox `MCX555A-ECAT` ConnectX-5 VPI single-port EDR/100GbE cards and an EDR-rated QSFP28 100G direct cable. Preserve all current QDR results as the pre-upgrade baseline.
-- Use the kernel `mlx4_core`/`mlx4_ib` drivers, `rdma-core`, `perftest`, Mellanox Firmware Tools, and one OpenSM instance per disconnected direct-connect rail. Current MLNX_OFED releases no longer support ConnectX-3.
-- Keep 10 GbE as the management/control plane. QDR ports do not aggregate automatically; select and benchmark both rails explicitly.
-- Default to host-staged NCCL/InfiniBand. RTX 3090 GPUDirect RDMA is not an officially supported configuration; test `nvidia-peermem` only as an optional A/B path.
-- NCCL 2.28 GIN requires ConnectX-4 or newer. On these ConnectX-3 cards, NCCL crashed in `ncclNetInit` while initializing its GIN plugin; `NCCL_GIN_ENABLE=0` alone was insufficient. Set both `NCCL_GIN_ENABLE=0` and `NCCL_GIN_TYPE=0`. GIN is a device-side API, not the ordinary host-launched NCCL/verbs transport, so disabling it loses no standard IB collective capability. `NCCL_NET=IB` selects the generic IB transport and fails rather than silently falling back to Socket; `NCCL_NET_GDR_LEVEL=LOC` deliberately keeps this baseline host-staged. [NCCL network selection](https://github.com/NVIDIA/nccl/blob/ae7aed194dc63c65d1bf5c0385ba3d68d3b64c8c/src/plugin/net.cc#L351-L380) [NCCL GDR level](https://github.com/NVIDIA/nccl/blob/5067397c2676d5aed50042fc39e5c8ee96eb0027/docs/userguide/source/env.rst#L1113-L1143)
+- A matched pair of Mellanox `MCX555A-ECAT` ConnectX-5 VPI cards and an
+  EDR-rated QSFP28 direct cable are installed and active between the hosts.
+  The current link-state receipt records `mlx5_0` at 100 Gb/s. This proves
+  negotiated EDR line rate, not application payload throughput or small-message
+  latency; those still require matched benchmark receipts.
+- One MCX354A ConnectX-3 VPI QDR card remains installed in each server. Both
+  physical links train `LinkUp` at 4X QDR, 40 Gb/s raw per port. After the
+  2026-07-19 reboot/slot change they were `INIT` until fwuff's enabled
+  `opensm.service` was restored by loading the in-tree `ib_umad` module and
+  starting its existing `PORTS=ALL` configuration. Two service-owned OpenSM
+  instances now keep both direct-connect subnets `ACTIVE`; benchmark manifests
+  must record this persistent infrastructure and must not stop or reconfigure
+  it.
+- Use the kernel `mlx5_core`/`mlx5_ib` drivers for ConnectX-5 and
+  `mlx4_core`/`mlx4_ib` for the legacy ConnectX-3 path, plus `rdma-core`,
+  `perftest`, Mellanox Firmware Tools, and one OpenSM instance per disconnected
+  direct-connect subnet. Current MLNX_OFED releases no longer support
+  ConnectX-3.
+- Keep 10 GbE as the management/control plane. Reserve EDR for
+  latency-critical traffic and treat the separate QDR links as a legacy or bulk
+  path; QDR ports do not aggregate automatically.
+- Default to registered pinned-host staging. ConnectX-5 is HCA-capable for
+  GPUDirect, and NVIDIA's current documentation is mixed rather than supporting
+  a blanket GeForce/RTX 3090 prohibition: the GPU Operator prerequisites include
+  Quadro RTX and RTX GPUs, while the general CUDA guide describes Tesla and
+  Quadro availability. On fwuff, however, CUDA attributes 116 and 124 still
+  report zero with driver 595.71.05 and the open kernel module, and the installed
+  `perftest` lacks CUDA options. The current GPU-memory path is therefore
+  unproven and is not admitted. Enable it only after a CUDA-capable
+  host-versus-GPU perftest, NCCL evidence, and exact-ring A/B in both directions
+  show correct data, clean counters, stability, and a repeatable win. See
+  [`speculative-infiniband.md`](speculative-infiniband.md#gpudirect-status-and-later-proof).
+- For the historical ConnectX-3/NCCL 2.28 profiles, NCCL crashed in
+  `ncclNetInit` while initializing its GIN plugin; `NCCL_GIN_ENABLE=0` alone was
+  insufficient. Set both `NCCL_GIN_ENABLE=0` and `NCCL_GIN_TYPE=0`. GIN is a
+  device-side API, not the ordinary host-launched NCCL/verbs transport, so
+  disabling it loses no standard IB collective capability. `NCCL_NET=IB`
+  selects the generic IB transport and fails rather than silently falling back
+  to Socket; `NCCL_NET_GDR_LEVEL=LOC` deliberately keeps this baseline
+  host-staged. [NCCL network selection](https://github.com/NVIDIA/nccl/blob/ae7aed194dc63c65d1bf5c0385ba3d68d3b64c8c/src/plugin/net.cc#L351-L380) [NCCL GDR level](https://github.com/NVIDIA/nccl/blob/5067397c2676d5aed50042fc39e5c8ee96eb0027/docs/userguide/source/env.rst#L1113-L1143)
 - Historical fwuff-x4 `ib_write_bw` baseline: 28.46 and 28.56 Gb/s
   single-rail, 29.80 Gb/s concurrent aggregate. With both HCAs at PCIe 3.0 x8
   but fwuff's OEM QDR personality, the reportable v4 baseline measured 31.74
@@ -320,7 +358,15 @@ If three logical resources cannot be launched reliably, design a separate fail-c
 - The pinned GLM-4.7 Flash 4-bit stage completed cleanly at `/var/lib/exo/benchmarks/glm47flash-stage-20260719-v1`, using revision `1454cffb1a21737e162f508e5bc70be9def89276` and exact clean source commit `6da455c8e3eb5e21d09812f10e44a31712545816`. Both hosts have the same complete 26-file snapshot with four weight shards, 16,852,202,496 indexed weight bytes, and canonical model-manifest SHA-256 `c9de2620a4cd99025abfc4758555637f3a8dbedb8cb69daf198be5edb3e6d64e`. Verified locations are `dwagon:/var/lib/exo/models/mlx-community--GLM-4.7-Flash-4bit--1454cffb1a21737e162f508e5bc70be9def89276` and `fwuff:/mnt/sanic/exo/models/mlx-community--GLM-4.7-Flash-4bit--1454cffb1a21737e162f508e5bc70be9def89276`. Result/manifest/runtime/config SHA-256 values are `d3eb9fd0e854b13494a115c872dc127fa569e525a14e115054283284f271fdec`, `f6360fd6eac23adf709fa109eee0dd45122ff5d09b706c7ae3e94f87e29d1a8b`, `b7cd82896c65af0bd4cee5a6417cfe34c845c669af096e17d274d5bdb1766ca8`, and `538831b0a93226c70d4d808d3331555a99bcb1a998feb8e91777efdcf3c05c58`.
 - The matching deterministic GLM-4.7 Flash TP1 oracle is reportable and clean at `/var/lib/exo/benchmarks/tp1-glm47flash-20260719-v1`. With `enable_thinking=false`, three repetitions each produced 16 prompt tokens, 32 completion tokens, `finish_reason=length`, 32 UTF-8 content bytes, prompt SHA-256 `5acfb781684c00d3313c5a4990dec4a7a3ebec7ffc2b014275fea69214348e45`, and completion SHA-256 `de1349c105ffe29ab10b68492986aa6c081672d045b02d474570fbf5bda3a40d`. Result/manifest/runtime/log/raw-config SHA-256 values are `0064768cb29f20072b22a6ac7fff5b9b947c0da70dcd0e446e0e25c820eaa890`, `2fbe883160900818e4d9cf46ab7c5c9a12d2a2d755996fee114d9e8def65ca53`, `c689c0358e802a00b6dc584c54750431f229ff283c614e5ac3975b274f0dbde3`, `6fffc3286c57a6b9da6408ffe916c52dacc9fac3fccdacddf56cf3dee048ba38`, and `719a89b29bb51fa8a8936d4f8fc03c9d4c251103ccc2cf77088abb4fc23a23ca`; the receipt-canonical config SHA-256 is `86159c2e48079c3c4d9d9130df6f64a52095d3d13d96856c133077b30ef148b4` and request digest is `74b6b0a06170e31438d9ec798773437e02da85909385ac2d07e789f65c4ebd6e`.
 - The strict GLM-4.7 Flash Tensor=2 proof is reportable and clean at `/var/lib/exo/benchmarks/tp2-glm47flash-20260719-v1`, using exact clean commit `6da455c8e3eb5e21d09812f10e44a31712545816`. One selected RTX 3090 on each host completed two warmups and three measured requests, all exactly matching the TP1 oracle; dwagon's second GPU remained observed but unowned. The run reported 9,380,021,417 bytes of peak memory usage. Diagnostic mean/median latency was 2.374/2.311 seconds, with mean prefill/decode rates of 45.31/19.57 tokens/s. Both ranks initialized, NCCL selected `mlx4_0:1` and `mlx4_0:2`, formed merged `NET/IB/2`, and showed no socket fallback or fatal marker. Bracketed HCA counters proved matched bidirectional payload with matching packet counters and zero selected health/error deltas: 199,084,700 PMA data bytes on `qdr-a` and 199,080,292 on `qdr-b`. The receipt has `dual_rail_payload_verified=true` and `performance_comparable=false` because ConnectX-3 GPUDirect RDMA and GIN were disabled and transport was host-staged. Instance and process cleanup were ownership-confirmed and unforced; independent post-run checks found no lease, held lock, reserved port, owned PID, log failure marker, or GPU compute process on either host. Result/manifest/runtime/dwagon-log/fwuff-log/config SHA-256 values are `503ac516604293c9e41e7fb7b7c2fa2805fbdaa8827c2053d4caae2c1c7bfc91`, `7f1ca0a897d1ec85c858a6cbf8504c4de522fd3ef62d96b75b8f1ad56082f568`, `f0bdf0541d7ae67c808dbd4fde03d3819c85bcf1ad040ed7b80b7a98edb91240`, `feaffc4148da1578b60dd48e2293800bec4e4290b7fab6c180f02f5147df33a8`, `f8c3ebda6bba21fd27cd4eb10e1125916a00bd6aaaa388a6f0b8f379ff9c2232`, and `7b3ff5a572c6319fc2f65632b1dd710f7f4e365929fee1ab6bb2710dec201a4f`.
-- Operational conflicts removed for shared testing: dwagon containers `/voice-backend` and `/voice-speaker-embedding` are stopped with restart policy `no`; fwuff `ollama.service` is disabled and inactive.
+- Operational conflicts removed for shared testing: dwagon containers
+  `/voice-backend` and `/voice-speaker-embedding` are stopped with restart
+  policy `no`. Fwuff `ollama.service` remains disabled at boot, but its daemon
+  was found active during the 2026-07-26 speculative-prefill iterations and
+  briefly loaded `gemma4:26b-a4b-it-q8_0`. The model expired naturally without
+  intervention before the final measurement; the final fwuff gate had only
+  the 4.3 GiB resident draft PID on GPU and about 19.85 GiB free. Future
+  performance leases must check both the daemon and `/api/ps`, not infer GPU
+  idleness from the unit's disabled preset.
 - The guarded serving release is published as commit `83e9e2e5`; its exact
   five-file slice passed `177` focused tests, Ruff lint/format, repository-wide
   Basedpyright, and independent final review. The hardened two-host staging
@@ -352,8 +398,10 @@ If three logical resources cannot be launched reliably, design a separate fail-c
   experts required by each placement and send only that set. Because existing
   safetensors files can mix placements, support byte-range loading or repack
   once into placement-aligned chunks. Use RDMA into registered host buffers and
-  pinned-host GPU staging first; RTX 3090/ConnectX-3 GPUDirect remains an
-  unsupported A/B experiment rather than a dependency.
+  pinned-host GPU staging first. The installed ConnectX-5 GPU-memory path
+  remains unproven and is not admitted until it passes the explicit A/B in
+  [`speculative-infiniband.md`](speculative-infiniband.md#gpudirect-status-and-later-proof);
+  it is not a dependency.
 - Remaining limitations before general NVIDIA support: ordered explicit GPU subsets and TP2/TP3 live proof contracts are supported for NCCL Tensor placement, but the current harness still requires exactly two hosts with the observed physical 2+1 GPU inventory; KV/workspace/prefix-cache VRAM is not modeled; GPU enumeration still requires NVML even though locality now comes from sysfs; port-wide HCA counter attribution depends on the exclusive lease, strict process preflight, and validated NCCL logs; the SGLang supervisor is not wired into Worker/API lifecycle and proxying; file-backed model-level capability collection and live SM86 GLM/NSA validation remain pending; and live multi-GPU dashboard validation plus broader post-upgrade hardware validation remain pending.
 
 1. **Resource model and discovery**
@@ -399,14 +447,24 @@ If three logical resources cannot be launched reliably, design a separate fail-c
 
 1. Keep both healthy NVIDIA drivers and the verified MLX CUDA 13/NCCL 2.28.9 user-space stack; exact driver versions may differ if both satisfy the CUDA ABI.
 2. A/B test moving dwagon's NUMA-1 RTX 3090 from x8 to a local x16 slot while preserving NVLink.
-3. Keep dwagon's HCA near the NUMA-1 inter-host pipeline stage and fwuff's HCA in its verified x8 NUMA-0 slot.
+3. Keep each installed ConnectX-5 as close as practical to the GPU handling the
+   inter-host boundary. On single-NUMA fwuff, still audit the PCIe root, ACS,
+   IOMMU, BAR, and negotiated link width rather than treating shared NUMA as
+   proof of a valid peer path.
 4. Both QDR rails are operational. Fwuff currently runs two service-owned OpenSM instances, one per direct-connect rail. Reproducible benchmark wrappers must verify and record those stable managers without stopping them, or explicitly replace that policy with lease-owned managers and clean up only the exact processes they launch.
 5. The completed x8/x8 retest improved aggregate throughput from 29.80 to 32.56 Gb/s, only about 9.3%, and did not approach the 1.7x target. Two independent pinned client/server pairs reproduced the same ceiling with zero health-counter deltas, so process-level native dual-port handling is not the sole explanation. Treat shared ConnectX-3/PCIe/host-path behavior as the measured ceiling for the same-direction v4 workload, not as a documented normal MCX354A limit, and preserve v4 for the ConnectX-5 comparison.
-6. Install the selected `MCX555A-ECAT` pair in PCIe 3.0 x16-or-better slots with NUMA/root-complex placement chosen for the inter-host GPU boundary. Re-run the identical perftest, NCCL, and model benchmark manifests over the EDR QSFP28 link.
+6. The selected `MCX555A-ECAT` pair is installed and active at EDR/100G.
+   Capture formal perftest, NCCL, and model benchmark receipts over the QSFP28
+   link before replacing the preserved QDR baseline with any application-level
+   performance claim.
 7. Free at least 650 GB on dwagon and retain at least 300 GB free on fwuff before full GLM-5.2 staging. Use NFS only for initial loading, not the inference hot path.
 8. Do not add slower nodes until profiling proves their memory contribution exceeds their pipeline/network penalty.
 
 ### RDMA HCA upgrade research (2026-07-18)
+
+This section preserves the 2026-07-18 selection rationale. The selected
+ConnectX-5 pair has since been installed; current status is recorded in the
+hardware baseline above.
 
 1. **Completed free fix and diagnosis:** fwuff's ConnectX-3 now negotiates PCIe 3.0 x8. The formal retest reached 32.56 Gb/s aggregate rather than the estimated 55-60 Gb/s. Two independent, per-rail, CPU-pinned `ib_write_bw` pairs also reported 32.56 Gb/s at the receipt's 0.01 Gb/s precision, proving that neither slot width nor the native dual-port process path was the sole bottleneck. QDR exposes 32 Gb/s after line coding per port and PCIe 3.0 x8 is about 63 Gb/s before PCIe overhead, but NVIDIA does not publish an exact dual-port MCX354A aggregate guarantee or declare a one-port aggregate ceiling. If more diagnosis is worthwhile before the ConnectX-5 swap, audit every upstream PCIe bridge, then run reversed same-direction writes and a crossed-direction pair. A crossed result near 63 Gb/s would identify a per-direction DMA/PCIe constraint; another result near 32 Gb/s would make shared HCA core/firmware or total host-path capacity the leading explanation. [ConnectX-3 card manual](https://network.nvidia.com/pdf/user_manuals/ConnectX-3_VPI_Single_and_Dual_QSFP_Port_Adapter_Card_User_Manual.pdf) [PCI-SIG bandwidth FAQ](https://pcisig.com/faq?page=1) [perftest documentation](https://github.com/linux-rdma/perftest)
 2. **Best-value matched pair:** ConnectX-5 VPI `MCX555A-ECAT`, one EDR InfiniBand/100GbE QSFP28 port on PCIe 3.0 x16. Prefer the dual-port `MCX556A-ECAT` only at similar cost because PCIe 3.0 x16 cannot sustain two 100 Gb/s ports simultaneously. A sensible used target is at or below roughly $150 per clean, full-height card. [Official ConnectX-5 VPI specifications](https://networking-docs.nvidia.com/connectx5vpihw/specifications)
@@ -415,7 +473,16 @@ If three logical resources cannot be launched reliably, design a separate fail-c
 5. **Skip ConnectX-7 for the RTX 3090 cluster:** NDR 400 Gb/s requires PCIe 5.0 x16 plus costlier OSFP-era cabling and cooling, while a 3090 and these host-staged paths cannot use the premium. [Official ConnectX-7 specifications](https://networking-docs.nvidia.com/connectx7hw/specifications)
 6. Keep native VPI InfiniBand for the simplest direct connection. Use a passive EDR-rated QSFP28 DAC for ConnectX-4/5 or an HDR-rated QSFP56 DAC for ConnectX-6; do not assume the current QDR QSFP+ optical path will train at EDR/HDR. RoCE-only ConnectX-6 Dx is a fallback only when unusually cheap, since it gives up native InfiniBand and adds Ethernet flow-control configuration.
 7. Place each HCA under the same upstream PCIe root complex/NUMA side as the GPU handling the inter-host boundary, then verify negotiated speed and width with `lspci -vv`. [CUDA GPUDirect RDMA topology guidance](https://docs.nvidia.com/cuda/gpudirect-rdma/)
-8. Do not justify an HCA purchase on GPUDirect or GIN alone. NVIDIA documents GPUDirect RDMA for Tesla/Quadro-class GPUs rather than GeForce; query CUDA device attribute 116 and treat `nvidia-peermem`/DMA-BUF on the RTX 3090 as an unsupported A/B experiment. Host-staged NCCL still benefits from EDR/HDR. [CUDA GPUDirect RDMA documentation](https://docs.nvidia.com/cuda/gpudirect-rdma/) [NCCL GPU Direct troubleshooting](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/troubleshooting/gpu_troubleshooting.html)
+8. Do not justify an HCA purchase on GPUDirect or GIN alone. ConnectX-5
+   satisfies the HCA-generation side, but NVIDIA's current GPU Operator
+   prerequisites include Quadro RTX and RTX GPUs while the general CUDA
+   GPUDirect guide describes Tesla and Quadro availability. The installed
+   fwuff runtime remains unproven: CUDA attributes 116 and 124 are zero on
+   driver 595.71.05 with the open kernel module, and its `perftest` build has no
+   CUDA options. Keep host-staged NCCL as the admitted path and require the
+   explicit data-validated A/B in
+   [`speculative-infiniband.md`](speculative-infiniband.md#gpudirect-status-and-later-proof)
+   before enabling GPUDirect. [CUDA GPUDirect RDMA documentation](https://docs.nvidia.com/cuda/gpudirect-rdma/) [NVIDIA GPUDirect RDMA prerequisites](https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/latest/gpu-operator-rdma.html) [NCCL InfiniBand/GPU Direct troubleshooting](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/troubleshooting/networking_troubleshooting.html)
 9. For more than two or three hosts, use an InfiniBand switch rather than a daisy chain: used SB7xxx/Switch-IB 2 for EDR or QM87xx for HDR. Continue running one OpenSM instance per direct-connect subnet until then.
 
 ## Proof-of-Concept Sequence
@@ -435,7 +502,7 @@ If three logical resources cannot be launched reliably, design a separate fail-c
    .venv/bin/python -c 'from pathlib import Path; from exo.download.download_utils import migrate_hugging_face_local_dir_to_pinned_revision as migrate; from exo.shared.types.common import ModelId; print(migrate(Path("/mnt/sanic/exo/models"), ModelId("mlx-community/Llama-3.2-1B-Instruct-4bit"), "08231374eeacb049a0eade7922910865b8fce912"))'
    ```
 
-3. Completed the formal pre-upgrade x8/x8 InfiniBand baseline: 31.74 Gb/s per standalone rail, 32.56 Gb/s native dual-port aggregate, and 32.56 Gb/s for two independent concurrent pairs. All selected health/error deltas were zero. Use `/var/lib/exo/benchmarks/ib-qdr-x8x8-independent-20260718-v4` for the later ConnectX-5 A/B comparison.
+3. Completed the formal pre-upgrade x8/x8 InfiniBand baseline: 31.74 Gb/s per standalone rail, 32.56 Gb/s native dual-port aggregate, and 32.56 Gb/s for two independent concurrent pairs. All selected health/error deltas were zero. Use `/var/lib/exo/benchmarks/ib-qdr-x8x8-independent-20260718-v4` for the matched comparison against the installed ConnectX-5 path.
 4. Completed the strict Tensor=3 proof for `mlx-community/SmolLM2-135M-Instruct-8bit@0f0d9b8218915bc34d401e1a340b8c049d300d5e`. The model-stage receipt at `/var/lib/exo/benchmarks/smollm2-stage-20260718-v1`, TP1 oracle at `/var/lib/exo/benchmarks/tp1-smollm2-20260718-v1`, and three-rank proof at `/var/lib/exo/benchmarks/tp3-smollm2-20260718-v6` together bind identical revision-pinned model snapshots and deterministic output. The live proof exercised two runners on dwagon plus one on fwuff, explicit GPU ownership, distributed initialization, forced IB/NCCL, model load/warmup/generation, deletion, process termination, and resource release. Its timing remains diagnostic because this historical v6 receipt predates the HCA payload-counter evidence.
 5. Completed the pinned stage, deterministic TP1 oracle, and strict Tensor=2 proof for `mlx-community/Llama-3.2-3B-Instruct-4bit@7f0dc925e0d0afb0322d96f9255cfddf2ba5636e`. The receipts at `/var/lib/exo/benchmarks/llama32-3b-stage-20260718-v1`, `/var/lib/exo/benchmarks/tp1-llama32-3b-20260718-v1`, and `/var/lib/exo/benchmarks/tp2-llama32-3b-20260718-v1` bind identical model snapshots and output. The TP2 run used one selected dwagon GPU plus fwuff's GPU, preserved the unused dwagon GPU as observed but unowned, and proved that both QDR rails carried the bracketed NCCL workload with clean health counters.
 6. Completed the pinned stage, deterministic TP1 oracle, and strict Tensor=2 proof for `mlx-community/Llama-3.1-8B-Instruct-4bit@90215b22ec18e72f623dde2ea7af4097025160e2`. The receipts at `/var/lib/exo/benchmarks/llama31-8b-stage-20260718-v1`, `/var/lib/exo/benchmarks/tp1-llama31-8b-20260718-v1`, and `/var/lib/exo/benchmarks/tp2-llama31-8b-20260718-v1` bind identical model snapshots and output. The TP2 run again proved payload on both QDR rails with clean health counters.
@@ -492,7 +559,7 @@ otherwise format and topology effects would be confounded. Preserve every
 attempt, including regressions, in `test_results.md` and its immutable run
 manifest under `/var/lib/exo/benchmarks/`.
 
-### Pre-ConnectX-5 MLX/NCCL benchmark ladder
+### Pre-ConnectX-5 MLX/NCCL benchmark ladder (historical)
 
 Run Tensor=2, concurrency 1, prefix cache off, and require at least 1 GiB free VRAM per rank. Use 256/4K/8K contexts for the last two models; test 8K and then 32K on smaller models where headroom permits. Each checkpoint must be present on both nodes.
 

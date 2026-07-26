@@ -1,0 +1,16 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jimm <jimm@jimm.horse>
+Date: Sat, 25 Jul 2026 15:24:23 -0400
+Subject: [PATCH 3/6] build: pin fail-closed hybrid MTP admission
+
+---
+ third_party/sglang | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/third_party/sglang b/third_party/sglang
+index a2c52a18fa8ea93a273678e938d9fcfdf8cad87c..f8e017ff6b528f9236966dc8c6d3b078e38c32e6 160000
+--- a/third_party/sglang
++++ b/third_party/sglang
+@@ -1 +1 @@
+-Subproject commit a2c52a18fa8ea93a273678e938d9fcfdf8cad87c
++Subproject commit f8e017ff6b528f9236966dc8c6d3b078e38c32e6

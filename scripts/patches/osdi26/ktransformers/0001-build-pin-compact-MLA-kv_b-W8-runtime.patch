@@ -1,0 +1,16 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jimm <jimm@jimm.horse>
+Date: Sat, 25 Jul 2026 14:38:00 -0400
+Subject: [PATCH 1/6] build: pin compact MLA kv_b W8 runtime
+
+---
+ third_party/sglang | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/third_party/sglang b/third_party/sglang
+index 1218b2f8965b5a27c9d9004ff9324373414be322..ec248edc186fd43e03a8dfae79bf30d41eab3ddc 160000
+--- a/third_party/sglang
++++ b/third_party/sglang
+@@ -1 +1 @@
+-Subproject commit 1218b2f8965b5a27c9d9004ff9324373414be322
++Subproject commit ec248edc186fd43e03a8dfae79bf30d41eab3ddc

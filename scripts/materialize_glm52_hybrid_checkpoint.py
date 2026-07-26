@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Materialize the immutable GLM-5.2 AMXINT4 + Marlin-INT8 checkpoint.
+"""Materialize the immutable GLM-5.2 AMXINT4 + Ampere W8 checkpoint.
 
 The source Hugging Face checkpoint contains the complete BF16 model.  This
 offline converter writes a much smaller, self-contained GPU-body checkpoint:
@@ -9,14 +9,15 @@ offline converter writes a much smaller, self-contained GPU-body checkpoint:
 * admitted large LinearBase matrices are converted to symmetric,
   per-output-channel W8A16 GPTQ layout (packed INT32 qweight plus BF16 scale);
 * each NSA ``kv_b_proj`` is transposed/split offline into compact per-head KC
-  and VC matrices in the exact grouped-Marlin W8 layout used on Ampere;
+  and VC matrices in a backend-neutral GPTQ W8 layout used directly by Triton
+  or compact-to-compact repacked for grouped Marlin;
 * embeddings, norms, routers, sensitive scalars, and the MTP ``eh_proj`` remain
   byte-identical to the BF16 source.
 
-SGLang's GPTQ-Marlin loader consumes the packed representation directly and
-performs only a compact INT8-to-Marlin repack.  It never expands these weights
-back to BF16.  The specialized ``kv_b_proj`` tensors are already in Marlin
-layout, so even that compact-to-compact repack is absent.
+SGLang consumes the compact representation directly.  Ordinary linears and
+the Marlin ``kv_b_proj`` backend perform only an INT8-to-INT8 layout repack;
+the Triton ``kv_b_proj`` backend bit-extracts the serialized GPTQ words
+directly.  Neither backend expands persistent weights back to BF16.
 
 The destination is staged on the destination filesystem, content-addressed,
 renamed atomically, and made read-only.  Existing destinations are never
@@ -39,7 +40,7 @@ import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Final, Literal, cast
 
 import numpy as np
@@ -50,17 +51,17 @@ type JsonValue = JsonScalar | list[JsonValue] | dict[str, JsonValue]
 type JsonObject = dict[str, JsonValue]
 type TensorDisposition = Literal[
     "quantize_int8",
-    "quantize_mla_kv_b_marlin",
+    "quantize_mla_kv_b_w8",
     "preserve_bf16",
     "omit_expert",
 ]
 type OutputTensorKind = Literal[
     "quantized_qweight",
     "quantized_scale",
-    "mla_kc_marlin_qweight",
-    "mla_kc_marlin_scale",
-    "mla_vc_marlin_qweight",
-    "mla_vc_marlin_scale",
+    "mla_kc_qweight",
+    "mla_kc_scale",
+    "mla_vc_qweight",
+    "mla_vc_scale",
     "preserved",
 ]
 
@@ -81,8 +82,12 @@ DEFAULT_EXPERT_MANIFEST_PATH: Final = Path(
 INDEX_FILENAME: Final = "model.safetensors.index.json"
 MANIFEST_FILENAME: Final = "hybrid-checkpoint-manifest.json"
 QUANT_CONFIG_FILENAME: Final = "quantize_config.json"
-MANIFEST_KIND: Final = "glm52_amxint4_marlin_int8_hybrid_checkpoint"
+MANIFEST_KIND: Final = "glm52_amxint4_ampere_w8a16_hybrid_checkpoint"
 MANIFEST_SCHEMA_VERSION: Final = 1
+EXPERT_MANIFEST_KIND: Final = "kt_shared_host_weights_manifest"
+EXPERT_CONTENT_KIND: Final = "kt_shared_host_weights_content"
+EXPERT_MANIFEST_SCHEMA_VERSION: Final = 1
+EXPERT_NUMA_NODES: Final = (0, 1)
 DEFAULT_MAXIMUM_SHARD_BYTES: Final = 4 * 1024**3
 DEFAULT_QUANTIZATION_CHUNK_BYTES: Final = 128 * 1024**2
 MAXIMUM_JSON_BYTES: Final = 64 * 1024**2
@@ -137,7 +142,6 @@ MLA_NUM_HEADS: Final = 64
 MLA_QK_NOPE_HEAD_DIM: Final = 192
 MLA_V_HEAD_DIM: Final = 256
 MLA_KV_LORA_RANK: Final = 512
-MARLIN_TILE_SIZE: Final = 16
 MARLIN_W8_PACK_FACTOR: Final = 4
 MARLIN_MOE_BLOCK_SIZE_M: Final = 8
 
@@ -152,6 +156,28 @@ class FileIdentity:
     inode: int
     size_bytes: int
     modified_ns: int
+    changed_ns: int
+    mode: int
+
+
+@dataclass(frozen=True, slots=True)
+class DirectoryIdentity:
+    device: int
+    inode: int
+    modified_ns: int
+    changed_ns: int
+    mode: int
+
+
+@dataclass(frozen=True, slots=True)
+class ExpertArtifactIdentity:
+    weight_path: Path
+    directory_identity: DirectoryIdentity
+    manifest_path: Path
+    manifest_identity: FileIdentity
+    manifest_sha256: str
+    content_id: str
+    file_identities: Mapping[Path, FileIdentity]
 
 
 @dataclass(frozen=True, slots=True)
@@ -213,10 +239,7 @@ class ConversionPlan:
     dispositions: Mapping[str, TensorDisposition]
     output_shards: tuple[OutputShard, ...]
     omitted_expert_names_sha256: str
-    expert_weight_path: Path
-    expert_manifest_path: Path
-    expert_manifest_sha256: str
-    expert_content_id: str
+    expert_artifact: ExpertArtifactIdentity
 
     @property
     def output_tensor_count(self) -> int:
@@ -276,6 +299,24 @@ def _file_identity(path: Path) -> FileIdentity:
         inode=status.st_ino,
         size_bytes=status.st_size,
         modified_ns=status.st_mtime_ns,
+        changed_ns=status.st_ctime_ns,
+        mode=status.st_mode,
+    )
+
+
+def _directory_identity(path: Path) -> DirectoryIdentity:
+    try:
+        status = path.lstat()
+    except OSError as error:
+        raise HybridCheckpointError(f"cannot stat required directory {path}") from error
+    if path.is_symlink() or not stat.S_ISDIR(status.st_mode):
+        raise HybridCheckpointError(f"required directory must be a non-symlink: {path}")
+    return DirectoryIdentity(
+        device=status.st_dev,
+        inode=status.st_ino,
+        modified_ns=status.st_mtime_ns,
+        changed_ns=status.st_ctime_ns,
+        mode=status.st_mode,
     )
 
 
@@ -298,13 +339,10 @@ def _read_bounded_json(path: Path, description: str) -> JsonObject:
 
 
 def _checked_shape(value: object, tensor_name: str) -> tuple[int, ...]:
-    if (
-        not isinstance(value, list)
-        or any(not isinstance(dimension, int) or dimension < 0 for dimension in value)
+    if not isinstance(value, list) or any(
+        not isinstance(dimension, int) or dimension < 0 for dimension in value
     ):
-        raise HybridCheckpointError(
-            f"{tensor_name} has an invalid safetensors shape"
-        )
+        raise HybridCheckpointError(f"{tensor_name} has an invalid safetensors shape")
     return tuple(cast(list[int], value))
 
 
@@ -393,13 +431,11 @@ def _validate_glm52_config(
     architectures = config.get("architectures")
     if architectures != ["GlmMoeDsaForCausalLM"]:
         failures.append(
-            f"architectures={architectures!r} "
-            "(expected ['GlmMoeDsaForCausalLM'])"
+            f"architectures={architectures!r} (expected ['GlmMoeDsaForCausalLM'])"
         )
     if failures:
         raise HybridCheckpointError(
-            "source config is not the admitted GLM-5.2 topology: "
-            + "; ".join(failures)
+            "source config is not the admitted GLM-5.2 topology: " + "; ".join(failures)
         )
     return config_sha256
 
@@ -435,8 +471,7 @@ def _load_source_tensors(
         )
     weight_map = cast(dict[str, str], raw_weight_map)
     if any(
-        Path(filename).name != filename
-        or not filename.endswith(".safetensors")
+        Path(filename).name != filename or not filename.endswith(".safetensors")
         for filename in weight_map.values()
     ):
         raise HybridCheckpointError("source index contains unsafe shard paths")
@@ -508,7 +543,7 @@ def classify_source_tensor(tensor: SourceTensor) -> TensorDisposition:
                 f"{tensor.name} dtype={tensor.dtype} shape={tensor.shape}, "
                 f"expected=BF16{expected_shape}"
             )
-        return "quantize_mla_kv_b_marlin"
+        return "quantize_mla_kv_b_w8"
     if QUANTIZED_WEIGHT_PATTERN.fullmatch(tensor.name):
         if tensor.dtype != "BF16" or len(tensor.shape) != 2:
             raise HybridCheckpointError(
@@ -545,48 +580,46 @@ def _output_unit(
             ),
         )
 
-    if disposition == "quantize_mla_kv_b_marlin":
+    if disposition == "quantize_mla_kv_b_w8":
         stem = tensor.name.removesuffix(".weight")
         kc_qweight = OutputTensor(
-            name=f"{stem}.kc_marlin_qweight",
+            name=f"{stem}.kc_qweight",
             dtype="I32",
             shape=(
                 MLA_NUM_HEADS,
-                MLA_QK_NOPE_HEAD_DIM // MARLIN_TILE_SIZE,
-                MLA_KV_LORA_RANK * MARLIN_W8_PACK_FACTOR,
+                MLA_QK_NOPE_HEAD_DIM // MARLIN_W8_PACK_FACTOR,
+                MLA_KV_LORA_RANK,
             ),
-            size_bytes=MLA_NUM_HEADS
-            * MLA_QK_NOPE_HEAD_DIM
-            * MLA_KV_LORA_RANK,
-            kind="mla_kc_marlin_qweight",
+            size_bytes=MLA_NUM_HEADS * MLA_QK_NOPE_HEAD_DIM * MLA_KV_LORA_RANK,
+            kind="mla_kc_qweight",
             source_name=tensor.name,
         )
         kc_scales = OutputTensor(
-            name=f"{stem}.kc_marlin_scales",
+            name=f"{stem}.kc_scales",
             dtype="BF16",
             shape=(MLA_NUM_HEADS, 1, MLA_KV_LORA_RANK),
             size_bytes=2 * MLA_NUM_HEADS * MLA_KV_LORA_RANK,
-            kind="mla_kc_marlin_scale",
+            kind="mla_kc_scale",
             source_name=tensor.name,
         )
         vc_qweight = OutputTensor(
-            name=f"{stem}.vc_marlin_qweight",
+            name=f"{stem}.vc_qweight",
             dtype="I32",
             shape=(
                 MLA_NUM_HEADS,
-                MLA_KV_LORA_RANK // MARLIN_TILE_SIZE,
-                MLA_V_HEAD_DIM * MARLIN_W8_PACK_FACTOR,
+                MLA_KV_LORA_RANK // MARLIN_W8_PACK_FACTOR,
+                MLA_V_HEAD_DIM,
             ),
             size_bytes=MLA_NUM_HEADS * MLA_KV_LORA_RANK * MLA_V_HEAD_DIM,
-            kind="mla_vc_marlin_qweight",
+            kind="mla_vc_qweight",
             source_name=tensor.name,
         )
         vc_scales = OutputTensor(
-            name=f"{stem}.vc_marlin_scales",
+            name=f"{stem}.vc_scales",
             dtype="BF16",
             shape=(MLA_NUM_HEADS, 1, MLA_V_HEAD_DIM),
             size_bytes=2 * MLA_NUM_HEADS * MLA_V_HEAD_DIM,
-            kind="mla_vc_marlin_scale",
+            kind="mla_vc_scale",
             source_name=tensor.name,
         )
         return OutputUnit(
@@ -653,20 +686,171 @@ def _expert_artifact_identity(
     expert_weight_path: Path,
     expert_manifest_path: Path,
     expected_content_id: str,
-) -> tuple[str, str]:
+) -> ExpertArtifactIdentity:
     if not expert_weight_path.is_absolute() or not expert_weight_path.is_dir():
         raise HybridCheckpointError(
             f"expert weight path must be an existing absolute directory: "
             f"{expert_weight_path}"
         )
+    directory_identity = _directory_identity(expert_weight_path)
+    if directory_identity.mode & 0o222:
+        raise HybridCheckpointError(
+            f"AMXINT4 expert directory must be immutable: {expert_weight_path}"
+        )
+    manifest_identity = _file_identity(expert_manifest_path)
+    if manifest_identity.mode & 0o222:
+        raise HybridCheckpointError(
+            f"AMXINT4 expert manifest must be immutable: {expert_manifest_path}"
+        )
     manifest = _read_bounded_json(expert_manifest_path, "AMXINT4 expert manifest")
+    if set(manifest) != {
+        "content_id",
+        "files",
+        "kind",
+        "numa_nodes",
+        "schema_version",
+    }:
+        raise HybridCheckpointError(
+            "AMXINT4 expert manifest has unexpected or missing fields"
+        )
+    if (
+        manifest.get("kind") != EXPERT_MANIFEST_KIND
+        or manifest.get("schema_version") != EXPERT_MANIFEST_SCHEMA_VERSION
+        or manifest.get("numa_nodes") != list(EXPERT_NUMA_NODES)
+    ):
+        raise HybridCheckpointError(
+            "AMXINT4 expert manifest has an unsupported schema or NUMA order"
+        )
     content_id = manifest.get("content_id")
     if content_id != expected_content_id:
         raise HybridCheckpointError(
             "AMXINT4 expert content ID differs from the pinned artifact: "
             f"expected={expected_content_id}, actual={content_id!r}"
         )
-    return expected_content_id, _sha256_file(expert_manifest_path)
+    raw_files = manifest.get("files")
+    if not isinstance(raw_files, list) or not raw_files:
+        raise HybridCheckpointError("AMXINT4 expert manifest has no files")
+
+    content_rows: list[JsonValue] = []
+    relative_paths: list[str] = []
+    expected_hashes: dict[str, str] = {}
+    expected_sizes: dict[str, int] = {}
+    for raw_file in cast(list[object], raw_files):
+        if not isinstance(raw_file, dict) or set(raw_file) != {
+            "path",
+            "sha256",
+            "size_bytes",
+        }:
+            raise HybridCheckpointError(
+                "AMXINT4 expert manifest file row has an invalid schema"
+            )
+        file_row = cast(dict[str, object], raw_file)
+        relative_path = file_row.get("path")
+        sha256 = file_row.get("sha256")
+        size_bytes = file_row.get("size_bytes")
+        if not isinstance(relative_path, str) or not relative_path:
+            raise HybridCheckpointError(
+                "AMXINT4 expert manifest contains an invalid file path"
+            )
+        pure_path = PurePosixPath(relative_path)
+        if (
+            pure_path.is_absolute()
+            or len(pure_path.parts) != 1
+            or pure_path.name != relative_path
+            or relative_path in {".", ".."}
+            or "\x00" in relative_path
+        ):
+            raise HybridCheckpointError(
+                f"AMXINT4 expert manifest contains an unsafe path: {relative_path!r}"
+            )
+        if (
+            not isinstance(sha256, str)
+            or len(sha256) != 64
+            or any(character not in "0123456789abcdef" for character in sha256)
+            or isinstance(size_bytes, bool)
+            or not isinstance(size_bytes, int)
+            or size_bytes < 0
+        ):
+            raise HybridCheckpointError(
+                f"AMXINT4 expert manifest metadata is invalid: {relative_path}"
+            )
+        relative_paths.append(relative_path)
+        expected_hashes[relative_path] = sha256
+        expected_sizes[relative_path] = size_bytes
+        content_rows.append(
+            {
+                "path": relative_path,
+                "sha256": sha256,
+                "size_bytes": size_bytes,
+            }
+        )
+    if relative_paths != sorted(relative_paths) or len(relative_paths) != len(
+        set(relative_paths)
+    ):
+        raise HybridCheckpointError(
+            "AMXINT4 expert manifest paths must be unique and sorted"
+        )
+    calculated_content_id = _sha256_bytes(
+        _canonical_json_bytes(
+            {
+                "files": content_rows,
+                "kind": EXPERT_CONTENT_KIND,
+                "schema_version": EXPERT_MANIFEST_SCHEMA_VERSION,
+            }
+        )
+    )
+    if calculated_content_id != expected_content_id:
+        raise HybridCheckpointError(
+            "AMXINT4 expert content ID does not authenticate its file table"
+        )
+
+    actual_entries = tuple(sorted(expert_weight_path.iterdir()))
+    actual_names = tuple(entry.name for entry in actual_entries)
+    if actual_names != tuple(relative_paths):
+        raise HybridCheckpointError(
+            "AMXINT4 expert directory contents differ from its manifest"
+        )
+    file_identities: dict[Path, FileIdentity] = {}
+    for entry in actual_entries:
+        identity_before = _file_identity(entry)
+        if identity_before.mode & 0o222:
+            raise HybridCheckpointError(
+                f"AMXINT4 expert file must be immutable: {entry}"
+            )
+        if identity_before.size_bytes != expected_sizes[entry.name]:
+            raise HybridCheckpointError(
+                f"AMXINT4 expert file size differs from its manifest: {entry}"
+            )
+        observed_sha256 = _sha256_file(entry)
+        identity_after = _file_identity(entry)
+        if identity_after != identity_before:
+            raise HybridCheckpointError(
+                f"AMXINT4 expert file changed while hashing: {entry}"
+            )
+        if observed_sha256 != expected_hashes[entry.name]:
+            raise HybridCheckpointError(
+                f"AMXINT4 expert file hash differs from its manifest: {entry}"
+            )
+        file_identities[entry] = identity_before
+
+    manifest_sha256 = _sha256_file(expert_manifest_path)
+    if _file_identity(expert_manifest_path) != manifest_identity:
+        raise HybridCheckpointError(
+            "AMXINT4 expert manifest changed while being authenticated"
+        )
+    if _directory_identity(expert_weight_path) != directory_identity:
+        raise HybridCheckpointError(
+            "AMXINT4 expert directory changed while being authenticated"
+        )
+    return ExpertArtifactIdentity(
+        weight_path=expert_weight_path,
+        directory_identity=directory_identity,
+        manifest_path=expert_manifest_path,
+        manifest_identity=manifest_identity,
+        manifest_sha256=manifest_sha256,
+        content_id=expected_content_id,
+        file_identities=file_identities,
+    )
 
 
 def build_conversion_plan(
@@ -698,9 +882,8 @@ def build_conversion_plan(
     identities = dict(identities)
     identities[config_path] = _file_identity(config_path)
 
-    dispositions = {
-        name: classify_source_tensor(tensor)
-        for name, tensor in source_tensors.items()
+    dispositions: dict[str, TensorDisposition] = {
+        name: classify_source_tensor(tensor) for name, tensor in source_tensors.items()
     }
     omitted_names = sorted(
         name
@@ -732,7 +915,7 @@ def build_conversion_plan(
     mla_kv_b_names = [
         name
         for name, disposition in dispositions.items()
-        if disposition == "quantize_mla_kv_b_marlin"
+        if disposition == "quantize_mla_kv_b_w8"
     ]
     if len(mla_kv_b_names) != 79:
         raise HybridCheckpointError(
@@ -751,16 +934,13 @@ def build_conversion_plan(
     units = tuple(
         unit
         for name in sorted(source_tensors)
-        if (
-            unit := _output_unit(source_tensors[name], dispositions[name])
-        )
-        is not None
+        if (unit := _output_unit(source_tensors[name], dispositions[name])) is not None
     )
     output_names = [tensor.name for unit in units for tensor in unit.tensors]
     if len(output_names) != len(set(output_names)):
         raise HybridCheckpointError("conversion produced duplicate output tensor names")
     output_shards = _plan_output_shards(units, maximum_shard_bytes)
-    expert_content_id, expert_manifest_sha256 = _expert_artifact_identity(
+    expert_artifact = _expert_artifact_identity(
         expert_weight_path.resolve(strict=True),
         expert_manifest_path.resolve(strict=True),
         expected_expert_content_id,
@@ -776,10 +956,7 @@ def build_conversion_plan(
         omitted_expert_names_sha256=_sha256_bytes(
             ("\n".join(omitted_names) + "\n").encode()
         ),
-        expert_weight_path=expert_weight_path.resolve(strict=True),
-        expert_manifest_path=expert_manifest_path.resolve(strict=True),
-        expert_manifest_sha256=expert_manifest_sha256,
-        expert_content_id=expert_content_id,
+        expert_artifact=expert_artifact,
     )
 
 
@@ -940,58 +1117,28 @@ def _quantize_matrix(
         del scales_view
 
 
-def _marlin_w8_weight_permutation() -> NDArray[np.intp]:
-    permutation: list[int] = []
-    for index in range(32):
-        first_level: list[int] = []
-        column = index // 4
-        for block in (0, 1):
-            for row in (
-                2 * (index % 4),
-                2 * (index % 4) + 1,
-                2 * (index % 4 + 4),
-                2 * (index % 4 + 4) + 1,
-            ):
-                first_level.append(16 * row + column + 8 * block)
-        for outer in range(4):
-            permutation.extend(value + 256 * outer for value in first_level)
-    interleave = np.asarray((0, 2, 1, 3), dtype=np.intp)
-    return (
-        np.asarray(permutation, dtype=np.intp)
-        .reshape((-1, MARLIN_W8_PACK_FACTOR))[:, interleave]
-        .reshape(-1)
-    )
-
-
-def _marlin_single_scale_permutation() -> NDArray[np.intp]:
-    permutation: list[int] = []
-    for index in range(4):
-        permutation.extend(
-            2 * index + value for value in (0, 1, 8, 9, 16, 17, 24, 25)
-        )
-    return np.asarray(permutation, dtype=np.intp)
-
-
-def _quantize_direct_marlin_matrix(
+def _quantize_packed_w8_matrix(
     weights: NDArray[np.float32],
 ) -> tuple[NDArray[np.int32], NDArray[np.uint16]]:
-    """Quantize a logical [K, N] matrix to direct uint8b128 Marlin layout."""
+    """Quantize logical ``[K, N]`` to canonical per-head GPTQ W8.
+
+    Four K-adjacent signed INT8 lanes are biased by 128 and serialized in
+    little-endian order into each INT32 word.  Scales remain in logical
+    per-output-channel order. Marlin performs only a compact layout repack
+    after loading.
+    """
 
     if weights.ndim != 2:
         raise HybridCheckpointError(
-            f"direct Marlin input must be rank two, got {weights.shape}"
+            f"packed W8 input must be rank two, got {weights.shape}"
         )
     input_features, output_features = weights.shape
-    if (
-        input_features % MARLIN_TILE_SIZE != 0
-        or output_features % 32 != 0
-    ):
+    if input_features % MARLIN_W8_PACK_FACTOR != 0 or output_features <= 0:
         raise HybridCheckpointError(
-            "direct Marlin matrix is not tile aligned: "
-            f"shape={weights.shape}"
+            f"packed W8 matrix cannot pack four K lanes: shape={weights.shape}"
         )
     if not np.isfinite(weights).all():
-        raise HybridCheckpointError("direct Marlin matrix contains NaN or infinity")
+        raise HybridCheckpointError("packed W8 matrix contains NaN or infinity")
 
     maximum = np.max(weights, axis=0)
     minimum = np.min(weights, axis=0)
@@ -1008,40 +1155,14 @@ def _quantize_direct_marlin_matrix(
     stored_scales = _bf16_bits_to_float32(scale_bits)
     signed = np.rint(weights / stored_scales[np.newaxis, :])
     signed = np.clip(signed, -128, 127).astype(np.int16)
-    unsigned = (signed + np.int16(128)).astype(np.uint8)
-
-    tiled = (
-        unsigned.reshape(
-            (
-                input_features // MARLIN_TILE_SIZE,
-                MARLIN_TILE_SIZE,
-                output_features // MARLIN_TILE_SIZE,
-                MARLIN_TILE_SIZE,
-            )
-        )
-        .transpose((0, 2, 1, 3))
-        .reshape((input_features // MARLIN_TILE_SIZE, output_features * 16))
-    )
-    weight_permutation = _marlin_w8_weight_permutation()
-    permuted = (
-        tiled.reshape((-1, weight_permutation.size))[:, weight_permutation]
-        .reshape(tiled.shape)
-        .astype(np.uint32)
-    )
+    unsigned = (signed + np.int16(128)).astype(np.uint32)
     packed = (
-        permuted[:, 0::4]
-        | (permuted[:, 1::4] << np.uint32(8))
-        | (permuted[:, 2::4] << np.uint32(16))
-        | (permuted[:, 3::4] << np.uint32(24))
-    ).view(np.int32)
-
-    scale_permutation = _marlin_single_scale_permutation()
-    permuted_scale_bits = (
-        scale_bits.reshape((-1, scale_permutation.size))[:, scale_permutation]
-        .reshape((1, output_features))
-        .astype(np.uint16)
+        unsigned[0::4]
+        | (unsigned[1::4] << np.uint32(8))
+        | (unsigned[2::4] << np.uint32(16))
+        | (unsigned[3::4] << np.uint32(24))
     )
-    return packed, permuted_scale_bits
+    return packed.view(np.int32), scale_bits.reshape((1, output_features))
 
 
 def _quantize_mla_kv_b_matrix(
@@ -1057,27 +1178,27 @@ def _quantize_mla_kv_b_matrix(
         raise AssertionError("MLA kv_b source contract was not validated")
     stem = source.name.removesuffix(".weight")
     output_specs = {
-        "kc_marlin_qweight": (
+        "kc_qweight": (
             "<i4",
             (
                 MLA_NUM_HEADS,
-                MLA_QK_NOPE_HEAD_DIM // MARLIN_TILE_SIZE,
-                MLA_KV_LORA_RANK * MARLIN_W8_PACK_FACTOR,
+                MLA_QK_NOPE_HEAD_DIM // MARLIN_W8_PACK_FACTOR,
+                MLA_KV_LORA_RANK,
             ),
         ),
-        "kc_marlin_scales": (
+        "kc_scales": (
             "<u2",
             (MLA_NUM_HEADS, 1, MLA_KV_LORA_RANK),
         ),
-        "vc_marlin_qweight": (
+        "vc_qweight": (
             "<i4",
             (
                 MLA_NUM_HEADS,
-                MLA_KV_LORA_RANK // MARLIN_TILE_SIZE,
-                MLA_V_HEAD_DIM * MARLIN_W8_PACK_FACTOR,
+                MLA_KV_LORA_RANK // MARLIN_W8_PACK_FACTOR,
+                MLA_V_HEAD_DIM,
             ),
         ),
-        "vc_marlin_scales": (
+        "vc_scales": (
             "<u2",
             (MLA_NUM_HEADS, 1, MLA_V_HEAD_DIM),
         ),
@@ -1120,12 +1241,12 @@ def _quantize_mla_kv_b_matrix(
                 dtype=np.float32,
                 order="C",
             )
-            kc_qweight, kc_scales = _quantize_direct_marlin_matrix(kc_weight)
-            vc_qweight, vc_scales = _quantize_direct_marlin_matrix(vc_weight)
-            output_views["kc_marlin_qweight"][head] = kc_qweight
-            output_views["kc_marlin_scales"][head] = kc_scales
-            output_views["vc_marlin_qweight"][head] = vc_qweight
-            output_views["vc_marlin_scales"][head] = vc_scales
+            kc_qweight, kc_scales = _quantize_packed_w8_matrix(kc_weight)
+            vc_qweight, vc_scales = _quantize_packed_w8_matrix(vc_weight)
+            output_views["kc_qweight"][head] = kc_qweight
+            output_views["kc_scales"][head] = kc_scales
+            output_views["vc_qweight"][head] = vc_qweight
+            output_views["vc_scales"][head] = vc_scales
         for view in output_views.values():
             view.flush()
     finally:
@@ -1170,7 +1291,7 @@ def _write_output_shard(
                 offsets,
                 chunk_bytes=quantization_chunk_bytes,
             )
-        elif unit.tensors[0].kind == "mla_kc_marlin_qweight":
+        elif unit.tensors[0].kind == "mla_kc_qweight":
             _quantize_mla_kv_b_matrix(
                 unit.source,
                 destination_path,
@@ -1189,19 +1310,23 @@ def _quantization_config() -> JsonObject:
         "bits": 8,
         "checkpoint_format": "gptq",
         "desc_act": False,
-        "dynamic": {
-            pattern: {} for pattern in QUANTIZATION_DYNAMIC_EXCLUSIONS
-        },
+        "dynamic": {pattern: {} for pattern in QUANTIZATION_DYNAMIC_EXCLUSIONS},
         "group_size": -1,
         "lm_head": True,
         "quant_method": "gptq",
         "sym": True,
-        "exo_mla_kv_b_marlin": {
+        "exo_mla_kv_b_w8": {
+            "bits": 8,
             "block_size_m": MARLIN_MOE_BLOCK_SIZE_M,
-            "format": "marlin_moe_uint8b128_v1",
+            "format": "gptq_packed_rows_per_head_v1",
+            "implicit_bias": 128,
             "kv_lora_rank": MLA_KV_LORA_RANK,
             "num_attention_heads": MLA_NUM_HEADS,
+            "pack_axis": "K",
+            "pack_order": "little_endian_k_lanes_0_1_2_3",
             "qk_nope_head_dim": MLA_QK_NOPE_HEAD_DIM,
+            "scale_compute_dtype": "float32",
+            "scale_dtype": "bfloat16",
             "v_head_dim": MLA_V_HEAD_DIM,
         },
     }
@@ -1302,9 +1427,7 @@ def _disposition_summary(
     disposition: TensorDisposition,
 ) -> JsonObject:
     names = [
-        name
-        for name, actual in plan.dispositions.items()
-        if actual == disposition
+        name for name, actual in plan.dispositions.items() if actual == disposition
     ]
     source_bytes = sum(plan.source_tensors[name].size_bytes for name in names)
     return {
@@ -1334,7 +1457,37 @@ def _tensor_manifest(plan: ConversionPlan) -> list[JsonValue]:
     return rows
 
 
-def _validate_source_identities(plan: ConversionPlan) -> None:
+def _validate_expert_artifact_identity(
+    artifact: ExpertArtifactIdentity,
+) -> None:
+    if _directory_identity(artifact.weight_path) != artifact.directory_identity:
+        raise HybridCheckpointError(
+            "AMXINT4 expert directory changed during conversion"
+        )
+    if _file_identity(artifact.manifest_path) != artifact.manifest_identity:
+        raise HybridCheckpointError("AMXINT4 expert manifest changed during conversion")
+    if _sha256_file(artifact.manifest_path) != artifact.manifest_sha256:
+        raise HybridCheckpointError(
+            "AMXINT4 expert manifest content changed during conversion"
+        )
+    changed_files = [
+        str(path)
+        for path, identity in artifact.file_identities.items()
+        if _file_identity(path) != identity
+    ]
+    if changed_files:
+        raise HybridCheckpointError(
+            f"AMXINT4 expert files changed during conversion: {changed_files[:3]}"
+        )
+    actual_names = tuple(sorted(entry.name for entry in artifact.weight_path.iterdir()))
+    expected_names = tuple(sorted(path.name for path in artifact.file_identities))
+    if actual_names != expected_names:
+        raise HybridCheckpointError(
+            "AMXINT4 expert directory contents changed during conversion"
+        )
+
+
+def _validate_input_identities(plan: ConversionPlan) -> None:
     changed = [
         str(path)
         for path, identity in plan.source_file_identities.items()
@@ -1348,16 +1501,52 @@ def _validate_source_identities(plan: ConversionPlan) -> None:
         raise HybridCheckpointError("source index content changed during conversion")
     if _sha256_file(plan.source_root / "config.json") != plan.source_config_sha256:
         raise HybridCheckpointError("source config content changed during conversion")
+    _validate_expert_artifact_identity(plan.expert_artifact)
+
+
+def _manifest_quantization_contract() -> JsonObject:
+    return {
+        "activation_dtype": "BF16",
+        "algorithm": "symmetric_per_output_channel_absmax_rne",
+        "checkpoint_layout": {
+            "ordinary_linear": "gptq_packed_rows",
+            "mla_kv_b": "gptq_packed_rows_per_head_v1",
+        },
+        "group_size": -1,
+        "kernel": {
+            "ordinary_linear": "gptq_marlin_w8a16",
+            "mla_kv_b": "grouped_marlin_w8a16",
+        },
+        "mla_kv_b": {
+            "block_size_m": MARLIN_MOE_BLOCK_SIZE_M,
+            "force_absorbed_mla": True,
+            "implicit_bias": 128,
+            "kv_lora_rank": MLA_KV_LORA_RANK,
+            "num_attention_heads": MLA_NUM_HEADS,
+            "pack_axis": "K",
+            "pack_order": "little_endian_k_lanes_0_1_2_3",
+            "qk_nope_head_dim": MLA_QK_NOPE_HEAD_DIM,
+            "scale_compute_dtype": "float32",
+            "scale_dtype": "bfloat16",
+            "v_head_dim": MLA_V_HEAD_DIM,
+        },
+        "serialized_scale_dtype": "BF16",
+        "serialized_weight_dtype": "INT8_biased_by_128_packed_in_INT32",
+        "temporary_bf16_expansion_at_load": False,
+        "ordinary_linear_compact_to_compact_marlin_repack_at_load": True,
+        "mla_kv_b_compact_to_compact_marlin_repack_at_load": True,
+        "dynamic_exclusions": list(QUANTIZATION_DYNAMIC_EXCLUSIONS),
+    }
 
 
 def _plan_receipt(plan: ConversionPlan) -> JsonObject:
     return {
         "expert_checkpoint": {
-            "content_id": plan.expert_content_id,
-            "manifest_path": str(plan.expert_manifest_path),
-            "manifest_sha256": plan.expert_manifest_sha256,
+            "content_id": plan.expert_artifact.content_id,
+            "manifest_path": str(plan.expert_artifact.manifest_path),
+            "manifest_sha256": plan.expert_artifact.manifest_sha256,
             "method": "AMXINT4",
-            "weight_path": str(plan.expert_weight_path),
+            "weight_path": str(plan.expert_artifact.weight_path),
         },
         "kind": MANIFEST_KIND,
         "output": {
@@ -1369,38 +1558,10 @@ def _plan_receipt(plan: ConversionPlan) -> JsonObject:
             "omit_expert": _disposition_summary(plan, "omit_expert"),
             "preserve_bf16": _disposition_summary(plan, "preserve_bf16"),
             "quantize_int8": _disposition_summary(plan, "quantize_int8"),
-            "quantize_mla_kv_b_marlin": _disposition_summary(
-                plan, "quantize_mla_kv_b_marlin"
-            ),
+            "quantize_mla_kv_b_w8": _disposition_summary(plan, "quantize_mla_kv_b_w8"),
             "omitted_expert_names_sha256": plan.omitted_expert_names_sha256,
         },
-        "quantization": {
-            "activation_dtype": "BF16",
-            "algorithm": "symmetric_per_output_channel_absmax_rne",
-            "checkpoint_layout": {
-                "ordinary_linear": "gptq_packed_rows",
-                "mla_kv_b": "marlin_moe_uint8b128_v1",
-            },
-            "group_size": -1,
-            "kernel": {
-                "ordinary_linear": "gptq_marlin_w8a16",
-                "mla_kv_b": "grouped_marlin_moe_w8a16",
-            },
-            "mla_kv_b": {
-                "block_size_m": MARLIN_MOE_BLOCK_SIZE_M,
-                "force_absorbed_mla": True,
-                "kv_lora_rank": MLA_KV_LORA_RANK,
-                "num_attention_heads": MLA_NUM_HEADS,
-                "qk_nope_head_dim": MLA_QK_NOPE_HEAD_DIM,
-                "v_head_dim": MLA_V_HEAD_DIM,
-            },
-            "serialized_scale_dtype": "BF16",
-            "serialized_weight_dtype": "INT8_biased_by_128_packed_in_INT32",
-            "temporary_bf16_expansion_at_load": False,
-            "ordinary_linear_compact_to_compact_marlin_repack_at_load": True,
-            "mla_kv_b_compact_repack_at_load": False,
-            "dynamic_exclusions": list(QUANTIZATION_DYNAMIC_EXCLUSIONS),
-        },
+        "quantization": _manifest_quantization_contract(),
         "schema_version": MANIFEST_SCHEMA_VERSION,
         "source_checkpoint": {
             "config_sha256": plan.source_config_sha256,
@@ -1455,7 +1616,7 @@ def materialize_checkpoint(
                 quantization_chunk_bytes=quantization_chunk_bytes,
             )
 
-        _validate_source_identities(plan)
+        _validate_input_identities(plan)
         content_files = sorted(
             [
                 *metadata_files,
@@ -1472,6 +1633,10 @@ def materialize_checkpoint(
                     "size_bytes": _file_identity(path).size_bytes,
                 }
             )
+        # Keep the content ID stable over the executable conversion contract and
+        # hashed checkpoint files. The verbose tensor/source provenance table is
+        # derived metadata; runtime admission separately binds the SHA-256 of the
+        # complete manifest, including that table and the creation timestamp.
         content_contract = _plan_receipt(plan)
         content_contract["files"] = file_rows
         content_id = _sha256_bytes(_canonical_json_bytes(content_contract))
@@ -1610,7 +1775,10 @@ def main() -> int:
             f"payload_bytes={plan.output_payload_bytes}"
         )
     except (HybridCheckpointError, OSError, ValueError) as error:
-        print(f"GLM-5.2 hybrid checkpoint materialization failed: {error}", file=sys.stderr)
+        print(
+            f"GLM-5.2 hybrid checkpoint materialization failed: {error}",
+            file=sys.stderr,
+        )
         return 1
     return 0
 

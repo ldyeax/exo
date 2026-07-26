@@ -5,7 +5,7 @@ One SGLang parent owns both dwagon RTX 3090 devices in the current PCI/NUMA
 order. KTransformers owns all 112 physical CPU cores, both NUMA nodes, and two
 CPUInfer pools. The server is launched once, receives one semantic coherency
 warm-up, and then serves selected deterministic 7,744-input/128-output
-concurrency 1 and/or 2 cases without a restart or cache flush. The default
+concurrency 1, 2, and/or 3 cases without a restart or cache flush. The default
 remains the matched c1/c2 run. A c1-only run admits a correspondingly smaller
 KV pool for VRAM-sensitive MTP and stream-prefill experiments. Every selected
 profile retains a 256-token scheduler admission reserve and a measured VRAM
@@ -58,6 +58,7 @@ type JsonScalar = str | int | float | bool | None
 type JsonValue = JsonScalar | list[JsonValue] | dict[str, JsonValue]
 type JsonObject = dict[str, JsonValue]
 type ExpertPlacementStrategy = Literal["uniform", "frequency"]
+type MlaKvBW8Backend = Literal["marlin"]
 type CapacityCommandRunner = Callable[
     [tuple[str, ...], float],
     subprocess.CompletedProcess[str],
@@ -82,6 +83,15 @@ MODEL_LAYER_COUNT: Final = 78
 ROUTED_LAYER_COUNT: Final = 75
 ROUTED_EXPERT_COUNT: Final = 256
 TOTAL_ROUTED_EXPERT_POSITIONS: Final = ROUTED_LAYER_COUNT * ROUTED_EXPERT_COUNT
+LOCAL_MLA_HEAD_COUNT: Final = 32
+HYBRID_CHECKPOINT_MANIFEST_NAME: Final = "hybrid-checkpoint-manifest.json"
+HYBRID_CHECKPOINT_MANIFEST_KIND: Final = "glm52_amxint4_ampere_w8a16_hybrid_checkpoint"
+HYBRID_CHECKPOINT_MANIFEST_MAXIMUM_BYTES: Final = 8 * 1024 * 1024
+_COMPACT_MLA_BACKEND_MARKER: Final = re.compile(
+    r"\bTP(?P<rank>[01])\] Loaded compact MLA kv_b W8 "
+    r"backend=(?P<backend>triton|marlin) "
+    r"local_heads=(?P<local_heads>[0-9]+)"
+)
 EXPERT_BYTES_PER_TP_RANK: Final = 36 * 1024 * 1024
 ADMITTED_CHUNKED_PREFILL_SIZES: Final = (2_048, 4_096, 8_192)
 
@@ -108,6 +118,8 @@ DEFAULT_SERVICE_PORT: Final = 62710
 DEFAULT_CONTEXT_LENGTH: Final = 9_216
 DEFAULT_BENCHMARK_INPUT_TOKENS: Final = 7_744
 DEFAULT_BENCHMARK_OUTPUT_TOKENS: Final = 128
+DEFAULT_SERVER_RANDOM_SEED: Final = 20_260_725
+ADMITTED_BENCHMARK_CONCURRENCIES: Final = (1, 2, 3)
 DEFAULT_BENCHMARK_CONCURRENCIES: Final = (1, 2)
 DEFAULT_SCHEDULER_TOKEN_HEADROOM: Final = 256
 DEFAULT_MAXIMUM_TOTAL_TOKENS: Final = 16_000
@@ -155,6 +167,11 @@ _EXPERT_RECORDER_DIRECTORY: Final = Path("/tmp")
 _CONCURRENCY_TWO_PROMPT_MARKERS: Final = (
     "Jadeite",
     "Kestrel",
+)
+_CONCURRENCY_THREE_PROMPT_MARKERS: Final = (
+    "Larkspur",
+    "Mica",
+    "Nuthatch",
 )
 _SPECULATIVE_ACCEPT_RATE_FIELD: Final = "spec_accept_rate"
 _SPECULATIVE_ACCEPT_LENGTH_FIELD: Final = "spec_accept_length"
@@ -488,6 +505,7 @@ class BenchmarkConfig:
     init_expert_location: Path | None
     init_expert_location_sha256: str | None
     kv_cache_dtype: Literal["bfloat16", "fp8_e4m3"]
+    mla_kv_b_w8_backend: MlaKvBW8Backend
     enable_two_batch_overlap: bool
     enable_amx_fine_grained_decode: bool
     enable_stream_prefill: bool
@@ -519,6 +537,7 @@ class Glm52Tp2ProcessSpec(tp2.Tp2LocalProcessSpec):
     maximum_total_tokens: int = DEFAULT_MAXIMUM_TOTAL_TOKENS
     maximum_running_requests: int = 2
     kv_cache_dtype: Literal["bfloat16", "fp8_e4m3"] = DEFAULT_KV_CACHE_DTYPE
+    mla_kv_b_w8_backend: MlaKvBW8Backend = "marlin"
     enable_two_batch_overlap: bool = False
     enable_amx_fine_grained_decode: bool = False
     enable_stream_prefill: bool = False
@@ -573,9 +592,14 @@ class Glm52Tp2ProcessSpec(tp2.Tp2LocalProcessSpec):
             raise ValueError("token capacities must be positive")
         if self.kv_cache_dtype not in {"bfloat16", "fp8_e4m3"}:
             raise ValueError("unsupported GLM-5.2 KV cache dtype")
-        if self.maximum_running_requests not in {1, 2}:
+        if self.mla_kv_b_w8_backend != "marlin":
             raise ValueError(
-                "the focused GLM-5.2 TP2 harness requires concurrency 1 or 2"
+                "the focused GLM-5.2 TP2 harness requires the Marlin compact "
+                "MLA kv_b W8 backend"
+            )
+        if self.maximum_running_requests not in ADMITTED_BENCHMARK_CONCURRENCIES:
+            raise ValueError(
+                "the focused GLM-5.2 TP2 harness requires concurrency 1, 2, or 3"
             )
         if self.chunked_prefill_size not in ADMITTED_CHUNKED_PREFILL_SIZES:
             raise ValueError("GLM-5.2 chunked prefill must be 2048, 4096, or 8192")
@@ -749,6 +773,9 @@ class Glm52Tp2ProcessSpec(tp2.Tp2LocalProcessSpec):
             "flashinfer",
             "--kv-cache-dtype",
             self.kv_cache_dtype,
+            *(() if self.enable_mtp else ("--load-format", "safetensors")),
+            "--random-seed",
+            str(DEFAULT_SERVER_RANDOM_SEED),
             "--moe-a2a-backend",
             "none",
             *(("--enable-two-batch-overlap",) if self.enable_two_batch_overlap else ()),
@@ -807,6 +834,7 @@ class Glm52Tp2ProcessSpec(tp2.Tp2LocalProcessSpec):
             ("CUDA_VISIBLE_DEVICES", ",".join(self.ordered_gpu_uuids)),
             ("PYTORCH_ALLOC_CONF", "expandable_segments:True"),
             ("SGLANG_ENABLE_JIT_DEEPGEMM", "0"),
+            ("SGLANG_MLA_KV_B_W8_BACKEND", self.mla_kv_b_w8_backend),
         )
         if self.enable_amx_fine_grained_decode:
             environment = (*environment, ("KT_AMX_FINE_GRAINED_DECODE", "1"))
@@ -839,8 +867,11 @@ class Glm52Tp2ProcessSpec(tp2.Tp2LocalProcessSpec):
             "model": {
                 "model_path": self.model_path,
                 "ktransformers_weight_path": self.ktransformers_weight_path,
-                "weight_dtype": "bfloat16",
+                "compute_dtype": "bfloat16",
+                "activation_dtype": "bfloat16",
+                "weight_storage": "checkpoint_contract",
                 "kv_cache_dtype": self.kv_cache_dtype,
+                "mla_kv_b_w8_backend": self.mla_kv_b_w8_backend,
                 "ktransformers_method": "AMXINT4",
                 "causal_layer_range": [0, MODEL_LAYER_COUNT],
                 "mtp_layer_78_loaded": self.enable_mtp,
@@ -1979,6 +2010,7 @@ def build_process_spec(config: BenchmarkConfig) -> Glm52Tp2ProcessSpec:
         maximum_total_tokens=config.maximum_total_tokens,
         maximum_running_requests=max(config.benchmark_concurrencies),
         kv_cache_dtype=config.kv_cache_dtype,
+        mla_kv_b_w8_backend=config.mla_kv_b_w8_backend,
         enable_two_batch_overlap=config.enable_two_batch_overlap,
         enable_amx_fine_grained_decode=(config.enable_amx_fine_grained_decode),
         enable_stream_prefill=config.enable_stream_prefill,
@@ -2025,6 +2057,195 @@ def _lifecycle_config(config: BenchmarkConfig) -> tp2.Tp2LocalDiagnosticConfig:
     )
 
 
+def _hybrid_checkpoint_manifest_receipt(
+    config: BenchmarkConfig,
+    model_root: Path,
+) -> JsonObject | None:
+    manifest_path = model_root / HYBRID_CHECKPOINT_MANIFEST_NAME
+    if not manifest_path.exists():
+        return None
+    try:
+        root_status = model_root.lstat()
+        manifest_status = manifest_path.lstat()
+    except OSError as error:
+        raise Glm52Tp2BenchmarkError(
+            "hybrid checkpoint manifest identity is unavailable"
+        ) from error
+    if (
+        model_root.is_symlink()
+        or manifest_path.is_symlink()
+        or not manifest_path.is_file()
+        or root_status.st_mode & 0o222
+        or manifest_status.st_mode & 0o222
+    ):
+        raise Glm52Tp2BenchmarkError(
+            "hybrid checkpoint root and manifest must be immutable regular paths"
+        )
+    if not 0 < manifest_status.st_size <= HYBRID_CHECKPOINT_MANIFEST_MAXIMUM_BYTES:
+        raise Glm52Tp2BenchmarkError("hybrid checkpoint manifest exceeds its bound")
+    try:
+        raw_manifest_value = cast(
+            object,
+            json.loads(manifest_path.read_text(encoding="utf-8")),
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise Glm52Tp2BenchmarkError(
+            "hybrid checkpoint manifest is unreadable or invalid"
+        ) from error
+    if not isinstance(raw_manifest_value, dict):
+        raise Glm52Tp2BenchmarkError("hybrid checkpoint manifest is not an object")
+    raw_manifest = cast(dict[str, object], raw_manifest_value)
+    content_id = raw_manifest.get("content_id")
+    if (
+        raw_manifest.get("schema_version") != 1
+        or raw_manifest.get("kind") != HYBRID_CHECKPOINT_MANIFEST_KIND
+        or not isinstance(content_id, str)
+        or len(content_id) != 64
+        or any(character not in "0123456789abcdef" for character in content_id)
+    ):
+        raise Glm52Tp2BenchmarkError(
+            "hybrid checkpoint manifest identity does not match the W8A16 contract"
+        )
+
+    quantization_value = raw_manifest.get("quantization")
+    if not isinstance(quantization_value, dict):
+        raise Glm52Tp2BenchmarkError(
+            "hybrid checkpoint quantization contract is incompatible"
+        )
+    quantization = cast(dict[str, object], quantization_value)
+    if (
+        quantization.get("activation_dtype") != "BF16"
+        or quantization.get("serialized_weight_dtype")
+        != "INT8_biased_by_128_packed_in_INT32"
+        or quantization.get("temporary_bf16_expansion_at_load") is not False
+        or quantization.get("mla_kv_b_compact_to_compact_marlin_repack_at_load")
+        is not True
+    ):
+        raise Glm52Tp2BenchmarkError(
+            "hybrid checkpoint quantization contract is incompatible"
+        )
+
+    expert_checkpoint_value = raw_manifest.get("expert_checkpoint")
+    if not isinstance(expert_checkpoint_value, dict):
+        raise Glm52Tp2BenchmarkError(
+            "hybrid checkpoint does not bind the configured AMXINT4 experts"
+        )
+    expert_checkpoint = cast(dict[str, object], expert_checkpoint_value)
+    if (
+        expert_checkpoint.get("method") != "AMXINT4"
+        or expert_checkpoint.get("weight_path") != config.ktransformers_weight_path
+    ):
+        raise Glm52Tp2BenchmarkError(
+            "hybrid checkpoint does not bind the configured AMXINT4 experts"
+        )
+    expert_content_id = expert_checkpoint.get("content_id")
+    if (
+        not isinstance(expert_content_id, str)
+        or len(expert_content_id) != 64
+        or any(character not in "0123456789abcdef" for character in expert_content_id)
+    ):
+        raise Glm52Tp2BenchmarkError(
+            "hybrid checkpoint expert content identity is invalid"
+        )
+    if (
+        config.enable_shared_host_weights
+        and expert_content_id != config.shared_host_weights_content_id
+    ):
+        raise Glm52Tp2BenchmarkError(
+            "hybrid and shared-host expert content identities differ"
+        )
+
+    raw_files_value = raw_manifest.get("files")
+    if not isinstance(raw_files_value, list):
+        raise Glm52Tp2BenchmarkError("hybrid checkpoint file table is absent")
+    raw_files = cast(list[object], raw_files_value)
+    file_receipts: dict[str, tuple[str, int]] = {}
+    for raw_file_value in raw_files:
+        if not isinstance(raw_file_value, dict):
+            raise Glm52Tp2BenchmarkError(
+                "hybrid checkpoint file table contains a non-object"
+            )
+        raw_file = cast(dict[str, object], raw_file_value)
+        relative_path = raw_file.get("path")
+        sha256 = raw_file.get("sha256")
+        size_bytes = raw_file.get("size_bytes")
+        if (
+            not isinstance(relative_path, str)
+            or not relative_path
+            or PurePosixPath(relative_path).is_absolute()
+            or ".." in PurePosixPath(relative_path).parts
+            or not isinstance(sha256, str)
+            or len(sha256) != 64
+            or any(character not in "0123456789abcdef" for character in sha256)
+            or not isinstance(size_bytes, int)
+            or isinstance(size_bytes, bool)
+            or size_bytes < 0
+            or relative_path in file_receipts
+        ):
+            raise Glm52Tp2BenchmarkError(
+                "hybrid checkpoint file table contains an invalid entry"
+            )
+        file_path = model_root / relative_path
+        try:
+            file_status = file_path.lstat()
+        except OSError as error:
+            raise Glm52Tp2BenchmarkError(
+                f"hybrid checkpoint file is unavailable: {relative_path}"
+            ) from error
+        if (
+            file_path.is_symlink()
+            or not file_path.is_file()
+            or file_status.st_size != size_bytes
+            or file_status.st_mode & 0o222
+        ):
+            raise Glm52Tp2BenchmarkError(
+                f"hybrid checkpoint file identity differs: {relative_path}"
+            )
+        file_receipts[relative_path] = (sha256, size_bytes)
+
+    for relative_path in ("config.json", "model.safetensors.index.json"):
+        expected = file_receipts.get(relative_path)
+        if expected is None or _sha256_file(model_root / relative_path) != expected[0]:
+            raise Glm52Tp2BenchmarkError(
+                f"hybrid checkpoint {relative_path} differs from its manifest"
+            )
+
+    output_value = raw_manifest.get("output")
+    if not isinstance(output_value, dict):
+        raise Glm52Tp2BenchmarkError("hybrid checkpoint output summary is absent")
+    output = cast(dict[str, object], output_value)
+    payload_bytes = output.get("payload_bytes")
+    shard_count = output.get("shard_count")
+    tensor_count = output.get("tensor_count")
+    if any(
+        not isinstance(value, int) or isinstance(value, bool) or value <= 0
+        for value in (payload_bytes, shard_count, tensor_count)
+    ):
+        raise Glm52Tp2BenchmarkError(
+            "hybrid checkpoint output summary contains invalid counts"
+        )
+    payload_bytes = cast(int, payload_bytes)
+    shard_count = cast(int, shard_count)
+    tensor_count = cast(int, tensor_count)
+    return {
+        "path": str(manifest_path),
+        "sha256": _sha256_file(manifest_path),
+        "schema_version": 1,
+        "kind": HYBRID_CHECKPOINT_MANIFEST_KIND,
+        "content_id": content_id,
+        "storage": "persistent_compact_w8_with_bf16_sensitive_tensors",
+        "activation_dtype": "BF16",
+        "kv_cache_dtype": config.kv_cache_dtype,
+        "temporary_bf16_expansion_at_load": False,
+        "mla_kv_b_marlin_compact_to_compact_repack": True,
+        "file_count": len(file_receipts),
+        "payload_bytes": payload_bytes,
+        "shard_count": shard_count,
+        "tensor_count": tensor_count,
+        "expert_content_id": expert_content_id,
+    }
+
+
 def verify_runtime_and_checkpoint_contract(config: BenchmarkConfig) -> JsonObject:
     runtime = Path(config.runtime_python)
     source_directory = Path(config.local_source_directory)
@@ -2046,9 +2267,18 @@ def verify_runtime_and_checkpoint_contract(config: BenchmarkConfig) -> JsonObjec
             "runtime install receipt SHA-256 differs from the configured identity"
         )
 
+    model_root = Path(config.model_path)
+    hybrid_manifest = _hybrid_checkpoint_manifest_receipt(config, model_root)
     checkpoint_receipts: list[JsonValue] = []
     for role, raw_root in (
-        ("bf16_model", config.model_path),
+        (
+            (
+                "persistent_w8a16_gpu_model"
+                if hybrid_manifest is not None
+                else "bf16_model"
+            ),
+            config.model_path,
+        ),
         ("amxint4_ktransformers", config.ktransformers_weight_path),
     ):
         root = Path(raw_root)
@@ -2123,6 +2353,8 @@ def verify_runtime_and_checkpoint_contract(config: BenchmarkConfig) -> JsonObjec
             "source_directory": str(source_directory),
         },
         "checkpoints": checkpoint_receipts,
+        "compact_mla_kv_b_w8": hybrid_manifest is not None,
+        "hybrid_checkpoint_manifest": hybrid_manifest,
         "frequency_placement_input": frequency_input,
         "mtp_policy": {
             "causal_layer_range": [0, MODEL_LAYER_COUNT],
@@ -2679,6 +2911,14 @@ def _prepare_benchmark_prompts(
             )
             for marker in _CONCURRENCY_TWO_PROMPT_MARKERS
         ),
+        3: tuple(
+            glm52._prepare_long_context_prompt(
+                tokenizer,
+                config.benchmark_input_tokens,
+                marker,
+            )
+            for marker in _CONCURRENCY_THREE_PROMPT_MARKERS
+        ),
     }
 
 
@@ -2748,6 +2988,74 @@ def _log_receipt(config: BenchmarkConfig) -> JsonObject | None:
     }
 
 
+def validate_compact_mla_backend_attestation(
+    log_path: Path,
+    spec: Glm52Tp2ProcessSpec,
+) -> JsonObject:
+    try:
+        status = log_path.stat()
+    except OSError as error:
+        raise Glm52Tp2BenchmarkError(
+            "compact MLA backend attestation log is unavailable"
+        ) from error
+    if not log_path.is_file() or status.st_size > _LOG_MAXIMUM_BYTES:
+        raise Glm52Tp2BenchmarkError(
+            "compact MLA backend attestation log is invalid or oversized"
+        )
+    try:
+        log_text = log_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as error:
+        raise Glm52Tp2BenchmarkError(
+            "compact MLA backend attestation log is unreadable"
+        ) from error
+
+    expected_backend: Literal["marlin"] = "marlin"
+    expected_module_count = MODEL_LAYER_COUNT + int(spec.enable_mtp)
+    observations: dict[int, dict[str, int]] = {0: {}, 1: {}}
+    for match in _COMPACT_MLA_BACKEND_MARKER.finditer(log_text):
+        tensor_parallel_rank = int(match.group("rank"))
+        backend = match.group("backend")
+        local_heads = int(match.group("local_heads"))
+        if local_heads != LOCAL_MLA_HEAD_COUNT:
+            raise Glm52Tp2BenchmarkError(
+                "compact MLA backend loaded an unexpected local-head count"
+            )
+        rank_counts = observations[tensor_parallel_rank]
+        rank_counts[backend] = rank_counts.get(backend, 0) + 1
+
+    for tensor_parallel_rank, rank_counts in observations.items():
+        unexpected_backends = {
+            backend: count
+            for backend, count in rank_counts.items()
+            if backend != expected_backend and count > 0
+        }
+        observed_count = rank_counts.get(expected_backend, 0)
+        if unexpected_backends or observed_count != expected_module_count:
+            raise Glm52Tp2BenchmarkError(
+                "compact MLA backend attestation differs on TP rank "
+                f"{tensor_parallel_rank}: expected {expected_module_count} "
+                f"{expected_backend} modules, observed {rank_counts}"
+            )
+
+    return {
+        "passed": True,
+        "source": "merged_parent_log_after_readiness",
+        "requested_backend": spec.mla_kv_b_w8_backend,
+        "expected_runtime_backend": expected_backend,
+        "expected_module_count_per_tp_rank": expected_module_count,
+        "expected_local_heads_per_module": LOCAL_MLA_HEAD_COUNT,
+        "observations": [
+            {
+                "tensor_parallel_rank": tensor_parallel_rank,
+                "backend": expected_backend,
+                "module_count": observations[tensor_parallel_rank][expected_backend],
+                "local_heads_per_module": LOCAL_MLA_HEAD_COUNT,
+            }
+            for tensor_parallel_rank in range(2)
+        ],
+    }
+
+
 def validate_concurrent_generation_admission(
     benchmark_case: glm52.BenchmarkCaseObservation,
 ) -> JsonObject:
@@ -2806,6 +3114,7 @@ def run_benchmark(config: BenchmarkConfig) -> JsonObject:
     postreadiness_snapshot: GpuCapacitySnapshot | None = None
     postreadiness_capacity_gate: JsonObject | None = None
     server_capacity_gate: JsonObject | None = None
+    compact_mla_backend_attestation: JsonObject | None = None
     benchmark_prompts: Mapping[int, tuple[glm52.PreparedPrompt, ...]] | None = None
     semantic_prompt: glm52.PreparedPrompt | None = None
     semantic: glm52.SemanticObservation | None = None
@@ -2870,6 +3179,13 @@ def run_benchmark(config: BenchmarkConfig) -> JsonObject:
                 config.readiness_timeout_seconds,
             )
             readiness_ownership = tp2.verify_owned_service_listener(spec, running)
+            if runtime_and_checkpoint_contract["compact_mla_kv_b_w8"] is True:
+                compact_mla_backend_attestation = (
+                    validate_compact_mla_backend_attestation(
+                        config.result_directory / "rank-0.log",
+                        spec,
+                    )
+                )
             postreadiness_snapshot = collect_gpu_capacity_snapshot()
             postreadiness_capacity_gate = validate_postreadiness_gpu_capacity(
                 postreadiness_snapshot,
@@ -3079,6 +3395,10 @@ def run_benchmark(config: BenchmarkConfig) -> JsonObject:
         tuple(case.concurrency for case in benchmark_cases)
         == config.benchmark_concurrencies
     )
+    compact_mla_attestation_required = (
+        runtime_and_checkpoint_contract is not None
+        and runtime_and_checkpoint_contract.get("compact_mla_kv_b_w8") is True
+    )
     payload: JsonObject = {
         "schema_version": 1,
         "kind": "glm52_bf16_amxint4_pp1_tp2_dwagon_benchmark",
@@ -3093,6 +3413,10 @@ def run_benchmark(config: BenchmarkConfig) -> JsonObject:
                 and prelaunch_capacity_gate is not None
                 and postreadiness_capacity_gate is not None
                 and server_capacity_gate is not None
+                and (
+                    not compact_mla_attestation_required
+                    or compact_mla_backend_attestation is not None
+                )
             )
             else "failed"
         ),
@@ -3129,6 +3453,7 @@ def run_benchmark(config: BenchmarkConfig) -> JsonObject:
             "benchmark_input_tokens": config.benchmark_input_tokens,
             "benchmark_output_tokens": config.benchmark_output_tokens,
             "kv_cache_dtype": config.kv_cache_dtype,
+            "mla_kv_b_w8_backend": config.mla_kv_b_w8_backend,
             "enable_two_batch_overlap": config.enable_two_batch_overlap,
             "enable_amx_fine_grained_decode": (config.enable_amx_fine_grained_decode),
             "enable_stream_prefill": config.enable_stream_prefill,
@@ -3186,6 +3511,7 @@ def run_benchmark(config: BenchmarkConfig) -> JsonObject:
             "server_capacity_gate": server_capacity_gate,
         },
         "server_info": server_info,
+        "compact_mla_backend_attestation": compact_mla_backend_attestation,
         "semantic_warmup": (
             None if semantic is None else cast(JsonObject, asdict(semantic))
         ),
@@ -3344,12 +3670,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--benchmark-concurrencies",
         type=int,
-        choices=(1, 2),
+        choices=ADMITTED_BENCHMARK_CONCURRENCIES,
         nargs="+",
         default=DEFAULT_BENCHMARK_CONCURRENCIES,
         help=(
-            "ordered unique cases to run; default is 1 2. Use 1 for the "
-            "VRAM-sensitive MTP and stream-prefill lane"
+            "ordered unique cases to run from 1, 2, and 3; default is 1 2. "
+            "Use 1 for the VRAM-sensitive MTP and stream-prefill lane"
         ),
     )
     parser.add_argument(
@@ -3402,6 +3728,15 @@ def _parser() -> argparse.ArgumentParser:
         help=(
             "KV cache storage dtype; bfloat16 is canonical on SM86 because "
             "Triton's NVIDIA E4M3 path requires newer GPU architecture"
+        ),
+    )
+    parser.add_argument(
+        "--mla-kv-b-w8-backend",
+        choices=("marlin",),
+        default="marlin",
+        help=(
+            "Direct compact kv_b_proj backend. The focused OSDI26 path is "
+            "fail-closed on Marlin."
         ),
     )
     parser.add_argument(
@@ -3544,11 +3879,16 @@ def _config_from_arguments(arguments: argparse.Namespace) -> BenchmarkConfig:
     benchmark_concurrencies = tuple(
         cast(list[int] | tuple[int, ...], arguments.benchmark_concurrencies)
     )
-    if not benchmark_concurrencies or benchmark_concurrencies != tuple(
-        sorted(set(benchmark_concurrencies))
+    if (
+        not benchmark_concurrencies
+        or benchmark_concurrencies != tuple(sorted(set(benchmark_concurrencies)))
+        or any(
+            concurrency not in ADMITTED_BENCHMARK_CONCURRENCIES
+            for concurrency in benchmark_concurrencies
+        )
     ):
         raise Glm52Tp2BenchmarkError(
-            "benchmark concurrencies must be a nonempty ordered unique subset of 1,2"
+            "benchmark concurrencies must be a nonempty ordered unique subset of 1,2,3"
         )
     benchmark_working_set_tokens = max(benchmark_concurrencies) * (
         input_tokens + output_tokens
@@ -3724,6 +4064,10 @@ def _config_from_arguments(arguments: argparse.Namespace) -> BenchmarkConfig:
         kv_cache_dtype=cast(
             Literal["bfloat16", "fp8_e4m3"],
             arguments.kv_cache_dtype,
+        ),
+        mla_kv_b_w8_backend=cast(
+            MlaKvBW8Backend,
+            arguments.mla_kv_b_w8_backend,
         ),
         enable_two_batch_overlap=cast(
             bool,
