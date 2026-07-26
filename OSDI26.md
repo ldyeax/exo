@@ -394,6 +394,18 @@ its receipt has SHA-256
 
 `/var/lib/exo/runtimes/glm52-osdi26-w8-overlay/dwagon/b1b05ea2a1b5b893c2ce5d2e3cd907bd100b57e963725936cb743ff5bf3a64e9/install-receipt.json`
 
+The source is now retained directly in this repository as a local nested
+submodule checkout. `vendor/ktransformers` is pinned to
+`45a3a797658140dcf8426cd3f2b2c6c969f8f5d8`; its code-bearing patch terminal
+remains `2ba756c942a62de981a0f8d55ab7d1aea3ad5d9a`. The integration-only commit
+advances `vendor/ktransformers/third_party/sglang` from the installed
+eight-patch source above to the ninth-patch fwuff terminal
+`720b40b2783b1a515134f4ab9fe820931cfbee36` and changes its URL to the local
+durable source repository. The corresponding local bare repositories are
+`/var/lib/exo/sources/ktransformers-glm52-osdi26-patched.git` and
+`/var/lib/exo/sources/sglang-glm52-osdi26-patched.git`. They are not public
+remotes; the mail patches remain the portable reconstruction authority.
+
 The installed compact-W8 suite passed all 78 focused tests, including the
 Marlin `kv_b_proj` path, its earlier Triton cross-check, and the MTP
 shared-module ownership regressions.

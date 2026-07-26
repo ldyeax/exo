@@ -265,8 +265,11 @@ The target-only verifier is the correctness boundary:
 `EagleVerifyInput.verify`: target probabilities are constructed after target
 logit processing, `draft_probs` begins at zero, rejected candidate target mass
 is recorded, and final sampling uses the residual. Accepted hidden rows are
-then selected for the next draft extend. The pinned SGLang source bundle ends
-at commit `1218b2f8965b5a27c9d9004ff9324373414be322`.
+then selected for the next draft extend. The pre-W8 source bundle ended at
+`1218b2f8965b5a27c9d9004ff9324373414be322`; the current local nested
+submodule at `vendor/ktransformers/third_party/sglang` advances through all
+nine compact-W8/MTP/fwuff patches to
+`720b40b2783b1a515134f4ab9fe820931cfbee36`.
 
 **Source.** Exact speculative decoding preserves the target distribution; the
 original paper supplies the general rejection-sampling result. EAGLE and

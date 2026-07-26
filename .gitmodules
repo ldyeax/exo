@@ -1,0 +1,4 @@
+[submodule "vendor/ktransformers"]
+	path = vendor/ktransformers
+	url = /var/lib/exo/sources/ktransformers-glm52-osdi26-patched.git
+	branch = exo/glm52-osdi26-patched

@@ -21,6 +21,40 @@ The outer series advances only the `third_party/sglang` gitlink. It therefore
 expects the corresponding SGLang commits or equivalent patched trees to be
 available in that submodule.
 
+## Local submodule checkout
+
+The fully integrated local checkout is now available inside the Exo
+repository at:
+
+- `vendor/ktransformers`, root gitlink
+  `45a3a797658140dcf8426cd3f2b2c6c969f8f5d8`;
+- `vendor/ktransformers/third_party/sglang`, nested gitlink
+  `720b40b2783b1a515134f4ab9fe820931cfbee36`.
+
+The KTransformers integration commit is a direct child of the recorded
+six-patch terminal `2ba756c942a62de981a0f8d55ab7d1aea3ad5d9a`. It contains no
+additional runtime code: it advances the nested SGLang gitlink from
+`f3f6ccfbbcdd5ef5e650a74eecc1a233e07cec34` to the ninth-patch terminal
+`720b40b2783b1a515134f4ab9fe820931cfbee36` and points that nested submodule
+at its durable local repository.
+
+For now the root and nested URLs are deliberately machine-local:
+
+- `/var/lib/exo/sources/ktransformers-glm52-osdi26-patched.git`;
+- `/var/lib/exo/sources/sglang-glm52-osdi26-patched.git`.
+
+Initialize only the two patched source repositories without fetching
+KTransformers' unrelated optional submodules:
+
+```bash
+git -c protocol.file.allow=always submodule update --init vendor/ktransformers
+git -c protocol.file.allow=always -C vendor/ktransformers \
+  submodule update --init third_party/sglang
+```
+
+Replace both URLs when durable remote forks are created. The patch files and
+hashes below remain the portable reconstruction path.
+
 The SGLang stack:
 
 1. Adds direct compact MLA `kv_b_proj` W8A16 kernels for Ampere.
