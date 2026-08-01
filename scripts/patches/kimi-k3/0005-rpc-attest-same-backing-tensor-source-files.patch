@@ -1,0 +1,1424 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex Isolated Build <codex@example.invalid>
+Date: Thu, 30 Jul 2026 18:23:40 -0400
+Subject: [PATCH] rpc: attest same backing tensor source files
+
+---
+ common/arg.cpp                   |  14 ++
+ common/common.cpp                |   1 +
+ common/common.h                  |   1 +
+ ggml/include/ggml-rpc.h          |  17 +-
+ ggml/src/ggml-rpc/ggml-rpc.cpp   | 379 +++++++++++++++++++++++++------
+ include/llama.h                  |   4 +
+ src/llama-model-loader.cpp       | 102 ++++++++-
+ src/llama-model-loader.h         |  12 +
+ src/llama-model.cpp              |   1 +
+ src/llama-quant.cpp              |   3 +-
+ src/llama.cpp                    |   3 +-
+ tests/CMakeLists.txt             |   6 +
+ tests/test-rpc-tensor-source.cpp | 286 +++++++++++++++++++++++
+ tools/rpc/rpc-server.cpp         |  21 ++
+ 14 files changed, 769 insertions(+), 81 deletions(-)
+ create mode 100644 tests/test-rpc-tensor-source.cpp
+
+diff --git a/common/arg.cpp b/common/arg.cpp
+index af974394f..c60acde5c 100644
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -2524,6 +2524,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+                 params.rpc_tensor_source_root = value;
+             }
+         ).set_env("LLAMA_ARG_RPC_TENSOR_SOURCE"));
++        add_opt(common_arg(
++            {"--rpc-tensor-source-mode"}, "MODE",
++            "RPC tensor source identity policy: same-backing-file (default, fail closed) or fallback",
++            [](common_params & params, const std::string & value) {
++                if (value == "same-backing-file") {
++                    params.rpc_tensor_source_same_backing_file = true;
++                } else if (value == "fallback") {
++                    params.rpc_tensor_source_same_backing_file = false;
++                } else {
++                    throw std::invalid_argument(
++                        "--rpc-tensor-source-mode must be same-backing-file or fallback");
++                }
++            }
++        ).set_env("LLAMA_ARG_RPC_TENSOR_SOURCE_MODE"));
+     }
+     add_opt(common_arg(
+         {"--mlock"},
+diff --git a/common/common.cpp b/common/common.cpp
+index 9ce25b1a1..0a766b262 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -1562,6 +1562,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
+     mparams.rpc_tensor_source_root = params.rpc_tensor_source_root.empty()
+         ? nullptr
+         : params.rpc_tensor_source_root.c_str();
++    mparams.rpc_tensor_source_same_backing_file = params.rpc_tensor_source_same_backing_file;
+     mparams.check_tensors   = params.check_tensors;
+     mparams.use_extra_bufts = !params.no_extra_bufts;
+     mparams.no_host         = params.no_host;
+diff --git a/common/common.h b/common/common.h
+index fa06bc82d..fa7b45e2a 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -485,6 +485,7 @@ struct common_params {
+     enum llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER; // how to split the model across GPUs
+     enum llama_load_mode  load_mode  = LLAMA_LOAD_MODE_MMAP; // how to load the model
+     std::string rpc_tensor_source_root; // local root mirrored by RPC tensor-source servers
++    bool rpc_tensor_source_same_backing_file = true; // otherwise explicitly allow client-read fallback
+ 
+     common_cpu_params cpuparams;
+     common_cpu_params cpuparams_batch;
+diff --git a/ggml/include/ggml-rpc.h b/ggml/include/ggml-rpc.h
+index 90de3cebf..970db64df 100644
+--- a/ggml/include/ggml-rpc.h
++++ b/ggml/include/ggml-rpc.h
+@@ -6,7 +6,7 @@
+ extern "C" {
+ #endif
+ 
+-#define RPC_PROTO_MAJOR_VERSION    6
++#define RPC_PROTO_MAJOR_VERSION    7
+ #define RPC_PROTO_MINOR_VERSION    0
+ #define RPC_PROTO_PATCH_VERSION    0
+ 
+@@ -29,9 +29,17 @@ GGML_BACKEND_API bool ggml_backend_rpc_tensor_set_from_file(
+         const char * relative_path,
+         uint64_t file_offset,
+         size_t tensor_offset,
+-        size_t size);
+-
+-GGML_BACKEND_API bool ggml_backend_rpc_synchronize_tensor_files(ggml_backend_buffer_t buffer);
++        size_t size,
++        bool require_same_backing_file,
++        uint64_t source_inode,
++        uint64_t source_size,
++        int64_t source_mtime_sec,
++        uint32_t source_mtime_nsec);
++
++GGML_BACKEND_API bool ggml_backend_rpc_synchronize_tensor_files(
++        ggml_backend_buffer_t buffer,
++        uint64_t * completed_count,
++        uint64_t * completed_bytes);
+ 
+ GGML_BACKEND_API void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir,
+                                                     size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices);
+@@ -40,6 +48,7 @@ GGML_BACKEND_API void ggml_backend_rpc_start_server_with_tensor_source(
+         const char * endpoint,
+         const char * cache_dir,
+         const char * tensor_source_root,
++        size_t tensor_source_max_files,
+         size_t n_threads,
+         size_t n_devices,
+         ggml_backend_dev_t * devices);
+diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
+index c623f9e44..3a08b74ed 100644
+--- a/ggml/src/ggml-rpc/ggml-rpc.cpp
++++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
+@@ -20,6 +20,14 @@
+ #include <fstream>
+ #include <filesystem>
+ #include <algorithm>
++#include <cerrno>
++#include <limits>
++
++#if !defined(_WIN32)
++#include <fcntl.h>
++#include <sys/stat.h>
++#include <unistd.h>
++#endif
+ 
+ static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
+ 
+@@ -180,7 +188,16 @@ struct rpc_msg_set_tensor_file_req {
+     uint64_t tensor_offset;
+     uint64_t file_offset;
+     uint64_t size;
++    uint64_t source_inode;
++    uint64_t source_size;
++    int64_t source_mtime_sec;
++    uint32_t source_mtime_nsec;
+     uint32_t path_size;
++    uint8_t require_same_backing_file;
++};
++
++struct rpc_msg_sync_tensor_files_req {
++    uint64_t buffer;
+ };
+ 
+ struct rpc_msg_set_tensor_file_rsp {
+@@ -537,7 +554,12 @@ bool ggml_backend_rpc_tensor_set_from_file(
+         const char * relative_path,
+         uint64_t file_offset,
+         size_t tensor_offset,
+-        size_t size) {
++        size_t size,
++        bool require_same_backing_file,
++        uint64_t source_inode,
++        uint64_t source_size,
++        int64_t source_mtime_sec,
++        uint32_t source_mtime_nsec) {
+     if (tensor == nullptr || tensor->buffer == nullptr || relative_path == nullptr ||
+         !ggml_backend_buffer_is_rpc(tensor->buffer)) {
+         return false;
+@@ -552,7 +574,12 @@ bool ggml_backend_rpc_tensor_set_from_file(
+         /* .tensor_offset = */ tensor_offset,
+         /* .file_offset   = */ file_offset,
+         /* .size          = */ size,
++        /* .source_inode   = */ source_inode,
++        /* .source_size    = */ source_size,
++        /* .source_mtime_sec  = */ source_mtime_sec,
++        /* .source_mtime_nsec = */ source_mtime_nsec,
+         /* .path_size     = */ (uint32_t) path_size,
++        /* .require_same_backing_file = */ (uint8_t) (require_same_backing_file ? 1 : 0),
+     };
+     std::vector<uint8_t> input(sizeof(request) + path_size);
+     memcpy(input.data(), &request, sizeof(request));
+@@ -572,18 +599,24 @@ bool ggml_backend_rpc_tensor_set_from_file(
+     return response.result != 0;
+ }
+ 
+-bool ggml_backend_rpc_synchronize_tensor_files(ggml_backend_buffer_t buffer) {
++bool ggml_backend_rpc_synchronize_tensor_files(
++        ggml_backend_buffer_t buffer,
++        uint64_t * completed_count,
++        uint64_t * completed_bytes) {
+     if (!ggml_backend_buffer_is_rpc(buffer)) {
+         return false;
+     }
+     ggml_backend_rpc_buffer_context * ctx =
+         (ggml_backend_rpc_buffer_context *) buffer->context;
++    rpc_msg_sync_tensor_files_req request = {
++        /* .buffer = */ ctx->remote_ptr,
++    };
+     rpc_msg_sync_tensor_files_rsp response = {};
+     bool status = send_rpc_cmd(
+         ctx->sock,
+         RPC_CMD_SYNC_TENSOR_FILES,
+-        nullptr,
+-        0,
++        &request,
++        sizeof(request),
+         &response,
+         sizeof(response));
+     RPC_STATUS_ASSERT(status);
+@@ -592,6 +625,12 @@ bool ggml_backend_rpc_synchronize_tensor_files(ggml_backend_buffer_t buffer) {
+         __func__,
+         response.completed_count,
+         response.completed_bytes);
++    if (completed_count != nullptr) {
++        *completed_count = response.completed_count;
++    }
++    if (completed_bytes != nullptr) {
++        *completed_bytes = response.completed_bytes;
++    }
+     return response.result != 0;
+ }
+ 
+@@ -928,12 +967,32 @@ public:
+     rpc_server(
+             std::vector<ggml_backend_t> all_backends,
+             const char * cache_dir,
+-            const char * tensor_source_root)
++            const char * tensor_source_root,
++            size_t tensor_source_max_files)
+         : backends(std::move(all_backends)),
+           cache_dir(cache_dir),
+-          tensor_source_root(tensor_source_root ? tensor_source_root : "") {
++          tensor_source_root(tensor_source_root ? tensor_source_root : ""),
++          tensor_source_max_files(tensor_source_max_files) {
+         stored_graphs.resize(backends.size());
+         if (!this->tensor_source_root.empty()) {
++#if !defined(_WIN32)
++            tensor_source_root_fd = open(
++                this->tensor_source_root.c_str(),
++                O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
++            if (tensor_source_root_fd < 0) {
++                GGML_LOG_ERROR(
++                    "[%s] failed to open tensor source root '%s': %s\n",
++                    __func__,
++                    this->tensor_source_root.c_str(),
++                    strerror(errno));
++                this->tensor_source_root.clear();
++            }
++#else
++            GGML_LOG_ERROR("[%s] file-aware RPC is unsupported on Windows\n", __func__);
++            this->tensor_source_root.clear();
++#endif
++        }
++        if (!this->tensor_source_root.empty() && tensor_source_max_files > 0) {
+             tensor_file_worker = std::thread(&rpc_server::tensor_file_worker_loop, this);
+         }
+     }
+@@ -950,7 +1009,9 @@ public:
+     bool set_tensor(const std::vector<uint8_t> & input);
+     bool set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rpc_msg_set_tensor_hash_rsp & response);
+     bool queue_tensor_file(const std::vector<uint8_t> & input, rpc_msg_set_tensor_file_rsp & response);
+-    void synchronize_tensor_files(rpc_msg_sync_tensor_files_rsp & response);
++    void synchronize_tensor_files(
++        const rpc_msg_sync_tensor_files_req & request,
++        rpc_msg_sync_tensor_files_rsp & response);
+     bool get_tensor(const rpc_msg_get_tensor_req & request, std::vector<uint8_t> & response);
+     bool copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_copy_tensor_rsp & response);
+     bool graph_compute(const std::vector<uint8_t> & input);
+@@ -965,15 +1026,44 @@ public:
+     };
+ 
+ private:
++    struct tensor_source_file {
++        int fd = -1;
++        uint64_t inode = 0;
++        uint64_t size = 0;
++        int64_t mtime_sec = 0;
++        uint32_t mtime_nsec = 0;
++        std::string path;
++
++        ~tensor_source_file() {
++#if !defined(_WIN32)
++            if (fd >= 0) {
++                close(fd);
++            }
++#endif
++        }
++    };
++
+     struct tensor_file_job {
+         rpc_tensor tensor;
+         uint64_t tensor_offset;
++        uint64_t file_offset;
+         uint64_t size;
+-        std::unique_ptr<std::ifstream> stream;
+-        std::string path;
++        ggml_backend_buffer_t buffer;
++        std::shared_ptr<tensor_source_file> source;
++    };
++
++    struct tensor_file_stats {
++        uint64_t pending_count = 0;
++        uint64_t completed_count = 0;
++        uint64_t completed_bytes = 0;
++        bool failed = false;
+     };
+ 
+     bool get_cached_file(uint64_t hash, std::vector<uint8_t> & data);
++    std::shared_ptr<tensor_source_file> get_tensor_source_file(
++        const std::string & relative_path,
++        const rpc_msg_set_tensor_file_req & request);
++    bool tensor_source_file_is_unchanged(const tensor_source_file & source) const;
+     bool load_tensor_file(tensor_file_job & job);
+     void tensor_file_worker_loop();
+     ggml_tensor * deserialize_tensor(struct ggml_context * ctx, const rpc_tensor * tensor);
+@@ -986,6 +1076,9 @@ private:
+     std::vector<ggml_backend_t> backends;
+     const char * cache_dir;
+     fs::path tensor_source_root;
++    size_t tensor_source_max_files;
++    int tensor_source_root_fd = -1;
++    std::unordered_map<std::string, std::shared_ptr<tensor_source_file>> tensor_source_files;
+     std::unordered_set<ggml_backend_buffer_t> buffers;
+     // store the last computed graph for each backend
+     std::vector<stored_graph> stored_graphs;
+@@ -993,9 +1086,8 @@ private:
+     std::condition_variable tensor_file_condition;
+     std::deque<tensor_file_job> tensor_file_jobs;
+     std::thread tensor_file_worker;
++    std::unordered_map<ggml_backend_buffer_t, tensor_file_stats> tensor_file_stats_by_buffer;
+     uint64_t pending_tensor_file_count = 0;
+-    uint64_t completed_tensor_file_count = 0;
+-    uint64_t completed_tensor_file_bytes = 0;
+     bool tensor_file_failed = false;
+     bool tensor_file_stopping = false;
+ };
+@@ -1106,8 +1198,11 @@ bool rpc_server::buffer_get_base(const rpc_msg_buffer_get_base_req & request, rp
+ 
+ bool rpc_server::free_buffer(const rpc_msg_free_buffer_req & request) {
+     LOG_DBG("[%s] remote_ptr: %" PRIx64 "\n", __func__, request.remote_ptr);
++    rpc_msg_sync_tensor_files_req synchronize_request = {
++        /* .buffer = */ request.remote_ptr,
++    };
+     rpc_msg_sync_tensor_files_rsp ignored = {};
+-    synchronize_tensor_files(ignored);
++    synchronize_tensor_files(synchronize_request, ignored);
+     ggml_backend_buffer_t buffer = reinterpret_cast<ggml_backend_buffer_t>(request.remote_ptr);
+     if (buffers.find(buffer) == buffers.end()) {
+         GGML_LOG_ERROR("[%s] buffer not found\n", __func__);
+@@ -1115,6 +1210,7 @@ bool rpc_server::free_buffer(const rpc_msg_free_buffer_req & request) {
+     }
+     ggml_backend_buffer_free(buffer);
+     buffers.erase(buffer);
++    tensor_file_stats_by_buffer.erase(buffer);
+     return true;
+ }
+ 
+@@ -1339,15 +1435,122 @@ bool rpc_server::set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rp
+     return true;
+ }
+ 
+-static bool rpc_path_is_beneath(const fs::path & root, const fs::path & path) {
+-    auto root_component = root.begin();
+-    auto path_component = path.begin();
+-    for (; root_component != root.end(); ++root_component, ++path_component) {
+-        if (path_component == path.end() || *root_component != *path_component) {
+-            return false;
++#if !defined(_WIN32)
++static int64_t rpc_stat_mtime_sec(const struct stat & status) {
++#if defined(__APPLE__)
++    return status.st_mtimespec.tv_sec;
++#else
++    return status.st_mtim.tv_sec;
++#endif
++}
++
++static uint32_t rpc_stat_mtime_nsec(const struct stat & status) {
++#if defined(__APPLE__)
++    return status.st_mtimespec.tv_nsec;
++#else
++    return status.st_mtim.tv_nsec;
++#endif
++}
++#endif
++
++std::shared_ptr<rpc_server::tensor_source_file> rpc_server::get_tensor_source_file(
++        const std::string & relative_path,
++        const rpc_msg_set_tensor_file_req & request) {
++#if defined(_WIN32)
++    GGML_UNUSED(relative_path);
++    GGML_UNUSED(request);
++    return nullptr;
++#else
++    auto cached = tensor_source_files.find(relative_path);
++    if (cached != tensor_source_files.end()) {
++        const auto & source = cached->second;
++        if (!tensor_source_file_is_unchanged(*source)) {
++            GGML_LOG_ERROR("[%s] tensor source changed while open: %s\n", __func__, source->path.c_str());
++            return nullptr;
+         }
++        if (request.file_offset > source->size ||
++            request.size > source->size - request.file_offset) {
++            return nullptr;
++        }
++        if (request.require_same_backing_file != 0 &&
++            (source->inode != request.source_inode ||
++             source->size != request.source_size ||
++             source->mtime_sec != request.source_mtime_sec ||
++             source->mtime_nsec != request.source_mtime_nsec)) {
++            GGML_LOG_ERROR("[%s] same-backing-file attestation mismatch for %s\n", __func__, source->path.c_str());
++            return nullptr;
++        }
++        return source;
++    }
++
++    if (tensor_source_files.size() >= tensor_source_max_files) {
++        GGML_LOG_ERROR(
++            "[%s] tensor source file cap reached (%zu); rejecting %s\n",
++            __func__,
++            tensor_source_max_files,
++            relative_path.c_str());
++        return nullptr;
++    }
++
++    const int fd = openat(
++        tensor_source_root_fd,
++        relative_path.c_str(),
++        O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
++    if (fd < 0) {
++        GGML_LOG_ERROR(
++            "[%s] failed to open tensor source %s: %s\n",
++            __func__,
++            relative_path.c_str(),
++            strerror(errno));
++        return nullptr;
+     }
+-    return path_component != path.end();
++
++    struct stat status;
++    if (fstat(fd, &status) != 0 || !S_ISREG(status.st_mode) ||
++        status.st_size < 0) {
++        GGML_LOG_ERROR("[%s] tensor source is not a regular sized file: %s\n", __func__, relative_path.c_str());
++        close(fd);
++        return nullptr;
++    }
++
++    auto source = std::make_shared<tensor_source_file>();
++    source->fd = fd;
++    source->inode = status.st_ino;
++    source->size = status.st_size;
++    source->mtime_sec = rpc_stat_mtime_sec(status);
++    source->mtime_nsec = rpc_stat_mtime_nsec(status);
++    source->path = (tensor_source_root / relative_path).string();
++    if (request.file_offset > source->size ||
++        request.size > source->size - request.file_offset) {
++        return nullptr;
++    }
++    if (request.require_same_backing_file != 0 &&
++        (source->inode != request.source_inode ||
++         source->size != request.source_size ||
++         source->mtime_sec != request.source_mtime_sec ||
++         source->mtime_nsec != request.source_mtime_nsec)) {
++        GGML_LOG_ERROR("[%s] same-backing-file attestation mismatch for %s\n", __func__, source->path.c_str());
++        return nullptr;
++    }
++    tensor_source_files.emplace(relative_path, source);
++    return source;
++#endif
++}
++
++bool rpc_server::tensor_source_file_is_unchanged(const tensor_source_file & source) const {
++#if defined(_WIN32)
++    GGML_UNUSED(source);
++    return false;
++#else
++    struct stat status;
++    return fstat(source.fd, &status) == 0 &&
++        S_ISREG(status.st_mode) &&
++        status.st_size >= 0 &&
++        source.inode == (uint64_t) status.st_ino &&
++        source.size == (uint64_t) status.st_size &&
++        source.mtime_sec == rpc_stat_mtime_sec(status) &&
++        source.mtime_nsec == rpc_stat_mtime_nsec(status);
++#endif
+ }
+ 
+ bool rpc_server::queue_tensor_file(
+@@ -1365,7 +1568,10 @@ bool rpc_server::queue_tensor_file(
+         input.size() != sizeof(request) + request.path_size ||
+         request.size == 0 ||
+         request.size > SIZE_MAX ||
+-        request.tensor_offset > SIZE_MAX) {
++        request.tensor_offset > SIZE_MAX ||
++        request.require_same_backing_file > 1 ||
++        (request.require_same_backing_file != 0 &&
++         request.source_mtime_nsec >= 1000000000U)) {
+         return true;
+     }
+ 
+@@ -1376,29 +1582,8 @@ bool rpc_server::queue_tensor_file(
+         relative_path.find('\\') != std::string::npos) {
+         return true;
+     }
+-    fs::path relative(relative_path);
+-    if (relative.empty() ||
+-        relative.is_absolute() ||
+-        relative.has_root_path() ||
+-        relative.has_parent_path() ||
+-        relative.extension() != ".gguf") {
+-        return true;
+-    }
+-    for (const auto & component : relative) {
+-        if (component.empty() || component == "." || component == "..") {
+-            return true;
+-        }
+-    }
+-
+-    std::error_code path_error;
+-    const fs::path unresolved_path = tensor_source_root / relative;
+-    const fs::file_status unresolved_status = fs::symlink_status(unresolved_path, path_error);
+-    if (path_error || fs::is_symlink(unresolved_status)) {
+-        return true;
+-    }
+-    fs::path canonical_path = fs::canonical(unresolved_path, path_error);
+-    if (path_error || !rpc_path_is_beneath(tensor_source_root, canonical_path) ||
+-        !fs::is_regular_file(canonical_path, path_error) || path_error) {
++    if (relative_path.find('/') != std::string::npos ||
++        fs::path(relative_path).extension() != ".gguf") {
+         return true;
+     }
+ 
+@@ -1435,21 +1620,16 @@ bool rpc_server::queue_tensor_file(
+         return false;
+     }
+ 
+-    auto stream = std::make_unique<std::ifstream>(canonical_path, std::ios::binary);
+-    if (!stream->is_open()) {
++    std::shared_ptr<tensor_source_file> source =
++        get_tensor_source_file(relative_path, request);
++    if (source == nullptr) {
+         return true;
+     }
+-    stream->seekg(0, std::ios::end);
+-    const std::streamoff file_size = stream->tellg();
+-    if (file_size < 0 ||
+-        request.file_offset > (uint64_t) file_size ||
+-        request.size > (uint64_t) file_size - request.file_offset) {
+-        return true;
+-    }
+-    stream->seekg((std::streamoff) request.file_offset, std::ios::beg);
+-    if (!*stream) {
++#if !defined(_WIN32)
++    if (request.file_offset > (uint64_t) std::numeric_limits<off_t>::max()) {
+         return true;
+     }
++#endif
+ 
+     {
+         std::lock_guard<std::mutex> lock(tensor_file_mutex);
+@@ -1459,11 +1639,13 @@ bool rpc_server::queue_tensor_file(
+         tensor_file_jobs.push_back({
+             /* .tensor        = */ request.tensor,
+             /* .tensor_offset = */ request.tensor_offset,
++            /* .file_offset   = */ request.file_offset,
+             /* .size          = */ request.size,
+-            /* .stream        = */ std::move(stream),
+-            /* .path          = */ canonical_path.string(),
++            /* .buffer        = */ tensor->buffer,
++            /* .source        = */ std::move(source),
+         });
+         pending_tensor_file_count++;
++        tensor_file_stats_by_buffer[tensor->buffer].pending_count++;
+     }
+     tensor_file_condition.notify_one();
+     response.result = 1;
+@@ -1495,10 +1677,28 @@ bool rpc_server::load_tensor_file(tensor_file_job & job) {
+             destination =
+                 (uint8_t *) tensor->data + job.tensor_offset + completed;
+         }
+-        job.stream->read((char *) destination, current_size);
+-        if (job.stream->gcount() != (std::streamsize) current_size) {
+-            GGML_LOG_ERROR("[%s] short read from '%s'\n", __func__, job.path.c_str());
++        size_t chunk_completed = 0;
++        while (chunk_completed < current_size) {
++#if defined(_WIN32)
++            GGML_UNUSED(destination);
+             return false;
++#else
++            const uint64_t absolute_offset =
++                job.file_offset + completed + chunk_completed;
++            const ssize_t read_size = pread(
++                job.source->fd,
++                (uint8_t *) destination + chunk_completed,
++                current_size - chunk_completed,
++                (off_t) absolute_offset);
++            if (read_size < 0 && errno == EINTR) {
++                continue;
++            }
++            if (read_size <= 0) {
++                GGML_LOG_ERROR("[%s] short read from '%s'\n", __func__, job.source->path.c_str());
++                return false;
++            }
++            chunk_completed += read_size;
++#endif
+         }
+         if (!ggml_backend_buffer_is_host(tensor->buffer)) {
+             ggml_backend_tensor_set(
+@@ -1539,26 +1739,45 @@ void rpc_server::tensor_file_worker_loop() {
+ 
+         {
+             std::lock_guard<std::mutex> lock(tensor_file_mutex);
++            auto & stats = tensor_file_stats_by_buffer[job->buffer];
+             if (loaded) {
+-                completed_tensor_file_count++;
+-                completed_tensor_file_bytes += job->size;
++                stats.completed_count++;
++                stats.completed_bytes += job->size;
+             } else {
+                 tensor_file_failed = true;
++                stats.failed = true;
+             }
++            stats.pending_count--;
+             pending_tensor_file_count--;
+         }
+         tensor_file_condition.notify_all();
+     }
+ }
+ 
+-void rpc_server::synchronize_tensor_files(rpc_msg_sync_tensor_files_rsp & response) {
++void rpc_server::synchronize_tensor_files(
++        const rpc_msg_sync_tensor_files_req & request,
++        rpc_msg_sync_tensor_files_rsp & response) {
+     std::unique_lock<std::mutex> lock(tensor_file_mutex);
+     tensor_file_condition.wait(lock, [this] {
+         return pending_tensor_file_count == 0;
+     });
+-    response.result = tensor_file_failed ? 0 : 1;
+-    response.completed_count = completed_tensor_file_count;
+-    response.completed_bytes = completed_tensor_file_bytes;
++    ggml_backend_buffer_t buffer =
++        reinterpret_cast<ggml_backend_buffer_t>(request.buffer);
++    const auto stats = tensor_file_stats_by_buffer.find(buffer);
++    if (buffers.find(buffer) == buffers.end() ||
++        stats == tensor_file_stats_by_buffer.end()) {
++        response.result = 0;
++        return;
++    }
++    for (const auto & [_, source] : tensor_source_files) {
++        if (!tensor_source_file_is_unchanged(*source)) {
++            tensor_file_failed = true;
++            break;
++        }
++    }
++    response.result = tensor_file_failed || stats->second.failed ? 0 : 1;
++    response.completed_count = stats->second.completed_count;
++    response.completed_bytes = stats->second.completed_bytes;
+ }
+ 
+ bool rpc_server::init_tensor(const rpc_msg_init_tensor_req & request) {
+@@ -1836,6 +2055,12 @@ rpc_server::~rpc_server() {
+     if (tensor_file_worker.joinable()) {
+         tensor_file_worker.join();
+     }
++    tensor_source_files.clear();
++#if !defined(_WIN32)
++    if (tensor_source_root_fd >= 0) {
++        close(tensor_source_root_fd);
++    }
++#endif
+     for (auto buffer : buffers) {
+         ggml_backend_buffer_free(buffer);
+     }
+@@ -1845,8 +2070,9 @@ static void rpc_serve_client(
+         const std::vector<ggml_backend_t> & backends,
+         const char * cache_dir,
+         const char * tensor_source_root,
++        size_t tensor_source_max_files,
+         socket_ptr sock) {
+-    rpc_server server(backends, cache_dir, tensor_source_root);
++    rpc_server server(backends, cache_dir, tensor_source_root, tensor_source_max_files);
+     uint8_t cmd;
+     if (!sock->recv_data(&cmd, 1)) {
+         return;
+@@ -2056,11 +2282,12 @@ static void rpc_serve_client(
+                 break;
+             }
+             case RPC_CMD_SYNC_TENSOR_FILES: {
+-                if (!recv_msg(sock, nullptr, 0)) {
++                rpc_msg_sync_tensor_files_req request;
++                if (!recv_msg(sock, &request, sizeof(request))) {
+                     return;
+                 }
+                 rpc_msg_sync_tensor_files_rsp response = {};
+-                server.synchronize_tensor_files(response);
++                server.synchronize_tensor_files(request, response);
+                 if (!send_msg(sock, &response, sizeof(response))) {
+                     return;
+                 }
+@@ -2153,6 +2380,7 @@ static void ggml_backend_rpc_start_server_impl(
+         const char * endpoint,
+         const char * cache_dir,
+         const char * tensor_source_root,
++        size_t tensor_source_max_files,
+         size_t n_threads,
+         size_t n_devices,
+         ggml_backend_dev_t * devices) {
+@@ -2162,6 +2390,10 @@ static void ggml_backend_rpc_start_server_impl(
+     }
+     std::string canonical_tensor_source;
+     if (tensor_source_root != nullptr) {
++        if (tensor_source_max_files == 0) {
++            fprintf(stderr, "RPC tensor source max files must be positive\n");
++            return;
++        }
+         std::error_code source_error;
+         fs::path canonical_source = fs::canonical(tensor_source_root, source_error);
+         if (source_error || !canonical_source.is_absolute() ||
+@@ -2180,6 +2412,7 @@ static void ggml_backend_rpc_start_server_impl(
+     printf("  endpoint       : %s\n", endpoint);
+     printf("  local cache    : %s\n", cache_dir ? cache_dir : "n/a");
+     printf("  tensor source  : %s\n", tensor_source_root ? tensor_source_root : "n/a");
++    printf("  source file cap: %zu\n", tensor_source_max_files);
+     printf("Devices:\n");
+     for (size_t i = 0; i < n_devices; i++) {
+         auto dev = devices[i];
+@@ -2230,7 +2463,12 @@ static void ggml_backend_rpc_start_server_impl(
+         }
+         printf("Accepted client connection\n");
+         fflush(stdout);
+-        rpc_serve_client(backends, cache_dir, tensor_source_root, client_socket);
++        rpc_serve_client(
++            backends,
++            cache_dir,
++            tensor_source_root,
++            tensor_source_max_files,
++            client_socket);
+         printf("Client connection closed\n");
+         fflush(stdout);
+     }
+@@ -2250,6 +2488,7 @@ void ggml_backend_rpc_start_server(
+         endpoint,
+         cache_dir,
+         nullptr,
++        0,
+         n_threads,
+         n_devices,
+         devices);
+@@ -2259,6 +2498,7 @@ void ggml_backend_rpc_start_server_with_tensor_source(
+         const char * endpoint,
+         const char * cache_dir,
+         const char * tensor_source_root,
++        size_t tensor_source_max_files,
+         size_t n_threads,
+         size_t n_devices,
+         ggml_backend_dev_t * devices) {
+@@ -2266,6 +2506,7 @@ void ggml_backend_rpc_start_server_with_tensor_source(
+         endpoint,
+         cache_dir,
+         tensor_source_root,
++        tensor_source_max_files,
+         n_threads,
+         n_devices,
+         devices);
+diff --git a/include/llama.h b/include/llama.h
+index e899c22c6..6eec8d1ad 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -324,6 +324,10 @@ extern "C" {
+         // RPC servers must independently opt in with a corresponding tensor source root.
+         const char * rpc_tensor_source_root;
+ 
++        // Require both paths to identify the same open file by inode, size, and
++        // nanosecond mtime. False explicitly permits client-read fallback.
++        bool rpc_tensor_source_same_backing_file;
++
+         // Called with a progress value between 0.0 and 1.0. Pass NULL to disable.
+         // If the provided progress_callback returns true, model loading continues.
+         // If it returns false, model loading is immediately aborted.
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index 8ace2a669..67df65e7a 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -15,6 +15,10 @@
+ #include <future>
+ #include <regex>
+ 
++#if !defined(_WIN32)
++#include <sys/stat.h>
++#endif
++
+ namespace fs = std::filesystem;
+ 
+ static const size_t kiB = 1024;
+@@ -26,8 +30,34 @@ using rpc_tensor_set_from_file_t = bool (*)(
+     const char *,
+     uint64_t,
+     size_t,
+-    size_t);
+-using rpc_synchronize_tensor_files_t = bool (*)(ggml_backend_buffer_t);
++    size_t,
++    bool,
++    uint64_t,
++    uint64_t,
++    int64_t,
++    uint32_t);
++using rpc_synchronize_tensor_files_t = bool (*)(
++    ggml_backend_buffer_t,
++    uint64_t *,
++    uint64_t *);
++
++#if !defined(_WIN32)
++static int64_t rpc_source_mtime_sec(const struct stat & status) {
++#if defined(__APPLE__)
++    return status.st_mtimespec.tv_sec;
++#else
++    return status.st_mtim.tv_sec;
++#endif
++}
++
++static uint32_t rpc_source_mtime_nsec(const struct stat & status) {
++#if defined(__APPLE__)
++    return status.st_mtimespec.tv_nsec;
++#else
++    return status.st_mtim.tv_nsec;
++#endif
++}
++#endif
+ 
+ static void * rpc_buffer_proc_address(
+         ggml_backend_buffer_t buffer,
+@@ -570,9 +600,11 @@ llama_model_loader::llama_model_loader(
+         bool check_tensors,
+         bool no_alloc,
+         const char * param_rpc_tensor_source_root,
++        bool param_rpc_tensor_source_same_backing_file,
+         const llama_model_kv_override * param_overrides_p,
+         const llama_model_tensor_buft_override * param_tensor_buft_overrides_p)
+         : metadata(meta), set_tensor_data(set_tensor_data), set_tensor_data_ud(set_tensor_data_ud) {
++    rpc_tensor_source_same_backing_file = param_rpc_tensor_source_same_backing_file;
+     int trace = 0;
+     if (getenv("LLAMA_TRACE")) {
+         trace = atoi(getenv("LLAMA_TRACE"));
+@@ -741,6 +773,7 @@ llama_model_loader::llama_model_loader(
+     }
+ 
+     rpc_tensor_source_paths.resize(files.size());
++    rpc_tensor_source_identities.resize(files.size());
+     if (param_rpc_tensor_source_root != nullptr) {
+         if (file_paths.size() != files.size() ||
+             std::any_of(file_paths.begin(), file_paths.end(), [](const std::string & path) {
+@@ -756,6 +789,12 @@ llama_model_loader::llama_model_loader(
+                 "invalid RPC tensor source root: %s",
+                 param_rpc_tensor_source_root));
+         }
++#if defined(_WIN32)
++        if (rpc_tensor_source_same_backing_file) {
++            throw std::runtime_error(
++                "same-backing-file RPC tensor sources require POSIX file identity");
++        }
++#endif
+         for (size_t idx = 0; idx < file_paths.size(); ++idx) {
+             fs::path source_file = fs::canonical(file_paths[idx], source_error);
+             if (source_error || source_file.parent_path() != source_root ||
+@@ -766,12 +805,30 @@ llama_model_loader::llama_model_loader(
+                     source_root.string().c_str()));
+             }
+             rpc_tensor_source_paths[idx] = source_file.filename().generic_string();
++#if !defined(_WIN32)
++            struct stat status;
++            if (fstat(files[idx]->file_id(), &status) != 0 ||
++                !S_ISREG(status.st_mode) ||
++                status.st_size < 0 ||
++                (uint64_t) status.st_size != files[idx]->size()) {
++                throw std::runtime_error(format(
++                    "could not attest open GGUF source '%s'",
++                    file_paths[idx].c_str()));
++            }
++            rpc_tensor_source_identities[idx] = {
++                /* .inode = */ (uint64_t) status.st_ino,
++                /* .size = */ (uint64_t) status.st_size,
++                /* .mtime_sec = */ rpc_source_mtime_sec(status),
++                /* .mtime_nsec = */ rpc_source_mtime_nsec(status),
++            };
++#endif
+         }
+         LLAMA_LOG_INFO(
+-            "%s: enabled RPC server-local tensor loading for %zu GGUF file(s) under %s\n",
++            "%s: enabled RPC server-local tensor loading for %zu GGUF file(s) under %s (mode: %s)\n",
+             __func__,
+             rpc_tensor_source_paths.size(),
+-            source_root.string().c_str());
++            source_root.string().c_str(),
++            rpc_tensor_source_same_backing_file ? "same-backing-file" : "fallback");
+     }
+ 
+     n_kv      = gguf_get_n_kv(metadata);
+@@ -1506,6 +1563,7 @@ bool llama_model_loader::enqueue_rpc_tensor_source(
+         const llama_tensor_weight & weight) {
+     if (check_tensors ||
+         weight.idx >= rpc_tensor_source_paths.size() ||
++        weight.idx >= rpc_tensor_source_identities.size() ||
+         rpc_tensor_source_paths[weight.idx].empty() ||
+         unavailable_rpc_tensor_source_buffers.count(tensor->buffer) != 0) {
+         return false;
+@@ -1518,18 +1576,31 @@ bool llama_model_loader::enqueue_rpc_tensor_source(
+     }
+ 
+     const size_t size = ggml_nbytes(tensor);
++    const auto & identity = rpc_tensor_source_identities[weight.idx];
+     const bool queued = set_from_file(
+         tensor,
+         rpc_tensor_source_paths[weight.idx].c_str(),
+         weight.offs,
+         0,
+-        size);
++        size,
++        rpc_tensor_source_same_backing_file,
++        identity.inode,
++        identity.size,
++        identity.mtime_sec,
++        identity.mtime_nsec);
+     if (queued) {
+         pending_rpc_tensor_source_buffers.insert(tensor->buffer);
++        rpc_tensor_source_count_by_buffer[tensor->buffer]++;
++        rpc_tensor_source_bytes_by_buffer[tensor->buffer] += size;
+         rpc_tensor_source_count++;
+         rpc_tensor_source_bytes += size;
+         return true;
+     }
++    if (rpc_tensor_source_same_backing_file) {
++        throw std::runtime_error(format(
++            "strict same-backing-file RPC tensor source rejected '%s'",
++            rpc_tensor_source_paths[weight.idx].c_str()));
++    }
+     if (pending_rpc_tensor_source_buffers.count(tensor->buffer) != 0) {
+         throw std::runtime_error(format(
+             "RPC tensor source rejected '%s' after accepting earlier tensors",
+@@ -1546,10 +1617,27 @@ void llama_model_loader::synchronize_rpc_tensor_source() {
+     for (ggml_backend_buffer_t buffer : pending_rpc_tensor_source_buffers) {
+         rpc_synchronize_tensor_files_t synchronize =
+             rpc_synchronize_tensor_files(buffer);
+-        if (synchronize == nullptr || !synchronize(buffer)) {
++        uint64_t completed_count = 0;
++        uint64_t completed_bytes = 0;
++        if (synchronize == nullptr ||
++            !synchronize(buffer, &completed_count, &completed_bytes)) {
+             throw std::runtime_error(
+                 "an RPC server-local tensor load failed during synchronization");
+         }
++        const uint64_t expected_count =
++            rpc_tensor_source_count_by_buffer.at(buffer);
++        const uint64_t expected_bytes =
++            rpc_tensor_source_bytes_by_buffer.at(buffer);
++        if (completed_count != expected_count ||
++            completed_bytes != expected_bytes) {
++            throw std::runtime_error(format(
++                "RPC tensor source barrier completed %" PRIu64
++                "/%" PRIu64 " tensors and %" PRIu64 "/%" PRIu64 " bytes",
++                completed_count,
++                expected_count,
++                completed_bytes,
++                expected_bytes));
++        }
+     }
+     if (!pending_rpc_tensor_source_buffers.empty()) {
+         LLAMA_LOG_INFO(
+@@ -1559,6 +1647,8 @@ void llama_model_loader::synchronize_rpc_tensor_source() {
+             rpc_tensor_source_bytes / 1024.0 / 1024.0 / 1024.0);
+     }
+     pending_rpc_tensor_source_buffers.clear();
++    rpc_tensor_source_count_by_buffer.clear();
++    rpc_tensor_source_bytes_by_buffer.clear();
+ }
+ 
+ bool llama_model_loader::load_all_data(
+diff --git a/src/llama-model-loader.h b/src/llama-model-loader.h
+index 64e2992d2..679ddcd9f 100644
+--- a/src/llama-model-loader.h
++++ b/src/llama-model-loader.h
+@@ -18,6 +18,13 @@
+ 
+ using llama_buf_map = std::unordered_map<uint32_t, ggml_backend_buffer_t>;
+ 
++struct llama_rpc_tensor_source_identity {
++    uint64_t inode = 0;
++    uint64_t size = 0;
++    int64_t mtime_sec = 0;
++    uint32_t mtime_nsec = 0;
++};
++
+ // lists of buffer types used for each layer
+ using buft_list_t = std::vector<std::pair<ggml_backend_dev_t, ggml_backend_buffer_type_t>>;
+ 
+@@ -84,6 +91,8 @@ struct llama_model_loader {
+     llama_files files;
+     std::vector<std::string> file_paths;
+     std::vector<std::string> rpc_tensor_source_paths;
++    std::vector<llama_rpc_tensor_source_identity> rpc_tensor_source_identities;
++    bool rpc_tensor_source_same_backing_file = true;
+     llama_ftype ftype;
+     llama_fver  fver;
+ 
+@@ -124,6 +133,8 @@ struct llama_model_loader {
+ 
+     std::unordered_set<ggml_backend_buffer_t> pending_rpc_tensor_source_buffers;
+     std::unordered_set<ggml_backend_buffer_t> unavailable_rpc_tensor_source_buffers;
++    std::unordered_map<ggml_backend_buffer_t, uint64_t> rpc_tensor_source_count_by_buffer;
++    std::unordered_map<ggml_backend_buffer_t, uint64_t> rpc_tensor_source_bytes_by_buffer;
+     uint64_t rpc_tensor_source_count = 0;
+     uint64_t rpc_tensor_source_bytes = 0;
+ 
+@@ -138,6 +149,7 @@ struct llama_model_loader {
+         bool check_tensors,
+         bool no_alloc,
+         const char * param_rpc_tensor_source_root,
++        bool param_rpc_tensor_source_same_backing_file,
+         const llama_model_kv_override * param_overrides_p,
+         const llama_model_tensor_buft_override * param_tensor_buft_overrides_p);
+ 
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 9f16b6b93..2cfc8ed7f 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -2344,6 +2344,7 @@ llama_model_params llama_model_default_params() {
+         /*.main_gpu                    =*/ 0,
+         /*.tensor_split                =*/ nullptr,
+         /*.rpc_tensor_source_root      =*/ nullptr,
++        /*.rpc_tensor_source_same_backing_file =*/ true,
+         /*.progress_callback           =*/ nullptr,
+         /*.progress_callback_user_data =*/ nullptr,
+         /*.kv_overrides                =*/ nullptr,
+diff --git a/src/llama-quant.cpp b/src/llama-quant.cpp
+index 607320e95..12086b169 100644
+--- a/src/llama-quant.cpp
++++ b/src/llama-quant.cpp
+@@ -890,7 +890,8 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
+     std::vector<std::string> splits = {};
+     llama_model_loader ml(/*metadata*/ nullptr, /*set_tensor_data*/ nullptr, /*set_tensor_data_ud*/ nullptr,
+         fname_inp, splits, /*file*/ nullptr, /*load_mode*/ load_mode, /*check_tensors*/ true, /*no_alloc*/ false,
+-        /*param_rpc_tensor_source_root*/ nullptr, kv_overrides, nullptr);
++        /*param_rpc_tensor_source_root*/ nullptr,
++        /*param_rpc_tensor_source_same_backing_file*/ true, kv_overrides, nullptr);
+     ml.init_mappings(false); // no prefetching
+ 
+     auto mparams = llama_model_default_params();
+diff --git a/src/llama.cpp b/src/llama.cpp
+index 4be292fda..90118a455 100644
+--- a/src/llama.cpp
++++ b/src/llama.cpp
+@@ -305,7 +305,8 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
+         const std::string & fname, std::vector<std::string> & splits, FILE * file, llama_model_params & params) {
+     try {
+         llama_model_loader ml(metadata, set_tensor_data, set_tensor_data_ud, fname, splits, file, params.load_mode,
+-            params.check_tensors, params.no_alloc, params.rpc_tensor_source_root, params.kv_overrides, params.tensor_buft_overrides);
++            params.check_tensors, params.no_alloc, params.rpc_tensor_source_root,
++            params.rpc_tensor_source_same_backing_file, params.kv_overrides, params.tensor_buft_overrides);
+ 
+         ml.print_info();
+         std::unique_ptr<llama_model> model_ptr(llama_model_create(ml, params));
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index cd95e3ca6..b2c268fb8 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -260,6 +260,12 @@ set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-downlo
+ llama_build_and_test(test-arg-parser.cpp)
+ llama_build_and_test(test-dflash-plan.cpp)
+ 
++if (GGML_RPC AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
++    llama_build(test-rpc-tensor-source.cpp)
++    target_link_libraries(test-rpc-tensor-source PRIVATE ggml-rpc)
++    llama_test(test-rpc-tensor-source LABEL rpc)
++endif()
++
+ if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
+   # TODO: repair known memory leaks
+   llama_build_and_test(test-opt.cpp)
+diff --git a/tests/test-rpc-tensor-source.cpp b/tests/test-rpc-tensor-source.cpp
+new file mode 100644
+index 000000000..260e24860
+--- /dev/null
++++ b/tests/test-rpc-tensor-source.cpp
+@@ -0,0 +1,286 @@
++#include "ggml-backend.h"
++#include "ggml-rpc.h"
++#include "ggml.h"
++
++#include <array>
++#include <cerrno>
++#include <chrono>
++#include <cstdint>
++#include <cstring>
++#include <filesystem>
++#include <fstream>
++#include <stdexcept>
++#include <string>
++#include <thread>
++#include <vector>
++
++#if !defined(_WIN32)
++#    include <arpa/inet.h>
++#    include <dirent.h>
++#    include <netinet/in.h>
++#    include <sys/resource.h>
++#    include <sys/socket.h>
++#    include <sys/stat.h>
++#    include <sys/wait.h>
++#    include <unistd.h>
++
++#    include <csignal>
++#endif
++
++namespace fs = std::filesystem;
++
++#if !defined(_WIN32)
++struct source_identity {
++    uint64_t inode;
++    uint64_t size;
++    int64_t  mtime_sec;
++    uint32_t mtime_nsec;
++};
++
++static source_identity identity_for(const fs::path & path) {
++    struct stat status;
++    if (stat(path.c_str(), &status) != 0) {
++        throw std::runtime_error("stat failed");
++    }
++#    if defined(__APPLE__)
++    const auto & mtime = status.st_mtimespec;
++#    else
++    const auto & mtime = status.st_mtim;
++#    endif
++    return {
++        (uint64_t) status.st_ino,
++        (uint64_t) status.st_size,
++        mtime.tv_sec,
++        (uint32_t) mtime.tv_nsec,
++    };
++}
++
++static void require(bool condition, const char * message) {
++    if (!condition) {
++        throw std::runtime_error(message);
++    }
++}
++
++static size_t count_open_fds(pid_t process) {
++    const fs::path directory = fs::path("/proc") / std::to_string(process) / "fd";
++    size_t         count     = 0;
++    for (const auto & entry : fs::directory_iterator(directory)) {
++        (void) entry;
++        count++;
++    }
++    return count;
++}
++
++static bool port_is_ready(uint16_t port) {
++    const int socket_fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
++    if (socket_fd < 0) {
++        return false;
++    }
++    sockaddr_in address     = {};
++    address.sin_family      = AF_INET;
++    address.sin_port        = htons(port);
++    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
++    const bool ready        = connect(socket_fd, (sockaddr *) &address, sizeof(address)) == 0;
++    close(socket_fd);
++    return ready;
++}
++
++static uint16_t reserve_ephemeral_port() {
++    const int socket_fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
++    if (socket_fd < 0) {
++        throw std::runtime_error("socket failed");
++    }
++    sockaddr_in address     = {};
++    address.sin_family      = AF_INET;
++    address.sin_port        = 0;
++    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
++    socklen_t address_size  = sizeof(address);
++    if (bind(socket_fd, (sockaddr *) &address, address_size) != 0 ||
++        getsockname(socket_fd, (sockaddr *) &address, &address_size) != 0) {
++        close(socket_fd);
++        throw std::runtime_error("ephemeral port allocation failed");
++    }
++    const uint16_t port = ntohs(address.sin_port);
++    close(socket_fd);
++    return port;
++}
++
++static pid_t start_server(const fs::path & root, const std::string & endpoint, uint16_t port) {
++    const pid_t child = fork();
++    if (child < 0) {
++        throw std::runtime_error("fork failed");
++    }
++    if (child == 0) {
++        struct rlimit descriptor_limit = { 32, 32 };
++        if (setrlimit(RLIMIT_NOFILE, &descriptor_limit) != 0) {
++            _exit(70);
++        }
++        ggml_backend_load_all();
++        ggml_backend_dev_t device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
++        if (device == nullptr) {
++            _exit(71);
++        }
++        ggml_backend_rpc_start_server_with_tensor_source(endpoint.c_str(), nullptr, root.c_str(), 2, 1, 1, &device);
++        _exit(72);
++    }
++    for (int attempt = 0; attempt < 200; ++attempt) {
++        if (port_is_ready(port)) {
++            return child;
++        }
++        int status = 0;
++        if (waitpid(child, &status, WNOHANG) == child) {
++            throw std::runtime_error("RPC server exited during startup");
++        }
++        std::this_thread::sleep_for(std::chrono::milliseconds(10));
++    }
++    kill(child, SIGKILL);
++    waitpid(child, nullptr, 0);
++    throw std::runtime_error("RPC server did not become ready");
++}
++
++struct remote_tensor {
++    ggml_context *        context = nullptr;
++    ggml_backend_buffer_t buffer  = nullptr;
++    ggml_tensor *         tensor  = nullptr;
++
++    explicit remote_tensor(ggml_backend_buffer_type_t buffer_type) {
++        ggml_init_params params = {
++            /* .mem_size   = */ ggml_tensor_overhead(),
++            /* .mem_buffer = */ nullptr,
++            /* .no_alloc   = */ true,
++        };
++        context = ggml_init(params);
++        require(context != nullptr, "context allocation failed");
++        tensor = ggml_new_tensor_1d(context, GGML_TYPE_F32, 4);
++        buffer = ggml_backend_buft_alloc_buffer(buffer_type, 64);
++        require(buffer != nullptr, "RPC buffer allocation failed");
++        tensor->buffer = buffer;
++        tensor->data   = ggml_backend_buffer_get_base(buffer);
++    }
++
++    ~remote_tensor() {
++        if (buffer != nullptr) {
++            ggml_backend_buffer_free(buffer);
++        }
++        if (context != nullptr) {
++            ggml_free(context);
++        }
++    }
++};
++
++static bool queue(remote_tensor &         destination,
++                  const std::string &     name,
++                  const source_identity & identity,
++                  bool                    strict) {
++    return ggml_backend_rpc_tensor_set_from_file(destination.tensor, name.c_str(), 0, 0,
++                                                 ggml_nbytes(destination.tensor), strict, identity.inode, identity.size,
++                                                 identity.mtime_sec, identity.mtime_nsec);
++}
++
++static void synchronize(remote_tensor & destination, uint64_t expected_count, uint64_t expected_bytes) {
++    uint64_t completed_count = 0;
++    uint64_t completed_bytes = 0;
++    require(ggml_backend_rpc_synchronize_tensor_files(destination.buffer, &completed_count, &completed_bytes),
++            "RPC tensor source barrier failed");
++    require(completed_count == expected_count, "completed count mismatch");
++    require(completed_bytes == expected_bytes, "completed bytes mismatch");
++}
++
++int main() {
++    std::array<char, 64> directory_template = {};
++    std::strcpy(directory_template.data(), "/tmp/llama-rpc-source-XXXXXX");
++    char * directory_name = mkdtemp(directory_template.data());
++    require(directory_name != nullptr, "mkdtemp failed");
++    const fs::path temporary_root(directory_name);
++    const fs::path server_root = temporary_root / "server";
++    const fs::path copied_root = temporary_root / "copy";
++    fs::create_directories(server_root);
++    fs::create_directories(copied_root);
++
++    const std::array<float, 4> first_values  = { 1.0F, 2.0F, 3.0F, 4.0F };
++    const std::array<float, 4> second_values = { 5.0F, 6.0F, 7.0F, 8.0F };
++    for (const auto & [name, values] : std::array{
++             std::pair{ "first.gguf",  first_values  },
++             std::pair{ "second.gguf", second_values },
++             std::pair{ "third.gguf",  first_values  },
++    }) {
++        std::ofstream output(server_root / name, std::ios::binary);
++        output.write((const char *) values.data(), sizeof(values));
++    }
++    fs::copy_file(server_root / "first.gguf", copied_root / "first.gguf");
++
++    const uint16_t    port     = reserve_ephemeral_port();
++    const std::string endpoint = "127.0.0.1:" + std::to_string(port);
++    pid_t             server   = -1;
++    try {
++        server                                 = start_server(server_root, endpoint, port);
++        ggml_backend_buffer_type_t buffer_type = ggml_backend_rpc_buffer_type(endpoint.c_str(), 0);
++        require(buffer_type != nullptr, "RPC buffer type unavailable");
++
++        {
++            remote_tensor         first(buffer_type);
++            remote_tensor         second(buffer_type);
++            const source_identity first_identity  = identity_for(server_root / "first.gguf");
++            const source_identity copied_identity = identity_for(copied_root / "first.gguf");
++            const source_identity second_identity = identity_for(server_root / "second.gguf");
++            const source_identity third_identity  = identity_for(server_root / "third.gguf");
++            require(first_identity.inode != copied_identity.inode, "copy unexpectedly shares inode");
++
++            const size_t baseline_fds = count_open_fds(server);
++            require(queue(first, "first.gguf", first_identity, true), "strict source was rejected");
++            for (int repeat = 0; repeat < 256; ++repeat) {
++                require(queue(first, "first.gguf", first_identity, true), "repeated source was rejected");
++            }
++            synchronize(first, 257, 257 * sizeof(first_values));
++            const size_t one_source_fds = count_open_fds(server);
++            require(one_source_fds == baseline_fds + 1, "one shard did not consume exactly one FD");
++
++            std::array<float, 4> loaded = {};
++            ggml_backend_tensor_get(first.tensor, loaded.data(), 0, sizeof(loaded));
++            require(loaded == first_values, "server-local tensor bytes differ");
++
++            require(!queue(second, "first.gguf", copied_identity, true),
++                    "same-size copied shard passed same-backing-file attestation");
++            require(queue(second, "first.gguf", copied_identity, false),
++                    "explicit fallback mode did not preserve compatibility");
++            synchronize(second, 1, sizeof(first_values));
++
++            require(queue(second, "second.gguf", second_identity, true), "second shard was rejected");
++            synchronize(second, 2, sizeof(first_values) + sizeof(second_values));
++            const size_t two_source_fds = count_open_fds(server);
++            require(two_source_fds == baseline_fds + 2, "two shards did not consume exactly two FDs");
++
++            require(!queue(second, "third.gguf", third_identity, true),
++                    "configured shard FD cap admitted a third file");
++            require(count_open_fds(server) == two_source_fds, "rejected shard leaked a file descriptor");
++
++            std::this_thread::sleep_for(std::chrono::milliseconds(2));
++            {
++                std::ofstream changed(server_root / "first.gguf", std::ios::binary);
++                changed.write((const char *) second_values.data(), sizeof(second_values));
++            }
++            uint64_t ignored_count = 0;
++            uint64_t ignored_bytes = 0;
++            require(!ggml_backend_rpc_synchronize_tensor_files(first.buffer, &ignored_count, &ignored_bytes),
++                    "barrier accepted a source modified while held open");
++        }
++
++        kill(server, SIGTERM);
++        waitpid(server, nullptr, 0);
++        server = -1;
++        fs::remove_all(temporary_root);
++        return 0;
++    } catch (...) {
++        if (server > 0) {
++            kill(server, SIGKILL);
++            waitpid(server, nullptr, 0);
++        }
++        fs::remove_all(temporary_root);
++        throw;
++    }
++}
++#else
++int main() {
++    return 0;
++}
++#endif
+diff --git a/tools/rpc/rpc-server.cpp b/tools/rpc/rpc-server.cpp
+index e0c3ce324..322f5dc28 100644
+--- a/tools/rpc/rpc-server.cpp
++++ b/tools/rpc/rpc-server.cpp
+@@ -14,6 +14,7 @@
+ #include <clocale>
+ #include <codecvt>
+ #include <filesystem>
++#include <limits>
+ #include <regex>
+ #include <stdio.h>
+ #include <string>
+@@ -176,6 +177,7 @@ struct rpc_server_params {
+     int                      n_threads   = std::max(1U, std::thread::hardware_concurrency()/2);
+     std::vector<std::string> devices;
+     std::string              tensor_source_root;
++    size_t                   tensor_source_max_files = 32;
+ };
+ 
+ static void print_usage(int /*argc*/, char ** argv, rpc_server_params params) {
+@@ -188,6 +190,8 @@ static void print_usage(int /*argc*/, char ** argv, rpc_server_params params) {
+     fprintf(stderr, "  -p, --port PORT                  port to bind to (default: %d)\n", params.port);
+     fprintf(stderr, "  -c, --cache                      enable local file cache\n");
+     fprintf(stderr, "      --tensor-source-root PATH    exact local GGUF directory available to file-aware clients\n");
++    fprintf(stderr, "      --tensor-source-max-files N  maximum shard FDs pinned per client (default: %zu)\n",
++        params.tensor_source_max_files);
+     fprintf(stderr, "\n");
+ }
+ 
+@@ -240,6 +244,22 @@ static bool rpc_server_params_parse(int argc, char ** argv, rpc_server_params &
+                 return false;
+             }
+             params.tensor_source_root = argv[i];
++        } else if (arg == "--tensor-source-max-files") {
++            if (++i >= argc) {
++                return false;
++            }
++            try {
++                size_t parsed = 0;
++                const std::string value = argv[i];
++                const unsigned long long count = std::stoull(value, &parsed);
++                if (parsed != value.size() || count == 0 ||
++                    count > std::numeric_limits<size_t>::max()) {
++                    return false;
++                }
++                params.tensor_source_max_files = count;
++            } catch (const std::exception &) {
++                return false;
++            }
+         } else if (arg == "-h" || arg == "--help") {
+             print_usage(argc, argv, params);
+             exit(0);
+@@ -365,6 +385,7 @@ int main(int argc, char * argv[]) {
+             endpoint.c_str(),
+             cache_dir,
+             canonical_source_root.c_str(),
++            params.tensor_source_max_files,
+             params.n_threads,
+             devices.size(),
+             devices.data());

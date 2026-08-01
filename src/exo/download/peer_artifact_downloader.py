@@ -58,9 +58,7 @@ _HASH_READ_SIZE_BYTES = 8 * 1024 * 1024
 
 
 class PeerArtifactClientFactory(Protocol):
-    def __call__(
-        self, peer: PeerArtifactPeerConfig, /
-    ) -> PeerArtifactPeerClient: ...
+    def __call__(self, peer: PeerArtifactPeerConfig, /) -> PeerArtifactPeerClient: ...
 
 
 async def _sha256_regular_file(path: Path, expected_size_bytes: int) -> str | None:
@@ -304,8 +302,7 @@ def _snapshot_progress(
             speed=speed,
             eta=(
                 timedelta(
-                    seconds=max(int(snapshot_file.size_bytes) - local_size, 0)
-                    / speed
+                    seconds=max(int(snapshot_file.size_bytes) - local_size, 0) / speed
                 )
                 if speed > 0
                 else timedelta(0)
@@ -519,10 +516,7 @@ class PeerArtifactShardDownloader(ShardDownloader):
                 PeerArtifactProtocolError,
             ):
                 raise
-        if (
-            not self._config.fallback_to_origin
-            or self._origin_offline
-        ):
+        if not self._config.fallback_to_origin or self._origin_offline:
             if peer_errors:
                 raise PeerArtifactUnavailableError(
                     "no configured peer could provide the requested model snapshot"
@@ -568,9 +562,7 @@ class PeerArtifactShardDownloader(ShardDownloader):
                 )
             except PeerArtifactUnavailableError:
                 continue
-        return await self._origin_downloader.get_shard_download_status_for_shard(
-            shard
-        )
+        return await self._origin_downloader.get_shard_download_status_for_shard(shard)
 
 
 def _prepare_materialization_directory(destination: Path) -> None:

@@ -1,0 +1,925 @@
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index ee94d7c37..e23d5f3a2 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -126,6 +126,27 @@ static bool common_speculative_are_compatible(
+     return true;
+ }
+ 
++common_dflash_draft_plan common_dflash_make_draft_plan(
++        int32_t trained_block_size,
++           bool is_dspark,
++        int32_t n_requested) {
++    GGML_ASSERT(trained_block_size > 0);
++
++    const int32_t n_trained = is_dspark ? trained_block_size : trained_block_size - 1;
++    const int32_t n_return  = std::max(0, std::min(n_requested, n_trained));
++
++    return {
++        /* .n_decode = */ is_dspark ? n_trained : n_return,
++        /* .n_return = */ n_return,
++    };
++}
++
++bool common_dflash_dspark_block_is_supported(
++        int32_t trained_block_size,
++        int32_t n_ubatch) {
++    return trained_block_size == 7 && n_ubatch >= trained_block_size;
++}
++
+ using common_speculative_draft_params_vec = std::vector<common_speculative_draft_params>;
+ 
+ // state of an implementation of speculative decoding
+@@ -917,6 +938,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+ 
+     int32_t     block_size    = 0;
+     llama_token mask_token_id = 0;
++    bool        is_dspark     = false;
+ 
+     const int32_t * target_layer_ids   = nullptr; // model_dft's extract layer indices
+     uint32_t        target_layer_ids_n = 0;
+@@ -950,19 +972,26 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+             if (llama_model_meta_val_str(model_dft, "dflash.block_size", buf, sizeof(buf)) >= 0) {
+                 block_size = std::atoi(buf);
+             }
++            if (llama_model_meta_val_str(model_dft, "dflash.markov_rank", buf, sizeof(buf)) >= 0) {
++                is_dspark = std::atoi(buf) > 0;
++            }
+         }
+         mask_token_id = llama_vocab_mask(llama_model_get_vocab(model_dft));
+ 
+         LOG_INF("%s: adding speculative implementation 'draft-dflash'\n", __func__);
+         LOG_INF("%s: - n_max=%d, n_min=%d, p_min=%.2f\n", __func__, this->params.n_max, this->params.n_min, this->params.p_min);
+-        LOG_INF("%s: - block_size=%d, mask_token_id=%d, n_extract=%u\n", __func__, block_size, mask_token_id, target_layer_ids_n);
++        LOG_INF("%s: - block_size=%d, mask_token_id=%d, n_extract=%u, dspark=%d\n",
++                __func__, block_size, mask_token_id, target_layer_ids_n, is_dspark);
+ 
+-        // DFlash input is [id_last, <mask> * (block_size-1)], so it can draft at most block_size-1 tokens per step
+-        if (this->params.n_max > block_size - 1 || this->params.n_min > block_size - 1) {
+-            LOG_WRN("%s: requested draft size (n_max=%d, n_min=%d) exceeds the trained DFlash block size %d -- clamping to %d\n",
+-                    __func__, this->params.n_max, this->params.n_min, block_size, block_size - 1);
+-            this->params.n_max = std::min(this->params.n_max, block_size - 1);
+-            this->params.n_min = std::min(this->params.n_min, block_size - 1);
++        const int32_t n_trained = is_dspark ? block_size : block_size - 1;
++        if (is_dspark && !common_dflash_dspark_block_is_supported(n_trained, (int32_t) llama_n_ubatch(ctx_dft))) {
++            throw std::runtime_error("K3 DSpark requires a seven-row physical block and n_ubatch >= 7");
++        }
++        if (this->params.n_max > n_trained || this->params.n_min > n_trained) {
++            LOG_WRN("%s: requested draft size (n_max=%d, n_min=%d) exceeds the trained draft width %d -- clamping to %d\n",
++                    __func__, this->params.n_max, this->params.n_min, n_trained, n_trained);
++            this->params.n_max = std::min(this->params.n_max, n_trained);
++            this->params.n_min = std::min(this->params.n_min, n_trained);
+         }
+ 
+         batch        = llama_batch_init(llama_n_batch(ctx_dft), 0,          n_seq);
+@@ -1106,7 +1135,85 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+         return true;
+     }
+ 
++    void sample_block(
++            llama_seq_id seq_id,
++                   int32_t beg,
++                   int32_t n_return,
++                   int32_t i_first,
++            common_speculative_draft_params & dp) {
++        auto * smpl = smpls[seq_id].get();
++        auto & result = *dp.result;
++
++        for (int32_t i = i_first; i < i_first + n_return; ++i) {
++            common_sampler_sample(smpl, params.ctx_dft, beg + i, true);
++
++            const auto * cur_p = common_sampler_get_candidates(smpl, true);
++
++            for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
++                LOG_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
++                        seq_id, k, i - i_first, cur_p->data[k].id, cur_p->data[k].p,
++                        common_token_to_piece(params.ctx_dft, cur_p->data[k].id).c_str());
++            }
++
++            const llama_token id = cur_p->data[0].id;
++
++            if (cur_p->data[0].p < params.p_min) {
++                break;
++            }
++
++            common_sampler_accept(smpl, id, true);
++            result.push_back(id);
++        }
++
++        if (result.size() < (size_t) params.n_min) {
++            result.clear();
++        }
++    }
++
++    void draft_dspark(common_speculative_draft_params_vec & dparams) {
++        // Keep every physical seven-row block in one decode. In particular,
++        // unified KV uses split_simple(), whose ubatches are not tagged as
++        // equal-sequence even when they contain one complete sequence.
++        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
++            auto & dp = dparams[seq_id];
++            if (!dp.drafting) {
++                continue;
++            }
++
++            int32_t n_draft = params.n_max;
++            if (dp.n_max > 0) {
++                n_draft = std::min(n_draft, dp.n_max);
++            }
++
++            const auto plan = common_dflash_make_draft_plan(block_size, true, n_draft);
++            if (plan.n_return == 0) {
++                continue;
++            }
++
++            common_sampler_reset(smpls[seq_id].get());
++            common_batch_clear(batch);
++
++            const int32_t n = (int32_t) dp.n_past;
++            for (int32_t i = 0; i < plan.n_decode; ++i) {
++                common_batch_add(batch, i == 0 ? dp.id_last : mask_token_id, n + i, { seq_id }, true);
++            }
++
++            const int ret = llama_decode(params.ctx_dft, batch);
++            if (ret != 0) {
++                LOG_WRN("%s: llama_decode returned %d for seq_id %d\n", __func__, ret, seq_id);
++                continue;
++            }
++
++            sample_block(seq_id, 0, plan.n_return, 0, dp);
++        }
++    }
++
+     void draft(common_speculative_draft_params_vec & dparams) override {
++        if (is_dspark) {
++            draft_dspark(dparams);
++            return;
++        }
++
+         auto & ctx_dft = params.ctx_dft;
+ 
+         common_batch_clear(batch);
+@@ -1131,9 +1238,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+                 n_draft = std::min(n_draft, dp.n_max);
+             }
+ 
+-            const int32_t n_block_tokens = n_draft + 1; // id_last + n_draft * <mask>
++            const auto plan = common_dflash_make_draft_plan(block_size, is_dspark, n_draft);
++            const int32_t n_block_tokens = is_dspark ? plan.n_decode : plan.n_decode + 1;
+             i_block_beg[seq_id] = batch.n_tokens;
+-            n_block    [seq_id] = n_block_tokens;
++            n_block    [seq_id] = plan.n_return;
+             for (int32_t i = 0; i < n_block_tokens; ++i) {
+                 common_batch_add(batch, i == 0 ? dp.id_last : mask_token_id, n + i, { seq_id }, true);
+             }
+@@ -1156,39 +1264,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+             }
+             auto & dp = dparams[seq_id];
+ 
+-            const int32_t beg            = i_block_beg[seq_id];
+-            const int32_t n_block_tokens = n_block[seq_id];
+-
+-            auto * smpl = smpls[seq_id].get();
+-
+-            auto & result = *dp.result;
+-
+-            // greedily read the predicted block at this sequence's noise positions 1..n_block_tokens-1
+-            for (int32_t i = 1; i < n_block_tokens; ++i) {
+-                common_sampler_sample(smpl, ctx_dft, beg + i, true);
++            const int32_t beg      = i_block_beg[seq_id];
++            const int32_t n_return = n_block[seq_id];
+ 
+-                const auto * cur_p = common_sampler_get_candidates(smpl, true);
+-
+-                for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
+-                    LOG_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
+-                            seq_id, k, i - 1, cur_p->data[k].id, cur_p->data[k].p,
+-                            common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
+-                }
+-
+-                const llama_token id = cur_p->data[0].id;
+-
+-                if (cur_p->data[0].p < params.p_min) {
+-                    break;
+-                }
+-
+-                common_sampler_accept(smpl, id, true);
+-
+-                result.push_back(id);
+-            }
+-
+-            if (result.size() < (size_t) params.n_min) {
+-                result.clear();
+-            }
++            sample_block(seq_id, beg, n_return, 1, dp);
+         }
+     }
+ 
+@@ -2286,7 +2365,7 @@ common_speculative_init_result::common_speculative_init_result(
+         model_path = params.speculative.draft.mparams.path;
+         LOG_INF("%s: loading draft model '%s'\n", __func__, model_path.c_str());
+ 
+-        llama_model * model_dft = llama_model_load_from_file(params.model.path.c_str(), mparams);
++        llama_model * model_dft = llama_model_load_from_file(model_path.c_str(), mparams);
+         if (model_dft == NULL) {
+             LOG_ERR("%s: failed to load draft model, '%s'\n", __func__, model_path.c_str());
+             return;
+diff --git a/common/speculative.h b/common/speculative.h
+index 062bf2093..b3a5c2fd8 100644
+--- a/common/speculative.h
++++ b/common/speculative.h
+@@ -5,6 +5,22 @@
+ 
+ struct common_speculative;
+ 
++struct common_dflash_draft_plan {
++    int32_t n_decode;
++    int32_t n_return;
++};
++
++// DSpark always evaluates its complete trained block. n_requested only caps how
++// many candidates are returned to the target verifier.
++common_dflash_draft_plan common_dflash_make_draft_plan(
++        int32_t trained_block_size,
++           bool is_dspark,
++        int32_t n_requested);
++
++bool common_dflash_dspark_block_is_supported(
++        int32_t trained_block_size,
++        int32_t n_ubatch);
++
+ // comma separated list the provided types
+ std::string common_speculative_type_name_str(const std::vector<enum common_speculative_type> & types);
+ 
+diff --git a/conversion/__init__.py b/conversion/__init__.py
+index cb1d55522..84770675d 100644
+--- a/conversion/__init__.py
++++ b/conversion/__init__.py
+@@ -122,6 +122,7 @@ TEXT_MODEL_MAP: dict[str, str] = {
+     "KORMoForCausalLM": "qwen",
+     "KimiK25ForConditionalGeneration": "deepseek",
+     "KimiK3ForConditionalGeneration": "kimi_k3",
++    "K3DSparkModel": "qwen",
+     "KimiLinearForCausalLM": "kimi_linear",
+     "KimiLinearModel": "kimi_linear",
+     "KimiVLForConditionalGeneration": "deepseek",
+diff --git a/conversion/qwen.py b/conversion/qwen.py
+index 9bc2b99fd..abcbe695c 100644
+--- a/conversion/qwen.py
++++ b/conversion/qwen.py
+@@ -688,3 +688,92 @@ class DFlashModel(Qwen3Model):
+         if not name.startswith("model."):
+             name = "model." + name
+         return super().filter_tensors((name, gen))
++
++
++@ModelBase.register("K3DSparkModel")
++class K3DSparkModel(DFlashModel):
++    model_arch = gguf.MODEL_ARCH.DFLASH
++
++    def set_vocab(self):
++        super().set_vocab()
++        self.gguf_writer.add_mask_token_id(self.hparams["mask_token_id"])
++
++    def set_gguf_parameters(self):
++        if self.hparams.get("markov_head_type") != "vanilla":
++            raise ValueError("K3 DSpark requires the vanilla Markov head")
++        if self.hparams.get("draft_vocab_size") != self.hparams.get("vocab_size"):
++            raise ValueError("K3 DSpark requires draft_vocab_size == vocab_size")
++        if self.hparams.get("mla_use_nope") or self.hparams.get("mla_use_output_gate"):
++            raise ValueError("K3 DSpark requires RoPE MLA without an output gate")
++        if self.hparams.get("sample_from_anchor", True) is not True:
++            raise ValueError("K3 DSpark requires anchor-as-first-prediction layout")
++
++        self.hparams["num_key_value_heads"] = 1
++        TextModel.set_gguf_parameters(self)
++
++        self.gguf_writer.add_vocab_size(self.hparams["vocab_size"])
++        self.gguf_writer.add_rope_dimension_count(self.hparams["qk_rope_head_dim"])
++        self.gguf_writer.add_q_lora_rank(self.hparams["q_lora_rank"])
++        self.gguf_writer.add_kv_lora_rank(self.hparams["kv_lora_rank"])
++        self.gguf_writer.add_key_length(self.hparams["kv_lora_rank"] + self.hparams["qk_rope_head_dim"])
++        self.gguf_writer.add_value_length(self.hparams["kv_lora_rank"])
++        self.gguf_writer.add_key_length_mla(self.hparams["qk_nope_head_dim"] + self.hparams["qk_rope_head_dim"])
++        self.gguf_writer.add_value_length_mla(self.hparams["v_head_dim"])
++        self.gguf_writer.add_causal_attention(False)
++
++        target_layer_ids = self.hparams["target_layer_ids"]
++        if len(target_layer_ids) != self.hparams["num_target_layers"]:
++            raise ValueError("K3 DSpark target layer count does not match target_layer_ids")
++        if self.hparams["target_hidden_size"] != self.hparams["hidden_size"]:
++            raise ValueError("K3 DSpark target and draft hidden sizes must match")
++        self.gguf_writer.add_target_layers([il + 1 for il in target_layer_ids])
++
++        # K3 uses anchor-as-first-prediction: all seven query rows are predictions.
++        self.gguf_writer.add_block_size(7)
++        self.gguf_writer.add_uint32(
++            f"{self.gguf_writer.arch}.markov_rank",
++            self.hparams["markov_rank"],
++        )
++
++        if (mscale_all_dim := self.rope_parameters.get("mscale_all_dim")) is not None:
++            self.gguf_writer.add_rope_scaling_yarn_log_mul(0.1 * mscale_all_dim)
++
++    @classmethod
++    def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
++        name, _ = item
++        if name.startswith(("confidence_head.", "embed_tokens.")):
++            return None
++        return TextModel.filter_tensors(item)
++
++    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
++        if name == "context_proj.weight":
++            name = "model.fc.weight"
++        elif name == "context_norm.weight":
++            name = "model.hidden_norm.weight"
++        elif name == "final_norm.weight":
++            name = "model.norm.weight"
++        elif name == "markov_head.markov_w1.weight":
++            yield "markov_w1.weight", data_torch
++            return
++        elif name == "markov_head.markov_w2.weight":
++            yield "markov_w2.weight", data_torch
++            return
++        elif name.startswith("layers."):
++            name = "model." + name
++
++        if name.endswith("kv_b_proj.weight"):
++            n_head = self.hparams["num_attention_heads"]
++            v_head_dim = self.hparams["v_head_dim"]
++            qk_nope_head_dim = self.hparams["qk_nope_head_dim"]
++            if data_torch.shape[0] != n_head * (v_head_dim + qk_nope_head_dim):
++                raise ValueError(f"unexpected K3 DSpark kv_b shape {tuple(data_torch.shape)}")
++            kv_b = data_torch.view(n_head, v_head_dim + qk_nope_head_dim, data_torch.shape[-1])
++            k_b, v_b = torch.split(kv_b, [qk_nope_head_dim, v_head_dim], dim=1)
++            k_b = k_b.transpose(1, 2)
++            yield from TextModel.modify_tensors(
++                self, k_b, name.replace("kv_b_proj", "k_b_proj"), bid)
++            yield from TextModel.modify_tensors(
++                self, v_b, name.replace("kv_b_proj", "v_b_proj"), bid)
++            return
++
++        yield from TextModel.modify_tensors(self, data_torch, name, bid)
+diff --git a/docs/speculative.md b/docs/speculative.md
+index 4100b92f8..f3a23f557 100644
+--- a/docs/speculative.md
++++ b/docs/speculative.md
+@@ -74,6 +74,38 @@ llama-server -m Qwen3-4B.gguf -md Qwen3-4B-DFlash.gguf \
+ 
+ `--spec-draft-n-max` is clamped to the draft model's trained block size.
+ 
++Kimi K3's DSpark checkpoint uses the same runtime with a K3-specific dense
++RoPE-MLA decoder and sequential Markov head. Convert the draft against the
++unquantized target repository so the GGUF gets the target tokenizer and exact
++hidden-state extraction points:
++
++```bash
++python convert_hf_to_gguf.py /models/Inferact-Kimi-K3-DSpark \
++    --target-model-dir /models/moonshotai-Kimi-K3 \
++    --outtype bf16 --outfile Kimi-K3-DSpark-BF16.gguf
++
++llama-server -m Kimi-K3-UD-Q2_K_XL.gguf \
++    -md Kimi-K3-DSpark-BF16.gguf \
++    --spec-type draft-dflash --spec-draft-n-max 3 \
++    --spec-draft-device CUDA1 --spec-draft-ngl all \
++    --temp 0 -fa on --jinja
++```
++
++The target directory only needs its config and tokenizer files; its full
++unquantized weights are not read. Replace `CUDA1` with the device reported by
++`--list-devices`. The K3 checkpoint
++is trained as exactly seven query rows: an anchor and six masks, with the anchor
++predicting the first candidate. Values 3, 5, and 7 for
++`--spec-draft-n-max` only cap how many candidates are returned to the target
++verifier; the draft always evaluates the complete seven-row block. Start with
++3 and sweep 3/5/7 using measured accepted-token throughput.
++
++This K3 path is greedy-only for now (`--temp 0`). It deliberately uses normal
++speculative checkpoints rather than recurrent-state rollback. The converted
++draft shares the target token embedding and output projection at runtime, so
++placing the target and draft on different RPC devices still needs an
++end-to-end backend compatibility and transfer-cost measurement.
++
+ See:
+ 
+ - #22105
+diff --git a/gguf-py/gguf/constants.py b/gguf-py/gguf/constants.py
+index 8f70490b2..be8d88c1a 100644
+--- a/gguf-py/gguf/constants.py
++++ b/gguf-py/gguf/constants.py
+@@ -983,6 +983,8 @@ class MODEL_TENSOR(IntEnum):
+     NEXTN_SHARED_HEAD_NORM = auto()
+     # eagle3
+     FC                     = auto()  # feature fusion layer
++    MARKOV_W1              = auto()
++    MARKOV_W2              = auto()
+     D2T                    = auto()  # draft to target vocabulary mapping
+     # lfm2 audio
+     A_ENC_NORM_CONV        = auto()
+@@ -1607,6 +1609,8 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
+     MODEL_TENSOR.NEXTN_SHARED_HEAD_HEAD:    "blk.{bid}.nextn.shared_head_head",
+     MODEL_TENSOR.NEXTN_SHARED_HEAD_NORM:    "blk.{bid}.nextn.shared_head_norm",
+     MODEL_TENSOR.FC:                        "fc",
++    MODEL_TENSOR.MARKOV_W1:                 "markov_w1",
++    MODEL_TENSOR.MARKOV_W2:                 "markov_w2",
+     MODEL_TENSOR.D2T:                       "d2t",
+ }
+ 
+@@ -4326,16 +4330,25 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
+         MODEL_TENSOR.OUTPUT_NORM,
+         MODEL_TENSOR.ATTN_NORM,
+         MODEL_TENSOR.ATTN_Q,
++        MODEL_TENSOR.ATTN_Q_A,
++        MODEL_TENSOR.ATTN_Q_B,
+         MODEL_TENSOR.ATTN_K,
+         MODEL_TENSOR.ATTN_V,
+         MODEL_TENSOR.ATTN_OUT,
+         MODEL_TENSOR.ATTN_Q_NORM,
+         MODEL_TENSOR.ATTN_K_NORM,
++        MODEL_TENSOR.ATTN_Q_A_NORM,
++        MODEL_TENSOR.ATTN_KV_A_MQA,
++        MODEL_TENSOR.ATTN_KV_A_NORM,
++        MODEL_TENSOR.ATTN_K_B,
++        MODEL_TENSOR.ATTN_V_B,
+         MODEL_TENSOR.FFN_NORM,
+         MODEL_TENSOR.FFN_GATE,
+         MODEL_TENSOR.FFN_DOWN,
+         MODEL_TENSOR.FFN_UP,
+         MODEL_TENSOR.FC,
++        MODEL_TENSOR.MARKOV_W1,
++        MODEL_TENSOR.MARKOV_W2,
+         MODEL_TENSOR.ENC_OUTPUT_NORM,
+     ],
+     MODEL_ARCH.MISTRAL4: [
+diff --git a/src/llama-arch.cpp b/src/llama-arch.cpp
+index ebccfd61d..7c31a3d4e 100644
+--- a/src/llama-arch.cpp
++++ b/src/llama-arch.cpp
+@@ -323,6 +323,7 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
+     { LLM_KV_TARGET_LAYERS,         "%s.target_layers"        },
+     { LLM_KV_TARGET_HIDDEN_SIZE,    "%s.target_hidden_size"   },
+     { LLM_KV_NORM_BEFORE_RESIDUAL,  "%s.norm_before_residual" },
++    { LLM_KV_DFLASH_MARKOV_RANK,    "%s.markov_rank"          },
+ 
+     { LLM_KV_SHORTCONV_L_CACHE, "%s.shortconv.l_cache" },
+     // sentence-transformers dense modules feature dims
+@@ -627,6 +628,8 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
+     { LLM_TENSOR_MASKED_EMBD_CENTROIDS,                  "masked_embd_centroids" },
+     { LLM_TENSOR_MASKED_EMBD_ORDERING,                   "masked_embd_ordering" },
+     { LLM_TENSOR_FC,                                     "fc" },
++    { LLM_TENSOR_MARKOV_W1,                              "markov_w1" },
++    { LLM_TENSOR_MARKOV_W2,                              "markov_w2" },
+     { LLM_TENSOR_D2T,                                    "d2t" },
+ };
+ 
+@@ -888,6 +891,8 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
+     {LLM_TENSOR_MASKED_EMBD_ORDERING,       {LLM_TENSOR_LAYER_INPUT,     GGML_OP_NONE}},
+     // eagle3
+     {LLM_TENSOR_FC,                         {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
++    {LLM_TENSOR_MARKOV_W1,                  {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_GET_ROWS}},
++    {LLM_TENSOR_MARKOV_W2,                  {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
+     {LLM_TENSOR_D2T,                        {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_GET_ROWS}},
+ };
+ 
+diff --git a/src/llama-arch.h b/src/llama-arch.h
+index 262ab56bf..02ad437ff 100644
+--- a/src/llama-arch.h
++++ b/src/llama-arch.h
+@@ -369,6 +369,7 @@ enum llm_kv {
+     LLM_KV_TARGET_LAYERS,
+     LLM_KV_TARGET_HIDDEN_SIZE,
+     LLM_KV_NORM_BEFORE_RESIDUAL,
++    LLM_KV_DFLASH_MARKOV_RANK,
+ 
+     LLM_KV_SHORTCONV_L_CACHE,
+ 
+@@ -635,6 +636,8 @@ enum llm_tensor {
+     LLM_TENSOR_MASKED_EMBD_CENTROIDS,
+     LLM_TENSOR_MASKED_EMBD_ORDERING,
+     LLM_TENSOR_FC,
++    LLM_TENSOR_MARKOV_W1,
++    LLM_TENSOR_MARKOV_W2,
+     LLM_TENSOR_D2T,
+ };
+ 
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 9c7cf59de..4770a4e18 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -2343,6 +2343,7 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
+         model.arch == LLM_ARCH_QWEN35 ||
+         model.arch == LLM_ARCH_QWEN35MOE ||
+         model.arch == LLM_ARCH_DEEPSEEK4 ||
++        model.arch == LLM_ARCH_DFLASH ||
+         model.arch == LLM_ARCH_NANBEIGE ||
+         model.arch == LLM_ARCH_MINIMAX_M3) {
+         return std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors());
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 0fecca1fc..4efc1d279 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -499,9 +499,13 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
+ }
+ 
+ void llm_graph_input_attn_k::set_input(const llama_ubatch * ubatch) {
+-    mctx->set_input_k_idxs(self_k_idxs, ubatch);
++    if (self_k_idxs && self_k_idxs->buffer) {
++        mctx->set_input_k_idxs(self_k_idxs, ubatch);
++    }
+ 
+-    mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
++    if (self_kq_mask && self_kq_mask->buffer) {
++        mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
++    }
+ }
+ 
+ bool llm_graph_input_attn_k::can_reuse(const llm_graph_params & params) {
+@@ -511,9 +515,13 @@ bool llm_graph_input_attn_k::can_reuse(const llm_graph_params & params) {
+ 
+     bool res = true;
+ 
+-    res &= self_k_idxs->ne[0] == params.ubatch.n_tokens;
++    if (self_k_idxs && self_k_idxs->buffer) {
++        res &= self_k_idxs->ne[0] == params.ubatch.n_tokens;
++    }
+ 
+-    res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
++    if (self_kq_mask && self_kq_mask->buffer) {
++        res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
++    }
+ 
+     return res;
+ }
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index d55ba582c..9f16b6b93 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -2581,9 +2581,13 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
+         case LLM_ARCH_STEP35:
+         case LLM_ARCH_TALKIE:
+         case LLM_ARCH_MELLUM:
+-        case LLM_ARCH_DFLASH:
+             return LLAMA_ROPE_TYPE_NEOX;
+ 
++        case LLM_ARCH_DFLASH:
++            return static_cast<const llama_model_dflash *>(model)->markov_rank > 0
++                ? LLAMA_ROPE_TYPE_NORM
++                : LLAMA_ROPE_TYPE_NEOX;
++
+         case LLM_ARCH_QWEN2VL:
+         case LLM_ARCH_PADDLEOCR:
+             return LLAMA_ROPE_TYPE_MROPE;
+diff --git a/src/models/dflash.cpp b/src/models/dflash.cpp
+index 427eed459..93fd6ee77 100644
+--- a/src/models/dflash.cpp
++++ b/src/models/dflash.cpp
+@@ -1,5 +1,7 @@
+ #include "models.h"
+ 
++#include "dflash-recurrence.h"
++
+ #include "llama-impl.h"
+ #include "llama-kv-cache.h"
+ #include "llama-kv-cache-iswa.h"
+@@ -7,6 +9,7 @@
+ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
+ 
+     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
++    ml.get_key(LLM_KV_DFLASH_MARKOV_RANK, markov_rank, false);
+ 
+     if (!ml.get_arr(LLM_KV_TARGET_LAYERS, target_layer_ids, false)) {
+         throw std::runtime_error("DFlash model requires 'target_layers' in GGUF metadata");
+@@ -20,6 +23,19 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
+     }
+     LLAMA_LOG_INFO("]\n");
+ 
++    if (markov_rank > 0) {
++        ml.get_key(LLM_KV_ATTENTION_Q_LORA_RANK,     hparams.n_lora_q);
++        ml.get_key(LLM_KV_ATTENTION_KV_LORA_RANK,    hparams.n_lora_kv);
++        ml.get_key(LLM_KV_ATTENTION_KEY_LENGTH_MLA,  hparams.n_embd_head_k_mla_impl);
++        ml.get_key(LLM_KV_ATTENTION_VALUE_LENGTH_MLA, hparams.n_embd_head_v_mla_impl);
++
++        if (ml.get_key(LLM_KV_ROPE_SCALING_YARN_LOG_MUL, hparams.rope_yarn_log_mul, false)) {
++            hparams.rope_yarn_log_mul /= 0.1f;
++        }
++
++        LLAMA_LOG_INFO("%s: DSpark Markov rank = %u\n", __func__, markov_rank);
++    }
++
+     // optional interleaved sliding-window attention with per-layer pattern array.
+     // DFlash has a single rope, so the SWA rope == main rope.
+     if (ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW, hparams.n_swa, false) && hparams.n_swa > 0) {
+@@ -36,23 +52,45 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
+     LLAMA_LOAD_LOCALS;
+ 
+     const int64_t n_embd_inp = hparams.n_embd_inp_enc();
++    const bool is_dspark = markov_rank > 0;
+ 
+     fc              = create_tensor(tn(LLM_TENSOR_FC,              "weight"), { n_embd_inp, n_embd }, 0);
+     output_norm_enc = create_tensor(tn(LLM_TENSOR_ENC_OUTPUT_NORM, "weight"), { n_embd }, 0); // encoder hidden_norm (after fc)
+     output_norm     = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM,    "weight"), { n_embd }, 0); // decoder final norm
+ 
++    if (is_dspark) {
++        markov_w1 = create_tensor(tn(LLM_TENSOR_MARKOV_W1, "weight"), { markov_rank, n_vocab }, 0);
++        markov_w2 = create_tensor(tn(LLM_TENSOR_MARKOV_W2, "weight"), { markov_rank, n_vocab }, 0);
++    }
++
+     for (int i = 0; i < n_layer; ++i) {
+         auto & layer = layers[i];
+ 
+         layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), { n_embd }, 0);
+ 
+-        layer.wq = create_tensor(tn(LLM_TENSOR_ATTN_Q,   "weight", i), { n_embd, n_embd_head_k * n_head }, 0);
+-        layer.wk = create_tensor(tn(LLM_TENSOR_ATTN_K,   "weight", i), { n_embd, n_embd_k_gqa }, 0);
+-        layer.wv = create_tensor(tn(LLM_TENSOR_ATTN_V,   "weight", i), { n_embd, n_embd_v_gqa }, 0);
+-        layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), { n_embd_head_k * n_head, n_embd }, 0);
+-
+-        layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", i), { n_embd_head_k }, 0);
+-        layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", i), { n_embd_head_k }, 0);
++        if (is_dspark) {
++            const int64_t n_embd_head_k_mla = hparams.n_embd_head_k_mla();
++            const int64_t n_embd_head_v_mla = hparams.n_embd_head_v_mla();
++            const int64_t n_embd_head_qk_nope = n_embd_head_k_mla - hparams.n_rot();
++
++            layer.wq_a = create_tensor(tn(LLM_TENSOR_ATTN_Q_A, "weight", i), { n_embd, hparams.n_lora_q }, 0);
++            layer.attn_q_a_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_A_NORM, "weight", i), { hparams.n_lora_q }, 0);
++            layer.wq_b = create_tensor(tn(LLM_TENSOR_ATTN_Q_B, "weight", i), { hparams.n_lora_q, n_head * n_embd_head_k_mla }, 0);
++
++            layer.wkv_a_mqa = create_tensor(tn(LLM_TENSOR_ATTN_KV_A_MQA, "weight", i), { n_embd, hparams.n_lora_kv + hparams.n_rot() }, 0);
++            layer.attn_kv_a_norm = create_tensor(tn(LLM_TENSOR_ATTN_KV_A_NORM, "weight", i), { hparams.n_lora_kv }, 0);
++            layer.wk_b = create_tensor(tn(LLM_TENSOR_ATTN_K_B, "weight", i), { n_embd_head_qk_nope, hparams.n_lora_kv, n_head }, 0);
++            layer.wv_b = create_tensor(tn(LLM_TENSOR_ATTN_V_B, "weight", i), { hparams.n_lora_kv, n_embd_head_v_mla, n_head }, 0);
++            layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), { n_head * n_embd_head_v_mla, n_embd }, 0);
++        } else {
++            layer.wq = create_tensor(tn(LLM_TENSOR_ATTN_Q,   "weight", i), { n_embd, n_embd_head_k * n_head }, 0);
++            layer.wk = create_tensor(tn(LLM_TENSOR_ATTN_K,   "weight", i), { n_embd, n_embd_k_gqa }, 0);
++            layer.wv = create_tensor(tn(LLM_TENSOR_ATTN_V,   "weight", i), { n_embd, n_embd_v_gqa }, 0);
++            layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), { n_embd_head_k * n_head, n_embd }, 0);
++
++            layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", i), { n_embd_head_k }, 0);
++            layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", i), { n_embd_head_k }, 0);
++        }
+ 
+         layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), { n_embd }, 0);
+         layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), { n_embd, n_ff }, 0);
+@@ -110,6 +148,219 @@ llama_model_dflash::graph<true>::graph(const llama_model & model, const llm_grap
+ //   * token batch -> noise-block diffusion: attend over [committed, MASK...] to generate draft tokens
+ template <>
+ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
++    const auto & dflash_model = static_cast<const llama_model_dflash &>(model);
++
++    if (dflash_model.markov_rank > 0) {
++        GGML_ASSERT(hparams.swa_type == LLAMA_SWA_TYPE_NONE);
++        GGML_ASSERT(dflash_model.markov_w1 != nullptr);
++        GGML_ASSERT(dflash_model.markov_w2 != nullptr);
++
++        const int64_t n_embd_head_k = hparams.n_embd_head_k_mla();
++        const int64_t n_embd_head_qk_rope = hparams.n_rot();
++        const int64_t n_embd_head_qk_nope = n_embd_head_k - n_embd_head_qk_rope;
++        const int64_t kv_lora_rank = hparams.n_lora_kv;
++
++        ggml_tensor * inp_pos = build_inp_pos();
++        auto * inp_attn_k = build_attn_inp_k();
++
++        GGML_ASSERT(ext_factor >= 0.0f);
++        const float attn_factor_org = attn_factor * (1.0f + 0.1f * logf(1.0f / freq_scale));
++        const float mscale = attn_factor_org * (1.0f + 0.1f * hparams.rope_yarn_log_mul * logf(1.0f / freq_scale));
++        const float kq_scale = mscale * mscale / sqrtf(float(n_embd_head_k));
++
++        if (ubatch.embd) {
++            auto inp = std::make_unique<llm_graph_input_embd>(n_embd);
++
++            inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_tokens);
++            ggml_set_input(inp->embd);
++
++            ggml_tensor * inp_g = inp->embd;
++            cb(inp_g, "inp_g_embeddings", -1);
++
++            res->add_input(std::move(inp));
++
++            for (int il = 0; il < n_layer; ++il) {
++                const auto & layer = model.layers[il];
++
++                ggml_tensor * kv_cmpr_pe = build_lora_mm(layer.wkv_a_mqa, inp_g);
++                ggml_tensor * kv_cmpr = ggml_view_2d(
++                        ctx0, kv_cmpr_pe, kv_lora_rank, n_tokens,
++                        ggml_row_size(kv_cmpr_pe->type, kv_lora_rank + n_embd_head_qk_rope), 0);
++                ggml_tensor * k_pe = ggml_view_3d(
++                        ctx0, kv_cmpr_pe, n_embd_head_qk_rope, 1, n_tokens,
++                        ggml_row_size(kv_cmpr_pe->type, kv_lora_rank + n_embd_head_qk_rope),
++                        ggml_row_size(kv_cmpr_pe->type, kv_lora_rank + n_embd_head_qk_rope),
++                        ggml_row_size(kv_cmpr_pe->type, kv_lora_rank));
++
++                kv_cmpr = build_norm(kv_cmpr, layer.attn_kv_a_norm, nullptr, LLM_NORM_RMS, il);
++                k_pe = ggml_rope_ext(
++                        ctx0, k_pe, inp_pos, nullptr,
++                        n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
++                        ext_factor, attn_factor, beta_fast, beta_slow);
++
++                kv_cmpr = ggml_reshape_3d(ctx0, kv_cmpr, kv_lora_rank, 1, n_tokens);
++                ggml_tensor * Kcur = ggml_concat(ctx0, kv_cmpr, k_pe, 0);
++                cb(Kcur, "Kcur_injected", il);
++
++                ggml_build_forward_expand(gf, inp_attn_k->mctx->cpy_k(
++                            ctx0, Kcur, inp_attn_k->get_k_idxs(), il));
++            }
++
++            res->t_embd = inp_g;
++            ggml_build_forward_expand(gf, inp_g);
++            return;
++        }
++
++        auto * tok_embd = model.tok_embd;
++        if (tok_embd == nullptr) {
++            GGML_ASSERT(cparams.ctx_other != nullptr);
++            const auto * model_other = llama_get_model(cparams.ctx_other);
++            GGML_ASSERT(model_other->tok_embd != nullptr && "DSpark decoder requires the target model's token embeddings");
++            tok_embd = model_other->tok_embd;
++        }
++
++        auto inp = std::make_unique<llm_graph_input_embd>(n_embd);
++
++        inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
++        ggml_set_input(inp->tokens);
++        ggml_tensor * inp_tokens = inp->tokens;
++
++        ggml_tensor * inpL = ggml_get_rows(ctx0, tok_embd, inp_tokens);
++        cb(inpL, "inp_noise_embd", -1);
++
++        res->add_input(std::move(inp));
++
++        for (int il = 0; il < n_layer; ++il) {
++            const auto & layer = model.layers[il];
++
++            ggml_tensor * inpSA = inpL;
++            ggml_tensor * cur = build_norm(inpL, layer.attn_norm, nullptr, LLM_NORM_RMS, il);
++            cb(cur, "attn_norm", il);
++
++            ggml_tensor * q = build_lora_mm(layer.wq_a, cur);
++            q = build_norm(q, layer.attn_q_a_norm, nullptr, LLM_NORM_RMS, il);
++            q = build_lora_mm(layer.wq_b, q);
++
++            ggml_tensor * q_nope = ggml_view_3d(
++                    ctx0, q, n_embd_head_qk_nope, n_head, n_tokens,
++                    ggml_row_size(q->type, n_embd_head_k),
++                    ggml_row_size(q->type, n_embd_head_k) * n_head, 0);
++            ggml_tensor * q_pe = ggml_view_3d(
++                    ctx0, q, n_embd_head_qk_rope, n_head, n_tokens,
++                    ggml_row_size(q->type, n_embd_head_k),
++                    ggml_row_size(q->type, n_embd_head_k) * n_head,
++                    ggml_row_size(q->type, n_embd_head_qk_nope));
++
++            ggml_tensor * kv_cmpr_pe = build_lora_mm(layer.wkv_a_mqa, cur);
++            ggml_tensor * kv_cmpr = ggml_view_2d(
++                    ctx0, kv_cmpr_pe, kv_lora_rank, n_tokens,
++                    ggml_row_size(kv_cmpr_pe->type, kv_lora_rank + n_embd_head_qk_rope), 0);
++            ggml_tensor * k_pe = ggml_view_3d(
++                    ctx0, kv_cmpr_pe, n_embd_head_qk_rope, 1, n_tokens,
++                    ggml_row_size(kv_cmpr_pe->type, kv_lora_rank + n_embd_head_qk_rope),
++                    ggml_row_size(kv_cmpr_pe->type, kv_lora_rank + n_embd_head_qk_rope),
++                    ggml_row_size(kv_cmpr_pe->type, kv_lora_rank));
++
++            q_pe = ggml_rope_ext(
++                    ctx0, q_pe, inp_pos, nullptr,
++                    n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
++                    ext_factor, attn_factor, beta_fast, beta_slow);
++            k_pe = ggml_rope_ext(
++                    ctx0, k_pe, inp_pos, nullptr,
++                    n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
++                    ext_factor, attn_factor, beta_fast, beta_slow);
++            kv_cmpr = build_norm(kv_cmpr, layer.attn_kv_a_norm, nullptr, LLM_NORM_RMS, il);
++
++            q_nope = ggml_permute(ctx0, q_nope, 0, 2, 1, 3);
++            ggml_tensor * q_nope_absorbed = ggml_mul_mat(ctx0, layer.wk_b, q_nope);
++            q_nope_absorbed = ggml_permute(ctx0, q_nope_absorbed, 0, 2, 1, 3);
++
++            ggml_tensor * Qcur = ggml_concat(ctx0, q_nope_absorbed, q_pe, 0);
++            kv_cmpr = ggml_reshape_3d(ctx0, kv_cmpr, kv_lora_rank, 1, n_tokens);
++            ggml_tensor * Kcur = ggml_concat(ctx0, kv_cmpr, k_pe, 0);
++            ggml_tensor * Vcur = kv_cmpr;
++
++            cur = build_attn(
++                    inp_attn_k,
++                    layer.wo, nullptr, nullptr,
++                    Qcur, Kcur, Vcur,
++                    nullptr, nullptr, layer.wv_b,
++                    kq_scale, il);
++
++            ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
++            cur = build_norm(ffn_inp, layer.ffn_norm, nullptr, LLM_NORM_RMS, il);
++            cur = build_ffn(
++                    cur,
++                    layer.ffn_up,   nullptr, nullptr,
++                    layer.ffn_gate, nullptr, nullptr,
++                    layer.ffn_down, nullptr, nullptr,
++                    nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
++
++            inpL = ggml_add(ctx0, cur, ffn_inp);
++            cb(inpL, "l_out", il);
++        }
++
++        ggml_tensor * hidden = build_norm(inpL, model.output_norm, nullptr, LLM_NORM_RMS, -1);
++        cb(hidden, "result_norm", -1);
++        res->t_embd = hidden;
++
++        auto * output = model.output;
++        if (output == nullptr) {
++            GGML_ASSERT(cparams.ctx_other != nullptr);
++            const auto * model_other = llama_get_model(cparams.ctx_other);
++            GGML_ASSERT(model_other->output != nullptr && "DSpark decoder requires the target model's output projection");
++            output = model_other->output;
++        }
++
++        ggml_tensor * base_logits = build_lora_mm(output, hidden);
++        cb(base_logits, "base_logits", -1);
++
++        ggml_tensor * logits = nullptr;
++        const bool single_sequence = ubatch.n_seqs_unq == 1;
++        if (llama_dflash::use_markov_chain(ubatch.equal_seqs(), ubatch.n_seqs_unq)) {
++            const int64_t n_seqs = single_sequence ? 1 : ubatch.n_seqs;
++            const int64_t n_seq_tokens = single_sequence ? n_tokens : ubatch.n_seq_tokens;
++            GGML_ASSERT(n_tokens == n_seqs * n_seq_tokens);
++
++            for (int64_t is = 0; is < n_seqs; ++is) {
++                const int64_t i0 = is * n_seq_tokens;
++                ggml_tensor * prev = ggml_view_1d(ctx0, inp_tokens, 1, i0 * inp_tokens->nb[0]);
++
++                const auto rows = llama_dflash::build_markov_chain(
++                        n_seq_tokens,
++                        prev,
++                        [&](int64_t i, ggml_tensor * previous) {
++                            ggml_tensor * base = ggml_view_2d(
++                                    ctx0, base_logits, model.vocab.n_tokens(), 1, base_logits->nb[1],
++                                    (i0 + i) * base_logits->nb[1]);
++                            ggml_tensor * markov = ggml_get_rows(ctx0, dflash_model.markov_w1, previous);
++                            markov = build_lora_mm(dflash_model.markov_w2, markov);
++
++                            return ggml_add(ctx0, base, markov);
++                        },
++                        [&](ggml_tensor * combined) {
++                            return ggml_argmax(ctx0, combined);
++                        });
++
++                for (ggml_tensor * combined : rows) {
++                    logits = logits ? ggml_concat(ctx0, logits, combined, 1) : combined;
++                }
++            }
++        } else {
++            // Context capability probes can use non-uniform multi-sequence
++            // batches. Production DSpark submits one complete block per decode,
++            // so keep this independent one-step fallback only for those probes.
++            ggml_tensor * markov = ggml_get_rows(ctx0, dflash_model.markov_w1, inp_tokens);
++            markov = build_lora_mm(dflash_model.markov_w2, markov);
++            logits = ggml_add(ctx0, base_logits, markov);
++        }
++
++        cb(logits, "result_output", -1);
++        res->t_logits = logits;
++        ggml_build_forward_expand(gf, logits);
++        return;
++    }
++
+     const int64_t n_embd_head = hparams.n_embd_head_v();
+ 
+     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
+diff --git a/src/models/kimi-k3.cpp b/src/models/kimi-k3.cpp
+index ff7927e38..3feeaaab6 100644
+--- a/src/models/kimi-k3.cpp
++++ b/src/models/kimi-k3.cpp
+@@ -303,6 +303,8 @@ llama_model_kimi_k3::graph::graph(const llama_model & model, const llm_graph_par
+     for (int il = 0; il < n_layer; ++il) {
+         const auto & layer = model.layers[il];
+ 
++        res->t_layer_inp[il] = inpL;
++
+         // `prefix_sum` is the residual stream. On checkpoint layers it is banked
+         // into res_stack and restarts from the attention output alone.
+         ggml_tensor * prefix_sum = inpL;
+diff --git a/src/models/models.h b/src/models/models.h
+index 882bcc074..32a0a9d6b 100644
+--- a/src/models/models.h
++++ b/src/models/models.h
+@@ -1258,6 +1258,12 @@ struct llama_model_eagle3 : public llama_model_base {
+ 
+ struct llama_model_dflash : public llama_model_base {
+     llama_model_dflash(const struct llama_model_params & params) : llama_model_base(params) {}
++
++    uint32_t markov_rank = 0;
++
++    ggml_tensor * markov_w1 = nullptr;
++    ggml_tensor * markov_w2 = nullptr;
++
+     void load_arch_hparams(llama_model_loader & ml) override;
+     void load_arch_tensors(llama_model_loader & ml) override;
+ 
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index 7a93b19a0..cd95e3ca6 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -258,6 +258,7 @@ llama_build_and_test(test-thread-safety.cpp ARGS -m "${MODEL_DEST}" -ngl 99 -p "
+ set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-download-model)
+ 
+ llama_build_and_test(test-arg-parser.cpp)
++llama_build_and_test(test-dflash-plan.cpp)
+ 
+ if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
+   # TODO: repair known memory leaks

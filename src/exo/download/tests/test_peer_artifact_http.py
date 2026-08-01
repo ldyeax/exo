@@ -102,9 +102,7 @@ def _headers(
         _SECRET,
         method="GET",
         path=path,
-        parameters=tuple(
-            (name, str(value)) for name, value in parameters.items()
-        ),
+        parameters=tuple((name, str(value)) for name, value in parameters.items()),
         nonce=nonce,
     )
 
@@ -218,9 +216,10 @@ async def test_authenticated_routes_serve_confined_manifests_and_ranges(
             ),
         )
         assert manifest_response.status_code == 200
-        assert manifest_response.json()["sha256"] == hashlib.sha256(
-            b"abcdefgh"
-        ).hexdigest()
+        assert (
+            manifest_response.json()["sha256"]
+            == hashlib.sha256(b"abcdefgh").hexdigest()
+        )
 
         range_parameters = {
             "snapshot_id": snapshot_payload.snapshot_id,

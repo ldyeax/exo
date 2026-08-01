@@ -175,9 +175,9 @@ def test_materializes_atomic_symlink_views_and_filtered_indexes(
     rank_two_index = cast(
         dict[str, object],
         json.loads(
-            (
-                fixture.destination / "rank-2/model" / views.INDEX_FILENAME
-            ).read_text(encoding="utf-8")
+            (fixture.destination / "rank-2/model" / views.INDEX_FILENAME).read_text(
+                encoding="utf-8"
+            )
         ),
     )
     rank_two_weight_map = cast(dict[str, str], rank_two_index["weight_map"])

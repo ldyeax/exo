@@ -43,9 +43,7 @@ DEFAULT_TOPOLOGY_PATH: Final = (
 )
 _SAFE_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 _GUID = re.compile(r"^(?:[0-9a-f]{4}:){3}[0-9a-f]{4}$")
-_IPOIB_HARDWARE_ADDRESS = re.compile(
-    r"^(?:[0-9a-f]{2}:){19}[0-9a-f]{2}$"
-)
+_IPOIB_HARDWARE_ADDRESS = re.compile(r"^(?:[0-9a-f]{2}:){19}[0-9a-f]{2}$")
 _CONFLICTING_COMMAND_MARKERS = (
     "all_gather_perf",
     "all_reduce_perf",
@@ -161,9 +159,7 @@ class InterfaceObservation:
 
 
 def _object(value: object, description: str) -> dict[str, object]:
-    if not isinstance(value, dict) or not all(
-        isinstance(key, str) for key in value
-    ):
+    if not isinstance(value, dict) or not all(isinstance(key, str) for key in value):
         raise ProvisioningError(f"{description} must be a JSON object")
     return cast(dict[str, object], value)
 
@@ -207,9 +203,7 @@ def _absolute_path(value: object, description: str) -> Path:
     return result
 
 
-def _parse_infiniband_host(
-    value: object, description: str
-) -> InfiniBandHostSpec:
+def _parse_infiniband_host(value: object, description: str) -> InfiniBandHostSpec:
     raw = _object(value, description)
     try:
         address = ipaddress.IPv4Interface(
@@ -237,9 +231,7 @@ def _parse_ethernet_host(value: object, description: str) -> EthernetHostSpec:
             f"{description}.address must be a valid IPv4 address"
         ) from error
     return EthernetHostSpec(
-        interface=_identifier(
-            raw.get("interface"), f"{description}.interface"
-        ),
+        interface=_identifier(raw.get("interface"), f"{description}.interface"),
         address=address,
     )
 
@@ -258,9 +250,7 @@ def load_topology(path: Path = DEFAULT_TOPOLOGY_PATH) -> Topology:
     for host_name, value in raw_hosts.items():
         raw_host = _object(value, f"hosts.{host_name}")
         hosts[host_name] = HostSpec(
-            node_id=_identifier(
-                raw_host.get("node_id"), f"hosts.{host_name}.node_id"
-            ),
+            node_id=_identifier(raw_host.get("node_id"), f"hosts.{host_name}.node_id"),
             hostname=_identifier(
                 raw_host.get("hostname"), f"hosts.{host_name}.hostname"
             ),
@@ -281,20 +271,12 @@ def load_topology(path: Path = DEFAULT_TOPOLOGY_PATH) -> Topology:
             )
             for host_name, host_value in raw_rail_hosts.items()
         }
-        mode = _string(
-            raw.get("transport_mode"), f"{description}.transport_mode"
-        )
+        mode = _string(raw.get("transport_mode"), f"{description}.transport_mode")
         if mode not in {"connected", "datagram"}:
-            raise ProvisioningError(
-                f"{description}.transport_mode is unsupported"
-            )
+            raise ProvisioningError(f"{description}.transport_mode is unsupported")
         rail = InfiniBandRailSpec(
-            link_id=_identifier(
-                raw.get("link_id"), f"{description}.link_id"
-            ),
-            hca_name=_identifier(
-                raw.get("hca_name"), f"{description}.hca_name"
-            ),
+            link_id=_identifier(raw.get("link_id"), f"{description}.link_id"),
+            hca_name=_identifier(raw.get("hca_name"), f"{description}.hca_name"),
             port=_integer(raw.get("port"), f"{description}.port"),
             minimum_rate_gbps=_integer(
                 raw.get("minimum_rate_gbps"),
@@ -313,17 +295,12 @@ def load_topology(path: Path = DEFAULT_TOPOLOGY_PATH) -> Topology:
             hosts=rail_hosts,
         )
         if set(rail.hosts) != set(hosts):
-            raise ProvisioningError(
-                f"{description} must specify every topology host"
-            )
+            raise ProvisioningError(f"{description} must specify every topology host")
         if rail.port <= 0 or rail.minimum_rate_gbps <= 0:
             raise ProvisioningError(f"{description} has invalid port or rate")
         if rail.mtu < 2044 or rail.mtu > 65520:
             raise ProvisioningError(f"{description}.mtu is outside IPoIB bounds")
-        if (
-            rail.estimated_bytes_per_second <= 0
-            or rail.maximum_concurrent_chunks <= 0
-        ):
+        if rail.estimated_bytes_per_second <= 0 or rail.maximum_concurrent_chunks <= 0:
             raise ProvisioningError(f"{description} has invalid scheduler weights")
         networks = {host.address.network for host in rail.hosts.values()}
         addresses = {host.address.ip for host in rail.hosts.values()}
@@ -334,16 +311,12 @@ def load_topology(path: Path = DEFAULT_TOPOLOGY_PATH) -> Topology:
         infiniband_rails.append(rail)
 
     ethernet_rails: list[EthernetRailSpec] = []
-    for index, value in enumerate(
-        _array(root.get("ethernet_rails"), "ethernet_rails")
-    ):
+    for index, value in enumerate(_array(root.get("ethernet_rails"), "ethernet_rails")):
         description = f"ethernet_rails[{index}]"
         raw = _object(value, description)
         raw_rail_hosts = _object(raw.get("hosts"), f"{description}.hosts")
         rail = EthernetRailSpec(
-            link_id=_identifier(
-                raw.get("link_id"), f"{description}.link_id"
-            ),
+            link_id=_identifier(raw.get("link_id"), f"{description}.link_id"),
             estimated_bytes_per_second=_integer(
                 raw.get("estimated_bytes_per_second"),
                 f"{description}.estimated_bytes_per_second",
@@ -360,19 +333,12 @@ def load_topology(path: Path = DEFAULT_TOPOLOGY_PATH) -> Topology:
             },
         )
         if set(rail.hosts) != set(hosts):
-            raise ProvisioningError(
-                f"{description} must specify every topology host"
-            )
-        if (
-            rail.estimated_bytes_per_second <= 0
-            or rail.maximum_concurrent_chunks <= 0
-        ):
+            raise ProvisioningError(f"{description} must specify every topology host")
+        if rail.estimated_bytes_per_second <= 0 or rail.maximum_concurrent_chunks <= 0:
             raise ProvisioningError(f"{description} has invalid scheduler weights")
         ethernet_rails.append(rail)
 
-    link_ids = tuple(
-        rail.link_id for rail in (*infiniband_rails, *ethernet_rails)
-    )
+    link_ids = tuple(rail.link_id for rail in (*infiniband_rails, *ethernet_rails))
     if len(set(link_ids)) != len(link_ids):
         raise ProvisioningError("topology link IDs must be unique")
     networks = tuple(
@@ -475,7 +441,9 @@ def _read_text(path: Path, description: str) -> str:
 def _sysfs_guid(path: Path, description: str) -> str:
     value = _read_text(path, description).lower().removeprefix("0x")
     compact = value.replace(":", "")
-    if len(compact) != 16 or any(character not in "0123456789abcdef" for character in compact):
+    if len(compact) != 16 or any(
+        character not in "0123456789abcdef" for character in compact
+    ):
         raise ProvisioningError(f"{description} is not a 64-bit GUID")
     return ":".join(compact[index : index + 4] for index in range(0, 16, 4))
 
@@ -511,15 +479,11 @@ def _resolve_parent_ipoib_interface(
         network_device = sysfs_root / "class" / "net" / candidate.name
         try:
             device_type = int(_read_text(network_device / "type", "netdev type"))
-            device_port = int(
-                _read_text(network_device / "dev_port", "netdev port")
-            )
+            device_port = int(_read_text(network_device / "dev_port", "netdev port"))
             interface_index = int(
                 _read_text(network_device / "ifindex", "netdev ifindex")
             )
-            link_index = int(
-                _read_text(network_device / "iflink", "netdev iflink")
-            )
+            link_index = int(_read_text(network_device / "iflink", "netdev iflink"))
         except (ProvisioningError, ValueError):
             continue
         if (
@@ -563,12 +527,8 @@ def observe_hca_port(
         subnet_manager_lid=int(
             _read_text(port_root / "sm_lid", "subnet manager LID"), 0
         ),
-        local_identifier=int(
-            _read_text(port_root / "lid", "local identifier"), 0
-        ),
-        interface=_resolve_parent_ipoib_interface(
-            hca_root, rail.port, sysfs_root
-        ),
+        local_identifier=int(_read_text(port_root / "lid", "local identifier"), 0),
+        interface=_resolve_parent_ipoib_interface(hca_root, rail.port, sysfs_root),
     )
     if observation.node_guid != expected.node_guid:
         raise ProvisioningError(
@@ -590,10 +550,7 @@ def observe_hca_port(
             f"{rail.link_id}: rate {observation.rate_gbps} Gb/s is below "
             f"{rail.minimum_rate_gbps} Gb/s"
         )
-    if (
-        observation.subnet_manager_lid <= 0
-        or observation.local_identifier <= 0
-    ):
+    if observation.subnet_manager_lid <= 0 or observation.local_identifier <= 0:
         raise ProvisioningError(
             f"{rail.link_id}: no active subnet manager/LID assignment"
         )
@@ -641,15 +598,15 @@ def _interface_observation(
     if not root.is_dir():
         raise ProvisioningError(f"interface {interface} does not exist")
     addresses: list[str] = []
-    for raw_device in _json_command(("ip", "-json", "address", "show", "dev", interface)):
+    for raw_device in _json_command(
+        ("ip", "-json", "address", "show", "dev", interface)
+    ):
         device = _object(raw_device, "ip address device")
         for raw_address in _array(device.get("addr_info", []), "addr_info"):
             address = _object(raw_address, "address")
             if address.get("family") == "inet":
                 local = _string(address.get("local"), "IPv4 local address")
-                prefix_length = _integer(
-                    address.get("prefixlen"), "IPv4 prefix length"
-                )
+                prefix_length = _integer(address.get("prefixlen"), "IPv4 prefix length")
                 addresses.append(f"{local}/{prefix_length}")
     flags = {
         _string(flag, "interface flag")
@@ -712,9 +669,7 @@ def _all_ipv4_assignments() -> dict[ipaddress.IPv4Address, str]:
 def _validate_route_collisions(
     desired_routes: Mapping[ipaddress.IPv4Network, str | None],
 ) -> None:
-    for raw_route in _json_command(
-        ("ip", "-json", "route", "show", "table", "all")
-    ):
+    for raw_route in _json_command(("ip", "-json", "route", "show", "table", "all")):
         route = _object(raw_route, "route")
         destination = route.get("dst")
         if not isinstance(destination, str) or destination == "default":
@@ -778,8 +733,11 @@ def _conflicting_processes() -> tuple[str, ...]:
         if not entry.name.isdigit() or int(entry.name) == own_process:
             continue
         try:
-            command_line = (entry / "cmdline").read_bytes().replace(b"\0", b" ").decode(
-                errors="replace"
+            command_line = (
+                (entry / "cmdline")
+                .read_bytes()
+                .replace(b"\0", b" ")
+                .decode(errors="replace")
             )
         except OSError:
             continue
@@ -803,7 +761,10 @@ def _opensm_process_snapshot() -> tuple[str, ...]:
                 .strip()
             )
             start_identity = (
-                (entry / "stat").read_text(encoding="utf-8").rpartition(") ")[2].split()[19]
+                (entry / "stat")
+                .read_text(encoding="utf-8")
+                .rpartition(") ")[2]
+                .split()[19]
             )
         except (OSError, ProvisioningError, IndexError):
             continue
@@ -822,13 +783,9 @@ def inspect_network(
     _assert_host(topology, host_name)
     rails: list[JsonValue] = []
     for rail in _selected_infiniband_rails(topology, profile):
-        observation = observe_hca_port(
-            rail, host_name, sysfs_root=sysfs_root
-        )
+        observation = observe_hca_port(rail, host_name, sysfs_root=sysfs_root)
         interface_observation = (
-            _interface_observation(
-                observation.interface, sysfs_root=sysfs_root
-            )
+            _interface_observation(observation.interface, sysfs_root=sysfs_root)
             if observation.interface is not None
             else None
         )
@@ -866,8 +823,7 @@ def _apply_one_interface(
 ) -> None:
     if before.ipv4_addresses and str(desired_address) not in before.ipv4_addresses:
         raise ProvisioningError(
-            f"{before.interface} has unexpected IPv4 addresses "
-            f"{before.ipv4_addresses}"
+            f"{before.interface} has unexpected IPv4 addresses {before.ipv4_addresses}"
         )
     if before.transport_mode != rail.transport_mode:
         if before.is_up:
@@ -1000,10 +956,7 @@ def provision_network(
             ),
             None,
         )
-        if (
-            assigned_interface is not None
-            and assigned_interface != expected_interface
-        ):
+        if assigned_interface is not None and assigned_interface != expected_interface:
             raise ProvisioningError(
                 f"{desired_address} is already assigned to {assigned_interface}"
             )
@@ -1038,22 +991,16 @@ def provision_network(
     deadline = time.monotonic() + 10
     hca_observations: tuple[HcaPortObservation, ...]
     while True:
-        hca_observations = tuple(
-            observe_hca_port(rail, host_name) for rail in rails
-        )
+        hca_observations = tuple(observe_hca_port(rail, host_name) for rail in rails)
         if all(observation.interface for observation in hca_observations):
             break
         if time.monotonic() >= deadline:
             missing = [
                 rail.link_id
-                for rail, observation in zip(
-                    rails, hca_observations, strict=True
-                )
+                for rail, observation in zip(rails, hca_observations, strict=True)
                 if observation.interface is None
             ]
-            raise ProvisioningError(
-                f"ib_ipoib did not create interfaces for {missing}"
-            )
+            raise ProvisioningError(f"ib_ipoib did not create interfaces for {missing}")
         time.sleep(0.1)
     before: list[InterfaceObservation] = []
     try:
@@ -1066,8 +1013,7 @@ def provision_network(
                 rail, rail.hosts[host_name].address, observation, commands
             )
         after = tuple(
-            _interface_observation(cast(str, hca.interface))
-            for hca in hca_observations
+            _interface_observation(cast(str, hca.interface)) for hca in hca_observations
         )
         for rail, observation in zip(rails, after, strict=True):
             desired_address = str(rail.hosts[host_name].address)
@@ -1107,9 +1053,7 @@ def provision_network(
         for index in reversed(range(len(before))):
             rail = rails[index]
             observation = before[index]
-            _restore_interface(
-                observation, rail.hosts[host_name].address
-            )
+            _restore_interface(observation, rail.hosts[host_name].address)
         raise
     return {
         "schema_version": NETWORK_RECEIPT_SCHEMA_VERSION,
@@ -1121,8 +1065,7 @@ def provision_network(
         "opensm_processes_before": list(opensm_before),
         "opensm_processes_after": list(opensm_after),
         "hca_ports": [
-            cast(JsonObject, asdict(observation))
-            for observation in final_hca
+            cast(JsonObject, asdict(observation)) for observation in final_hca
         ],
         "interfaces_before": [
             cast(JsonObject, asdict(observation)) for observation in before
@@ -1143,8 +1086,7 @@ def provision_network(
             for rail, hca, observation in zip(
                 rails, hca_observations, before, strict=True
             )
-            if str(rail.hosts[host_name].address)
-            not in observation.ipv4_addresses
+            if str(rail.hosts[host_name].address) not in observation.ipv4_addresses
         ],
     }
 
@@ -1160,14 +1102,10 @@ def _secure_output_directory(path: Path) -> None:
         or observed.st_uid != os.geteuid()
         or observed.st_mode & 0o077
     ):
-        raise ProvisioningError(
-            f"output directory is not owner-only: {path}"
-        )
+        raise ProvisioningError(f"output directory is not owner-only: {path}")
 
 
-def _atomic_owner_only_write(
-    path: Path, contents: bytes, *, replace: bool
-) -> None:
+def _atomic_owner_only_write(path: Path, contents: bytes, *, replace: bool) -> None:
     _secure_output_directory(path.parent)
     if path.exists():
         observed = path.lstat()
@@ -1247,16 +1185,12 @@ def _peer_links(
                 "peer_node_id": topology.hosts[source_host].node_id,
                 "medium": "infiniband",
                 "local_interface": observation.interface,
-                "local_ip_address": str(
-                    rail.hosts[receiver_host].address.ip
-                ),
+                "local_ip_address": str(rail.hosts[receiver_host].address.ip),
                 "peer_endpoint": {
                     "ip": str(rail.hosts[source_host].address.ip),
                     "port": topology.api_port,
                 },
-                "estimated_bytes_per_second": (
-                    rail.estimated_bytes_per_second
-                ),
+                "estimated_bytes_per_second": (rail.estimated_bytes_per_second),
                 "maximum_concurrent_chunks": rail.maximum_concurrent_chunks,
             }
         )
@@ -1280,9 +1214,7 @@ def _peer_links(
                     "ip": str(source.address),
                     "port": topology.api_port,
                 },
-                "estimated_bytes_per_second": (
-                    rail.estimated_bytes_per_second
-                ),
+                "estimated_bytes_per_second": (rail.estimated_bytes_per_second),
                 "maximum_concurrent_chunks": rail.maximum_concurrent_chunks,
             }
         )
@@ -1301,9 +1233,7 @@ def render_deployment(
     source_host = topology.deployment.source_host
     _assert_host(topology, receiver_host)
     secret = _read_secret(secret_file)
-    links = _peer_links(
-        topology, receiver_host, source_host, profile
-    )
+    links = _peer_links(topology, receiver_host, source_host, profile)
     source_configuration: JsonObject = {
         "schema_version": 1,
         "authentication_secret": secret,
@@ -1345,9 +1275,7 @@ def render_deployment(
             }
         ],
         "server": None,
-        "disk_cache_directory": str(
-            topology.deployment.receiver_disk_cache_directory
-        ),
+        "disk_cache_directory": str(topology.deployment.receiver_disk_cache_directory),
         "memory_cache_directory": str(
             topology.deployment.receiver_memory_cache_directory
         ),
@@ -1379,9 +1307,7 @@ def render_deployment(
         ],
     }
     source_path = output_directory / f"{source_host}-peer-artifacts.json"
-    receiver_path = (
-        output_directory / f"{receiver_host}-peer-artifacts.json"
-    )
+    receiver_path = output_directory / f"{receiver_host}-peer-artifacts.json"
     plan_path = output_directory / "materialization-plan.json"
     for path, value in (
         (source_path, source_configuration),
@@ -1390,9 +1316,7 @@ def render_deployment(
     ):
         _atomic_owner_only_write(
             path,
-            (
-                json.dumps(value, indent=2, sort_keys=True) + "\n"
-            ).encode(),
+            (json.dumps(value, indent=2, sort_keys=True) + "\n").encode(),
             replace=replace,
         )
     return source_path, receiver_path, plan_path
@@ -1452,9 +1376,7 @@ def render_networkmanager_profiles(
     return tuple(paths)
 
 
-def _write_receipt(
-    path: Path, receipt: JsonObject, *, replace: bool
-) -> None:
+def _write_receipt(path: Path, receipt: JsonObject, *, replace: bool) -> None:
     _atomic_owner_only_write(
         path,
         (json.dumps(receipt, indent=2, sort_keys=True) + "\n").encode(),
@@ -1470,9 +1392,7 @@ def _profile(value: str) -> ProfileName:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--topology", type=Path, default=DEFAULT_TOPOLOGY_PATH
-    )
+    parser.add_argument("--topology", type=Path, default=DEFAULT_TOPOLOGY_PATH)
     subparsers = parser.add_subparsers(dest="operation", required=True)
 
     inspect_parser = subparsers.add_parser("inspect")
@@ -1488,24 +1408,14 @@ def _parser() -> argparse.ArgumentParser:
 
     deployment_parser = subparsers.add_parser("render-deployment")
     deployment_parser.add_argument("--secret-file", type=Path, required=True)
-    deployment_parser.add_argument(
-        "--output-directory", type=Path, required=True
-    )
-    deployment_parser.add_argument(
-        "--profile", type=_profile, default="all"
-    )
+    deployment_parser.add_argument("--output-directory", type=Path, required=True)
+    deployment_parser.add_argument("--profile", type=_profile, default="all")
     deployment_parser.add_argument("--replace", action="store_true")
 
-    networkmanager_parser = subparsers.add_parser(
-        "render-networkmanager"
-    )
+    networkmanager_parser = subparsers.add_parser("render-networkmanager")
     networkmanager_parser.add_argument("--host", required=True)
-    networkmanager_parser.add_argument(
-        "--output-directory", type=Path, required=True
-    )
-    networkmanager_parser.add_argument(
-        "--profile", type=_profile, default="all"
-    )
+    networkmanager_parser.add_argument("--output-directory", type=Path, required=True)
+    networkmanager_parser.add_argument("--profile", type=_profile, default="all")
     networkmanager_parser.add_argument("--replace", action="store_true")
     return parser
 

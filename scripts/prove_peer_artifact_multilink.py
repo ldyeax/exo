@@ -37,9 +37,7 @@ def _install_python311_proof_type_stubs() -> None:
     common.ModelId = NewType("ModelId", str)
     common.NodeId = NewType("NodeId", str)
     model_cards.HuggingFaceRevision = str
-    model_cards.MODEL_REVISION_RECEIPT_FILENAME = (
-        ".exo-huggingface-revision.json"
-    )
+    model_cards.MODEL_REVISION_RECEIPT_FILENAME = ".exo-huggingface-revision.json"
     sys.modules[common.__name__] = common
     sys.modules[model_cards.__name__] = model_cards
 
@@ -161,9 +159,7 @@ def prepare_proof(
         raise ProofError("source config has no server")
     server = cast(dict[str, object], raw_server)
     server["model_roots"] = [str(remote_root / "source")]
-    server["manifest_cache_directory"] = str(
-        remote_root / "manifest-cache"
-    )
+    server["manifest_cache_directory"] = str(remote_root / "manifest-cache")
     server["served_snapshots"] = [
         {
             "model_id": str(PROOF_MODEL_ID),
@@ -192,9 +188,7 @@ def prepare_proof(
         if not isinstance(endpoint, dict):
             raise ProofError("receiver peer endpoint is invalid")
         endpoint["port"] = port
-    receiver["disk_cache_directory"] = str(
-        output_directory / "receiver-cache"
-    )
+    receiver["disk_cache_directory"] = str(output_directory / "receiver-cache")
     receiver["memory_cache_directory"] = None
     receiver["disk_reserve_bytes"] = 0
     receiver["memory_reserve_bytes"] = 0

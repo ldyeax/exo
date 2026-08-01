@@ -11,8 +11,7 @@ from scripts import prepare_dsv4_flash_0731 as prepare
 def _ordering_payload() -> dict[str, object]:
     return {
         "physical_to_logical_map": [
-            list(range(prepare.EXPERT_COUNT))
-            for _ in range(prepare.ROUTED_LAYER_COUNT)
+            list(range(prepare.EXPERT_COUNT)) for _ in range(prepare.ROUTED_LAYER_COUNT)
         ]
     }
 
@@ -80,7 +79,9 @@ def test_validate_model_rejects_wrong_revision(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     (tmp_path / "model.safetensors.index.json").write_text(
-        json.dumps({"metadata": {"total_size": prepare.MODEL_WEIGHT_BYTES}, "weight_map": {}}),
+        json.dumps(
+            {"metadata": {"total_size": prepare.MODEL_WEIGHT_BYTES}, "weight_map": {}}
+        ),
         encoding="utf-8",
     )
     metadata_dir = tmp_path / ".cache" / "huggingface" / "download"

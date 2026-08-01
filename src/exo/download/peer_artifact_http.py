@@ -173,9 +173,7 @@ def peer_artifact_snapshot_id(
             "model_id": str(model_id),
             "revision": revision,
             "allow_partial_snapshot": allow_partial_snapshot,
-            "files": [
-                file.model_dump(mode="json", by_alias=True) for file in files
-            ],
+            "files": [file.model_dump(mode="json", by_alias=True) for file in files],
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -194,9 +192,7 @@ class PeerArtifactServedSnapshot(_StrictModel):
     @field_validator("relative_directory")
     @classmethod
     def validate_relative_directory(cls, value: str) -> str:
-        return _validate_relative_path(
-            value, description="served snapshot directories"
-        )
+        return _validate_relative_path(value, description="served snapshot directories")
 
 
 @final
@@ -219,12 +215,9 @@ class PeerArtifactServerConfig(_StrictModel):
         if any(not root.is_absolute() for root in self.model_roots):
             raise ValueError("peer artifact model roots must be absolute paths")
         if not self.manifest_cache_directory.is_absolute():
-            raise ValueError(
-                "peer artifact manifest cache directory must be absolute"
-            )
+            raise ValueError("peer artifact manifest cache directory must be absolute")
         snapshot_ids = tuple(
-            (snapshot.model_id, snapshot.revision)
-            for snapshot in self.served_snapshots
+            (snapshot.model_id, snapshot.revision) for snapshot in self.served_snapshots
         )
         if len(set(snapshot_ids)) != len(snapshot_ids):
             raise ValueError("served model snapshots must be unique")
@@ -632,9 +625,9 @@ class PeerArtifactHttpClient(PeerArtifactPeerClient):
                 link.link_id,
                 f"link {link.link_id} is unavailable",
             ) from error
-        self._received_bytes[link.link_id] = (
-            self._received_bytes.get(link.link_id, 0) + len(contents)
-        )
+        self._received_bytes[link.link_id] = self._received_bytes.get(
+            link.link_id, 0
+        ) + len(contents)
         return bytes(contents)
 
     async def fetch_snapshot_manifest(
@@ -685,10 +678,7 @@ class PeerArtifactHttpClient(PeerArtifactPeerClient):
             raise PeerArtifactProtocolError(
                 f"link {link.link_id} returned a manifest for another artifact"
             )
-        if (
-            peer_artifact_manifest_fingerprint(manifest)
-            != expected_manifest_sha256
-        ):
+        if peer_artifact_manifest_fingerprint(manifest) != expected_manifest_sha256:
             raise PeerArtifactProtocolError(
                 f"link {link.link_id} returned an unpinned artifact manifest"
             )
@@ -765,9 +755,7 @@ def _open_absolute_directory_without_symlinks(path: Path) -> int:
         for component in path.parts[1:]:
             next_descriptor = os.open(
                 component,
-                os.O_RDONLY
-                | os.O_DIRECTORY
-                | getattr(os, "O_NOFOLLOW", 0),
+                os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
                 dir_fd=descriptor,
             )
             os.close(descriptor)
@@ -778,17 +766,13 @@ def _open_absolute_directory_without_symlinks(path: Path) -> int:
         raise
 
 
-def _open_directory_beneath(
-    root_descriptor: int, relative_directory: str
-) -> int:
+def _open_directory_beneath(root_descriptor: int, relative_directory: str) -> int:
     descriptor = os.dup(root_descriptor)
     try:
         for component in PurePosixPath(relative_directory).parts:
             next_descriptor = os.open(
                 component,
-                os.O_RDONLY
-                | os.O_DIRECTORY
-                | getattr(os, "O_NOFOLLOW", 0),
+                os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
                 dir_fd=descriptor,
             )
             os.close(descriptor)
@@ -799,9 +783,7 @@ def _open_directory_beneath(
         raise
 
 
-def _open_regular_file_beneath(
-    root_descriptor: int, relative_file_path: str
-) -> int:
+def _open_regular_file_beneath(root_descriptor: int, relative_file_path: str) -> int:
     normalized = _validate_relative_path(
         relative_file_path, description="snapshot file paths"
     )
@@ -811,9 +793,7 @@ def _open_regular_file_beneath(
         for component in parts[:-1]:
             next_descriptor = os.open(
                 component,
-                os.O_RDONLY
-                | os.O_DIRECTORY
-                | getattr(os, "O_NOFOLLOW", 0),
+                os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
                 dir_fd=descriptor,
             )
             os.close(descriptor)
@@ -914,9 +894,7 @@ class PeerArtifactHttpSource:
             raise PeerArtifactConfigurationError(
                 "a served snapshot contains a missing or symlinked directory"
             ) from error
-        config.manifest_cache_directory.mkdir(
-            mode=0o700, parents=True, exist_ok=True
-        )
+        config.manifest_cache_directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         cache_descriptor = _open_absolute_directory_without_symlinks(
             config.manifest_cache_directory
         )
@@ -933,9 +911,7 @@ class PeerArtifactHttpSource:
                 "manifest cache must be an owner-controlled non-symlink directory"
             )
         self._manifest_cache_directory = config.manifest_cache_directory
-        self._pinned_snapshots: dict[
-            PeerArtifactSnapshotId, _PersistedSnapshot
-        ] = {}
+        self._pinned_snapshots: dict[PeerArtifactSnapshotId, _PersistedSnapshot] = {}
 
     def close(self) -> None:
         for state in self._snapshot_states.values():
@@ -962,9 +938,7 @@ class PeerArtifactHttpSource:
 
     def _read_cache(self, path: Path, maximum_bytes: int) -> bytes | None:
         try:
-            descriptor = os.open(
-                path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-            )
+            descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
         except FileNotFoundError:
             return None
         try:
@@ -978,12 +952,7 @@ class PeerArtifactHttpSource:
         return contents
 
     def _write_immutable_cache(self, path: Path, contents: bytes) -> None:
-        flags = (
-            os.O_WRONLY
-            | os.O_CREAT
-            | os.O_EXCL
-            | getattr(os, "O_NOFOLLOW", 0)
-        )
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
         try:
             descriptor = os.open(path, flags, 0o600)
         except FileExistsError as error:
@@ -1072,9 +1041,7 @@ class PeerArtifactHttpSource:
             follow_symlinks=False,
             dir_fd=state.directory_descriptor,
         ):
-            directory_names[:] = [
-                name for name in directory_names if name != ".cache"
-            ]
+            directory_names[:] = [name for name in directory_names if name != ".cache"]
             for directory_name in directory_names:
                 directory_stat = os.stat(
                     directory_name,
@@ -1087,21 +1054,16 @@ class PeerArtifactHttpSource:
                     )
             relative_directory = PurePosixPath(directory)
             for file_name in file_names:
-                if (
-                    file_name
-                    in (
-                        MODEL_REVISION_RECEIPT_FILENAME,
-                        PEER_ARTIFACT_SNAPSHOT_RECEIPT_FILENAME,
-                    )
-                    or file_name.endswith(".partial")
-                ):
+                if file_name in (
+                    MODEL_REVISION_RECEIPT_FILENAME,
+                    PEER_ARTIFACT_SNAPSHOT_RECEIPT_FILENAME,
+                ) or file_name.endswith(".partial"):
                     continue
                 file_path = (
-                    relative_directory / file_name
-                ).as_posix().removeprefix("./")
+                    (relative_directory / file_name).as_posix().removeprefix("./")
+                )
                 artifact_path = (
-                    PurePosixPath(state.configuration.relative_directory)
-                    / file_path
+                    PurePosixPath(state.configuration.relative_directory) / file_path
                 ).as_posix()
                 try:
                     descriptor = _open_regular_file_beneath(
@@ -1240,9 +1202,7 @@ class PeerArtifactHttpSource:
                 "artifact ranges require nonnegative offsets and positive sizes"
             )
         if size_bytes > self._config.maximum_range_bytes:
-            raise ValueError(
-                "requested artifact range exceeds the configured maximum"
-            )
+            raise ValueError("requested artifact range exceeds the configured maximum")
         descriptor, record = self._pinned_artifact(snapshot_id, artifact_path)
         if record.file.sha256 != expected_artifact_sha256:
             os.close(descriptor)
@@ -1265,9 +1225,7 @@ class _RequestAuthenticator:
     def authorize(self, request: Request) -> None:
         timestamp_header = request.headers.get(_AUTHENTICATION_TIMESTAMP_HEADER, "")
         nonce = request.headers.get(_AUTHENTICATION_NONCE_HEADER, "")
-        supplied_signature = request.headers.get(
-            _AUTHENTICATION_SIGNATURE_HEADER, ""
-        )
+        supplied_signature = request.headers.get(_AUTHENTICATION_SIGNATURE_HEADER, "")
         try:
             timestamp = int(timestamp_header)
         except ValueError:

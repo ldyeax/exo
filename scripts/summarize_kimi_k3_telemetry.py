@@ -751,12 +751,75 @@ def benchmark_response_summary(response: JsonObject) -> JsonObject:
     }
 
 
+def validate_completed_benchmark_campaign(
+    lines: Sequence[ParsedLine],
+    provenance: FileProvenance,
+    expected_performance_runs: int,
+) -> None:
+    """Bind telemetry admission to one complete benchmark campaign."""
+
+    started = [
+        line for line in lines if line.payload.get("event") == "campaign_started"
+    ]
+    completed = [
+        line for line in lines if line.payload.get("event") == "campaign_completed"
+    ]
+    failed = [line for line in lines if line.payload.get("event") == "campaign_failed"]
+    if len(started) != 1:
+        raise SummaryError(
+            "benchmark must contain exactly one campaign_started event; "
+            f"found {len(started)} in {provenance.path}"
+        )
+    if len(completed) != 1:
+        raise SummaryError(
+            "benchmark must contain exactly one campaign_completed event; "
+            f"found {len(completed)} in {provenance.path}"
+        )
+    if failed:
+        raise SummaryError(
+            f"benchmark contains campaign_failed at {provenance.path}:"
+            f"{failed[0].line_number}"
+        )
+    if lines[0] is not started[0]:
+        raise SummaryError("campaign_started must be the first benchmark event")
+    if lines[-1] is not completed[0]:
+        raise SummaryError("campaign_completed must be the final benchmark event")
+
+    configuration = require_object(
+        started[0].payload.get("configuration"),
+        f"campaign_started configuration at {provenance.path}:{started[0].line_number}",
+    )
+    configured_run_count = integer_value(configuration.get("run_count"))
+    if configured_run_count != expected_performance_runs:
+        raise SummaryError(
+            "benchmark campaign run_count does not match requested telemetry "
+            f"summary count: configured={configured_run_count!r}, "
+            f"expected={expected_performance_runs}"
+        )
+    accepted_pairs = integer_value(completed[0].payload.get("accepted_pairs"))
+    if accepted_pairs != expected_performance_runs:
+        raise SummaryError(
+            "campaign_completed accepted_pairs does not match requested telemetry "
+            f"summary count: completed={accepted_pairs!r}, "
+            f"expected={expected_performance_runs}"
+        )
+
+
 def read_performance_windows(
     path: Path,
+    expected_performance_runs: int = EXPECTED_PERFORMANCE_RUNS,
 ) -> tuple[tuple[PerformanceWindow, ...], FileProvenance]:
-    """Extract exactly five unique accepted performance result windows."""
+    """Extract the expected unique accepted performance result windows."""
+
+    if isinstance(expected_performance_runs, bool) or expected_performance_runs <= 0:
+        raise SummaryError("expected performance run count must be positive")
 
     lines, provenance = parse_jsonl(path, "benchmark JSONL")
+    validate_completed_benchmark_campaign(
+        lines,
+        provenance,
+        expected_performance_runs,
+    )
     windows: list[PerformanceWindow] = []
     for line in lines:
         event = line.payload
@@ -815,17 +878,19 @@ def read_performance_windows(
             )
         )
 
-    if len(windows) != EXPECTED_PERFORMANCE_RUNS:
+    if len(windows) != expected_performance_runs:
         raise SummaryError(
-            "benchmark must contain exactly five accepted performance_result "
-            f"events; found {len(windows)} in {provenance.path}"
+            "benchmark must contain exactly "
+            f"{expected_performance_runs} accepted performance_result events; "
+            f"found {len(windows)} in {provenance.path}"
         )
     windows.sort(key=lambda item: item.run_index)
     indices = [window.run_index for window in windows]
-    expected_indices = list(range(1, EXPECTED_PERFORMANCE_RUNS + 1))
+    expected_indices = list(range(1, expected_performance_runs + 1))
     if indices != expected_indices:
         raise SummaryError(
-            f"accepted performance run indices must be exactly 1..5; found {indices}"
+            "accepted performance run indices must be exactly "
+            f"1..{expected_performance_runs}; found {indices}"
         )
     chronological = sorted(windows, key=lambda item: item.start_realtime_ns)
     for previous, current in zip(chronological, chronological[1:], strict=False):
@@ -1669,7 +1734,7 @@ def aggregate_gpus(
     metrics: Sequence[SourceWindowStatistics],
     expected_count: int,
 ) -> JsonObject:
-    """Aggregate GPU gauges and trapezoidal energy across all five windows."""
+    """Aggregate GPU gauges and trapezoidal energy across all windows."""
 
     identities = sorted({identity for metric in metrics for identity in metric.gpus})
     result: JsonObject = {}
@@ -1834,10 +1899,7 @@ def aggregate_source(
         "performance_window_duration_seconds": duration,
         "join_quality": {
             "maximum_sample_gap_seconds": max(
-                (
-                    metric.join.maximum_sample_gap_seconds
-                    for metric in metrics
-                ),
+                (metric.join.maximum_sample_gap_seconds for metric in metrics),
                 default=None,
             )
         },
@@ -1872,9 +1934,7 @@ def aggregate_source(
         },
         "cpu": {
             "runs_included": len(cpu_values),
-            "complete_across_all_runs": (
-                len(cpu_values) == aggregate_expected_count
-            ),
+            "complete_across_all_runs": (len(cpu_values) == aggregate_expected_count),
             "total_jiffies_delta_estimate": cpu_total if cpu_values else None,
             "busy_jiffies_delta_estimate": cpu_busy if cpu_values else None,
             "utilization_percent": (
@@ -1891,8 +1951,7 @@ def aggregate_source(
             ),
             "average_cpu_core_equivalents": (
                 process_total / (metrics[0].process.clock_ticks_per_second * duration)
-                if metrics
-                and len(process_total_values) == aggregate_expected_count
+                if metrics and len(process_total_values) == aggregate_expected_count
                 else None
             ),
             "process_major_faults_delta_estimate": (
@@ -1936,9 +1995,7 @@ def aggregate_source(
             "covered_window_count": len(metrics),
             "complete": len(metrics) == expected_count,
             "covered_run_indices": covered_run_indices,
-            "unavailable_run_indices": [
-                item.window.run_index for item in unavailable
-            ],
+            "unavailable_run_indices": [item.window.run_index for item in unavailable],
             "unavailable_by_run": unavailable_by_run,
             "aggregation_scope": (
                 "covered performance windows only; unavailable windows are "
@@ -1947,8 +2004,7 @@ def aggregate_source(
         }
         process_result = require_object(result["process"], "process aggregate")
         process_result["average_cpu_core_equivalents_over_covered_windows"] = (
-            process_total
-            / (metrics[0].process.clock_ticks_per_second * duration)
+            process_total / (metrics[0].process.clock_ticks_per_second * duration)
             if metrics and process_total_values and duration > 0
             else None
         )
@@ -1997,9 +2053,7 @@ def run_cluster_totals(
     result: JsonObject = {
         "gpu_count": gpu_count,
         "integrated_gpu_joules": (
-            sum(gpu_energy_values)
-            if gpu_energy_for_included_sources_complete
-            else None
+            sum(gpu_energy_values) if gpu_energy_for_included_sources_complete else None
         ),
         "gpu_energy_complete": (
             gpu_energy_for_included_sources_complete and source_coverage_complete
@@ -2229,10 +2283,14 @@ def build_summary(
     output_path: Path,
     *,
     allow_uncovered_source_windows: bool = False,
+    expected_performance_runs: int = EXPECTED_PERFORMANCE_RUNS,
 ) -> JsonObject:
     """Read, validate, join, and summarize all requested receipts."""
 
-    windows, benchmark_provenance = read_performance_windows(benchmark_path)
+    windows, benchmark_provenance = read_performance_windows(
+        benchmark_path,
+        expected_performance_runs,
+    )
     sources = tuple(
         read_telemetry_source(label, path) for label, path in telemetry_specs
     )
@@ -2300,9 +2358,8 @@ def build_summary(
                 "python_version": sys.version,
                 "clock_ticks_per_second": clock_ticks,
                 "output_path": str(output_path),
-                "allow_uncovered_source_windows": (
-                    allow_uncovered_source_windows
-                ),
+                "allow_uncovered_source_windows": (allow_uncovered_source_windows),
+                "expected_performance_runs": expected_performance_runs,
             },
         },
         "coverage_mode": (
@@ -2319,7 +2376,7 @@ def build_summary(
             "gauge_average_method": "trapezoidal time weighting",
             "gpu_energy_method": "trapezoidal integration of power.draw watts",
             "overall_scope": (
-                "sum or extrema across the five disjoint accepted performance "
+                "sum or extrema across the disjoint accepted performance "
                 "windows only; semantic requests and gaps are excluded"
             ),
             "counter_reset_policy": (
@@ -2350,11 +2407,7 @@ def build_summary(
                 source.label: aggregate_source(
                     source,
                     per_source_metrics[source.label],
-                    (
-                        len(windows)
-                        if allow_uncovered_source_windows
-                        else None
-                    ),
+                    (len(windows) if allow_uncovered_source_windows else None),
                     per_source_unavailable[source.label],
                 )
                 for source in sources
@@ -2396,7 +2449,7 @@ def parse_arguments() -> argparse.Namespace:
 
     parser = argparse.ArgumentParser(
         description=(
-            "Join five accepted Kimi K3 performance windows to one or more "
+            "Join accepted Kimi K3 performance windows to one or more "
             "kimi-k3-telemetry-v1 JSONL streams."
         ),
     )
@@ -2420,6 +2473,15 @@ def parse_arguments() -> argparse.Namespace:
         help="atomically replaced summary JSON",
     )
     parser.add_argument(
+        "--expected-runs",
+        type=int,
+        default=EXPECTED_PERFORMANCE_RUNS,
+        help=(
+            "required accepted performance_result count and contiguous run-index "
+            f"range (default: {EXPECTED_PERFORMANCE_RUNS})"
+        ),
+    )
+    parser.add_argument(
         "--allow-uncovered-source-windows",
         action="store_true",
         help=(
@@ -2441,6 +2503,13 @@ def main() -> int:
         bool,
         arguments.allow_uncovered_source_windows,
     )
+    expected_performance_runs = cast(int, arguments.expected_runs)
+    if expected_performance_runs <= 0:
+        print(
+            "summarize-kimi-k3-telemetry: error: --expected-runs must be positive",
+            file=sys.stderr,
+        )
+        return 2
     try:
         telemetry_specs = parse_telemetry_arguments(telemetry_values)
         ensure_distinct_paths(benchmark, telemetry_specs, output)
@@ -2449,6 +2518,7 @@ def main() -> int:
             telemetry_specs,
             output,
             allow_uncovered_source_windows=allow_uncovered_source_windows,
+            expected_performance_runs=expected_performance_runs,
         )
         atomic_write_json(output, summary)
     except SummaryError as error:

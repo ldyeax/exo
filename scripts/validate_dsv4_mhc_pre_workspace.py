@@ -6,9 +6,7 @@ from __future__ import annotations
 import hashlib
 
 import torch
-
 from sglang.srt.layers.mhc import mhc_pre
-
 
 TOKENS = 4096
 TAIL_TOKENS = 4032
@@ -67,9 +65,7 @@ def main() -> None:
         dtype=torch.float32,
         device="cuda",
     )
-    norm_weight = torch.randn(
-        (HIDDEN_SIZE,), dtype=torch.bfloat16, device="cuda"
-    )
+    norm_weight = torch.randn((HIDDEN_SIZE,), dtype=torch.bfloat16, device="cuda")
 
     torch.cuda.synchronize()
     ordinary_baseline = torch.cuda.memory_allocated()
@@ -79,9 +75,7 @@ def main() -> None:
     torch.cuda.synchronize()
     ordinary_live_delta = torch.cuda.memory_allocated() - ordinary_baseline
 
-    workspace = torch.empty(
-        (MAIN_Q_ELEMENTS,), dtype=torch.bfloat16, device="cuda"
-    )
+    workspace = torch.empty((MAIN_Q_ELEMENTS,), dtype=torch.bfloat16, device="cuda")
     output_elements = TOKENS * HIDDEN_SIZE
     caller_output = workspace[-output_elements:].view(TOKENS, HIDDEN_SIZE)
     caller_pointer = caller_output.data_ptr()
@@ -118,13 +112,9 @@ def main() -> None:
     # its output at the end of the backing workspace.
     tail_output_elements = TAIL_TOKENS * HIDDEN_SIZE
     tail_q_elements = TAIL_TOKENS * 128 * 512
-    tail_output = workspace[-tail_output_elements:].view(
-        TAIL_TOKENS, HIDDEN_SIZE
-    )
+    tail_output = workspace[-tail_output_elements:].view(TAIL_TOKENS, HIDDEN_SIZE)
     tail_start_bytes = tail_output.data_ptr() - workspace.data_ptr()
-    tail_end_bytes = (
-        tail_start_bytes + tail_output.numel() * tail_output.element_size()
-    )
+    tail_end_bytes = tail_start_bytes + tail_output.numel() * tail_output.element_size()
     workspace_bytes = workspace.numel() * workspace.element_size()
     tail_q_bytes = tail_q_elements * workspace.element_size()
     if tail_end_bytes != workspace_bytes:
@@ -133,8 +123,7 @@ def main() -> None:
         )
     if tail_end_bytes == tail_q_bytes:
         raise AssertionError(
-            "tail oracle did not distinguish the live Q view from its backing "
-            "workspace"
+            "tail oracle did not distinguish the live Q view from its backing workspace"
         )
     if tail_start_bytes >= tail_q_bytes:
         raise AssertionError(
@@ -150,7 +139,7 @@ def main() -> None:
         )
 
     print(f"output_shape={tuple(actual_output.shape)}")
-    print(f"pointer_preserved=True byte_exact=True")
+    print("pointer_preserved=True byte_exact=True")
     print(f"protected_suffix_start_bytes={protected_start_bytes}")
     print(f"tail_protected_suffix_start_bytes={tail_start_bytes}")
     print(f"tail_q_bytes={tail_q_bytes}")

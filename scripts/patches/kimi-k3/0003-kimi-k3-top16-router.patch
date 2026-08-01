@@ -1,0 +1,97 @@
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index e73a7b890..5c98bc352 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -2848,7 +2848,7 @@ static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int nod
+         node_idx++;
+     }
+ 
+-    if (nodes[node_idx]->op == GGML_OP_SCALE && nodes[node_idx]->src[0] == nodes[node_idx - 1]) {
++    if (node_idx < n_nodes && nodes[node_idx]->op == GGML_OP_SCALE && nodes[node_idx]->src[0] == nodes[node_idx - 1]) {
+         args.scale = true;
+     }
+ 
+diff --git a/ggml/src/ggml-cuda/topk-moe.cu b/ggml/src/ggml-cuda/topk-moe.cu
+index c8cec70bb..e99f55a90 100644
+--- a/ggml/src/ggml-cuda/topk-moe.cu
++++ b/ggml/src/ggml-cuda/topk-moe.cu
+@@ -337,6 +337,11 @@ static void launch_topk_moe_cuda(ggml_backend_cuda_context & ctx,
+             ggml_cuda_kernel_launch(topk_moe_cuda<576, has_bias>, launch_params,
+                 logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
+             break;
++        case 896: // Kimi-K3
++            GGML_ASSERT(n_expert_used == 16);
++            ggml_cuda_kernel_launch(topk_moe_cuda<896, has_bias>, launch_params,
++                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
++            break;
+         default:
+             GGML_ASSERT(false && "fatal error");
+             break;
+@@ -392,13 +397,16 @@ void ggml_cuda_op_topk_moe(ggml_backend_cuda_context &     ctx,
+ }
+ 
+ bool ggml_cuda_should_use_topk_moe(const ggml_tensor * gating_op,
+-                                   const ggml_tensor * weights,
+                                    const ggml_tensor * logits,
++                                   const ggml_tensor * weights,
+                                    const ggml_tensor * ids) {
+     // must match an instantiation of launch_topk_moe_cuda: a power of 2 up to 512,
+     // or one of the non-power-of-2 expert counts of supported models
+     const int n_expert = ids->nb[1] / ids->nb[0];
+-    if (((n_expert & (n_expert - 1)) != 0 || n_expert > 512) && n_expert != 288 && n_expert != 576) {
++    if (((n_expert & (n_expert - 1)) != 0 || n_expert > 512) && n_expert != 288 && n_expert != 576 && n_expert != 896) {
++        return false;
++    }
++    if (n_expert == 896 && weights->ne[1] != 16) {
+         return false;
+     }
+ 
+diff --git a/ggml/src/ggml-cuda/topk-moe.cuh b/ggml/src/ggml-cuda/topk-moe.cuh
+index 091ef02a4..0bd728815 100644
+--- a/ggml/src/ggml-cuda/topk-moe.cuh
++++ b/ggml/src/ggml-cuda/topk-moe.cuh
+@@ -23,6 +23,6 @@ void ggml_cuda_op_topk_moe(ggml_backend_cuda_context &     ctx,
+                            const ggml_cuda_topk_moe_args & args);
+ 
+ bool ggml_cuda_should_use_topk_moe(const ggml_tensor * gating_op,
+-                                   const ggml_tensor * weights,
+                                    const ggml_tensor * logits,
++                                   const ggml_tensor * weights,
+                                    const ggml_tensor * ids);
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index e7cd6d0cb..1d8d02665 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -1588,6 +1588,9 @@ struct test_case {
+             size_t target_size = is_cpu ? target_size_cpu : target_size_gpu;
+             n_runs = (int)std::min<int64_t>(ggml_graph_size(gf) - ggml_graph_n_nodes(gf), target_size / op_size(out)) + 1;
+         }
++        if (run_whole_graph()) {
++            n_runs = 1;
++        }
+ 
+         // duplicate the op
+         for (int i = 1; i < n_runs; i++) {
+@@ -9600,10 +9603,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+                     test_cases.emplace_back(new test_topk_moe({160, 4, 1, 1}, 160, with_norm, bias_probs, gate, scale_w));
+                     test_cases.emplace_back(new test_topk_moe({256, 22, 1, 1}, 6, with_norm, bias_probs, gate, scale_w)); // Used by DeepSeek-V4
+                     test_cases.emplace_back(new test_topk_moe({288, 22, 1, 1}, 8, with_norm, bias_probs, gate, scale_w)); // Used by StepFun 3.7
++                    test_cases.emplace_back(new test_topk_moe({896, 22, 1, 1}, 16, with_norm, bias_probs, gate, scale_w)); // Used by Kimi-K3
+                 }
+             }
+         }
+     }
++    test_cases.emplace_back(new test_topk_moe({896, 22, 1, 1}, 15, true, true, GATING_FUNC_SIGMOID, 0.0f));
+ 
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1));
+@@ -9846,6 +9851,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+         }
+     }
+ 
++    for (int bs : {1, 512}) {
++        test_cases.emplace_back(new test_topk_moe({896, bs, 1, 1}, 16, true, true, GATING_FUNC_SIGMOID, 0.0f));
++    }
+ 
+     // gpt-oss-20b
+     for (int bs : {1, 4, 8, 512}) {

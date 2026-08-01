@@ -145,9 +145,11 @@ def test_lifecycle_publishes_private_receipt_and_allows_exact_attachment(
 
     assert receipt_path.stat().st_mode & 0o777 == 0o600
     assert attachment.receipt.status == "running"
-    assert tuple(
-        stage.pipeline_rank for stage in attachment.receipt.stages
-    ) == (0, 1, 2)
+    assert tuple(stage.pipeline_rank for stage in attachment.receipt.stages) == (
+        0,
+        1,
+        2,
+    )
     assert len(attachment.receipt.owner_token) >= 32
 
     cleanup = lifecycle.stop()
@@ -190,9 +192,7 @@ def test_attachment_rejects_insecure_receipt_permissions(tmp_path: Path) -> None
             resident.ResidentClusterAttachmentError,
             match="mode 0600",
         ):
-            resident.load_resident_cluster_ownership_receipt(
-                lifecycle.receipt_path
-            )
+            resident.load_resident_cluster_ownership_receipt(lifecycle.receipt_path)
     finally:
         os.chmod(lifecycle.receipt_path, 0o600)
         lifecycle.stop()

@@ -17,23 +17,43 @@ def _write_jsonl(path: Path, records: list[dict[str, object]]) -> None:
     )
 
 
-def _benchmark_records() -> list[dict[str, object]]:
-    return [
+def _benchmark_records(
+    *,
+    run_count: int = 5,
+    completed: bool = True,
+) -> list[dict[str, object]]:
+    records: list[dict[str, object]] = [
         {
-            "accepted": True,
-            "case": f"case-{run_index}",
-            "event": "performance_result",
-            "run_index": run_index,
-            "sequence": run_index,
-            "response": {
-                "elapsed_seconds": 5.0,
-                "started_at_utc": (
-                    f"1970-01-01T00:01:{10 + (run_index - 1) * 10:02d}Z"
-                ),
-            },
-        }
-        for run_index in range(1, 6)
+            "configuration": {"run_count": run_count},
+            "event": "campaign_started",
+            "sequence": 1,
+        },
+        *[
+            {
+                "accepted": True,
+                "case": f"case-{run_index}",
+                "event": "performance_result",
+                "run_index": run_index,
+                "sequence": run_index + 1,
+                "response": {
+                    "elapsed_seconds": 5.0,
+                    "started_at_utc": (
+                        f"1970-01-01T00:01:{10 + (run_index - 1) * 10:02d}Z"
+                    ),
+                },
+            }
+            for run_index in range(1, run_count + 1)
+        ],
     ]
+    if completed:
+        records.append(
+            {
+                "accepted_pairs": run_count,
+                "event": "campaign_completed",
+                "sequence": run_count + 2,
+            }
+        )
+    return records
 
 
 def _telemetry_records(
@@ -171,3 +191,59 @@ def test_partial_coverage_never_interpolates_missing_source_window(
     assert cluster_coverage["expected_source_window_count"] == 10
     assert cluster_coverage["covered_source_window_count"] == 9
     assert cluster_coverage["coverage_fraction"] == 0.9
+
+
+def test_single_run_campaign_is_admitted_only_when_declared_complete(
+    tmp_path: Path,
+) -> None:
+    benchmark = tmp_path / "benchmark-one.jsonl"
+    _write_jsonl(benchmark, _benchmark_records(run_count=1))
+
+    windows, _ = summary.read_performance_windows(
+        benchmark,
+        expected_performance_runs=1,
+    )
+
+    assert [window.run_index for window in windows] == [1]
+
+
+def test_interrupted_campaign_cannot_be_reclassified_as_one_run(
+    tmp_path: Path,
+) -> None:
+    benchmark = tmp_path / "benchmark-interrupted.jsonl"
+    _write_jsonl(
+        benchmark,
+        _benchmark_records(run_count=5, completed=False)[:2],
+    )
+
+    try:
+        summary.read_performance_windows(
+            benchmark,
+            expected_performance_runs=1,
+        )
+    except summary.SummaryError as error:
+        assert "campaign_completed" in str(error)
+    else:
+        raise AssertionError("interrupted five-run campaign was admitted as one run")
+
+
+def test_expected_runs_must_match_campaign_configuration(
+    tmp_path: Path,
+) -> None:
+    benchmark = tmp_path / "benchmark-mismatched-count.jsonl"
+    records = _benchmark_records(run_count=1)
+    configuration = records[0]["configuration"]
+    assert isinstance(configuration, dict)
+    configuration["run_count"] = 5
+    _write_jsonl(benchmark, records)
+
+    try:
+        summary.read_performance_windows(
+            benchmark,
+            expected_performance_runs=1,
+        )
+    except summary.SummaryError as error:
+        assert "campaign run_count" in str(error)
+        assert "configured=5" in str(error)
+    else:
+        raise AssertionError("mismatched campaign run_count was admitted")

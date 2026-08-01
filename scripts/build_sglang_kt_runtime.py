@@ -1341,8 +1341,7 @@ def _collect_runtime_wheels(plan: RuntimeBuildPlan) -> tuple[WheelArtifact, ...]
                     EXPECTED_SGLANG_WHEEL_ENTRY_COUNT
                     if (
                         distribution != "sglang-kt"
-                        or plan.pins.sglang_revision
-                        == GLM_4_7_FLASH_SGLANG_REVISION
+                        or plan.pins.sglang_revision == GLM_4_7_FLASH_SGLANG_REVISION
                     )
                     else None
                 ),
@@ -1588,7 +1587,9 @@ def main() -> int:
         )
         receipt = execute_runtime_build(plan, build=arguments.build)
     except (OSError, RuntimeBuildError) as error:
-        raise SystemExit(f"SGLang-KTransformers runtime build failed: {error}") from error
+        raise SystemExit(
+            f"SGLang-KTransformers runtime build failed: {error}"
+        ) from error
     print(json.dumps(asdict(receipt), indent=2, sort_keys=True))
     return 0
 

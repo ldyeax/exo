@@ -1,0 +1,131 @@
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index f476644ea..8ace2a669 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -1501,6 +1501,47 @@ bool llama_model_loader::prioritize_rpc_tensor_source(
+     return false;
+ }
+ 
++bool llama_model_loader::enqueue_rpc_tensor_source(
++        struct ggml_tensor * tensor,
++        const llama_tensor_weight & weight) {
++    if (check_tensors ||
++        weight.idx >= rpc_tensor_source_paths.size() ||
++        rpc_tensor_source_paths[weight.idx].empty() ||
++        unavailable_rpc_tensor_source_buffers.count(tensor->buffer) != 0) {
++        return false;
++    }
++
++    rpc_tensor_set_from_file_t set_from_file =
++        rpc_tensor_set_from_file(tensor->buffer);
++    if (set_from_file == nullptr) {
++        return false;
++    }
++
++    const size_t size = ggml_nbytes(tensor);
++    const bool queued = set_from_file(
++        tensor,
++        rpc_tensor_source_paths[weight.idx].c_str(),
++        weight.offs,
++        0,
++        size);
++    if (queued) {
++        pending_rpc_tensor_source_buffers.insert(tensor->buffer);
++        rpc_tensor_source_count++;
++        rpc_tensor_source_bytes += size;
++        return true;
++    }
++    if (pending_rpc_tensor_source_buffers.count(tensor->buffer) != 0) {
++        throw std::runtime_error(format(
++            "RPC tensor source rejected '%s' after accepting earlier tensors",
++            rpc_tensor_source_paths[weight.idx].c_str()));
++    }
++    unavailable_rpc_tensor_source_buffers.insert(tensor->buffer);
++    LLAMA_LOG_WARN(
++        "%s: RPC server did not admit its local tensor source; falling back to client reads\n",
++        __func__);
++    return false;
++}
++
+ void llama_model_loader::synchronize_rpc_tensor_source() {
+     for (ggml_backend_buffer_t buffer : pending_rpc_tensor_source_buffers) {
+         rpc_synchronize_tensor_files_t synchronize =
+@@ -1534,6 +1575,23 @@ bool llama_model_loader::load_all_data(
+     }
+     GGML_ASSERT(size_data != 0 && "call init_mappings() first");
+ 
++    std::unordered_set<ggml_tensor *> queued_rpc_tensors;
++    for (ggml_tensor * tensor = ggml_get_first_tensor(ctx);
++         tensor != nullptr;
++         tensor = ggml_get_next_tensor(ctx, tensor)) {
++        const auto * weight = get_weight(ggml_get_name(tensor));
++        if (weight != nullptr &&
++            enqueue_rpc_tensor_source(tensor, *weight)) {
++            queued_rpc_tensors.insert(tensor);
++        }
++    }
++    if (!queued_rpc_tensors.empty()) {
++        LLAMA_LOG_DEBUG(
++            "%s: queued %zu RPC server-local tensor load(s) before client-side tensor reads\n",
++            __func__,
++            queued_rpc_tensors.size());
++    }
++
+     std::vector<no_init<uint8_t>> read_buf;
+     std::vector<std::future<std::pair<ggml_tensor *, bool>>> validation_result;
+ 
+@@ -1650,36 +1708,9 @@ bool llama_model_loader::load_all_data(
+ 
+         size_t n_size = ggml_nbytes(cur);
+ 
+-        if (!check_tensors &&
+-            weight->idx < rpc_tensor_source_paths.size() &&
+-            !rpc_tensor_source_paths[weight->idx].empty() &&
+-            unavailable_rpc_tensor_source_buffers.count(cur->buffer) == 0) {
+-            rpc_tensor_set_from_file_t set_from_file =
+-                rpc_tensor_set_from_file(cur->buffer);
+-            if (set_from_file != nullptr) {
+-                const bool queued = set_from_file(
+-                    cur,
+-                    rpc_tensor_source_paths[weight->idx].c_str(),
+-                    weight->offs,
+-                    0,
+-                    n_size);
+-                if (queued) {
+-                    pending_rpc_tensor_source_buffers.insert(cur->buffer);
+-                    rpc_tensor_source_count++;
+-                    rpc_tensor_source_bytes += n_size;
+-                    size_done += n_size;
+-                    continue;
+-                }
+-                if (pending_rpc_tensor_source_buffers.count(cur->buffer) != 0) {
+-                    throw std::runtime_error(format(
+-                        "RPC tensor source rejected '%s' after accepting earlier tensors",
+-                        rpc_tensor_source_paths[weight->idx].c_str()));
+-                }
+-                unavailable_rpc_tensor_source_buffers.insert(cur->buffer);
+-                LLAMA_LOG_WARN(
+-                    "%s: RPC server did not admit its local tensor source; falling back to client reads\n",
+-                    __func__);
+-            }
++        if (queued_rpc_tensors.count(cur) != 0) {
++            size_done += n_size;
++            continue;
+         }
+ 
+         if (use_mmap) {
+diff --git a/src/llama-model-loader.h b/src/llama-model-loader.h
+index e0eddcd05..64e2992d2 100644
+--- a/src/llama-model-loader.h
++++ b/src/llama-model-loader.h
+@@ -211,6 +211,10 @@ struct llama_model_loader {
+ 
+     bool prioritize_rpc_tensor_source(struct ggml_context * ctx) const;
+ 
++    bool enqueue_rpc_tensor_source(
++            struct ggml_tensor * tensor,
++            const llama_tensor_weight & weight);
++
+     void synchronize_rpc_tensor_source();
+ 
+     std::string ftype_name() const;

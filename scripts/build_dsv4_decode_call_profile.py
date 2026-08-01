@@ -36,48 +36,36 @@ def main() -> None:
         int(value) for value in args.stage_layer_partition.split(",")
     )
     if len(stage_partition) != len(args.rank_profiles):
-        raise ValueError(
-            "rank profile count must match the pipeline layer partition"
-        )
+        raise ValueError("rank profile count must match the pipeline layer partition")
     loaded_profiles = [
         torch.load(path, map_location="cpu", weights_only=True)
         for path in args.rank_profiles
     ]
     raw_counts = []
-    for path, profile in zip(
-        args.rank_profiles, loaded_profiles, strict=True
-    ):
+    for path, profile in zip(args.rank_profiles, loaded_profiles, strict=True):
         if not isinstance(profile, dict) or not isinstance(
             profile.get("logical_count"), torch.Tensor
         ):
             raise ValueError(f"profile lacks logical_count tensor: {path}")
         tensor = profile["logical_count"]
         if tensor.ndim != 3:
-            raise ValueError(
-                f"profile logical_count must be three-dimensional: {path}"
-            )
+            raise ValueError(f"profile logical_count must be three-dimensional: {path}")
         raw_counts.append(tensor.to(device="cpu"))
 
     shape = raw_counts[0].shape[1:]
     if any(tuple(tensor.shape[1:]) != tuple(shape) for tensor in raw_counts):
         raise ValueError("rank profiles have different layer/expert shapes")
     if sum(stage_partition) != shape[0]:
-        raise ValueError(
-            "pipeline layer partition does not cover the profile layers"
-        )
+        raise ValueError("pipeline layer partition does not cover the profile layers")
 
     call_counts = torch.zeros(shape, dtype=torch.int64)
     route_counts = torch.zeros(shape, dtype=torch.int64)
     decode_records_by_rank = []
     layer_start = 0
-    for tensor, layer_count in zip(
-        raw_counts, stage_partition, strict=True
-    ):
+    for tensor, layer_count in zip(raw_counts, stage_partition, strict=True):
         layer_end = layer_start + layer_count
         stage = tensor[:, layer_start:layer_end]
-        decode_rows = (
-            stage[:, 0].sum(dim=-1) == args.decode_routes_per_layer
-        )
+        decode_rows = stage[:, 0].sum(dim=-1) == args.decode_routes_per_layer
         if not bool(decode_rows.any()):
             raise ValueError(
                 f"rank stage {layer_start}:{layer_end} has no decode records "
@@ -85,11 +73,7 @@ def main() -> None:
             )
         selected = stage[decode_rows]
         per_layer_totals = selected.sum(dim=-1)
-        if not bool(
-            torch.all(
-                per_layer_totals == args.decode_routes_per_layer
-            )
-        ):
+        if not bool(torch.all(per_layer_totals == args.decode_routes_per_layer)):
             raise ValueError(
                 f"decode record route total changes inside stage "
                 f"{layer_start}:{layer_end}"
@@ -97,9 +81,7 @@ def main() -> None:
         call_counts[layer_start:layer_end] = (selected > 0).sum(
             dim=0, dtype=torch.int64
         )
-        route_counts[layer_start:layer_end] = selected.sum(
-            dim=0, dtype=torch.int64
-        )
+        route_counts[layer_start:layer_end] = selected.sum(dim=0, dtype=torch.int64)
         decode_records_by_rank.append(int(decode_rows.sum().item()))
         layer_start = layer_end
 
@@ -114,9 +96,7 @@ def main() -> None:
             "decode_records_by_rank": decode_records_by_rank,
             "decode_routes_per_layer": args.decode_routes_per_layer,
             "stage_layer_partition": stage_partition,
-            "source_profiles": [
-                str(path.resolve()) for path in args.rank_profiles
-            ],
+            "source_profiles": [str(path.resolve()) for path in args.rank_profiles],
             "metric": "distinct_decode_expert_calls",
         },
         args.output,

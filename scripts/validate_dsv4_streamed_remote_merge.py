@@ -8,7 +8,6 @@ import hashlib
 import json
 
 import torch
-
 from sglang.srt.layers.moe.kt_remote_sidecar import KTExpertSidecarClient
 
 
@@ -23,8 +22,7 @@ def main() -> None:
     parser.add_argument(
         "--plan",
         default=(
-            "/var/lib/exo/plans/dsv4-pro-profile7/balanced-fwuff12/"
-            "opposite-numa64.pt"
+            "/var/lib/exo/plans/dsv4-pro-profile7/balanced-fwuff12/opposite-numa64.pt"
         ),
     )
     parser.add_argument("--layer", type=int, default=0)
@@ -80,9 +78,7 @@ def main() -> None:
         device=device,
     )
     streamed = torch.zeros_like(hidden_states)
-    for token_start in range(
-        0, args.tokens, args.merge_chunk_tokens
-    ):
+    for token_start in range(0, args.tokens, args.merge_chunk_tokens):
         token_end = min(
             token_start + args.merge_chunk_tokens,
             args.tokens,

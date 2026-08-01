@@ -16,19 +16,19 @@ processor_count=${7:-}
 model_path=/mnt/sanic/llm_models/DeepSeek-V4-Pro-DSpark
 
 case "$(hostname -s)" in
-  fwuff)
-    python_path=/var/lib/exo/runtimes/glm47-kt/a4b0c45-sgl449c59f-py312-fwuff/venv/bin/python
-    export PYTHONPATH=/var/lib/exo/sources/ktransformers-dsv4-native-mxfp4:/var/lib/exo/runtimes/dsv4-native-mxfp4/fwuff/amx-prefill-v1/site-packages
-    processor_count=${processor_count:-60}
-    sidecar_script=/var/lib/exo/scripts/dsv4_mxfp4_expert_sidecar.py
-    ;;
-  *)
-    python_path=/var/lib/exo/runtimes/dsv4-native-mxfp4/dwagon/amx-prefill-v1/venv/bin/python
-    export PYTHONPATH=/root/exo/vendor/ktransformers
-    # Match the 56 physical cores in one dwagon socket; do not use SMT workers.
-    processor_count=${processor_count:-56}
-    sidecar_script=/root/exo/scripts/dsv4_mxfp4_expert_sidecar.py
-    ;;
+fwuff)
+  python_path=/var/lib/exo/runtimes/glm47-kt/a4b0c45-sgl449c59f-py312-fwuff/venv/bin/python
+  export PYTHONPATH=/var/lib/exo/sources/ktransformers-dsv4-native-mxfp4:/var/lib/exo/runtimes/dsv4-native-mxfp4/fwuff/amx-prefill-v1/site-packages
+  processor_count=${processor_count:-60}
+  sidecar_script=/var/lib/exo/scripts/dsv4_mxfp4_expert_sidecar.py
+  ;;
+*)
+  python_path=/var/lib/exo/runtimes/dsv4-native-mxfp4/dwagon/amx-prefill-v1/venv/bin/python
+  export PYTHONPATH=/root/exo/vendor/ktransformers
+  # Match the 56 physical cores in one dwagon socket; do not use SMT workers.
+  processor_count=${processor_count:-56}
+  sidecar_script=/root/exo/scripts/dsv4_mxfp4_expert_sidecar.py
+  ;;
 esac
 
 export KT_KERNEL_VARIANT=amx

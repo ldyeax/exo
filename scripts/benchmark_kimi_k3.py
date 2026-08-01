@@ -4,7 +4,7 @@
 The measured protocol is deliberately small and hard to accidentally game:
 
 * one sacrificial warmup;
-* five deterministic semantic gates;
+* one to five deterministic semantic gates;
 * one exact 512-input-token, 128-output-token performance request paired with
   every semantic gate;
 * prompt-cache erasure before every inference request; and
@@ -42,6 +42,8 @@ DEFAULT_BASE_URL: Final[str] = "http://127.0.0.1:11434"
 DEFAULT_MODEL: Final[str] = "Kimi-K3-UD-Q2_K_XL"
 DEFAULT_TIMEOUT_SECONDS: Final[float] = 6 * 60 * 60
 DEFAULT_REASONING_BUDGET_TOKENS: Final[int] = 96
+DEFAULT_RUN_COUNT: Final[int] = 5
+SPECULATIVE_CANDIDATE_WIDTHS: Final[tuple[int, ...]] = (3, 5, 7)
 TARGET_PROMPT_TOKENS: Final[int] = 512
 PERFORMANCE_OUTPUT_TOKENS: Final[int] = 128
 SEMANTIC_OUTPUT_TOKENS: Final[int] = 256
@@ -253,6 +255,8 @@ class BenchmarkConfiguration:
     reasoning_effort: str
     thinking_effort: str
     reasoning_budget_tokens: int
+    run_count: int
+    speculative_n_max: int | None
     output_jsonl: Path
     summary_json: Path
     overwrite: bool
@@ -260,7 +264,7 @@ class BenchmarkConfiguration:
     api_key_environment_variable: str
 
     def public_json(self) -> JsonObject:
-        return {
+        public_configuration: JsonObject = {
             "base_url": self.server_address.public_url(),
             "model": self.model,
             "quantization": self.quantization,
@@ -268,6 +272,7 @@ class BenchmarkConfiguration:
             "reasoning_effort": self.reasoning_effort,
             "thinking_effort": self.thinking_effort,
             "reasoning_budget_tokens": self.reasoning_budget_tokens,
+            "run_count": self.run_count,
             "output_jsonl": str(self.output_jsonl),
             "summary_json": str(self.summary_json),
             "api_key_configured": self.api_key is not None,
@@ -300,6 +305,9 @@ class BenchmarkConfiguration:
                 "-np 1",
             ],
         }
+        if self.speculative_n_max is not None:
+            public_configuration["speculative_n_max"] = self.speculative_n_max
+        return public_configuration
 
 
 def utc_now() -> str:
@@ -520,8 +528,7 @@ class ReceiptWriter:
         semantic_events = [
             event
             for event in self._events
-            if event.get("event") == "semantic_result"
-            and event.get("accepted") is True
+            if event.get("event") == "semantic_result" and event.get("accepted") is True
         ]
         performance_events = [
             event
@@ -596,12 +603,8 @@ class ReceiptWriter:
                     "case": event.get("case"),
                     "prompt_tokens": timings.get("prompt_n"),
                     "output_tokens": timings.get("predicted_n"),
-                    "prompt_tokens_per_second": timings.get(
-                        "prompt_per_second"
-                    ),
-                    "decode_tokens_per_second": timings.get(
-                        "predicted_per_second"
-                    ),
+                    "prompt_tokens_per_second": timings.get("prompt_per_second"),
+                    "decode_tokens_per_second": timings.get("predicted_per_second"),
                     "time_to_first_token_seconds": first_token_latency,
                     "time_to_first_content_seconds": response.get(
                         "time_to_first_content_seconds"
@@ -890,16 +893,12 @@ class LlamaServerClient:
                             reasoning_text = extract_delta_text(
                                 delta_mapping.get("reasoning")
                             )
-                        content_text = extract_delta_text(
-                            delta_mapping.get("content")
-                        )
+                        content_text = extract_delta_text(delta_mapping.get("content"))
 
                         if (
                             reasoning_text or content_text
                         ) and first_token_seconds is None:
-                            first_token_seconds = (
-                                received_at - started_at_monotonic
-                            )
+                            first_token_seconds = received_at - started_at_monotonic
                         if reasoning_text:
                             reasoning_parts.append(reasoning_text)
                         if content_text:
@@ -1067,9 +1066,7 @@ class LiveTokenCounter:
         )
         tokens = tokenize_response.get("tokens")
         if not isinstance(tokens, list):
-            raise CalibrationError(
-                "/tokenize response did not contain a tokens array"
-            )
+            raise CalibrationError("/tokenize response did not contain a tokens array")
         return len(cast(list[object], tokens))
 
     def rendered_prompt_receipt(
@@ -1101,9 +1098,7 @@ class LiveTokenCounter:
         )
         tokens = tokenize_response.get("tokens")
         if not isinstance(tokens, list):
-            raise CalibrationError(
-                "/tokenize response did not contain a tokens array"
-            )
+            raise CalibrationError("/tokenize response did not contain a tokens array")
         token_count = len(cast(list[object], tokens))
         return {
             "rendered_prompt_sha256": sha256_text(rendered_prompt),
@@ -1123,9 +1118,7 @@ class LiveTokenCounter:
             "messages": [{"role": "user", "content": content}],
             "reasoning_effort": self._reasoning_effort,
             "reasoning_budget_tokens": self._reasoning_budget_tokens,
-            "chat_template_kwargs": {
-                "thinking_effort": self._thinking_effort
-            },
+            "chat_template_kwargs": {"thinking_effort": self._thinking_effort},
         }
 
 
@@ -1284,7 +1277,7 @@ def common_chat_payload(
 ) -> JsonObject:
     """Build fields shared by semantic and performance requests."""
 
-    return {
+    payload: JsonObject = {
         "model": configuration.model,
         "messages": [{"role": "user", "content": content}],
         "stream": True,
@@ -1295,10 +1288,11 @@ def common_chat_payload(
         "id_slot": SLOT_IDENTIFIER,
         "reasoning_effort": configuration.reasoning_effort,
         "reasoning_budget_tokens": configuration.reasoning_budget_tokens,
-        "chat_template_kwargs": {
-            "thinking_effort": configuration.thinking_effort
-        },
+        "chat_template_kwargs": {"thinking_effort": configuration.thinking_effort},
     }
+    if configuration.speculative_n_max is not None:
+        payload["speculative.n_max"] = configuration.speculative_n_max
+    return payload
 
 
 def semantic_payload(
@@ -1354,9 +1348,7 @@ def validate_cache_is_cold(result: StreamResult) -> list[str]:
     try:
         cache_tokens = require_integer(result.timings, "cache_n")
         if cache_tokens != 0:
-            errors.append(
-                f"timings.cache_n is {cache_tokens}, expected exactly 0"
-            )
+            errors.append(f"timings.cache_n is {cache_tokens}, expected exactly 0")
     except AcceptanceError as error:
         errors.append(str(error))
 
@@ -1367,13 +1359,10 @@ def validate_cache_is_cold(result: StreamResult) -> list[str]:
             prompt_token_details,
         )
         cached_tokens = prompt_token_details_mapping.get("cached_tokens")
-        if (
-            cached_tokens is not None
-            and (
-                isinstance(cached_tokens, bool)
-                or not isinstance(cached_tokens, int)
-                or cached_tokens != 0
-            )
+        if cached_tokens is not None and (
+            isinstance(cached_tokens, bool)
+            or not isinstance(cached_tokens, int)
+            or cached_tokens != 0
         ):
             errors.append(
                 "usage.prompt_tokens_details.cached_tokens is "
@@ -1631,24 +1620,19 @@ def validate_python_code(content: str) -> GateVerdict:
         return GateVerdict(False, f"Python code does not parse: {error}", None)
 
     imports = [
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Import | ast.ImportFrom)
+        node for node in ast.walk(tree) if isinstance(node, ast.Import | ast.ImportFrom)
     ]
     functions = [
         node
         for node in tree.body
-        if isinstance(node, ast.FunctionDef)
-        and node.name == "dedupe_keep_order"
+        if isinstance(node, ast.FunctionDef) and node.name == "dedupe_keep_order"
     ]
     assertions = [node for node in ast.walk(tree) if isinstance(node, ast.Assert)]
     errors: list[str] = []
     if imports:
         errors.append("imports are forbidden")
     if len(functions) != 1:
-        errors.append(
-            "exactly one top-level dedupe_keep_order function is required"
-        )
+        errors.append("exactly one top-level dedupe_keep_order function is required")
     elif len(functions[0].args.args) != 1:
         errors.append("dedupe_keep_order must have exactly one positional argument")
     if len(assertions) < 2:
@@ -1732,8 +1716,7 @@ BENCHMARK_CASES: Final[tuple[BenchmarkCase, ...]] = (
             "sum_is_even. Do not use a Markdown fence."
         ),
         gate_description=(
-            'Exact JSON value: {"sorted":[1,3,5,8],"sum":17,'
-            '"sum_is_even":false}.'
+            'Exact JSON value: {"sorted":[1,3,5,8],"sum":17,"sum_is_even":false}.'
         ),
         validator=validate_json_transformation,
     ),
@@ -1782,8 +1765,7 @@ def execute_stream_request(
     """Erase the slot, stream a request, and durably record transport failures."""
 
     print(
-        f"[kimi-k3] erasing slot {SLOT_IDENTIFIER} before {event_prefix} "
-        f"{case_name}",
+        f"[kimi-k3] erasing slot {SLOT_IDENTIFIER} before {event_prefix} {case_name}",
         file=sys.stderr,
         flush=True,
     )
@@ -1816,9 +1798,10 @@ def execute_stream_request(
 
 
 def run_benchmark(configuration: BenchmarkConfiguration) -> JsonObject:
-    """Execute one complete five-pair Kimi K3 benchmark campaign."""
+    """Execute one complete Kimi K3 benchmark campaign."""
 
     public_configuration = configuration.public_json()
+    selected_cases = BENCHMARK_CASES[: configuration.run_count]
     receipt_writer = ReceiptWriter(
         configuration.output_jsonl,
         configuration.summary_json,
@@ -1832,7 +1815,7 @@ def run_benchmark(configuration: BenchmarkConfiguration) -> JsonObject:
             "semantic_cases": [
                 benchmark_case.public_plan(run_index)
                 for run_index, benchmark_case in enumerate(
-                    BENCHMARK_CASES,
+                    selected_cases,
                     start=1,
                 )
             ],
@@ -1924,11 +1907,10 @@ def run_benchmark(configuration: BenchmarkConfiguration) -> JsonObject:
         )
         if warmup_errors:
             raise AcceptanceError(
-                "warmup violated benchmark invariants: "
-                + "; ".join(warmup_errors)
+                "warmup violated benchmark invariants: " + "; ".join(warmup_errors)
             )
 
-        for run_index, benchmark_case in enumerate(BENCHMARK_CASES, start=1):
+        for run_index, benchmark_case in enumerate(selected_cases, start=1):
             semantic_request = semantic_payload(configuration, benchmark_case)
             semantic_rendered_prompt = token_counter.rendered_prompt_receipt(
                 benchmark_case.prompt
@@ -2001,8 +1983,7 @@ def run_benchmark(configuration: BenchmarkConfiguration) -> JsonObject:
             if performance_errors:
                 raise AcceptanceError(
                     f"performance run {run_index} ({benchmark_case.name}) "
-                    "failed: "
-                    + "; ".join(performance_errors)
+                    "failed: " + "; ".join(performance_errors)
                 )
 
             prompt_rate = require_positive_number(
@@ -2014,7 +1995,7 @@ def run_benchmark(configuration: BenchmarkConfiguration) -> JsonObject:
                 "predicted_per_second",
             )
             print(
-                f"[kimi-k3] accepted pair {run_index}/5 "
+                f"[kimi-k3] accepted pair {run_index}/{configuration.run_count} "
                 f"({benchmark_case.name}): prompt={prompt_rate:.3f} tok/s, "
                 f"decode={decode_rate:.3f} tok/s, "
                 f"TTFT={performance_result.time_to_first_token_seconds:.3f}s",
@@ -2025,7 +2006,7 @@ def run_benchmark(configuration: BenchmarkConfiguration) -> JsonObject:
         receipt_writer.append(
             {
                 "event": "campaign_completed",
-                "accepted_pairs": len(BENCHMARK_CASES),
+                "accepted_pairs": len(selected_cases),
             }
         )
         return receipt_writer.summary()
@@ -2053,13 +2034,19 @@ def dry_run_plan(configuration: BenchmarkConfiguration) -> JsonObject:
             "live input-token calibration to exactly 512 tokens",
             "slot erase before every inference request",
             "one sacrificial warmup",
-            "five semantic requests",
-            "five paired 512-input/128-output performance requests",
+            f"{configuration.run_count} semantic request(s)",
+            (
+                f"{configuration.run_count} paired 512-input/128-output "
+                "performance request(s)"
+            ),
             "atomic JSONL and JSON receipt writes",
         ],
         "semantic_cases": [
             benchmark_case.public_plan(run_index)
-            for run_index, benchmark_case in enumerate(BENCHMARK_CASES, start=1)
+            for run_index, benchmark_case in enumerate(
+                BENCHMARK_CASES[: configuration.run_count],
+                start=1,
+            )
         ],
         "ttft_trigger_fields_in_order": [
             "delta.reasoning_content",
@@ -2071,7 +2058,7 @@ def dry_run_plan(configuration: BenchmarkConfiguration) -> JsonObject:
             "performance_timings.prompt_n": TARGET_PROMPT_TOKENS,
             "performance_timings.predicted_n": PERFORMANCE_OUTPUT_TOKENS,
             "positive_server_prompt_and_decode_rates": True,
-            "all_five_semantic_gates": True,
+            "all_selected_semantic_gates": configuration.run_count,
         },
     }
 
@@ -2102,13 +2089,45 @@ def nonnegative_integer(value: str) -> int:
     return parsed_value
 
 
+def benchmark_run_count(value: str) -> int:
+    """Parse a positive run count bounded by the frozen semantic case set."""
+
+    try:
+        parsed_value = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("run count must be an integer") from error
+    if not 1 <= parsed_value <= len(BENCHMARK_CASES):
+        raise argparse.ArgumentTypeError(
+            f"run count must be between 1 and {len(BENCHMARK_CASES)}"
+        )
+    return parsed_value
+
+
+def speculative_candidate_width(value: str) -> int:
+    """Parse one of the Kimi K3 DSpark candidate widths under test."""
+
+    try:
+        parsed_value = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "speculative candidate width must be an integer"
+        ) from error
+    if parsed_value not in SPECULATIVE_CANDIDATE_WIDTHS:
+        valid_widths = ", ".join(str(width) for width in SPECULATIVE_CANDIDATE_WIDTHS)
+        raise argparse.ArgumentTypeError(
+            f"speculative candidate width must be one of: {valid_widths}"
+        )
+    return parsed_value
+
+
 def build_argument_parser() -> argparse.ArgumentParser:
     """Construct the command-line interface."""
 
     parser = argparse.ArgumentParser(
         description=(
-            "Benchmark a live Kimi K3 llama-server with five semantic gates and "
-            "five paired, cache-cold 512-input/128-output performance requests."
+            "Benchmark a live Kimi K3 llama-server with one to five semantic "
+            "gates and paired, cache-cold 512-input/128-output performance "
+            "requests."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
         epilog=(
@@ -2156,6 +2175,20 @@ def build_argument_parser() -> argparse.ArgumentParser:
         help=(
             "per-request reasoning token budget, leaving semantic output space "
             "for final content"
+        ),
+    )
+    parser.add_argument(
+        "--runs",
+        type=benchmark_run_count,
+        default=DEFAULT_RUN_COUNT,
+        help="number of paired semantic/performance runs to execute",
+    )
+    parser.add_argument(
+        "--speculative-n-max",
+        type=speculative_candidate_width,
+        help=(
+            "request-level Kimi K3 DSpark candidate width; omit for ordinary "
+            "non-speculative requests"
         ),
     )
     parser.add_argument(
@@ -2230,6 +2263,8 @@ def configuration_from_arguments(
         reasoning_effort=reasoning_effort,
         thinking_effort=thinking_effort,
         reasoning_budget_tokens=cast(int, arguments.reasoning_budget_tokens),
+        run_count=cast(int, arguments.runs),
+        speculative_n_max=cast(int | None, arguments.speculative_n_max),
         output_jsonl=output_jsonl,
         summary_json=summary_json,
         overwrite=cast(bool, arguments.overwrite),

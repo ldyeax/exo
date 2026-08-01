@@ -332,3 +332,29 @@ formatting rewrite was applied.
 
 Until those measurements exist, “fastest expected” means the strongest
 evidence-backed launch configuration, not a new benchmark claim.
+# Cumulative fork and dependency graph update (2026-08-01)
+
+The audited runtime sources are now published as public forks and referenced by
+the local cumulative graph:
+
+- `ldyeax/exo_sglang`, branch `bundle/glm52-fwuff-sglang`, commit
+  `73e877ac5` (with the DeepSeek V4 integration branch
+  `exo/dsv4-flash-0731` at `40e43604a`).
+- `ldyeax/exo_ktransformers`, branch `exo/glm52-osdi26-patched`, commit
+  `f38772417`.
+- `ldyeax/exo_llama_cpp`, branch `exo/kimi-k3-cumulative`, commit
+  `651092c60`.
+
+KTransformers no longer pins its active llama dependency to the unrelated
+ancient shallow snapshot. It uses the cumulative llama fork and contains the
+small compatibility layer required by modern ggml. Its active and archived
+llama submodule declarations point to the same fork/branch; its SGLang
+submodule points to `exo_sglang`. Exo also tracks `exo_llama_cpp` directly at
+`vendor/llama.cpp`, preventing the llama work from being siloed under
+KTransformers.
+
+System validation used CUDA 13.1/13.3 from `/opt/cuda`, system-wide ccache
+4.13.5, and system-wide NCCL 2.30.7 installed under `/usr/local`. The cumulative
+llama CUDA/NCCL targets and focused DFlash/RPC/backend tests passed, and
+KTransformers built successfully in both CPU-only and SM86 CUDA modes against
+the new llama revision. No model launch was performed.

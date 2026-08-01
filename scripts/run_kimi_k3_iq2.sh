@@ -108,26 +108,26 @@ print_shell_command() {
 
 while (($# > 0)); do
   case "$1" in
-    --validate-only)
-      validate_only=1
-      ;;
-    --print-command)
-      print_command=1
-      ;;
-    --help)
-      print_usage
-      exit 0
-      ;;
-    --)
-      shift
-      extra_server_arguments=("$@")
-      break
-      ;;
-    *)
-      printf 'Unknown argument: %s\n\n' "$1" >&2
-      print_usage >&2
-      exit 2
-      ;;
+  --validate-only)
+    validate_only=1
+    ;;
+  --print-command)
+    print_command=1
+    ;;
+  --help)
+    print_usage
+    exit 0
+    ;;
+  --)
+    shift
+    extra_server_arguments=("$@")
+    break
+    ;;
+  *)
+    printf 'Unknown argument: %s\n\n' "$1" >&2
+    print_usage >&2
+    exit 2
+    ;;
   esac
   shift
 done
@@ -262,7 +262,7 @@ if [[ ${skip_model_check} != 1 ]]; then
       continue
     fi
     shard_bytes=$(stat --format=%s "${shard_path}")
-    shard_allocated_bytes=$(( $(stat --format=%b "${shard_path}") * 512 ))
+    shard_allocated_bytes=$(($(stat --format=%b "${shard_path}") * 512))
     ((shard_allocated_bytes >= shard_bytes)) ||
       fail "model shard is sparse/incomplete: ${shard_path} has ${shard_bytes} logical bytes but ${shard_allocated_bytes} allocated bytes"
     actual_model_bytes=$((actual_model_bytes + shard_bytes))

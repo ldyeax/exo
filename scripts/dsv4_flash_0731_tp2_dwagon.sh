@@ -3,11 +3,11 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 mode=prepare
-if [[ "${1:-}" == "--launch" ]]; then
+if [[ ${1:-} == "--launch" ]]; then
   mode=launch
   shift
 fi
-if [[ "$#" -ne 0 ]]; then
+if [[ $# -ne 0 ]]; then
   echo "usage: $0 [--launch]" >&2
   exit 2
 fi
@@ -21,7 +21,7 @@ patch_path="${repo_root}/scripts/patches/dsv4-flash/0001-dsv4-flash-release-audi
 cache_root="${DSV4_CACHE_ROOT:-/var/lib/exo/cache/dsv4-flash-0731-release}"
 plan_path="${DSV4_GPU_EXPERT_PLAN:-${cache_root}/agentic-hot48-mask.pt}"
 
-if [[ -n "${DSV4_MODEL_PATH:-}" ]]; then
+if [[ -n ${DSV4_MODEL_PATH:-} ]]; then
   model_path="$DSV4_MODEL_PATH"
 elif [[ -f /mnt/sanic-edr/llm_models/DeepSeek-V4-Flash-0731/config.json ]]; then
   model_path=/mnt/sanic-edr/llm_models/DeepSeek-V4-Flash-0731
@@ -36,7 +36,7 @@ for required_path in \
   "$ordering_path" \
   "$sps_table_path" \
   "$patch_path"; do
-  if [[ ! -e "$required_path" ]]; then
+  if [[ ! -e $required_path ]]; then
     echo "missing required DSV4 launch input: $required_path" >&2
     exit 1
   fi
@@ -54,7 +54,7 @@ mkdir -p "$cache_root" "${cache_root}/triton" "${cache_root}/flashinfer" "${cach
   --gpu-experts-per-layer 48 \
   --write-plan "$plan_path"
 
-if [[ "$mode" == prepare ]]; then
+if [[ $mode == prepare ]]; then
   echo "DSV4 Flash 0731 launch is prepared; no model process was started."
   echo "Run $0 --launch only after both GPUs are free."
   exit 0
@@ -69,13 +69,13 @@ mapfile -t gpu_free_mib < <(
   nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits
 )
 minimum_gpu_free_mib="${DSV4_MINIMUM_GPU_FREE_MIB:-22000}"
-if [[ "${#gpu_free_mib[@]}" -lt 2 ]]; then
+if [[ ${#gpu_free_mib[@]} -lt 2 ]]; then
   echo "the TP2 launch requires two visible NVIDIA GPUs" >&2
   exit 1
 fi
 for gpu_index in 0 1; do
   free_mib="${gpu_free_mib[$gpu_index]//[[:space:]]/}"
-  if [[ ! "$free_mib" =~ ^[0-9]+$ ]] || (( free_mib < minimum_gpu_free_mib )); then
+  if [[ ! $free_mib =~ ^[0-9]+$ ]] || ((free_mib < minimum_gpu_free_mib)); then
     echo "GPU ${gpu_index} has ${free_mib:-unknown} MiB free; require ${minimum_gpu_free_mib} MiB" >&2
     exit 1
   fi

@@ -71,14 +71,14 @@ aria2c \
 while IFS=$'\t' read -r file_name expected_size; do
   downloaded_file="${output_directory}/${file_name}"
   actual_size=$(stat --format=%s "${downloaded_file}")
-  if [[ "${actual_size}" -ne "${expected_size}" ]]; then
+  if [[ ${actual_size} -ne ${expected_size} ]]; then
     echo \
       "Size mismatch for ${downloaded_file}: expected ${expected_size}, got ${actual_size}" \
       >&2
     exit 1
   fi
-  allocated_size=$(( $(stat --format=%b "${downloaded_file}") * 512 ))
-  if [[ "${allocated_size}" -lt "${actual_size}" ]]; then
+  allocated_size=$(($(stat --format=%b "${downloaded_file}") * 512))
+  if [[ ${allocated_size} -lt ${actual_size} ]]; then
     echo \
       "Sparse/incomplete file ${downloaded_file}: ${actual_size} logical bytes, ${allocated_size} allocated bytes" \
       >&2
@@ -94,7 +94,7 @@ done < <(
 remaining_control=$(
   find "${output_directory}" -maxdepth 1 -type f -name '*.aria2' -print -quit
 )
-if [[ -n "${remaining_control}" ]]; then
+if [[ -n ${remaining_control} ]]; then
   echo "Incomplete aria2 control files remain in ${output_directory}" >&2
   exit 1
 fi

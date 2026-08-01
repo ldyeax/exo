@@ -286,9 +286,7 @@ def _validate_receipt(receipt: ResidentClusterOwnershipReceipt) -> None:
                 "running resident receipt cannot contain cleanup evidence"
             )
     elif receipt.completed_at_utc is None:
-        raise ResidentClusterError(
-            "terminal resident receipt requires completion time"
-        )
+        raise ResidentClusterError("terminal resident receipt requires completion time")
 
 
 def _receipt_to_json(receipt: ResidentClusterOwnershipReceipt) -> JsonObject:
@@ -303,12 +301,8 @@ def _receipt_to_json(receipt: ResidentClusterOwnershipReceipt) -> JsonObject:
         "controller_start_time_ticks": receipt.controller_start_time_ticks,
         "launch_contract_sha256": receipt.launch_contract_sha256,
         "owner_token": receipt.owner_token,
-        "stages": [
-            cast(JsonObject, asdict(stage)) for stage in receipt.stages
-        ],
-        "cleanup": [
-            cast(JsonObject, asdict(evidence)) for evidence in receipt.cleanup
-        ],
+        "stages": [cast(JsonObject, asdict(stage)) for stage in receipt.stages],
+        "cleanup": [cast(JsonObject, asdict(evidence)) for evidence in receipt.cleanup],
     }
 
 
@@ -416,9 +410,7 @@ def _receipt_from_json(raw: object) -> ResidentClusterOwnershipReceipt:
         )
     completed_at = raw.get("completed_at_utc")
     if completed_at is not None and not isinstance(completed_at, str):
-        raise ResidentClusterError(
-            "resident completion time has the wrong type"
-        )
+        raise ResidentClusterError("resident completion time has the wrong type")
     raw_stages = _required(raw, "stages", list)
     raw_cleanup = _required(raw, "cleanup", list)
     status = cast(str, _required(raw, "status", str))
@@ -462,13 +454,16 @@ def _write_owner_only_receipt(
         raise ResidentClusterError(
             "resident receipt parent must be canonical and contain no symlinks"
         )
-    encoded = json.dumps(
-        _receipt_to_json(receipt),
-        allow_nan=False,
-        ensure_ascii=True,
-        indent=2,
-        sort_keys=True,
-    ).encode() + b"\n"
+    encoded = (
+        json.dumps(
+            _receipt_to_json(receipt),
+            allow_nan=False,
+            ensure_ascii=True,
+            indent=2,
+            sort_keys=True,
+        ).encode()
+        + b"\n"
+    )
     if len(encoded) > _MAXIMUM_RECEIPT_BYTES:
         raise ResidentClusterError("resident receipt exceeds the size limit")
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
@@ -494,9 +489,7 @@ def load_resident_cluster_ownership_receipt(
     """Load a private explicit receipt without following a final symlink."""
 
     if not path.is_absolute():
-        raise ResidentClusterAttachmentError(
-            "resident receipt path must be absolute"
-        )
+        raise ResidentClusterAttachmentError("resident receipt path must be absolute")
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
         descriptor = os.open(path, flags)
@@ -583,9 +576,7 @@ def verify_local_resident_stage(
                         f"rank {stage.pipeline_rank} PID start time changed"
                     )
                 environment = (entry / "environ").read_bytes().split(b"\0")
-                owner_entry = (
-                    f"EXO_BENCHMARK_OWNER_TOKEN={stage.owner_token}".encode()
-                )
+                owner_entry = f"EXO_BENCHMARK_OWNER_TOKEN={stage.owner_token}".encode()
                 command_line = (entry / "cmdline").read_bytes()
                 if owner_entry not in environment:
                     raise ResidentClusterAttachmentError(
@@ -728,8 +719,7 @@ class TwoHostResidentStageVerifier:
             )
             if completed.returncode != 0:
                 raise ResidentClusterAttachmentError(
-                    "remote ownership verification failed: "
-                    f"{completed.stderr[-500:]}"
+                    f"remote ownership verification failed: {completed.stderr[-500:]}"
                 )
             raw = cast(object, json.loads(completed.stdout))
             if not isinstance(raw, dict):
@@ -798,9 +788,7 @@ def verify_resident_cluster_attachment(
             "resident launch contract does not match the requested benchmark"
         )
     try:
-        _, _, controller_start_time = _read_process_identity(
-            receipt.controller_pid
-        )
+        _, _, controller_start_time = _read_process_identity(receipt.controller_pid)
     except (OSError, IndexError, ValueError) as error:
         raise ResidentClusterAttachmentError(
             "resident controller is not alive"
@@ -933,9 +921,7 @@ class ResidentClusterLifecycle[SpecT, RunningT, CleanupT]:
                 completed_at_utc=None,
                 controller_pid=os.getpid(),
                 controller_start_time_ticks=controller_start_time,
-                launch_contract_sha256=launch_contract_sha256(
-                    self.launch_contract
-                ),
+                launch_contract_sha256=launch_contract_sha256(self.launch_contract),
                 owner_token=self._owner_token,
                 stages=ownership,
                 cleanup=(),
@@ -966,9 +952,7 @@ class ResidentClusterLifecycle[SpecT, RunningT, CleanupT]:
         for running in reversed(self._running):
             try:
                 cleanup = self._stop_stage(running)
-                evidence.append(
-                    self._build_cleanup_evidence(running, cleanup)
-                )
+                evidence.append(self._build_cleanup_evidence(running, cleanup))
             except BaseException as error:
                 stop_errors.append(error)
                 rank = cast(RunningStageLike, running).owned.rank
@@ -983,8 +967,10 @@ class ResidentClusterLifecycle[SpecT, RunningT, CleanupT]:
                 )
         ordered = tuple(sorted(evidence, key=lambda item: item.pipeline_rank))
         self._cleanup = ordered
-        complete = not stop_errors and len(ordered) == len(self._running) and all(
-            item.ownership_verified and item.terminated for item in ordered
+        complete = (
+            not stop_errors
+            and len(ordered) == len(self._running)
+            and all(item.ownership_verified and item.terminated for item in ordered)
         )
         self._state = "stopped" if complete else "cleanup_failed"
         if not complete:

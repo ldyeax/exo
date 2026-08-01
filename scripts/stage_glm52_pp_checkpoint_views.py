@@ -251,7 +251,9 @@ def _source_file_evidence(source_path: Path, *, name: str) -> SourceFileEvidence
     try:
         status = source_path.stat()
     except OSError as error:
-        raise CheckpointViewError(f"cannot stat required source file {source_path}") from error
+        raise CheckpointViewError(
+            f"cannot stat required source file {source_path}"
+        ) from error
     if not source_path.is_file():
         raise CheckpointViewError(f"required source is not a file: {source_path}")
     identity: JsonObject = {
@@ -394,13 +396,10 @@ def _select_ktransformers_weight_map(
         if match is None:
             continue
         layer = int(match.group(1))
-        if (
-            start_layer <= layer < end_layer
-            and _is_sparse_layer(
-                layer,
-                first_sparse_layer=first_sparse_layer,
-                moe_layer_frequency=moe_layer_frequency,
-            )
+        if start_layer <= layer < end_layer and _is_sparse_layer(
+            layer,
+            first_sparse_layer=first_sparse_layer,
+            moe_layer_frequency=moe_layer_frequency,
         ):
             selected[weight_name] = filename
 
@@ -507,8 +506,7 @@ def build_checkpoint_view_plan(
         )
     if not resolved_ktransformers_source.is_dir():
         raise CheckpointViewError(
-            "KTransformers source is not a directory: "
-            f"{resolved_ktransformers_source}"
+            f"KTransformers source is not a directory: {resolved_ktransformers_source}"
         )
     if resolved_destination == Path("/"):
         raise CheckpointViewError("destination root cannot be the filesystem root")
@@ -653,9 +651,7 @@ def _file_evidence_receipt(evidence: SourceFileEvidence) -> JsonObject:
 
 def _stage_summary(stage: StageViewPlan) -> JsonObject:
     model_bytes = sum(shard.size_bytes for shard in stage.model_shards)
-    ktransformers_bytes = sum(
-        shard.size_bytes for shard in stage.ktransformers_shards
-    )
+    ktransformers_bytes = sum(shard.size_bytes for shard in stage.ktransformers_shards)
     return {
         "pipeline_rank": stage.pipeline_rank,
         "layer_range": [stage.start_layer, stage.end_layer],
@@ -666,13 +662,9 @@ def _stage_summary(stage: StageViewPlan) -> JsonObject:
         "ktransformers_tensor_count": len(stage.ktransformers_weight_map),
         "ktransformers_shard_count": len(stage.ktransformers_shards),
         "ktransformers_linked_bytes": ktransformers_bytes,
-        "ktransformers_weight_map_sha256": (
-            stage.ktransformers_weight_map_sha256
-        ),
+        "ktransformers_weight_map_sha256": (stage.ktransformers_weight_map_sha256),
         "rank_view_linked_bytes": model_bytes + ktransformers_bytes,
-        "model_path": str(
-            stage_path := Path(f"rank-{stage.pipeline_rank}") / "model"
-        ),
+        "model_path": str(stage_path := Path(f"rank-{stage.pipeline_rank}") / "model"),
         "ktransformers_weight_path": str(stage_path.parent / "ktransformers"),
     }
 
@@ -698,9 +690,7 @@ def checkpoint_view_plan_receipt(plan: CheckpointViewSuitePlan) -> JsonObject:
             "model_shard_bytes": plan.source_model_shard_bytes,
             "ktransformers_weight_path": str(plan.ktransformers_source),
             "ktransformers_index_sha256": plan.ktransformers_index.sha256,
-            "ktransformers_shard_bytes": (
-                plan.source_ktransformers_shard_bytes
-            ),
+            "ktransformers_shard_bytes": (plan.source_ktransformers_shard_bytes),
         },
         "stages": [_stage_summary(stage) for stage in plan.stages],
         "plan_sha256": plan.plan_sha256,
@@ -713,13 +703,16 @@ def checkpoint_view_plan_receipt(plan: CheckpointViewSuitePlan) -> JsonObject:
 
 
 def _write_json(path: Path, value: JsonObject) -> str:
-    encoded = json.dumps(
-        value,
-        allow_nan=False,
-        ensure_ascii=True,
-        indent=2,
-        sort_keys=True,
-    ).encode() + b"\n"
+    encoded = (
+        json.dumps(
+            value,
+            allow_nan=False,
+            ensure_ascii=True,
+            indent=2,
+            sort_keys=True,
+        ).encode()
+        + b"\n"
+    )
     with path.open("xb") as output:
         output.write(encoded)
         output.flush()
@@ -803,12 +796,9 @@ def _stage_manifest(
             }
             for asset in plan.model_assets
         ],
-        "model_shards": [
-            _file_evidence_receipt(shard) for shard in stage.model_shards
-        ],
+        "model_shards": [_file_evidence_receipt(shard) for shard in stage.model_shards],
         "ktransformers_shards": [
-            _file_evidence_receipt(shard)
-            for shard in stage.ktransformers_shards
+            _file_evidence_receipt(shard) for shard in stage.ktransformers_shards
         ],
         "hash_evidence": {
             "indexes": "sha256-content",
@@ -890,8 +880,7 @@ def materialize_checkpoint_views(plan: CheckpointViewSuitePlan) -> Path:
                 {
                     "pipeline_rank": stage.pipeline_rank,
                     "relative_path": str(
-                        Path(f"rank-{stage.pipeline_rank}")
-                        / STAGE_MANIFEST_FILENAME
+                        Path(f"rank-{stage.pipeline_rank}") / STAGE_MANIFEST_FILENAME
                     ),
                     "sha256": manifest_sha256,
                 }

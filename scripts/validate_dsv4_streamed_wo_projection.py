@@ -87,9 +87,7 @@ def main() -> None:
             torch.nn.functional.linear(low_rank_chunk.flatten(1), wo_b)
         )
     torch.cuda.synchronize(device)
-    streamed_peak_bytes = (
-        torch.cuda.max_memory_allocated(device) - streamed_base_bytes
-    )
+    streamed_peak_bytes = torch.cuda.max_memory_allocated(device) - streamed_base_bytes
 
     reference_float = reference.float()
     streamed_float = output_buffer.float()

@@ -967,9 +967,7 @@ def run_concurrency_case(
                 f"concurrency {concurrency} requests reused cached prompt tokens: "
                 f"{cached_by_request}"
             )
-    total_prompt_tokens = sum(
-        request.observation.prompt_tokens for request in ordered
-    )
+    total_prompt_tokens = sum(request.observation.prompt_tokens for request in ordered)
     total_completion_tokens = sum(
         request.observation.completion_tokens for request in ordered
     )
@@ -1109,9 +1107,7 @@ def run_benchmark(config: BenchmarkConfig) -> JsonObject:
     tokenizer = _load_tokenizer(config.model_path)
     semantic_prompt = _prepare_semantic_prompt(tokenizer)
     concurrent_request_count = sum(
-        concurrency
-        for concurrency in config.benchmark_concurrencies
-        if concurrency > 1
+        concurrency for concurrency in config.benchmark_concurrencies if concurrency > 1
     )
     if concurrent_request_count > len(_CONCURRENT_PROMPT_MARKERS):
         raise Glm52Pp3BenchmarkError(
@@ -1206,8 +1202,7 @@ def run_benchmark(config: BenchmarkConfig) -> JsonObject:
                 benchmark_cases.append(benchmark_case)
                 if not all_stages_alive(running):
                     raise Glm52Pp3BenchmarkError(
-                        "a pipeline rank exited during concurrency "
-                        f"{concurrency}"
+                        f"a pipeline rank exited during concurrency {concurrency}"
                     )
                 _status(
                     f"concurrency {concurrency} complete: "
@@ -1279,8 +1274,7 @@ def run_benchmark(config: BenchmarkConfig) -> JsonObject:
             "input_tokens_per_request": config.benchmark_input_tokens,
             "input_ids_sha256_by_concurrency": {
                 str(concurrency): [
-                    prompt.input_ids_sha256
-                    for prompt in benchmark_prompts[concurrency]
+                    prompt.input_ids_sha256 for prompt in benchmark_prompts[concurrency]
                 ]
                 for concurrency in config.benchmark_concurrencies
             },
@@ -1504,9 +1498,7 @@ def _config_from_arguments(arguments: argparse.Namespace) -> BenchmarkConfig:
         arguments.benchmark_concurrencies,
     )
     if len(set(benchmark_concurrencies)) != len(benchmark_concurrencies):
-        raise Glm52Pp3BenchmarkError(
-            "benchmark concurrency cases must be unique"
-        )
+        raise Glm52Pp3BenchmarkError("benchmark concurrency cases must be unique")
     if benchmark_input_tokens + benchmark_output_tokens > context_length:
         raise Glm52Pp3BenchmarkError(
             "benchmark input plus output tokens exceed context length"

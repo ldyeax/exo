@@ -1,0 +1,304 @@
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 4770a4e18..881102c19 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -12,6 +12,7 @@
+ #include "llama-ext.h"
+ #include "llama.h"
+ 
++#include <algorithm>
+ #include <cinttypes>
+ #include <cmath>
+ #include <cstring>
+@@ -351,6 +352,83 @@ llama_context::llama_context(
+         }
+         backends.emplace_back(backend_cpu);
+ 
++        // Some draft/assistant architectures use pre-allocated tensors from
++        // ctx_other directly in their graph. A scheduler cannot move such a
++        // tensor, so it must also know the exact backend handle that owns the
++        // tensor. Reusing the handle is important for RPC, where a new backend
++        // connection would not own the target context's remote tensor IDs.
++        if (cparams.ctx_other != nullptr) {
++            const auto & model_other = cparams.ctx_other->model;
++
++            std::vector<std::pair<const ggml_tensor *, const char *>> tensors_other;
++            switch (model.arch) {
++                case LLM_ARCH_GEMMA4_ASSISTANT:
++                    tensors_other.emplace_back(model_other.tok_embd, "token embeddings");
++                    break;
++                case LLM_ARCH_EAGLE3:
++                case LLM_ARCH_DFLASH:
++                    if (model.tok_embd == nullptr) {
++                        tensors_other.emplace_back(model_other.tok_embd, "token embeddings");
++                    }
++                    if (model.output == nullptr) {
++                        tensors_other.emplace_back(model_other.output, "output projection");
++                    }
++                    break;
++                default:
++                    break;
++            }
++
++            const auto supports_tensor_buffer = [](ggml_backend_t backend, const ggml_tensor * tensor) {
++                const ggml_tensor * root = tensor;
++                while (root != nullptr && root->buffer == nullptr && root->view_src != nullptr) {
++                    root = root->view_src;
++                }
++                if (root == nullptr || root->buffer == nullptr) {
++                    return false;
++                }
++
++                return ggml_backend_supports_buft(backend, ggml_backend_buffer_get_type(root->buffer)) &&
++                       ggml_backend_supports_op(backend, tensor);
++            };
++
++            for (const auto & [tensor, role] : tensors_other) {
++                if (tensor == nullptr) {
++                    throw std::runtime_error(format("%s requires ctx_other %s", model.arch_name().c_str(), role));
++                }
++
++                const ggml_tensor * root = tensor;
++                while (root->buffer == nullptr && root->view_src != nullptr) {
++                    root = root->view_src;
++                }
++                if (root->buffer == nullptr) {
++                    // no_alloc/model-fitting contexts do not have a fixed
++                    // buffer to make visible to the scheduler
++                    continue;
++                }
++
++                const auto already_visible = [&](ggml_backend_t backend) {
++                    return supports_tensor_buffer(backend, tensor);
++                };
++                if (std::any_of(backends.begin(), backends.end(),
++                                [&](const ggml_backend_ptr & backend) { return already_visible(backend.get()); }) ||
++                    std::any_of(borrowed_backends.begin(), borrowed_backends.end(), already_visible)) {
++                    continue;
++                }
++
++                const auto & other_backends = cparams.ctx_other->backend_ptrs;
++                const auto it = std::find_if(other_backends.begin(), other_backends.end(), already_visible);
++                if (it == other_backends.end()) {
++                    throw std::runtime_error(format(
++                            "%s cannot access ctx_other %s tensor '%s' in buffer '%s'",
++                            model.arch_name().c_str(), role, tensor->name, ggml_backend_buffer_name(root->buffer)));
++                }
++
++                borrowed_backends.push_back(*it);
++                LLAMA_LOG_INFO("%s: borrowing %s backend for ctx_other %s tensor '%s'\n",
++                        __func__, ggml_backend_name(*it), role, tensor->name);
++            }
++        }
++
+         // create a list of the set_n_threads functions in the backends
+         for (auto & backend : backends) {
+             ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
+@@ -398,11 +476,11 @@ llama_context::llama_context(
+         backend_ptrs.clear();
+         backend_buf_exp_size.clear();
+ 
+-        for (auto & backend : backends) {
+-            auto * buft = ggml_backend_get_default_buffer_type(backend.get());
+-            auto backend_type = ggml_backend_dev_type(ggml_backend_get_device(backend.get()));
++        const auto add_backend = [&](ggml_backend_t backend, bool use_model_host_buffer) {
++            auto * buft = ggml_backend_get_default_buffer_type(backend);
++            auto backend_type = ggml_backend_dev_type(ggml_backend_get_device(backend));
+ 
+-            if (backend_type == GGML_BACKEND_DEVICE_TYPE_CPU && !model.devices.empty()) {
++            if (use_model_host_buffer && backend_type == GGML_BACKEND_DEVICE_TYPE_CPU && !model.devices.empty()) {
+                 // use the host buffer of the first device CPU for faster transfer of the intermediate state
+                 const auto & dev = model.devices[0];
+                 auto * host_buft = ggml_backend_dev_host_buffer_type(dev.dev);
+@@ -412,8 +490,20 @@ llama_context::llama_context(
+             }
+ 
+             backend_buft.push_back(buft);
+-            backend_ptrs.push_back(backend.get());
++            backend_ptrs.push_back(backend);
+             backend_buf_exp_size.push_back(0);
++        };
++
++        for (auto & backend : backends) {
++            if (backend.get() == backend_cpu) {
++                // Keep the context's CPU backend last, as required by the
++                // scheduler. Borrowed target backends do not own draft weights
++                // and therefore remain below the draft's own device priority.
++                for (ggml_backend_t borrowed_backend : borrowed_backends) {
++                    add_backend(borrowed_backend, false);
++                }
++            }
++            add_backend(backend.get(), true);
+         }
+ 
+         LLAMA_LOG_DEBUG("%s: backend_ptrs.size() = %zu\n", __func__, backend_ptrs.size());
+diff --git a/src/llama-context.h b/src/llama-context.h
+index bf91daa8b..1104063ff 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -348,6 +348,11 @@ private:
+     ggml_backend_t backend_cpu = nullptr;
+     std::vector<ggml_backend_ptr> backends;
+ 
++    // Non-owning backend handles from ctx_other. Draft/assistant models can
++    // borrow pre-allocated target tensors, whose buffers must remain on the
++    // target backend. ctx_other is required to outlive this context.
++    std::vector<ggml_backend_t> borrowed_backends;
++
+     // training
+     ggml_opt_context_t opt_ctx = nullptr;
+ 
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index b2c268fb8..fef192122 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -259,6 +259,7 @@ set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-downlo
+ 
+ llama_build_and_test(test-arg-parser.cpp)
+ llama_build_and_test(test-dflash-plan.cpp)
++llama_build_and_test(test-backend-sched-shared-tensors.cpp)
+ 
+ if (GGML_RPC AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+     llama_build(test-rpc-tensor-source.cpp)
+diff --git a/tests/test-backend-sched-shared-tensors.cpp b/tests/test-backend-sched-shared-tensors.cpp
+new file mode 100644
+index 000000000..469323fc2
+--- /dev/null
++++ b/tests/test-backend-sched-shared-tensors.cpp
+@@ -0,0 +1,136 @@
++#include "ggml-backend.h"
++#include "ggml-cpp.h"
++#include "ggml.h"
++
++#undef NDEBUG
++#include <cassert>
++#include <cmath>
++#include <cstdio>
++#include <vector>
++
++static ggml_context_ptr make_context(size_t n_tensors, size_t n_nodes = 0) {
++    const ggml_init_params params = {
++        /* .mem_size   = */ n_tensors * ggml_tensor_overhead() +
++                           (n_nodes == 0 ? 0 : ggml_graph_overhead_custom(n_nodes, false)),
++        /* .mem_buffer = */ nullptr,
++        /* .no_alloc   = */ true,
++    };
++    return ggml_context_ptr(ggml_init(params));
++}
++
++int main() {
++    ggml_backend_load_all();
++
++    ggml_backend_dev_t cpu_device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
++    assert(cpu_device != nullptr);
++
++    ggml_backend_ptr cpu_backend(ggml_backend_dev_init(cpu_device, nullptr));
++    assert(cpu_backend != nullptr);
++
++    constexpr int64_t n_embd   = 8;
++    constexpr int64_t n_vocab  = 16;
++    constexpr int64_t n_tokens = 2;
++    constexpr size_t  n_nodes  = 32;
++
++    auto weight_context = make_context(2);
++    assert(weight_context != nullptr);
++    ggml_tensor * token_embedding = ggml_new_tensor_2d(
++            weight_context.get(), GGML_TYPE_F32, n_embd, n_vocab);
++    ggml_set_name(token_embedding, "target.token_embd.weight");
++    ggml_tensor * output = ggml_new_tensor_2d(
++            weight_context.get(), GGML_TYPE_F32, n_embd, n_vocab);
++    ggml_set_name(output, "target.output.weight");
++
++    auto graph_context = make_context(8, n_nodes);
++    assert(graph_context != nullptr);
++    ggml_tensor * tokens = ggml_new_tensor_1d(
++            graph_context.get(), GGML_TYPE_I32, n_tokens);
++    ggml_set_name(tokens, "draft.tokens");
++    ggml_set_input(tokens);
++
++    ggml_tensor * hidden = ggml_get_rows(graph_context.get(), token_embedding, tokens);
++    ggml_set_name(hidden, "draft.hidden");
++    ggml_tensor * logits = ggml_mul_mat(graph_context.get(), output, hidden);
++    ggml_set_name(logits, "draft.logits");
++    ggml_set_output(logits);
++
++    ggml_cgraph * graph = ggml_new_graph_custom(graph_context.get(), n_nodes, false);
++    ggml_build_forward_expand(graph, logits);
++
++    ggml_backend_ptr target_backend;
++    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
++        ggml_backend_dev_t device = ggml_backend_dev_get(i);
++        if (ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_CPU) {
++            continue;
++        }
++
++        ggml_backend_ptr candidate(ggml_backend_dev_init(device, nullptr));
++        if (candidate != nullptr &&
++            ggml_backend_supports_op(candidate.get(), hidden) &&
++            ggml_backend_supports_op(candidate.get(), logits)) {
++            target_backend = std::move(candidate);
++            break;
++        }
++    }
++
++    if (target_backend == nullptr) {
++        std::puts("SKIP: no non-CPU backend supports GET_ROWS and MUL_MAT");
++        return 0;
++    }
++
++    ggml_backend_buffer_ptr weights(
++            ggml_backend_alloc_ctx_tensors(weight_context.get(), target_backend.get()));
++    assert(weights != nullptr);
++    ggml_backend_buffer_set_usage(weights.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
++
++    std::vector<float> embedding_data(n_embd * n_vocab);
++    std::vector<float> output_data(n_embd * n_vocab);
++    for (int64_t row = 0; row < n_vocab; ++row) {
++        for (int64_t column = 0; column < n_embd; ++column) {
++            embedding_data[row * n_embd + column] = 0.01f * float(1 + row * n_embd + column);
++            output_data[row * n_embd + column] =
++                    0.005f * float(1 + ((row + 3) % n_vocab) * n_embd + column);
++        }
++    }
++    ggml_backend_tensor_set(
++            token_embedding, embedding_data.data(), 0, embedding_data.size() * sizeof(float));
++    ggml_backend_tensor_set(output, output_data.data(), 0, output_data.size() * sizeof(float));
++
++    // The target backend is non-owning from the draft scheduler's point of
++    // view, exactly like a backend borrowed from ctx_other. Its presence lets
++    // immutable target weights remain in their original buffers while graph
++    // inputs and draft-owned work still have the CPU fallback.
++    ggml_backend_t scheduler_backends[] = {
++        target_backend.get(),
++        cpu_backend.get(),
++    };
++    ggml_backend_sched_ptr scheduler(ggml_backend_sched_new(
++            scheduler_backends, nullptr, 2, n_nodes, false, true));
++    assert(scheduler != nullptr);
++    assert(ggml_backend_sched_reserve(scheduler.get(), graph));
++    assert(ggml_backend_sched_alloc_graph(scheduler.get(), graph));
++
++    const std::vector<int32_t> token_data = { 2, 11 };
++    ggml_backend_tensor_set(tokens, token_data.data(), 0, token_data.size() * sizeof(int32_t));
++    assert(ggml_backend_sched_graph_compute(scheduler.get(), graph) == GGML_STATUS_SUCCESS);
++
++    std::vector<float> actual(n_vocab * n_tokens);
++    ggml_backend_tensor_get(logits, actual.data(), 0, actual.size() * sizeof(float));
++
++    for (int64_t token_index = 0; token_index < n_tokens; ++token_index) {
++        const int32_t token = token_data[token_index];
++        for (int64_t vocab_index = 0; vocab_index < n_vocab; ++vocab_index) {
++            float expected = 0.0f;
++            for (int64_t column = 0; column < n_embd; ++column) {
++                expected += output_data[vocab_index * n_embd + column] *
++                            embedding_data[token * n_embd + column];
++            }
++            const float observed = actual[token_index * n_vocab + vocab_index];
++            assert(std::fabs(observed - expected) < 1e-4f);
++        }
++    }
++
++    std::printf("PASS: shared token embedding and output projection on %s\n",
++            ggml_backend_name(target_backend.get()));
++    return 0;
++}

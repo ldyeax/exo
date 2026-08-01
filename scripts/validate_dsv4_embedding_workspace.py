@@ -9,9 +9,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import torch
-import torch.nn.functional as F
+import torch.nn.functional as torch_functional
 from safetensors import safe_open
-
 from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
 
 
@@ -48,7 +47,7 @@ def main() -> None:
         device="cuda",
         generator=generator,
     )
-    reference = F.embedding(input_ids, weight)
+    reference = torch_functional.embedding(input_ids, weight)
     output = torch.empty_like(reference)
     output_pointer = output.data_ptr()
     layer = SimpleNamespace(weight=weight)
@@ -76,9 +75,7 @@ def main() -> None:
     torch.cuda.synchronize()
     peak_delta = torch.cuda.max_memory_allocated() - baseline
     if peak_delta != 0:
-        raise AssertionError(
-            f"steady embedding_into allocated {peak_delta} bytes"
-        )
+        raise AssertionError(f"steady embedding_into allocated {peak_delta} bytes")
 
     print(f"weight_shape={tuple(weight.shape)} dtype={weight.dtype}")
     print(f"output_shape={tuple(output.shape)} pointer_preserved=True")

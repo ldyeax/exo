@@ -1127,11 +1127,7 @@ def _selected_revisions(
             if ktransformers_revision is None
             else ktransformers_revision
         ),
-        (
-            GLM_4_7_FLASH_SGLANG_REVISION
-            if sglang_revision is None
-            else sglang_revision
-        ),
+        (GLM_4_7_FLASH_SGLANG_REVISION if sglang_revision is None else sglang_revision),
     )
 
 
@@ -1204,7 +1200,9 @@ def main() -> int:
         )
         receipt = execute_runtime_install(plan, install=arguments.install)
     except (OSError, RuntimeInstallError) as error:
-        raise SystemExit(f"SGLang-KTransformers runtime install failed: {error}") from error
+        raise SystemExit(
+            f"SGLang-KTransformers runtime install failed: {error}"
+        ) from error
     print(json.dumps(asdict(receipt), indent=2, sort_keys=True))
     return 0
 

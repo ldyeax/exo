@@ -1,0 +1,867 @@
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index 35f0c44ec..74148bbaa 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -627,6 +627,7 @@ extern "C" {
+         GGML_GLU_OP_SWIGLU_OAI,
+         GGML_GLU_OP_GEGLU_ERF,
+         GGML_GLU_OP_GEGLU_QUICK,
++        GGML_GLU_OP_SITU,
+ 
+         GGML_GLU_OP_COUNT,
+     };
+@@ -1367,6 +1368,13 @@ extern "C" {
+             float                 alpha,
+             float                 limit);
+ 
++    GGML_API struct ggml_tensor * ggml_situ(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * gate,
++            struct ggml_tensor  * up,
++            float                 beta,
++            float                 linear_beta);
++
+     // normalize along rows
+     GGML_API struct ggml_tensor * ggml_norm(
+             struct ggml_context * ctx,
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index 491316f74..22dc5c0e6 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -2311,6 +2311,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
+                 case GGML_GLU_OP_SWIGLU_OAI:
+                 case GGML_GLU_OP_GEGLU_ERF:
+                 case GGML_GLU_OP_GEGLU_QUICK:
++                case GGML_GLU_OP_SITU:
+                     {
+                         n_tasks = n_threads;
+                     } break;
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index 42ec809ce..130ba4bd7 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -3407,6 +3407,65 @@ static void ggml_compute_forward_swiglu_oai(
+     }
+ }
+ 
++// ggml_compute_forward_situ
++
++static void ggml_compute_forward_situ_f32(
++        const ggml_compute_params * params,
++        ggml_tensor * dst) {
++
++    const ggml_tensor * gate = dst->src[0];
++    const ggml_tensor * up   = dst->src[1];
++
++    GGML_ASSERT(up);
++    GGML_ASSERT(gate->type == GGML_TYPE_F32);
++    GGML_ASSERT(up->type == GGML_TYPE_F32);
++    GGML_ASSERT(ggml_is_contiguous_1(gate));
++    GGML_ASSERT(ggml_is_contiguous_1(up));
++    GGML_ASSERT(ggml_is_contiguous_1(dst));
++
++    const int ith = params->ith;
++    const int nth = params->nth;
++
++    const int nc = gate->ne[0];
++    const int nr = ggml_nrows(gate);
++
++    GGML_ASSERT(dst->ne[0] == nc);
++    GGML_ASSERT(ggml_nrows(dst) == nr);
++
++    const float beta        = ggml_get_op_params_f32(dst, 2);
++    const float linear_beta = ggml_get_op_params_f32(dst, 3);
++
++    const int dr  = (nr + nth - 1)/nth;
++    const int ir0 = dr*ith;
++    const int ir1 = MIN(ir0 + dr, nr);
++
++    for (int ir = ir0; ir < ir1; ++ir) {
++        const float * gate_row = (const float *) ((const char *) gate->data + ir*gate->nb[1]);
++        const float * up_row   = (const float *) ((const char *) up->data   + ir*up->nb[1]);
++        float * dst_row        =       (float *) (      (char *) dst->data + ir*dst->nb[1]);
++
++        for (int i = 0; i < nc; ++i) {
++            const float gate_value = gate_row[i];
++            const float up_value   = linear_beta > 0.0f ? linear_beta*tanhf(up_row[i]/linear_beta) : up_row[i];
++            const float gate_act   = beta*tanhf(gate_value/beta)/(1.0f + expf(-gate_value));
++            dst_row[i] = gate_act*up_value;
++        }
++    }
++}
++
++static void ggml_compute_forward_situ(
++        const ggml_compute_params * params,
++        ggml_tensor * dst) {
++
++    switch (dst->src[0]->type) {
++        case GGML_TYPE_F32:
++            ggml_compute_forward_situ_f32(params, dst);
++            break;
++        default:
++            GGML_ABORT("fatal error");
++    }
++}
++
+ // ggml_compute_forward_geglu_erf
+ 
+ static void ggml_compute_forward_geglu_erf_f32(
+@@ -10113,6 +10172,10 @@ void ggml_compute_forward_glu(
+             {
+                 ggml_compute_forward_geglu_quick(params, dst);
+             } break;
++        case GGML_GLU_OP_SITU:
++            {
++                ggml_compute_forward_situ(params, dst);
++            } break;
+         default:
+             {
+                 GGML_ABORT("fatal error");
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index fa2dd2620..942ca2a30 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -1524,6 +1524,8 @@ struct ggml_cuda_mm_fusion_args_host {
+     const ggml_tensor * x_scale = nullptr;
+     const ggml_tensor * gate_scale = nullptr;
+     ggml_glu_op glu_op;
++    float situ_beta = 0.0f;
++    float situ_linear_beta = 0.0f;
+ };
+ struct ggml_cuda_mm_fusion_args_device {
+     const void * x_bias = nullptr;
+@@ -1532,6 +1534,8 @@ struct ggml_cuda_mm_fusion_args_device {
+     const void * x_scale = nullptr;
+     const void * gate_scale = nullptr;
+     ggml_glu_op glu_op;
++    float situ_beta = 0.0f;
++    float situ_linear_beta = 0.0f;
+ };
+ 
+ struct ggml_cuda_kernel_launch_params {
+@@ -1658,4 +1662,3 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
+     kernel<<<launch_params.block_nums, launch_params.block_dims, launch_params.shmem, launch_params.stream>>>(std::forward<Args>(args)... );
+     CUDA_CHECK(cudaGetLastError());
+ }
+-
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index e73a7b890..eaa96cab0 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -1740,10 +1740,30 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
+         return false;
+     }
+ 
+-    static constexpr std::array<ggml_glu_op, 3> valid_glu_ops = { GGML_GLU_OP_SWIGLU, GGML_GLU_OP_GEGLU, GGML_GLU_OP_SWIGLU_OAI };
+-
+-    if (std::find(valid_glu_ops.begin(), valid_glu_ops.end(), ggml_get_glu_op(glu)) == valid_glu_ops.end()) {
+-        return false;
++    const ggml_glu_op glu_op = ggml_get_glu_op(glu);
++    if (glu_op == GGML_GLU_OP_SITU) {
++        const ggml_tensor * weights = ffn_up->src[0];
++        const ggml_tensor * input   = ffn_up->src[1];
++        const ggml_tensor * ids     = ffn_up->src[2];
++        // IQ2_XS uses the four-row small-K specialization on SM86; pairing doubles its
++        // live dot-product state and is slower than two MMIDs. IQ3_XXS is a measured win.
++        const bool supported_type = weights->type == GGML_TYPE_IQ3_XXS;
++        const bool kimi_k3_shape =
++            is_mul_mat_id && !has_bias && !has_scale && supported_type &&
++            weights->ne[0] == 3584 && weights->ne[1] == 3072 && weights->ne[2] == 896 &&
++            input->ne[0] == 3584 && input->ne[1] == 1 && input->ne[2] == 1 &&
++            ids->ne[0] == 16 && ids->ne[1] == 1 &&
++            ffn_up->ne[0] == 3072 && ffn_up->ne[1] == 16 && ffn_up->ne[2] == 1;
++        if (!kimi_k3_shape) {
++            return false;
++        }
++    } else {
++        static constexpr std::array<ggml_glu_op, 3> valid_glu_ops = {
++            GGML_GLU_OP_SWIGLU, GGML_GLU_OP_GEGLU, GGML_GLU_OP_SWIGLU_OAI
++        };
++        if (std::find(valid_glu_ops.begin(), valid_glu_ops.end(), glu_op) == valid_glu_ops.end()) {
++            return false;
++        }
+     }
+ 
+     if (const bool swapped = ggml_get_op_params_i32(glu, 1); swapped) {
+@@ -1753,6 +1773,14 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
+     return true;
+ }
+ 
++static void ggml_cuda_set_mm_fusion_glu(ggml_cuda_mm_fusion_args_host & fusion, const ggml_tensor * glu) {
++    fusion.glu_op = ggml_get_glu_op(glu);
++    if (fusion.glu_op == GGML_GLU_OP_SITU) {
++        fusion.situ_beta        = ggml_get_op_params_f32(glu, 2);
++        fusion.situ_linear_beta = ggml_get_op_params_f32(glu, 3);
++    }
++}
++
+ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
+     ggml_tensor *       src0 = tensor->src[0];
+     ggml_tensor *       src1 = tensor->src[1];
+@@ -2154,6 +2182,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
+                 case GGML_GLU_OP_GEGLU_QUICK:
+                     ggml_cuda_op_geglu_quick(ctx, dst);
+                     break;
++                case GGML_GLU_OP_SITU:
++                    ggml_cuda_op_situ(ctx, dst);
++                    break;
+                 default:
+                     return false;
+             }
+@@ -3461,7 +3492,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+                 fusion_data.gate_bias  = gate_bias;
+                 fusion_data.x_scale    = up_scale;
+                 fusion_data.gate_scale = gate_scale;
+-                fusion_data.glu_op     = ggml_get_glu_op(glu);
++                ggml_cuda_set_mm_fusion_glu(fusion_data, glu);
+ 
+                 if (ggml_cuda_should_fuse_mul_mat_vec_q(up_n)) {
+                     ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, cgraph->nodes[glu_idx], &fusion_data);
+@@ -3554,7 +3585,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+                 fusion_data.gate_bias  = gate_bias;
+                 fusion_data.x_scale    = up_scale;
+                 fusion_data.gate_scale = gate_scale;
+-                fusion_data.glu_op     = ggml_get_glu_op(glu);
++                ggml_cuda_set_mm_fusion_glu(fusion_data, glu);
+ 
+                 if (ggml_cuda_should_fuse_mul_mat_vec_q(up_n)) {
+                     ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, cgraph->nodes[glu_idx], &fusion_data);
+@@ -3610,7 +3641,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+                 fusion_data.gate      = gate_n->src[0];
+                 fusion_data.x_bias    = up_bias_tensor;
+                 fusion_data.gate_bias = gate_bias_tensor;
+-                fusion_data.glu_op    = ggml_get_glu_op(glu);
++                ggml_cuda_set_mm_fusion_glu(fusion_data, glu);
+ 
+                 ggml_cuda_mul_mat_vec_f(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
+                 fused_mul_mat_vec = true;
+@@ -3623,7 +3654,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+                 fusion_data.gate      = gate_n->src[0];
+                 fusion_data.x_bias    = up_bias_tensor;
+                 fusion_data.gate_bias = gate_bias_tensor;
+-                fusion_data.glu_op    = ggml_get_glu_op(glu);
++                ggml_cuda_set_mm_fusion_glu(fusion_data, glu);
+ 
+                 ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
+                 fused_mul_mat_vec = true;
+@@ -3649,7 +3680,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+             if (ggml_cuda_should_fuse_mul_mat_vec_f(up)) {
+                 ggml_cuda_mm_fusion_args_host fusion_data{};
+                 fusion_data.gate   = gate->src[0];
+-                fusion_data.glu_op = ggml_get_glu_op(glu);
++                ggml_cuda_set_mm_fusion_glu(fusion_data, glu);
+ 
+                 ggml_cuda_mul_mat_vec_f(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
+                 fused_mul_mat_vec = true;
+@@ -3660,7 +3691,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+             if (ggml_cuda_should_fuse_mul_mat_vec_q(up)) {
+                 ggml_cuda_mm_fusion_args_host fusion_data{};
+                 fusion_data.gate   = gate->src[0];
+-                fusion_data.glu_op = ggml_get_glu_op(glu);
++                ggml_cuda_set_mm_fusion_glu(fusion_data, glu);
+ 
+                 ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
+                 fused_mul_mat_vec = true;
+@@ -4770,6 +4801,13 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+                 case GGML_GLU_OP_GEGLU_ERF:
+                 case GGML_GLU_OP_GEGLU_QUICK:
+                     return ggml_is_contiguous_1(op->src[0]);
++                case GGML_GLU_OP_SITU:
++                    return op->src[1] != nullptr &&
++                           op->src[0]->type == GGML_TYPE_F32 &&
++                           op->src[1]->type == GGML_TYPE_F32 &&
++                           ggml_are_same_shape(op->src[0], op->src[1]) &&
++                           ggml_is_contiguous_1(op->src[0]) &&
++                           ggml_is_contiguous_1(op->src[1]);
+                 default:
+                     return false;
+             }
+diff --git a/ggml/src/ggml-cuda/mmvf.cu b/ggml/src/ggml-cuda/mmvf.cu
+index d7dbc8b99..1ce37a37f 100644
+--- a/ggml/src/ggml-cuda/mmvf.cu
++++ b/ggml/src/ggml-cuda/mmvf.cu
+@@ -56,6 +56,8 @@ static __global__ void mul_mat_vec_f(
+     bool use_bias = false;
+     bool use_gate_bias = false;
+     ggml_glu_op glu_op = ggml_glu_op::GGML_GLU_OP_SWIGLU;
++    float situ_beta = 0.0f;
++    float situ_linear_beta = 0.0f;
+     const T * gate_x = nullptr;
+     const float * x_bias = nullptr;
+     const float * gate_bias = nullptr;
+@@ -65,6 +67,8 @@ static __global__ void mul_mat_vec_f(
+         use_bias = fusion.x_bias != nullptr;
+         use_gate_bias = fusion.gate_bias != nullptr;
+         glu_op = fusion.glu_op;
++        situ_beta = fusion.situ_beta;
++        situ_linear_beta = fusion.situ_linear_beta;
+ 
+         if (use_gate) {
+             gate_x = static_cast<const T *>(fusion.gate);
+@@ -365,6 +369,9 @@ static __global__ void mul_mat_vec_f(
+                     value = ggml_cuda_op_swiglu_oai_single(gate_value, value);
+                     break;
+                 }
++                case GGML_GLU_OP_SITU:
++                    value = ggml_cuda_op_situ_single(gate_value, value, situ_beta, situ_linear_beta);
++                    break;
+                 default:
+                     break;
+             }
+@@ -374,7 +381,7 @@ static __global__ void mul_mat_vec_f(
+     dst[tid*stride_col_dst + row] = value;
+ 
+     if constexpr (!has_fusion) {
+-        GGML_UNUSED_VARS(use_gate, use_bias, use_gate_bias, glu_op, gate_x, x_bias, gate_bias, sumf_gate);
++        GGML_UNUSED_VARS(use_gate, use_bias, use_gate_bias, glu_op, gate_x, x_bias, gate_bias, situ_beta, situ_linear_beta, sumf_gate);
+     }
+ }
+ 
+@@ -675,6 +682,8 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor
+             fusion_local.gate_bias = fusion->gate_bias->data;
+         }
+         fusion_local.glu_op = fusion->glu_op;
++        fusion_local.situ_beta = fusion->situ_beta;
++        fusion_local.situ_linear_beta = fusion->situ_linear_beta;
+     }
+ 
+     const int64_t s01 = src0->nb[1] / ts_src0;
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index e18ada537..697c74040 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -529,6 +529,8 @@ static __global__ void mul_mat_vec_q(
+     const float * x_scale = nullptr;
+     const float * gate_scale = nullptr;
+     ggml_glu_op active_glu;
++    float situ_beta = 0.0f;
++    float situ_linear_beta = 0.0f;
+ 
+     if constexpr (has_fusion) {
+         use_gate      = fusion.gate      != nullptr;
+@@ -538,6 +540,8 @@ static __global__ void mul_mat_vec_q(
+         x_bias        = (const float *) fusion.x_bias;
+         gate_bias     = (const float *) fusion.gate_bias;
+         active_glu    = fusion.glu_op;
++        situ_beta     = fusion.situ_beta;
++        situ_linear_beta = fusion.situ_linear_beta;
+         if constexpr (type == GGML_TYPE_NVFP4) {
+             use_scale      = fusion.x_scale    != nullptr;
+             use_gate_scale = fusion.gate_scale != nullptr && use_gate;
+@@ -679,6 +683,9 @@ static __global__ void mul_mat_vec_q(
+                             case GGML_GLU_OP_SWIGLU_OAI:
+                                 result = ggml_cuda_op_swiglu_oai_single(gate_value, result);
+                                 break;
++                            case GGML_GLU_OP_SITU:
++                                result = ggml_cuda_op_situ_single(gate_value, result, situ_beta, situ_linear_beta);
++                                break;
+                             default:
+                                 result = result * gate_value;
+                                 break;
+@@ -691,7 +698,7 @@ static __global__ void mul_mat_vec_q(
+     }
+ 
+     if constexpr (!has_fusion) {
+-        GGML_UNUSED_VARS(use_gate, use_bias, use_gate_bias, use_scale, use_gate_scale, active_glu, gate_bias, x_bias, x_scale, gate_scale, tmp_gate);
++        GGML_UNUSED_VARS(use_gate, use_bias, use_gate_bias, use_scale, use_gate_scale, active_glu, gate_bias, x_bias, x_scale, gate_scale, situ_beta, situ_linear_beta, tmp_gate);
+     }
+     if constexpr (type != GGML_TYPE_NVFP4) {
+         GGML_UNUSED_VARS(use_scale, use_gate_scale, x_scale, gate_scale, x_scales, gate_scales);
+@@ -1206,6 +1213,8 @@ void ggml_cuda_mul_mat_vec_q(
+             fusion_local.gate_scale = fusion->gate_scale->data;
+         }
+         fusion_local.glu_op = fusion->glu_op;
++        fusion_local.situ_beta = fusion->situ_beta;
++        fusion_local.situ_linear_beta = fusion->situ_linear_beta;
+     }
+ 
+     // If src0 is a temporary compute buffer, clear any potential padding.
+diff --git a/ggml/src/ggml-cuda/unary.cu b/ggml/src/ggml-cuda/unary.cu
+index 4cb805fa6..b24e949c5 100644
+--- a/ggml/src/ggml-cuda/unary.cu
++++ b/ggml/src/ggml-cuda/unary.cu
+@@ -427,6 +427,53 @@ void ggml_cuda_op_swiglu_oai(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
+     swiglu_oai_cuda(src0_p, src1_p, (float *)dst_d, ggml_nelements(dst), nc, src0_o / sizeof(float), src1_o / sizeof(float), alpha, limit, stream);
+ }
+ 
++// situ
++
++static __global__ void situ_kernel(
++        const float * gate,
++        const float * up,
++        float * dst,
++        const int64_t k,
++        const int64_t n,
++        const int64_t gate_stride,
++        const int64_t up_stride,
++        const float beta,
++        const float linear_beta) {
++    const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
++    if (i >= k) {
++        return;
++    }
++
++    const int64_t gate_idx = (i/n)*gate_stride + i%n;
++    const int64_t up_idx   = (i/n)*up_stride   + i%n;
++    dst[i] = ggml_cuda_op_situ_single(gate[gate_idx], up[up_idx], beta, linear_beta);
++}
++
++void ggml_cuda_op_situ(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    const ggml_tensor * gate = dst->src[0];
++    const ggml_tensor * up   = dst->src[1];
++
++    GGML_ASSERT(up);
++    GGML_ASSERT(gate->type == GGML_TYPE_F32);
++    GGML_ASSERT(up->type == GGML_TYPE_F32);
++    GGML_ASSERT(dst->type == GGML_TYPE_F32);
++    GGML_ASSERT(ggml_is_contiguous_1(gate));
++    GGML_ASSERT(ggml_is_contiguous_1(up));
++    GGML_ASSERT(ggml_is_contiguous(dst));
++    GGML_ASSERT(ggml_are_same_shape(gate, up));
++    GGML_ASSERT(ggml_are_same_shape(gate, dst));
++
++    const float beta        = ggml_get_op_params_f32(dst, 2);
++    const float linear_beta = ggml_get_op_params_f32(dst, 3);
++    const int64_t nelements = ggml_nelements(dst);
++    const int64_t n         = gate->ne[0];
++    const int64_t nblocks   = (nelements + CUDA_GLU_BLOCK_SIZE - 1)/CUDA_GLU_BLOCK_SIZE;
++    const ggml_cuda_kernel_launch_params launch_params(nblocks, CUDA_GLU_BLOCK_SIZE, 0, ctx.stream());
++    ggml_cuda_kernel_launch(situ_kernel, launch_params,
++        (const float *) gate->data, (const float *) up->data, (float *) dst->data,
++        nelements, n, gate->nb[1]/sizeof(float), up->nb[1]/sizeof(float), beta, linear_beta);
++}
++
+ /* CUDA kernel + launcher for xIELU */
+ 
+ template <typename T>
+diff --git a/ggml/src/ggml-cuda/unary.cuh b/ggml/src/ggml-cuda/unary.cuh
+index 81ed873ec..b74064ea6 100644
+--- a/ggml/src/ggml-cuda/unary.cuh
++++ b/ggml/src/ggml-cuda/unary.cuh
+@@ -83,6 +83,8 @@ void ggml_cuda_op_swiglu(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+ 
+ void ggml_cuda_op_swiglu_oai(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+ 
++void ggml_cuda_op_situ(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
++
+ void ggml_cuda_op_geglu_erf(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+ 
+ void ggml_cuda_op_geglu_quick(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+@@ -112,3 +114,9 @@ __device__ __forceinline__ float ggml_cuda_op_swiglu_oai_single(float x, float g
+     out_glu = out_glu * (1.0f + g);
+     return out_glu;
+ }
++
++__device__ __forceinline__ float ggml_cuda_op_situ_single(float gate, float up, float beta, float linear_beta) {
++    const float gate_act = beta*tanhf(gate/beta)/(1.0f + expf(-gate));
++    const float up_act   = linear_beta > 0.0f ? linear_beta*tanhf(up/linear_beta) : up;
++    return gate_act*up_act;
++}
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index a7d1fe7d9..9d7b39105 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -1253,9 +1253,10 @@ static const char * GGML_GLU_OP_NAME[GGML_GLU_OP_COUNT] = {
+     "SWIGLU_OAI",
+     "GEGLU_ERF",
+     "GEGLU_QUICK",
++    "SITU",
+ };
+ 
+-static_assert(GGML_GLU_OP_COUNT == 6, "GGML_GLU_OP_COUNT != 6");
++static_assert(GGML_GLU_OP_COUNT == 7, "GGML_GLU_OP_COUNT != 7");
+ 
+ 
+ static_assert(sizeof(struct ggml_object)%GGML_MEM_ALIGN == 0, "ggml_object size must be a multiple of GGML_MEM_ALIGN");
+@@ -3119,6 +3120,24 @@ struct ggml_tensor * ggml_swiglu_oai(
+     return result;
+ }
+ 
++struct ggml_tensor * ggml_situ(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * gate,
++        struct ggml_tensor  * up,
++        float                 beta,
++        float                 linear_beta) {
++    GGML_ASSERT(beta > 0.0f && isfinite(beta));
++    GGML_ASSERT(isfinite(linear_beta));
++    GGML_ASSERT(gate->type == GGML_TYPE_F32);
++    GGML_ASSERT(up->type == GGML_TYPE_F32);
++
++    struct ggml_tensor * result = ggml_glu_impl(ctx, gate, up, GGML_GLU_OP_SITU, false);
++    ggml_set_op_params_f32(result, 2, beta);
++    ggml_set_op_params_f32(result, 3, linear_beta);
++
++    return result;
++}
++
+ // ggml_norm
+ 
+ static struct ggml_tensor * ggml_norm_impl(
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 0fecca1fc..705e9a330 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -23,6 +23,16 @@
+ 
+ // dedup helpers
+ 
++static bool weight_backend_supports_op(const ggml_tensor * weight, const ggml_tensor * op) {
++    if (!weight || !weight->buffer) {
++        return false;
++    }
++
++    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(weight->buffer);
++    ggml_backend_dev_t device = ggml_backend_buft_get_device(buft);
++    return device && ggml_backend_dev_supports_op(device, op);
++}
++
+ static ggml_tensor * build_attn_inp_kq_mask(
+         ggml_context * ctx,
+         const llama_kv_cache_context * mctx,
+@@ -2071,17 +2081,24 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+             } break;
+         case LLM_FFN_SITU:
+             {
+-                // situ(gate, up) = beta*tanh(gate/beta)*sigmoid(gate) * lb*tanh(up/lb)
+                 GGML_ASSERT(has_gate);
+-                const float beta = hparams.situ_beta;
+-                const float lb   = hparams.situ_linear_beta;
+-
+-                ggml_tensor * act = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, cur, 1.0f/beta)), beta);
+-                act = ggml_mul(ctx0, act, ggml_sigmoid(ctx0, cur));
+-                if (lb > 0.0f) {
+-                    up = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, up, 1.0f/lb)), lb);
++                ggml_tensor * situ = ggml_situ(ctx0, cur, up, hparams.situ_beta, hparams.situ_linear_beta);
++                const ggml_tensor * placement_weight = gate_exps ? gate_exps : gate_up_exps;
++                if (placement_weight && placement_weight->type == GGML_TYPE_IQ3_XXS &&
++                    weight_backend_supports_op(placement_weight, situ)) {
++                    cur = situ;
++                } else {
++                    const float beta = hparams.situ_beta;
++                    const float linear_beta = hparams.situ_linear_beta;
++                    ggml_tensor * gate_act =
++                        ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, cur, 1.0f/beta)), beta);
++                    gate_act = ggml_mul(ctx0, gate_act, ggml_sigmoid(ctx0, cur));
++                    if (linear_beta > 0.0f) {
++                        up = ggml_scale(
++                            ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, up, 1.0f/linear_beta)), linear_beta);
++                    }
++                    cur = ggml_mul(ctx0, gate_act, up);
+                 }
+-                cur = ggml_mul(ctx0, act, up);
+                 cb(cur, "ffn_moe_situ", il);
+             } break;
+         case LLM_FFN_GELU:
+diff --git a/src/models/kimi-k3.cpp b/src/models/kimi-k3.cpp
+index ff7927e38..65156e6d8 100644
+--- a/src/models/kimi-k3.cpp
++++ b/src/models/kimi-k3.cpp
+@@ -184,15 +184,28 @@ std::unique_ptr<llm_graph_context> llama_model_kimi_k3::build_arch_graph(const l
+ //   situ(gate, up) = beta*tanh(gate/beta)*sigmoid(gate) * linear_beta*tanh(up/linear_beta)
+ // linear_beta <= 0 disables the transform on the up branch.
+ //
+-static ggml_tensor * kimi_k3_situ(ggml_context * ctx0, ggml_tensor * gate, ggml_tensor * up,
+-                                  float beta, float linear_beta) {
+-    ggml_tensor * a = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, gate, 1.0f/beta)), beta);
+-    a = ggml_mul(ctx0, a, ggml_sigmoid(ctx0, gate));
++static ggml_tensor * kimi_k3_situ(
++        ggml_context * ctx0,
++        ggml_tensor * gate,
++        ggml_tensor * up,
++        const ggml_tensor * placement_weight,
++        float beta,
++        float linear_beta) {
++    ggml_tensor * situ = ggml_situ(ctx0, gate, up, beta, linear_beta);
++    if (placement_weight && placement_weight->type == GGML_TYPE_IQ3_XXS && placement_weight->buffer) {
++        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(placement_weight->buffer);
++        ggml_backend_dev_t device = ggml_backend_buft_get_device(buft);
++        if (device && ggml_backend_dev_supports_op(device, situ)) {
++            return situ;
++        }
++    }
+ 
++    ggml_tensor * gate_act = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, gate, 1.0f/beta)), beta);
++    gate_act = ggml_mul(ctx0, gate_act, ggml_sigmoid(ctx0, gate));
+     if (linear_beta > 0.0f) {
+         up = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, up, 1.0f/linear_beta)), linear_beta);
+     }
+-    return ggml_mul(ctx0, a, up);
++    return ggml_mul(ctx0, gate_act, up);
+ }
+ 
+ //
+@@ -341,7 +354,8 @@ llama_model_kimi_k3::graph::graph(const llama_model & model, const llm_graph_par
+         if ((uint32_t) il < hparams.n_layer_dense_lead) {
+             ggml_tensor * g = ggml_mul_mat(ctx0, layer.ffn_gate, cur);
+             ggml_tensor * u = ggml_mul_mat(ctx0, layer.ffn_up,   cur);
+-            cur = kimi_k3_situ(ctx0, g, u, hparams.situ_beta, hparams.situ_linear_beta);
++            cur = kimi_k3_situ(
++                ctx0, g, u, layer.ffn_gate, hparams.situ_beta, hparams.situ_linear_beta);
+             cur = ggml_mul_mat(ctx0, layer.ffn_down, cur);
+             cb(cur, "ffn_out", il);
+         } else {
+@@ -637,7 +651,8 @@ ggml_tensor * llama_model_kimi_k3::graph::build_latent_moe(
+     if (layer.ffn_gate_shexp) {
+         ggml_tensor * g = ggml_mul_mat(ctx0, layer.ffn_gate_shexp, identity);
+         ggml_tensor * u = ggml_mul_mat(ctx0, layer.ffn_up_shexp,   identity);
+-        ggml_tensor * sh = kimi_k3_situ(ctx0, g, u, hparams.situ_beta, hparams.situ_linear_beta);
++        ggml_tensor * sh = kimi_k3_situ(
++            ctx0, g, u, layer.ffn_gate_shexp, hparams.situ_beta, hparams.situ_linear_beta);
+         sh = ggml_mul_mat(ctx0, layer.ffn_down_shexp, sh);
+         cb(sh, "ffn_shexp", il);
+         moe_out = ggml_add(ctx0, moe_out, sh);
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index e7cd6d0cb..dcbe2926c 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -1569,6 +1569,13 @@ struct test_case {
+             fprintf(stderr, "%s: ggml_backend_graph_compute failed. status=%s \n", __func__, ggml_status_to_string(status));
+             return false;
+         }
++        const bool benchmark_whole_graph =
++            current_op_name == "KIMI_K3_SITU_MMID" ||
++            current_op_name == "KIMI_K3_SITU_MMID_CONTROL" ||
++            current_op_name == "KIMI_K3_SITU_MMID_LEGACY";
++        if (benchmark_whole_graph) {
++            ggml_backend_synchronize(backend);
++        }
+ 
+         // determine number of runs
+         int n_runs;
+@@ -1624,6 +1634,9 @@ struct test_case {
+                 fprintf(stderr, "%s: ggml_backend_graph_compute failed. status=%s \n", __func__, ggml_status_to_string(status));
+                 return false;
+             }
++            if (benchmark_whole_graph) {
++                ggml_backend_synchronize(backend);
++            }
+             int64_t end_time = ggml_time_us();
+ 
+             total_time_us += end_time - start_time;
+@@ -2239,6 +2252,50 @@ struct test_swiglu_oai : public test_case {
+     }
+ };
+ 
++struct test_situ : public test_case {
++    const std::array<int64_t, 4> ne;
++    const float beta;
++    const float linear_beta;
++
++    std::string vars() override {
++        return VARS_TO_STR3(ne, beta, linear_beta);
++    }
++
++    test_situ(std::array<int64_t, 4> ne = {128, 2, 2, 2}, float beta = 1.0f, float linear_beta = 0.0f)
++        : ne(ne), beta(beta), linear_beta(linear_beta) {}
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        ggml_tensor * gate = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
++        ggml_set_name(gate, "gate");
++
++        ggml_tensor * up = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
++        ggml_set_name(up, "up");
++
++        ggml_tensor * out = ggml_situ(ctx, gate, up, beta, linear_beta);
++        ggml_set_name(out, "out");
++        return out;
++    }
++
++    void initialize_tensors(ggml_context * ctx) override {
++        static constexpr float values[] = {
++            -150.0f, -32.0f, -8.0f, -1.0f, -1.0e-6f, 0.0f, 1.0e-6f, 1.0f, 8.0f, 32.0f, 150.0f,
++        };
++        int tensor_index = 0;
++        for (ggml_tensor * tensor = ggml_get_first_tensor(ctx); tensor != nullptr;
++             tensor = ggml_get_next_tensor(ctx, tensor)) {
++            if (tensor->op != GGML_OP_NONE) {
++                continue;
++            }
++            std::vector<float> data(ggml_nelements(tensor));
++            for (size_t i = 0; i < data.size(); ++i) {
++                data[i] = values[(i + 3 * tensor_index) % (sizeof(values) / sizeof(values[0]))];
++            }
++            ggml_backend_tensor_set(tensor, data.data(), 0, data.size() * sizeof(float));
++            ++tensor_index;
++        }
++    }
++};
++
+ // GGML_OP_GET_ROWS
+ struct test_get_rows : public test_case {
+     const ggml_type type;
+@@ -4558,6 +4615,131 @@ struct test_mul_mat_id_fusion : public test_case {
+     }
+ };
+ 
++struct test_kimi_k3_situ_mmid : public test_case {
++    const ggml_type weight_type;
++    const float beta;
++    const float linear_beta;
++    const bool decomposed;
++    const int n_used;
++
++    std::string vars() override {
++        return VARS_TO_STR5(weight_type, beta, linear_beta, decomposed, n_used);
++    }
++
++    double max_nmse_err() override {
++        return 2e-3;
++    }
++
++    uint64_t op_flops(ggml_tensor * tensor) override {
++        GGML_UNUSED(tensor);
++        return 4ULL * 3584 * 3072 * n_used;
++    }
++
++    test_kimi_k3_situ_mmid(
++            ggml_type weight_type, float beta, float linear_beta, bool decomposed = false, int n_used = 16)
++        : weight_type(weight_type), beta(beta), linear_beta(linear_beta), decomposed(decomposed), n_used(n_used) {}
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        ggml_tensor * gate_weights = ggml_new_tensor_3d(ctx, weight_type, 3584, 3072, 896);
++        ggml_set_name(gate_weights, "gate_weights");
++
++        ggml_tensor * up_weights = ggml_new_tensor_3d(ctx, weight_type, 3584, 3072, 896);
++        ggml_set_name(up_weights, "up_weights");
++
++        ggml_tensor * ids_storage = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 896, 1);
++        ggml_set_name(ids_storage, "ids_storage");
++        ggml_tensor * ids = ggml_view_2d(ctx, ids_storage, n_used, 1, ids_storage->nb[1], 0);
++        ggml_set_name(ids, "ids");
++
++        ggml_tensor * input = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 3584, 1, 1);
++        ggml_set_name(input, "input");
++
++        ggml_tensor * up = ggml_mul_mat_id(ctx, up_weights, input, ids);
++        ggml_tensor * gate = ggml_mul_mat_id(ctx, gate_weights, input, ids);
++        ggml_set_name(up, "up");
++        ggml_set_name(gate, "gate");
++
++        ggml_tensor * out;
++        if (decomposed) {
++            ggml_tensor * gate_act = ggml_scale(ctx, ggml_tanh(ctx, ggml_scale(ctx, gate, 1.0f / beta)), beta);
++            gate_act = ggml_mul(ctx, gate_act, ggml_sigmoid(ctx, gate));
++            ggml_tensor * up_act =
++                linear_beta > 0.0f
++                    ? ggml_scale(ctx, ggml_tanh(ctx, ggml_scale(ctx, up, 1.0f / linear_beta)), linear_beta)
++                    : up;
++            out = ggml_mul(ctx, gate_act, up_act);
++        } else {
++            out = ggml_situ(ctx, gate, up, beta, linear_beta);
++        }
++        ggml_set_name(out, "out");
++        return out;
++    }
++
++    void initialize_tensors(ggml_context * ctx) override {
++        ggml_tensor * gate_weights = ggml_get_tensor(ctx, "gate_weights");
++        ggml_tensor * up_weights = ggml_get_tensor(ctx, "up_weights");
++        ggml_tensor * ids = ggml_get_tensor(ctx, "ids_storage");
++        ggml_tensor * input = ggml_get_tensor(ctx, "input");
++        GGML_ASSERT(gate_weights && up_weights && ids && input);
++
++        std::vector<int32_t> ids_data(896, 0);
++        for (int i = 0; i < n_used; ++i) {
++            ids_data[i] = i;
++        }
++        ggml_backend_tensor_set(ids, ids_data.data(), 0, ids_data.size() * sizeof(int32_t));
++
++        std::vector<float> input_data(3584);
++        for (size_t i = 0; i < input_data.size(); ++i) {
++            input_data[i] = 0.5f * sinf(float(i) * 0.03125f) + 0.25f * cosf(float(i) * 0.0078125f);
++        }
++        ggml_backend_tensor_set(input, input_data.data(), 0, input_data.size() * sizeof(float));
++
++        constexpr int64_t nrows = 3072;
++        constexpr int64_t ncols = 3584;
++        std::vector<float> gate_matrix(nrows * ncols);
++        std::vector<float> up_matrix(nrows * ncols);
++        for (size_t i = 0; i < gate_matrix.size(); ++i) {
++            const float col = float(i % ncols);
++            const float row = float(i / ncols);
++            gate_matrix[i] = 0.125f * sinf(col * 0.015625f + row * 0.00390625f);
++            up_matrix[i] =
++                0.09375f * cosf(col * 0.01171875f - row * 0.005859375f) +
++                0.03125f * sinf(col * 0.00390625f + row * 0.0078125f);
++        }
++
++        std::vector<float> imatrix(ncols, 1.0f);
++        const size_t expert_size = ggml_row_size(weight_type, ncols) * nrows;
++        std::vector<uint8_t> gate_quantized(expert_size);
++        std::vector<uint8_t> up_quantized(expert_size);
++        const size_t gate_size = ggml_quantize_chunk(
++            weight_type, gate_matrix.data(), gate_quantized.data(), 0, nrows, ncols, imatrix.data());
++        const size_t up_size = ggml_quantize_chunk(
++            weight_type, up_matrix.data(), up_quantized.data(), 0, nrows, ncols, imatrix.data());
++        GGML_ASSERT(gate_size == expert_size && up_size == expert_size);
++        for (int expert = 0; expert < n_used; ++expert) {
++            ggml_backend_tensor_set(
++                gate_weights, gate_quantized.data(), expert * gate_weights->nb[2], gate_quantized.size());
++            ggml_backend_tensor_set(
++                up_weights, up_quantized.data(), expert * up_weights->nb[2], up_quantized.size());
++        }
++    }
++
++    bool run_whole_graph() override {
++        return true;
++    }
++
++    std::string op_desc(ggml_tensor * tensor) override {
++        GGML_UNUSED(tensor);
++        if (n_used != 16) {
++            return "KIMI_K3_SITU_MMID_NEAR_MISS";
++        }
++        if (!decomposed && weight_type == GGML_TYPE_IQ2_XS) {
++            return "KIMI_K3_SITU_MMID_CONTROL";
++        }
++        return decomposed ? "KIMI_K3_SITU_MMID_LEGACY" : "KIMI_K3_SITU_MMID";
++    }
++};
++
+ // GGML_OP_OUT_PROD
+ struct test_out_prod : public test_case {
+     const ggml_type type_a;
+@@ -8068,8 +8250,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
+         for (int v : {0, 1}) {
+             for (int op = 0; op < GGML_GLU_OP_COUNT; op++) {
+-                if (op == GGML_GLU_OP_SWIGLU_OAI) {
+-                    // SWIGLU_OAI is handled separately
++                if (op == GGML_GLU_OP_SWIGLU_OAI || op == GGML_GLU_OP_SITU) {
++                    // SWIGLU_OAI and SITU are handled separately
+                     continue;
+                 }
+ 
+@@ -8092,6 +8274,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         }
+     }
+ 
++    test_cases.emplace_back(new test_situ({128, 2, 2, 2}, 0.5f, 0.0f));
++    test_cases.emplace_back(new test_situ({127, 3, 2, 1}, 8.0f, 1.25f));
++    test_cases.emplace_back(new test_situ({3072, 16, 1, 1}, 4.0f, 25.0f));
++    if (getenv("GGML_KIMI_K3_KERNEL_TESTS")) {
++        test_cases.emplace_back(new test_kimi_k3_situ_mmid(GGML_TYPE_IQ2_XS, 4.0f, 25.0f));
++        test_cases.emplace_back(new test_kimi_k3_situ_mmid(GGML_TYPE_IQ3_XXS, 4.0f, 25.0f));
++        test_cases.emplace_back(new test_kimi_k3_situ_mmid(GGML_TYPE_IQ2_XS, 4.0f, 25.0f, true));
++        test_cases.emplace_back(new test_kimi_k3_situ_mmid(GGML_TYPE_IQ3_XXS, 4.0f, 25.0f, true));
++        test_cases.emplace_back(new test_kimi_k3_situ_mmid(GGML_TYPE_IQ3_XXS, 4.0f, 25.0f, false, 15));
++    }
++
+     for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_Q4_0}) {
+         test_cases.emplace_back(new test_get_rows(type, 300*256,   5,         4,   1,   2, false));
+         test_cases.emplace_back(new test_get_rows(type,     256,   80000, 70000,   2,   1, false));
+@@ -9681,6 +9874,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+     std::vector<std::unique_ptr<test_case>> test_cases;
+ 
++    if (getenv("GGML_KIMI_K3_KERNEL_TESTS")) {
++        test_cases.emplace_back(new test_kimi_k3_situ_mmid(GGML_TYPE_IQ2_XS, 4.0f, 25.0f));
++        test_cases.emplace_back(new test_kimi_k3_situ_mmid(GGML_TYPE_IQ3_XXS, 4.0f, 25.0f));
++        test_cases.emplace_back(new test_kimi_k3_situ_mmid(GGML_TYPE_IQ2_XS, 4.0f, 25.0f, true));
++        test_cases.emplace_back(new test_kimi_k3_situ_mmid(GGML_TYPE_IQ3_XXS, 4.0f, 25.0f, true));
++    }
++
+     // Conv2d: K=CRS=NPQ=4096 matmul performance
+     uint32_t                        iwh_idx  = 0;
+     uint32_t                        kwh_idx  = 1;

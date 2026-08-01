@@ -1,0 +1,39 @@
+diff --git a/src/models/dflash-recurrence.h b/src/models/dflash-recurrence.h
+new file mode 100644
+index 000000000..18cc6449b
+--- /dev/null
++++ b/src/models/dflash-recurrence.h
+@@ -0,0 +1,33 @@
++#pragma once
++
++#include <cstdint>
++#include <type_traits>
++#include <vector>
++
++namespace llama_dflash {
++
++inline bool use_markov_chain(bool equal_sequences, int32_t n_unique_sequences) {
++    return equal_sequences || n_unique_sequences == 1;
++}
++
++template<typename Token, typename BuildLogits, typename SelectToken>
++auto build_markov_chain(
++        int64_t n_rows,
++          Token previous_token,
++    BuildLogits build_logits,
++    SelectToken select_token) -> std::vector<std::invoke_result_t<BuildLogits, int64_t, Token>> {
++    using Logits = std::invoke_result_t<BuildLogits, int64_t, Token>;
++
++    std::vector<Logits> rows;
++    rows.reserve(n_rows);
++
++    for (int64_t row = 0; row < n_rows; ++row) {
++        Logits logits = build_logits(row, previous_token);
++        previous_token = select_token(logits);
++        rows.push_back(logits);
++    }
++
++    return rows;
++}
++
++}

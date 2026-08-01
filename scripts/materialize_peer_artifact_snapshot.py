@@ -43,8 +43,7 @@ async def _run(arguments: argparse.Namespace) -> Path:
         destination=destination,
     )
     print(
-        f"{destination} snapshot_id={snapshot.snapshot_id} "
-        f"files={len(snapshot.files)}"
+        f"{destination} snapshot_id={snapshot.snapshot_id} files={len(snapshot.files)}"
     )
     return destination
 

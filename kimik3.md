@@ -3,18 +3,22 @@
 ## Objective and completion gate
 
 This journal records the deployment, tuning, research, failures, fixes, and
-measurements for running Kimi K3 on dwagon and fwuff. The campaign is complete
-only after both `UD-Q2_K_XL` and `UD-IQ2_XXS` have five coherent, comparable
-served-inference runs with measured prompt-processing and decode rates plus the
-supporting latency, memory, power, and system statistics that are available.
+measurements for running Kimi K3 on dwagon and fwuff. The original baseline
+campaign was complete only after both `UD-Q2_K_XL` and `UD-IQ2_XXS` had five
+coherent, comparable served-inference runs with measured prompt-processing and
+decode rates plus the supporting latency, memory, power, and system statistics
+that were available.
 
 The operating bias is deliberately aggressive: start from the best-supported
 high-performance configuration, measure real behavior, and spend time fixing
 observed bottlenecks rather than constructing a large synthetic preflight.
 
-Completion status: **complete**. Both requested quantizations have independent
-5/5 semantic, 5/5 exact-length performance, and 5/5 paired completion gates.
-On this hardware, `UD-IQ2_XXS` is the clear interactive/default quant:
+Original baseline status: **complete**. Both requested quantizations have
+independent 5/5 semantic, 5/5 exact-length performance, and 5/5 paired
+completion gates. Later `tensor_memset` and file-aware-loader follow-ups were
+explicitly reduced to one representative Q2 pair each; those A/B probes do not
+replace the five-run distributions. On this hardware, `UD-IQ2_XXS` is the
+clear interactive/default quant:
 all-local auto-fit reaches 7.302 prompt and 1.622 decode token/s mean, versus
 5.075/0.373 for distributed `UD-Q2_K_XL`. Q2 remains the quality-first choice.
 
@@ -56,6 +60,15 @@ is authoritative.
 - Model revision selected at download start:
   `3d4b61ab4b6789d401191c476cbb4567246db8f5`
 - Revision timestamp reported by Hugging Face: 2026-07-29 18:03:55 UTC
+- Repository-local pinned GGUF manifest:
+  `scripts/data/kimi_k3_gguf_manifests.json`, SHA-256
+  `6e58b10b6505c833e274e8a4c2ff6b0cc97c66854f883504b82ac262a567a000`.
+  It records the revision's exact Hugging Face LFS SHA-256 OID and length for
+  every requested shard. The sorted per-quant manifest hashes are
+  `34273843bf7edc60eb9f74fcaa0265e80e2ac30be172b653387a090dde80a387`
+  for Q2 and
+  `7b166810d1ee0778067e20f854347bc52786bcdacb4eb2079dac6806e2d9a689`
+  for IQ2.
 - Q2 layout: 19 GGUF shards; the first metadata-heavy shard is only about
   6.9 MB, while the weight shards are mostly 47--50 GB.
 - Text runtime: Unsloth's llama.cpp fork at the full-size fix commit
@@ -220,9 +233,9 @@ marked UTC; JSON receipts use RFC 3339 UTC.
   cache reuse remain disabled independently.
 - Replaced fwuff's still-idle RPC unit before model load. Its original
   `--cpunodebind=0` admitted both physical CPUs and sibling hyperthreads; the
-  current exact unit binds its 60 worker threads to physical CPUs `0-59` and
-  memory node 0. It restarted once intentionally, is active on only the private
-  EDR address, and has zero runtime restarts.
+  unit used for that phase bound its 60 worker threads to physical CPUs
+  `0-59` and memory node 0. It restarted once intentionally, was active on
+  only the private EDR address, and had zero runtime restarts.
 - Prepared, but did not promote, a surgical output-head A/B:
   `--override-tensor '^output[.]weight$=CUDA0'`. The anchored regex matches
   only the Q8_0 `output.weight` tensor, shape `(7168, 163840)`, exactly
@@ -257,10 +270,12 @@ marked UTC; JSON receipts use RFC 3339 UTC.
   `f5b9bd39...`. The isolated worktree is
   `/var/lib/exo/sources/llama.cpp-kimik3-text-47c5bbdf-rpc-memset` on both
   machines. Dwagon's CUDA/RPC build is complete. Fwuff's worktree is also
-  clean, but its validation build remains safely paused at 145/430 objects:
-  the unrelated 3.7-TiB root LV has zero bytes available, and resuming a build
-  with a roughly 6-GiB observed peak would be unsafe. No unrelated data was
-  deleted. The broad nightly/vision carrier remains rejected.
+  clean. At that stage its validation build was safely paused at 145/430
+  objects: the unrelated 3.7-TiB root LV had zero bytes available, and
+  resuming a build with a roughly 6-GiB observed peak would have been unsafe.
+  No unrelated data was deleted. The broad nightly/vision carrier remained
+  rejected. A later follow-up moved build data to Sanic and completed 430/430,
+  as recorded below.
 - Audited the benchmark harness against the pinned server endpoints and K3
   parser. Slot erase, exact input-token calibration, thinking-budget fields,
   final SSE usage/timings, and all expected timing names match this revision;
@@ -741,10 +756,11 @@ quality: Unsloth's reported KLD/perplexity/top-1 agreement move from
   `qwen3-tts-nano-gpu0` and `qwen3-tts-nano-gpu1`, were restarted and are
   healthy with zero restarts, using 22,049/21,841 MiB. Fwuff's benchmark RPC
   and GPU remain inactive/idle.
-- Current direct free space on `/mnt/sanic` is 2,451,272,343,552 bytes
-  (about 2.23 TiB). Fwuff's root remains at 100% with zero bytes available; no
-  unrelated data was deleted. This is why the clean incorporated RPC patch
-  branch remains only partially built on fwuff.
+- At baseline-restoration time, direct free space on `/mnt/sanic` was
+  2,451,272,343,552 bytes (about 2.23 TiB), while fwuff's root was at 100%
+  with zero bytes available. No unrelated data was deleted, so the clean
+  incorporated RPC patch branch was then only partially built on fwuff. The
+  later relocation/completed build supersedes that historical state.
 - The useful infrastructure intentionally remains: fwuff OpenSM is active,
   EDR IPoIB is `10.44.0.1/30` (`ibs5`) to `10.44.0.2/30` (`ibs2`), the
   dwagon view is a read-only NFSv3 `nconnect=8` mount at `/mnt/sanic-edr`, and
@@ -794,6 +810,699 @@ The telemetry sampler/summarizer hashes are
 `3fe51507a06d06ea78f1ff3f8d53dedbd7374f2350b7ffe79fe76c4eca6af43b` and
 `45b71ebed12639a89c1e6e04336ea46baa88d71b1a2e11cd536b4ba1f4d82fd8`.
 Model and runtime revisions remain the immutable pins recorded above.
+
+## RPC `tensor_memset` follow-up
+
+### Root-space audit, relocation, and build completion
+
+- Fwuff's root LV was already a 3.7-TiB filesystem with essentially all ext4
+  free and reserved blocks consumed. The task-created patched worktree was
+  only 1.1 GiB, including a 900-MiB partial `build-kimik3-text` directory; it
+  did not explain the multi-terabyte exhaustion. A read-only audit attributed
+  about 2.0 TiB to `/home` and 1.2 TiB to `/var`. The largest `/var`
+  components were about 576 GiB of Docker data, 474 GiB of logs, and 79 GiB
+  of PostgreSQL data. Deleted-but-open files were negligible.
+- Only the generated build directory attributable to this task was moved:
+  `/var/lib/exo/sources/llama.cpp-kimik3-text-47c5bbdf-rpc-memset/build-kimik3-text`
+  is now a symlink to
+  `/mnt/sanic/builds/fwuff/llama.cpp-kimik3-text-47c5bbdf-rpc-memset-build`.
+  The completed build occupies about 1.2 GiB on `/mnt/sanic`; source and
+  unrelated root-resident data were not moved or deleted.
+- The relocated build resumed from 145/430 objects and completed at 430/430.
+  Its RPC server reports protocol v5.0.0, and the paired dwagon server reports
+  runtime version 10163 at commit
+  `a30437bc3a2a661d1e9aad71b1160d9ad9bbfec1`. Both builds have CUDA
+  architecture 86 and RPC enabled. The stable patch ID remains the upstream
+  `tensor_memset` patch recorded earlier.
+- The full root filesystem had also prevented sshd's `xauth` helper from
+  creating `/root/.Xauthority-n`. After space was moved, a synthetic trusted
+  X11 handshake verified a valid remote display and cookie. The user
+  subsequently confirmed X forwarding works. No sshd configuration workaround
+  was installed.
+- A real launcher compatibility issue was fixed: version 10163 prints a
+  nine-character Git abbreviation, while the launcher had required a closing
+  parenthesis immediately after eight characters. The gate now accepts any
+  longer lowercase hexadecimal abbreviation only when it begins with the
+  pinned full commit's first eight characters.
+
+### Patched distributed load
+
+- Both hosts were transactionally held at
+  `performance/performance`. The exact accepted Q2 topology was reused:
+  `CUDA0,RPC0,CUDA1`, 16 offloaded layers, tensor split `2,11,3`,
+  512 microbatch, `--no-op-offload`, 32K context, and a CPU-only fwuff RPC
+  endpoint on `10.44.0.2:50052`.
+- The patched server reached healthy state in 25m48s with zero service
+  restarts. Final GPU allocations exactly matched the baseline at
+  18,286/21,954 MiB, and fwuff stabilized near 95.5 GiB RPC RSS. No RPC
+  `tensor_memset`, protocol, assertion, CUDA application, OOM, or swap error
+  occurred. Normal RPC verbosity does not log individual command dispatch, so
+  this proves the patched client/server pair is stable but does not prove a
+  nonzero `RPC_CMD_MEMSET_TENSOR` call count. A forced tensor override would
+  exercise that exact command more directly, but the accepted N16 placement
+  no longer needs an override and this follow-up did not introduce one.
+- The kernel emitted one `NVRM: failed to allocate page table` warning during
+  the load, but graph allocation later completed with the exact baseline VRAM
+  footprint and the service remained healthy. Corrected socket-0 APEI
+  processor events 439--443 occurred during load or before the measured
+  campaign. Event 444 arrived 55 seconds after the accepted performance
+  request. No corrected or uncorrected hardware event, Xid, OOM, restart, or
+  process major fault overlapped the accepted request.
+- The load trace exposed an important architectural inefficiency. Dwagon is
+  the only GGUF reader, while fwuff's RPC service is a passive tensor-buffer
+  endpoint. Fwuff-assigned weights therefore travel
+  `fwuff /mnt/sanic -> NFS/EDR -> dwagon -> RPC/EDR -> fwuff RAM`.
+  The current patch supplies a missing remote tensor operation but does not
+  make RPC file-aware or parallelize model loading. Eliminating this roughly
+  95-GiB round trip requires a new server-side GGUF-read operation or a
+  distributed loader that gives fwuff shard/path plus tensor-offset metadata.
+  Such a change should materially reduce cold-load time but should not be
+  expected to change steady-state token throughput.
+
+### One accepted representative A/B
+
+The user requested one representative result rather than another five-run
+campaign. The strict harness completed one sacrificial warmup, one coherent
+arithmetic semantic gate, and its paired cache-cold performance request. A
+watcher stopped the harness immediately after the accepted
+`performance_result` was atomically written. Pair 2's semantic HTTP request
+had just opened but produced no event and is not counted. The server returned
+healthy and idle afterward.
+
+| Metric | Patched representative | Baseline five-run mean | Baseline range | Difference from mean |
+| --- | ---: | ---: | ---: | ---: |
+| Prompt processing | 4.744242 tok/s | 5.074897 tok/s | 4.900342--5.272632 | -6.52% |
+| Decode | 0.368137 tok/s | 0.372718 tok/s | 0.271966--0.470774 | -1.23% |
+| TTFT | 107.924 s | 100.961 s | 97.110--104.487 | +6.90% |
+| End-to-end | 455.621 s | 461.964 s | 369.003--570.210 | -1.37% |
+
+The result is exactly 512 rendered input tokens and 128 output tokens, with
+zero cached tokens and a length finish. The independent arithmetic gate
+completed coherently with 124 input and 138 output tokens. Decode is within
+the baseline distribution and only 0.91% below its median; prompt processing
+is below every baseline sample. One observation is not enough to estimate a
+new distribution, but there is no evidence that `tensor_memset` improves
+steady-state speed. Its demonstrated value here is correctness and enabling
+otherwise-invalid RPC tensor initialization/override paths.
+
+The one-run telemetry join has strict, fully bracketed coverage from both
+hosts:
+
+- integrated GPU-board energy: 105,867.577 J, or 827.09 GPU-board
+  J/generated output token across prompt plus decode; RAPL is unavailable, so
+  this is not whole-system energy;
+- average process CPU use: 42.63 core-equivalents on dwagon and 34.75 on
+  fwuff; host CPU utilization was 19.43% and 31.00%;
+- maximum process RSS: 705,161,868 KiB on dwagon and 100,627,292 KiB on
+  fwuff; minimum `MemAvailable` was 65,131,852 and 139,342,792 KiB;
+- zero process major faults and zero swap on both hosts;
+- about 0.0198 Gb/s total over the EDR IPoIB interface during steady
+  inference, confirming that compute rather than fabric bandwidth remains the
+  decode bottleneck.
+
+The then-current telemetry summarizer admitted this one historical window via
+an explicit positive `--expected-runs` count while retaining five as its
+default. The raw tensor-`memset` benchmark JSONL is deliberately truncated
+after `performance_result`: it predates `configuration.run_count` and has no
+terminal `campaign_completed`. Today's hardened summarizer intentionally does
+not re-admit that truncated receipt. It requires the requested run count to
+match both the campaign configuration and terminal accepted-pair count, which
+prevents an interrupted five-run campaign from being reclassified as one
+valid run. The later file-aware receipt is the canonical one-run schema with
+`run_count=1` and terminal `accepted_pairs=1`.
+
+### Follow-up receipts and restoration
+
+Artifacts are under
+`/var/lib/exo/benchmarks/kimi-k3-q2-rpc-memset-20260730-v1`:
+
+- `benchmark.jsonl`:
+  `ad07cb754caa084ea9b1a951516a36a2fb1755bbd1598a6c06a003391af223de`
+- `telemetry-dwagon.jsonl`:
+  `6769df5e9178b262a5d35ceb7e53af09efd4c9f664ad06630ec7165e6a195220`
+- `telemetry-fwuff.jsonl`:
+  `71ec974e7b2eec7a418ad4035be1dd9af0a8f2ba006b70250271c3909cf0e219`
+- `telemetry-summary.json`:
+  `85eddb55338f088baa1717780f35077cd4a3721bb06aa55c86ca4bbecdad669b`
+- `server.log`:
+  `99730f6ddd9a796696fb417063fb3947d90160e2a6a47132e3369d7af7b01abf`
+- `cpu-policy-dwagon.json`:
+  `1ef21e700d8d280c822ba6bcd4e831055ee166c03ffa578415f564158ee6eed5`
+- fwuff `rpc-server.log`:
+  `0f123033800b52eb2abc575ec7d0344861cf9883743b32060bc30655f8921a94`
+- fwuff `cpu-policy-fwuff.json`:
+  `da7ce6e5300016bffda8e570be41e1102ab8d8f40f9c247df81d2bc743fb16a7`
+
+The contemporaneous Q2 launcher and telemetry summarizer hashes for this
+tensor-`memset` receipt were
+`11b9a11aad92bed3b29611700dcf67c6d5c207ca078010731794616d40124999`
+and
+`ce0b265128ddebdc655f58b30ce53df1487d1547f668ce3780541e3df0cac0a9`.
+Both benchmark services and both samplers are inactive. CPU policy receipts
+have `status=restored` and no failure; all 224 dwagon plus 120 fwuff policies
+are back at `powersave/balance_performance`. The two TTS GPU containers are
+healthy again.
+
+## File-aware loading and expansion follow-up
+
+### Complete Q2 stage and evidence-based source selection
+
+- `UD-Q2_K_XL` is now atomically staged at
+  `/mnt/llm-models/Kimi-K3-GGUF/UD-Q2_K_XL`: 19 shards and
+  861,277,858,912 logical bytes. Follow-up service
+  `exo-kimi-k3-verify-q2-content-20260730.service` (invocation
+  `ad9459280af7463bac743abb8e4486b2`) checked every published shard against
+  the pinned Hugging Face LFS SHA-256 in 35m22.844s wall time and upgraded the
+  receipt in place at 22:36:04Z. The schema-2 receipt records exact names,
+  exact sizes, non-sparse allocation, per-shard content hashes, revision
+  `3d4b61ab4b6789d401191c476cbb4567246db8f5`, and quant-manifest hash
+  `34273843bf7edc60eb9f74fcaa0265e80e2ac30be172b653387a090dde80a387`.
+  Its SHA-256 is
+  `f99872a96e71ef83597e62ef126e13d86387697b6d899ac90a63dfa64cb0328d`.
+  The model filesystem has 3,294,314,041,344 bytes free with both quantizations
+  published.
+- The post-Q2 capacity gate for `UD-IQ2_XXS` passed: 16 shards require
+  711,067,773,664 bytes, the conservative reserve is 88,286,646,550 bytes,
+  and 4,005,382,529,024 bytes were available. The first four-worker service,
+  `exo-kimi-k3-stage-iq2-20260730.service` (invocation
+  `98f22be0a96a458682f8b1dd777cdd0f`), filled the complete partial from Sanic
+  over EDR but did not publish it: after 32m05s, its long-running shell parsed
+  a newly edited portion of the live script and failed with a syntax error.
+  No size-only snapshot was represented as complete. The stager now re-execs
+  from an already-open, unlinked copy of its own source before parsing
+  arguments. Repository edits therefore cannot alter an active transaction,
+  and no temporary script remains after the descriptor closes. A regression
+  test truncates the original inode while the staged copy is blocked in source
+  selection and proves that the immutable copy still emits the complete plan.
+- Recovery service `exo-kimi-k3-verify-iq2-20260730.service` (invocation
+  `ed8f4d6a95564d62a37ff16c1f7754db`) first proved all pinned names, lengths,
+  and non-sparse allocations, skipped the redundant second network copy, and
+  then checked all 16 destination shards against the pinned Hugging Face LFS
+  SHA-256 values. It atomically published `UD-IQ2_XXS` at 17:59:13 after
+  22m10.933s. The schema-2 receipt has SHA-256
+  `02096e0704f427cd630d7ee399928a71b0a54bd709e93cfd07f223b157c1e874`;
+  it records 16 files, 711,067,773,664 bytes, revision
+  `3d4b61ab4b6789d401191c476cbb4567246db8f5`, and quant-manifest hash
+  `7b166810d1ee0778067e20f854347bc52786bcdacb4eb2079dac6806e2d9a689`.
+  The model RAID has 3,294,314,041,344 bytes free after publication.
+- Fwuff's root-full incident was not caused by the new K3 source, build, or
+  kernel threads. Their substantial fwuff artifacts are under
+  `/mnt/sanic/exo`; the down-kernel SM86 payload was only 74 MB at
+  `/mnt/sanic/exo/kimi-k3-kernels/down-mmid-baseline-sm86`, and the matching
+  llama.cpp source/build was already under `/mnt/sanic/exo/sources`. The
+  3.7-TB root LV was at 100% while the directly attached Sanic XFS array still
+  had about 2.2 TB free. Read-only accounting attributed about 1.960 TB to
+  unrelated `/home` data, 1.219 TB to `/var`, 199 GB to `/usr`, 143 GB to
+  `/root`, and 83 GB to `/ai`; no user home or live Docker volume was moved.
+- The immediately recoverable fault was two stale OpenSM instances for absent
+  port GUIDs `0xe41d2d03004d32e1` and `0xe41d2d03004d32e2`. Their logs were
+  281,330,700,288 and 284,849,410,048 bytes and consisted of a runaway
+  `umad_receiver: ERR 5404` I/O-error loop. `ibstat` showed only the separate
+  live `mlx5_0` GUID `0x248a070300a32154`, active at 100 Gb/s. I stopped only
+  the two dead-port units, discarded the 527.3-GiB repetitive logs and
+  interrupted archival copies after the user confirmed they had no credible
+  retention value, and left the live subnet manager running. Root recovered
+  to 374 GiB free (90% used); Sanic returned to about 2.2 TB free (61% used).
+  The two known stale `/var/log/opensm.*` names are now symlinks to empty files
+  under `/mnt/sanic/exo/system-logs/opensm`, so an accidental restart cannot
+  refill root. All future substantial fwuff-side K3 source, build, model,
+  benchmark, and temporary-transfer storage belongs under `/mnt/sanic/exo`;
+  compatibility paths should be symlinks rather than root-backed copies.
+- I initially preferred the local copy without measuring the two actual paths.
+  That was a mistake. I then made a second incorrect inference from RSS growth
+  that the HDD RAID was reading slowly and aborted the first file-aware load.
+  `/proc/<pid>/io` disproved it: hundreds of GiB of RSS had been materialized
+  while only about 9 MiB had been read. The aborted artifact directory is
+  retained as a diagnostic rather than represented as a storage result.
+- The hardware explains why locality is not enough. Dwagon's
+  `/mnt/llm-models` is XFS on a ten-disk 7,200-RPM-class RAID0 with 1-MiB
+  chunks. Fwuff's `/mnt/sanic` is XFS on a three-NVMe RAID0 and is exported to
+  dwagon over the dedicated EDR IPoIB link as read-only NFSv3 with 1-MiB
+  `rsize`, `nconnect=8`, and endpoint `10.44.0.2`.
+- Matched read-only direct-I/O measurements used the same Q2 shard and offset,
+  one synchronous reader, queue depth one, and no concurrent dwagon RAID
+  transfer. They are source-path measurements, not inference benchmarks:
+
+| Read shape | Dwagon HDD RAID | Sanic over EDR | EDR advantage |
+| --- | ---: | ---: | ---: |
+| 1 MiB requests, 8 GiB | 333 MB/s | 1,105 MB/s | 3.32x |
+| 4 MiB requests, 16 GiB | 388.6 MB/s | 3,243.3 MB/s | 8.35x |
+| 64 MiB requests, 16 GiB | 405.4 MB/s | 7,392.4 MB/s | 18.23x |
+
+  The two larger EDR results benefited from fwuff's warm server cache, so the
+  conservative figure is the live full-model phase: dwagon read
+  759,028,195,328 bytes over NFS at roughly 1.3 GB/s while fwuff populated its
+  own approximately 100-GB assignment locally. Even that cold-ish result
+  decisively beats the local direct-read tests.
+- The launcher therefore defaults dwagon to `/mnt/sanic-edr`, while fwuff maps
+  assigned tensors directly from `/mnt/sanic`; the verified local snapshot is
+  a fallback. The staging selector now gives this measured EDR source priority
+  over generic local block storage on this cluster. The conclusion is specific
+  to these mounts and should be remeasured after changing arrays or fabric.
+
+### File-aware RPC loader
+
+- Historical protocol-v6 context: the binaries used by the full-size
+  representative result below were built from
+  `d29a524eeaf39155825d6f0ef373075fe585cb12`, based on the already-tested
+  `tensor_memset` ancestor `a30437bc3a2a661d1e9aad71b1160d9ad9bbfec1`.
+  Protocol v6 patch `0000` added client `--rpc-tensor-source` and RPC-server
+  `--tensor-source-root`: the client sent shard-relative path, file offset,
+  and tensor size, and the server read the bytes into its backend buffer on a
+  background worker. Dwagon's historical source/build is under
+  `/mnt/llm-models/exo/sources`; fwuff's matching source/build is under
+  `/mnt/sanic/exo/sources`, not fwuff's root filesystem.
+- That historical v6 implementation was validated by a tiny mixed CPU/RPC
+  model and the live Q2 load. The integration proved direct server-local reads,
+  the barrier, and generated output; the full load raised fwuff's RPC RSS to
+  about 95.5 GiB from local `/mnt/sanic` reads instead of sending those bytes
+  `fwuff -> NFS -> dwagon -> RPC -> fwuff`. Commit `d29a524e` ordered
+  RPC-bearing tensor contexts ahead of ordinary contexts but did not overlap
+  RPC and local reads inside a mixed context.
+- Historical follow-up `0001` added the tested two-pass prequeue: every
+  admitted RPC tensor is enqueued before client-side reads, accepted tensors
+  are skipped in the normal pass, and progress, validation,
+  reject-after-accept protection, and the final barrier remain intact. Its
+  mixed integration queued all 56 remote tensors before local reads, loaded
+  12.56 MiB by RPC plus 4.94 MiB locally, and produced the expected completion.
+  Its stable patch ID is
+  `fd252af1865a0524b43c0efabc40feef2c696fa1`; its raw SHA-256 is
+  `9419ac4c6d78203b08c4dd58053cec3d0c0017599fe13bd7eb7e43c0d8d426ad`.
+- The implemented current hardening is
+  `0005-rpc-attest-same-backing-tensor-source-files.patch`, which upgrades the
+  wire protocol to major version 7. In the default
+  `--rpc-tensor-source-mode same-backing-file`, the client attests each
+  already-open GGUF shard by the exact `{inode, size, mtime_ns}` identity and
+  the server requires its opened file to match. The server accepts only a
+  direct-child `.gguf` name, opens the configured root directory and then the
+  child with race-resistant `openat(..., O_NOFOLLOW)`, verifies a regular
+  file with `fstat`, and keeps that descriptor open. Reads use `pread` from
+  the held descriptor, and the server rechecks that its identity is unchanged
+  before reuse and at synchronization.
+- Held shard descriptors are bounded per client by
+  `--tensor-source-max-files`, default 32; reaching the cap rejects another
+  shard rather than silently reopening an unpinned path. Synchronization now
+  returns exact completed tensor counts and bytes for the requested backend
+  buffer. The loader tracks its expected count and byte total independently
+  for every RPC buffer and rejects any missing, extra, cross-buffer, changed,
+  or failed receipt.
+- Strict same-backing-file mode is fail closed: a path, identity, queue, read,
+  or receipt mismatch aborts loading. Compatibility fallback is available
+  only through the explicit `--rpc-tensor-source-mode fallback`; it permits
+  the historical client-read path while retaining reject-after-accept safety.
+  The launcher defaults to strict mode and passes the 32-file server cap.
+- A live read-only identity comparison of the canonical dwagon Sanic-over-EDR
+  view with fwuff's local Sanic root matched `{inode, size, mtime_ns}` for all
+  19 Q2 shards. The complete filename-ordered `0001`--`0005` follow-on stack
+  on `0000` also completed its CPU/RPC build and RPC tensor-source integration,
+  and all 24 Q2 topology-launcher tests passed. Patch `0005` has raw SHA-256
+  `38f6e350a2b58523df5fdab0f6e89231229139bffaa1b52fbe27bb698566d6c2`
+  and stable patch ID
+  `7a36335bec0b22bc83dc2d7dc38a55a2c700f965`.
+- Reproducible patches remain under `scripts/patches/kimi-k3`. The current
+  `d29a524e` benchmark binaries on dwagon and fwuff contain historical
+  protocol v6/`0000`, not protocol v7/`0005`; the representative result below
+  is therefore not evidence for strict attestation. Protocol v7 changes the
+  RPC wire ABI, so both endpoints must be rebuilt from the same complete patch
+  stack before the next live load.
+- The RPC device's advertised CPU MiB is physical capacity, not free memory.
+  It is no longer used as a headroom gate. Every active RPC topology now
+  queries fwuff over SSH and fails closed on the smaller of real
+  `MemAvailable` and every finite cgroup-v2
+  `memory.max - memory.current`
+  ancestor. The live check reported 235,378 MiB effective/MemAvailable with
+  no finite cgroup limit against the 200,000-MiB CPU-RPC requirement.
+  Non-CPU RPC devices separately gate the parsed free-device-memory field.
+  Exact device-name parsing also prevents a device description from
+  masquerading as a missing `CUDA0`/`RPC0` enumeration.
+
+### The real cold-start bottleneck and next default
+
+- Source inspection located the long pre-read phase. CPU-assigned weights
+  choose the first CUDA device's host buffer in `llama-model.cpp`, and every
+  backend context is allocated serially before `load_all_data()` begins. The
+  approximately 700-GiB CPU context consequently blocks in `cudaMallocHost()`.
+  CPU `init_tensor` is null and this path does not clear the slab: the RSS
+  sweep is page materialization/pinning, not RPC `tensor_memset` and not a
+  storage read.
+- `--no-host` is now the bold default for this topology. With
+  `--no-op-offload`, no explicit steady-state use for whole-model CUDA pinning
+  was identified, but steady-state neutrality remains unproven: the later
+  representative regressed under a confounded `--no-host` plus NUMA-policy
+  change. Its demonstrated benefit is avoiding the long serial
+  `cudaMallocHost()` initialization.
+  The flag affects model-weight selection only: CUDA-pinned upload staging and
+  CPU/GPU boundary activation buffers remain available. Do not use the global
+  `GGML_CUDA_NO_PINNED=1`, which also removes those useful small transfer
+  buffers.
+- Header inspection of all 19 shards found 698.465 GiB `IQ2_XS`,
+  45.722 GiB `IQ3_XXS`, 55.503 GiB `Q8_0`, and 2.431 GiB `F32`. The dominant
+  744.187-GiB routed-expert bulk has no x86 repack/AMX path and therefore
+  simply moves from pinned to ordinary resident DRAM with the same compute
+  kernels. Some eligible dense Q8 weights may select AMX and repack once;
+  that is an acceptable one-time cost with potential prompt/decode benefit.
+  `--no-host --no-repack` remains the strict pageable-versus-pinned control.
+- A hybrid pinning threshold is not useful while operation offload is
+  disabled. If large-prompt operation offload is re-enabled later, use a
+  bounded 8--32-GiB profile-guided pool for frequently transferred dense
+  weights and explicitly exclude the fused IQ2/IQ3 routed-expert tensors.
+
+### Planned 3090/5090/2080 Ti topologies
+
+`scripts/run_kimi_k3_q2.sh` now validates arbitrary aligned device/split
+lists, per-GPU free-memory minima, exact required CUDA architectures, optional
+RPC, and the following presets. Future-hardware presets fail closed when
+architecture evidence is absent; `legacy` retains a compatibility warning:
+
+| Preset | Devices | Offloaded layers | Split | Purpose |
+| --- | --- | ---: | --- | --- |
+| `legacy` | 3090, fwuff CPU RPC, 3090 | 16 | `2,11,3` | Current measured topology |
+| `future-4gpu-rpc2` | fwuff RPC, 3 x 3090, 5090 | 12 | `2,2,2,2,4` | Safe first expanded Q2 profile |
+| `future-4gpu-local` | 3 x 3090, 5090 | 10 | `2,2,2,4` | Bold all-local profile; requires nearly all 768 GiB free |
+| `future-5gpu-local-2080` | 22-GB 2080 Ti, 3 x 3090, 5090 | 12 | `2,2,2,2,4` | Removes RPC if PCIe/host headroom permits |
+
+- The 5090 is deliberately last so it receives output-side layers; the safe
+  first expanded profile leaves approximately 703.6 GiB of Q2 tensor bytes on
+  dwagon host RAM. The all-local four-GPU profile leaves approximately
+  720.6 GiB and is too close to capacity unless nearly every GiB is recovered,
+  hence its 750,000-MiB admission gate.
+- Builds must contain `sm_86;sm_120` for the future four-GPU presets and
+  `sm_75;sm_86;sm_120` when the modified 2080 Ti is local. A non-CPU fwuff RPC
+  endpoint disables CUDA graphs by default because the modified 2080 Ti and
+  the reported K3 RPC-CUDA path require the conservative mode.
+- Keep the 22-GB 2080 Ti on fwuff initially. It can hold hot/owned experts or a
+  quantized/FP16 draft fallback while fwuff's 3090 runs the BF16 DSpark draft.
+  Moving it local is worthwhile only if the fifth device has clean PCIe
+  topology and removing 92 RPC synchronization points beats the lost lanes
+  and cooling headroom.
+
+### K3-specific expert parallelism
+
+- `scripts/build_kimi_k3_expert_ownership_plan.py` and its exact Q2 tensor-size
+  data model all 92 routed layers x 896 experts. Routed expert weights total
+  799,065,243,648 bytes. The deterministic planner accepts measured per-layer
+  route counts, per-host capacity, and relative throughput, then uses
+  load-aware assignment plus capacity repair rather than contiguous expert
+  IDs.
+- An unprofiled 650-GiB dwagon/180-GiB fwuff, 2:1-throughput smoke plan assigns
+  605,799,161,856 bytes to dwagon and 193,266,081,792 bytes to fwuff with
+  7,446,528 bytes spare. This proves capacity arithmetic, not optimal
+  ownership; real route frequency and co-occurrence profiles are mandatory.
+- The proposed SmallEP-like primitive routes once on dwagon, sends one
+  3,584-float latent plus selected IDs/weights to each remote owner, executes
+  local and remote experts concurrently, and returns one F32
+  3,584-element partial per host. Traffic is about 28.1 KiB per remote host
+  per MoE layer, or 2.53 MiB/token across 92 layers. EDR bandwidth is ample;
+  the risks are 92 latency barriers and route imbalance.
+- Expert weights must be compact on each owner with a global-to-local map.
+  Profile-guided duplication of hot experts on the 2080 Ti can avoid common
+  remote routes. First prove the local expert-partial primitive between
+  dwagon's 3090s, then CPU RPC correctness, then compare the 2080 Ti on fwuff
+  against installing it locally.
+
+### K3 DSpark port
+
+- The official [Kimi K3 DSpark draft](https://huggingface.co/Inferact/Kimi-K3-DSpark/blob/main/README.md)
+  is a five-dense-layer, hidden-7,168/intermediate-14,336 model with
+  rank-256 Markov recurrence and target checkpoints
+  `[2,23,47,71,89]`. BF16 weights are about 7.1 GB. Its published mean
+  acceptance is 3.85 tokens in greedy mode and 3.73 under sampling.
+- An intentionally uncommitted llama.cpp vertical slice now converts the
+  official architecture, exposes target inputs `[3,24,48,72,90]`, shares the
+  target embedding/head, implements the dense RoPE/MLA draft, and always
+  evaluates the physical seven-row block. Requested widths 3/5/7 cap returned
+  candidates; they do not change the seven-row graph.
+- Review found and the implementation fixed a subtle correctness blocker:
+  single-slot `split_simple()` had marked the batch unequal and caused rows
+  1--6 to index Markov weights by the MASK token rather than the preceding
+  sample. The port now serializes one indivisible
+  `[anchor + 6 x MASK]` block per sequence, uses the sequential path when
+  there is one unique sequence, and rejects `n_ubatch < 7`.
+- CPU/RPC and SM86 CUDA builds plus the focused CTest pass. A synthetic
+  end-to-end target/draft run generated 12 draft tokens and accepted 3; a
+  six-row microbatch rejected DSpark and safely fell back to target-only.
+  Converter compilation and official-header mapping validation also pass.
+  The original three-patch implementation has stable patch ID
+  `65f93ce350585e42336d51031e2f7bca289ed91d`. Compatibility patch `0002d`
+  has raw SHA-256
+  `2439173c5bf8075ce648d4fbda662bda99526ed999b261e318732597d686dfeb`
+  and stable patch ID `5c154e738b7ad434535f8c341e97f45810c088e2`; the complete four-file
+  DSpark series has concatenated SHA-256
+  `60c83d20d1e55a34cf8304c81d7dc1ce7746c751b8f89b80976bbbc1061054e8`.
+- The official artifact is now pinned and converted rather than inferred from
+  headers. Source repository commit
+  `cf6b8244620e7ea4b0651d214f28e89eac75bed6` supplied a
+  7,124,633,450-byte `model.safetensors` whose Git-LFS SHA-256 is
+  `f9972a636d92a11994cdcfc88fd4c5b5d50d6eb2a89af016031593b8c65c2053`.
+  The real conversion completed in 96 seconds with approximately 5.1 GB peak
+  memory and produced a 4,782,905,984-byte
+  `Kimi-K3-DSpark-BF16.gguf`, SHA-256
+  `71989564e0bec353cc0b7f5ee3f333781de072da34a03871ad3a040d68b64de9`.
+  `gguf_dump` reports architecture `dflash`, five blocks, hidden size 7,168,
+  intermediate size 14,336, 64 attention heads, one KV head, target layers
+  `[3,24,48,72,90]`, seven-token physical blocks, Markov rank 256, and mask
+  token 163837. The apparent 2.4B converted parameter count is expected
+  because DSpark shares the target embedding and output head.
+- All of that storage is on fwuff's Sanic array at
+  `/mnt/sanic/exo/models/Inferact-Kimi-K3-DSpark-cf6b8244`. A zero-copy
+  20-file hardlink view at
+  `/mnt/sanic/exo/model-views/Kimi-K3-Q2-DSpark-cf6b8244` combines the 19 Q2
+  shards and the draft GGUF under the one direct-child source root required
+  by strict RPC attestation. Dwagon sees the same inodes through
+  `/mnt/sanic-edr/exo/model-views/Kimi-K3-Q2-DSpark-cf6b8244`; no 866-GB
+  model copy was created.
+- This is still not a claimed model-level speedup until the full Q2 target and
+  real draft run together. The first live sweep uses request-level verifier
+  caps 3/5/7 on fwuff's otherwise-idle 3090 without reloading either model.
+  Shared embedding/head access, real acceptance, sampled decoding, and
+  rollback remain the integration gates. Multi-slot drafting is correct but
+  deliberately serialized.
+
+### K3 CUDA kernels
+
+- The first measured specialization fuses the exact 896-expert/top-16 router
+  path. On an RTX 3090 it reduced batch-one router time from 31.96 to
+  13.17 microseconds (2.43x) and batch-512 time from 177.56 to
+  19.70 microseconds (9.01x). All 353 `TOPK_MOE` and 33 K3-focused checks
+  passed. The fat binary contains SM75, SM86, and SM120a cubins; only SM86 was
+  executed. Stable patch ID:
+  `37a27b04d66aa431cd2dafd93c27d0061e72959a`; raw patch SHA-256:
+  `82396307a9c71d56201e649b2b2400971ff19a957d65c4271d0a397e2baa44a7`.
+- Router fusion is real but not the main bottleneck: even all 92 local routers
+  save at most about 1.73 ms/token, approximately 0.28% of an IQ2 decode and
+  much less in the distributed Q2 placement.
+- The first SiTU gate/up implementation is complete, with the negative result
+  used as a dispatch rule rather than hidden. A removed experimental paired
+  `IQ2_XS` path measured 223.28 microseconds after a focused launch-policy
+  tune versus 205.11 for the legacy decomposition, an 8.86% regression, so
+  final source has no IQ2 pair dispatch. That experiment's small-K kernel grew
+  from 96 to 116 registers/thread and from 1,536 to 3,072 bytes shared memory.
+  `IQ3_XXS` behaves in the opposite direction:
+  261.67 microseconds fused versus 289.15 for two MMIDs plus standalone SiTU
+  and 291.82 legacy, 10.33% lower latency, while registers fall from 54 to 48.
+- The patch therefore selects first-class SiTU only for an exact K3
+  `[3584,3072,896]`, one-token, top-16, no-bias/no-scale `IQ3_XXS` pair whose
+  actual placement backend reports support. `IQ2_XS` and unsupported
+  Metal/Vulkan/SYCL paths preserve the original graph. A positive debug trace
+  fused exactly three nodes from gate `MUL_MAT_ID` to output `GLU`; an IQ3
+  15-expert shape near miss and exact IQ2 control did not fuse. Standalone
+  SiTU passed 3/3 and distinct-weight K3 cases passed 5/5; the final source
+  built release server/tests plus SM75/SM86/SM120a cubins. Patch `0004` has
+  not yet run a full-size K3 model; this is microbenchmark, correctness-test,
+  and build evidence.
+- In `UD-Q2_K_XL`, only block 91 has IQ3 gate/up weights; the other 91 routed
+  blocks are IQ2_XS. The saving is consequently about 30 microseconds/token
+  when that block is CUDA-resident—approximately 0.00112% against the
+  historical 0.372718-token/s Q2 mean and 0.000634% against the latest
+  0.210238-token/s file-aware run. `UD-IQ2_XXS` has 46 IQ1_M and 46 IQ2_XXS
+  gate/up pairs, no IQ3_XXS pair, and its accepted placement keeps routed
+  experts on CPU, so this specialization does not accelerate it. This is
+  useful fusion infrastructure, not a visible end-to-end speed claim. Series
+  patch `0004`, rebased after
+  `0003`'s generic whole-graph test hook, has SHA-256
+  `e777bd9351dad1f040fe61ee3cc3eadf80a64fb784b4a4e5daa897f95bcf73e2`
+  and stable patch ID
+  `b3d1eddceb226af14da08b6315d8b8be32bcea48`. The validated pre-rebase clean
+  diff has SHA-256
+  `04c379d4e8021bdc7ce34b07264b970d55fd3cb2ace89cc3595ab7b6973fbb38`
+  and patch ID
+  `23d8f8c095c31f0fa8ddad791930dc0a6305edb8`; matched patched binaries are
+  required on both RPC client and server.
+- Follow-on patch `0007` makes the dominant `IQ2_XS` case profitable without
+  changing frozen patch `0004`. Its exact K3 kernel uses four warps/four rows
+  and two sequential phases: reduce the gate MMID to four shared scalars,
+  reuse the same accumulators and 1,536-byte inter-warp scratch for the up
+  MMID, then apply SiTU and write the final `[3072,16]` result. This removes
+  the simultaneous accumulator lifetime that made the first generic IQ2
+  pairing regress.
+- The SM86 cubin uses 96 registers/thread, 1,552 bytes shared memory, and zero
+  stack/local memory. The removed pairing used 116 registers and 3,072 bytes;
+  the new kernel therefore returns to the unfused IQ2 register-occupancy
+  class. In a controlled same-binary RTX 3090 comparison, fused runs were
+  162.25 and 162.45 microseconds, while
+  `GGML_CUDA_DISABLE_FUSION=1` runs were 170.14, 169.11, and 169.05
+  microseconds. The approximate means are 162.35 versus 169.43
+  microseconds, 4.18% lower latency. An earlier independent pair measured
+  161.50 versus 168.34 microseconds, 4.06% lower.
+- Admission is exact: K3 batch one, 896 experts/top-16,
+  `[3584,3072,896,1]` `IQ2_XS` gate/up weights, matching layouts,
+  `[3584,1,1,1]` input, `[3072,16,1,1]` output, every unused higher
+  dimension equal to one, and no bias or scale. Unsupported cases retain the
+  standalone-SiTU path. `GGML_CUDA_KIMI_K3_SITU_MMID=0` is the targeted
+  kill switch. Kimi's routed and model-specific graph admission now accepts
+  first-class IQ2 SiTU only when the placement backend reports support.
+- The exact pre-hardening CPU-reference/CUDA fixture passed. The final source
+  adds scattered far expert IDs, expert-distinct quant-block scales, an IQ2
+  15-expert near miss, and strict fourth-dimension checks. Those additions
+  compile in release `test-backend-ops`, `llama-server`, and
+  `ggml-rpc-server`, but were not rerun on a GPU after fwuff's 3090 was
+  yielded to the resident K3/DSpark benchmark. This patch has not run a
+  full-size model.
+- When all routed blocks are GPU-resident, `0007` applies to 91 of Q2's 92
+  routed blocks rather than only the single IQ3 block. The microbenchmark
+  ceiling is still only about 0.64 ms/token across all 91 layers, so this is
+  a concrete kernel improvement, not a visible distributed-model speed
+  claim. No operation was added and RPC remains v7.0.1. Deploying matched
+  binaries on both ends is nevertheless recommended so model-graph admission
+  and server execution select the same path.
+- Exported patch
+  `scripts/patches/kimi-k3/0007-kimi-k3-iq2-situ-mmid-sequential.patch`
+  has SHA-256
+  `66fa3d71a75f886aed6ddcf6f4a6a37d7dbc3c93afa7c1eeb25cc1c37a34426a`
+  and stable patch ID
+  `da7086b47540028b90b25a60c8c7a09e14a6b1dc`. The complete filename-ordered
+  `0001`--`0007` stack apply-checks cleanly from `d29a524e`; the live
+  K3/DSpark run intentionally remains on frozen `0006`.
+- Patch `0006` now implements the higher-value decode primitive:
+  `MUL_MAT_ID_WEIGHTED_REDUCE` accepts the exact K3 down weights
+  `[3072,3584,896]`, 16 activated expert rows, selected IDs, and router
+  weights, then writes one 3,584-element F32 partial. Four SM86 warps process
+  four selected experts concurrently and each CTA produces two output rows.
+  The router products and additions use `__fmul_rn`/`__fadd_rn` in slot order,
+  so the reduction is deterministic and does not use atomics.
+- Admission is deliberately narrow: K3 only, batch one, 896 experts/top-16,
+  exact dimensions, `IQ1_M`/`IQ2_XS`/`IQ3_XXS` down weights, no LoRA, no
+  output scale or bias, no weight-before-FFN path, and a GPU placement backend
+  that explicitly reports operation support. Warmup shapes, CPU and other
+  backends retain the old graph. `LLAMA_KIMI_K3_FUSED_DOWN=0` is the kill
+  switch. Adding the operation advances the attested RPC stack from v7.0.0
+  to v7.0.1, so client and server binaries must match.
+- The same patch incorporates open llama.cpp PR
+  [#25952](https://github.com/ggml-org/llama.cpp/pull/25952)'s structural
+  post-MMID weighted reduction. The matcher is extended from top-15 to K3's
+  exact 32-node top-16 short form; the 33-node scaled top-16 form still falls
+  back. This is the fair optimized baseline for the first-class operation.
+- Final same-binary RTX 3090/SM86 timings for the exact
+  3072-by-3584-by-896, scattered-ID, distinct-activation/router-weight fixture
+  were:
+
+  | Down type | Original MMID/tail | PR #25952 post-MMID | Fused 4-warp x 2-row | vs original | vs post-MMID |
+  | --- | ---: | ---: | ---: | ---: | ---: |
+  | `IQ1_M` | 79.33 us | 80.71 us | 66.26 us | 16.48% faster | 17.90% faster |
+  | `IQ2_XS` | 91.95 us | 90.07 us | 81.52 us | 11.34% faster | 9.49% faster |
+  | `IQ3_XXS` | 128.70 us | 127.06 us | 96.26 us | 25.21% faster | 24.24% faster |
+
+  One-row CTAs measured 77.52/87.06/101.35 us for
+  `IQ1_M`/`IQ2_XS`/`IQ3_XXS`; four-row CTAs measured
+  69.13/85.01/98.72 us. Two rows won all three formats. The final kernels use
+  56/63/62 registers per thread respectively, 128 bytes of shared memory, no
+  local stack, and no local spills.
+- Direct CPU-versus-CUDA graph checks passed 3/3 for the three real down
+  formats. The general post-MMID suite passed 5/5, including the exact
+  top-16 boundary, scaled top-16 fallback, runtime-k, vector, scalar, and
+  unaligned cases. The complete `0001`--`0006` stack built release
+  `test-backend-ops`, `llama-server`, and `ggml-rpc-server` with RPC/RDMA and
+  SM86 enabled, and the filename-ordered stack apply-checks cleanly from
+  `d29a524e`. This remains microbenchmark/build evidence; `0006` has not yet
+  run a full-size K3 model.
+- Exported patch
+  `scripts/patches/kimi-k3/0006-kimi-k3-down-mmid-weighted-reduce.patch`
+  has SHA-256
+  `3ca1b11b8073364fccea04b2e80c56c117a1ef03233bd0b712b361ef3c64be05`
+  and stable patch ID
+  `1f829a7affbcdb35922186e5242e3e604a86aa21`. The matched SM86 benchmark
+  payload is
+  `/mnt/sanic/exo/kimi-k3-kernels/down-mmid-dev-sm86`.
+- The one-vector result is also the intended network unit for the
+  SmallEP-like topology. A later prompt-batch implementation should compact
+  active experts and use grouped work plus segmented reduction instead of
+  millions of F32 atomics.
+
+### File-aware Q2 representative result
+
+The requested single representative run completed on the current
+3090/RPC/3090 placement after one sacrificial warmup. It used the server-local
+fwuff tensor reads, dwagon's `/mnt/sanic-edr` source, pageable model weights,
+one cache-cold semantic gate, and one cache-cold performance request. The
+semantic run produced exactly `FINAL=1080` from 124 input and 138 output
+tokens. The performance run produced exactly 512 input and 128 output tokens,
+zero cached tokens, and a length finish:
+
+| Metric | File-aware representative | Prior patched representative | Prior five-run mean |
+| --- | ---: | ---: | ---: |
+| Prompt processing | 3.720789 tok/s | 4.744242 tok/s | 5.074897 tok/s |
+| Decode | 0.210238 tok/s | 0.368137 tok/s | 0.372718 tok/s |
+| TTFT | 137.609 s | 107.924 s | 100.961 s |
+| End-to-end | 746.444 s | 455.621 s | 461.964 s |
+
+This is a real regression signal, not a win to rationalize away. Against the
+prior representative, prompt throughput fell 21.57%, decode fell 42.89%, TTFT
+rose 27.51%, and end-to-end latency rose 63.83%. The generated content and
+reasoning are byte-identical to the prior seeded run (SHA-256
+`ac316f5c4c4900c944bf7dc5dd24cec8f61fdb22995a59792f6c4c2e5bff8e60`
+and
+`89c8d5847e0dd5cfe22bc0eccb86d0bc782e51461fc658263616ade697bd02d3`),
+as is the rendered prompt. This rules out a different sampled token sequence
+as the explanation.
+
+The strict two-host telemetry join covered the entire accepted request:
+
+- integrated GPU-board energy was 174,101.179 J, or 1,360.17 board
+  J/generated token including prompt work, 64.45% above the prior
+  representative;
+- average process CPU use was 43.19 core-equivalents on dwagon and 33.42 on
+  fwuff; host CPU use was 19.96% and 30.48%;
+- maximum process RSS was 705,270,184 KiB and 100,634,980 KiB; minimum
+  `MemAvailable` was 61,454,132 KiB and 139,952,124 KiB;
+- neither process incurred a major fault, neither host swapped, and steady
+  EDR traffic was only about 0.0121 Gb/s.
+
+GPU power, clocks, CPU use, memory residency, and fabric traffic do not expose
+an external contention event large enough to explain the loss. The SiTU build
+overlapped only the semantic gate and was paused before the accepted
+performance request; IQ2 staging began only after the model was unloaded.
+The important confound is host-memory policy: this run introduced
+`--no-host` and also manually disabled automatic NUMA balancing, whereas the
+prior accepted run retained pinned host weights and the kernel default. It
+therefore cannot assign causality to either change. Automatic NUMA balancing
+has been restored to `1`; the launcher now records this value but never
+mutates the host-global setting. `--no-host` remains the bold cold-start
+default because it eliminates the approximately 700-GiB serial
+`cudaMallocHost()` pass, but it is no longer described as steady-state
+performance-neutral. A future controlled optimization run should compare
+`KIMI_Q2_NO_HOST=1/0` with automatic NUMA balancing held at `1`.
+
+The accepted artifacts are under
+`/mnt/llm-models/exo/benchmarks/kimi-k3-q2-file-aware-20260730-run2-sanic-edr`:
+
+- `benchmark.jsonl`:
+  `e75b6fad1993413cae981a404fd4f5cf458fde9f6307affb0253dcef5b5ec377`
+- `benchmark-summary.json`:
+  `e88e894a0aaf6e897a2059e1992fbc147533a3444db2225114c5b8f26102b92b`
+- `telemetry-dwagon.jsonl`:
+  `4d9501b6a196f897fa251850aa88a97d17ac11666a8acd3c191f791134c03f56`
+- `telemetry-fwuff.jsonl`:
+  `b885ffa274e7ed03674ad2c38871811a819eb75fe3ddf2dff166cedd0e688a39`
+- `telemetry-summary.json`:
+  `93fea264f851633f9b8f6e8bbc4bd4d82d08911ccd50516605f70f01b60d59a7`
+- `server.log`:
+  `cb891d229a98364573e22550e8f032de873728682d8878b248fdba5c930cffd9`
+- `rpc-server-fwuff.log`:
+  `6bdc9aa38048847ac4f8968331ea41ef1d5ab40f66767821ad23b383c198e17a`
+- restored CPU-policy receipts, dwagon then fwuff:
+  `3b75971d53ed3674019e709ebc69d31fbb360c35db8fa177b3bc2b99e24dbb53`
+  and
+  `ac25f8147019b349eac37d1cabcf155cb2a1920c94542188c93ae4d1b8dfe6e2`
 
 ## Research ledger
 
@@ -864,7 +1573,7 @@ RPC stage and could make it the more useful interactive configuration.
   32K context. F16 K/V is therefore the conservative starting point
   ([implementation discussion](https://github.com/ggml-org/llama.cpp/pull/26185)).
 - Prefix reuse has produced incorrect full-size KDA state. Keep
-  `--cache-reuse 0`, disable request prefix caching in the five-run gate, and
+  `--cache-reuse 0`, disable request prefix caching in every measured gate, and
   erase the slot between accepted samples
   ([implementation discussion](https://github.com/ggml-org/llama.cpp/pull/26185)).
 - Built-in llama.cpp warmup routes to only 16 of 896 experts. It is not a
@@ -939,6 +1648,71 @@ RPC stage and could make it the more useful interactive configuration.
   whole-layer RPC is much simpler and avoids a network round trip inside every
   MoE block. Establish the layer baseline before considering a K3-specific
   expert sidecar.
+
+### Fresh upstream and marketplace delta (2026-07-30)
+
+The following is an implementation-input audit, not local K3 validation:
+
+- Draft [llama.cpp PR #26322](https://github.com/ggml-org/llama.cpp/pull/26322)
+  at head `8da6ce7` is the clearest full-MoE CUDA design reference found. It
+  combines routing, activation reuse, gate/up, quantize-plus-SwiGLU, down
+  projection, and weighted reduction, with 6--11% prefill gains reported for
+  Qwen3.5 MoE on DGX Spark and RTX 5090. Its current graph admission requires
+  the softmax-plus-normalized-SwiGLU pattern and rejects routing features K3
+  needs, so K3 is excluded: borrow the dataflow and kernels, not the PR as a
+  validated K3 patch.
+- Open [PR #25952](https://github.com/ggml-org/llama.cpp/pull/25952) at head
+  `fbc1bd7` is the nearer baseline: one CUDA kernel replaces the weighted
+  expert-combine tail after `MUL_MAT_ID`. Its structural matcher supports
+  top-k 2--15 because the long form reaches the 31-node fusion limit; K3's
+  top-16 route therefore falls back. Extending that cap is required before
+  its reported 3.6--7.1% non-K3 prefill gains can even be tested here.
+- Merged [PR #24481](https://github.com/ggml-org/llama.cpp/pull/24481) supplies
+  the upstream precedent for matching gate/up lanes from `MUL_MAT` or
+  `MUL_MAT_ID`, optional scale/bias, and GLU as one fusion. Reuse that matcher
+  framework for the K3 fused gate/up MMID work instead of adding a second
+  model-name gate.
+- Open [PR #26079](https://github.com/ggml-org/llama.cpp/pull/26079) found on
+  an RTX 5090 that the K-quant MMVQ-to-MMQ crossover depends on model and
+  quant, with best thresholds spanning 3--5 and MMQ gains of 20--55% at width
+  eight in its dense microbenchmarks. This is not K3 or speculation
+  validation, but it is strong reason to sweep K3 DSpark widths 3/5/7 on the
+  5090 rather than assume seven.
+- Closed, unmerged [PR #24524](https://github.com/ggml-org/llama.cpp/pull/24524)
+  proposes a persistent hot-expert VRAM cache while CPU misses execute in
+  parallel. The author reports concentrated expert reuse and 7--25% gains on
+  two large spilling MoEs, but the large predominantly AI-generated change
+  was not reviewed. Treat it only as a controlled, kill-switch A/B after K3
+  route telemetry establishes a stable hot set; do not port it wholesale.
+- Withdrawn [CPU TP/EP RFC #25209](https://github.com/ggml-org/llama.cpp/pull/25209)
+  sketches quant-aligned load-time expert sharding and hierarchical
+  shared-memory/UCX-InfiniBand reduction. It received no maintainer review, so
+  its claimed results are not evidence for this cluster; it is only a useful
+  topology reference for the K3 SmallEP experiment.
+- Open [PR #26291](https://github.com/ggml-org/llama.cpp/pull/26291) parallelizes
+  FNV hashing on warm RPC-cache loads. That can help only the transfer/cache
+  fallback here; the strict protocol-v7 file-aware path reads an attested
+  local shard directly and should not pay this hashing path.
+- [GHSA-j8rj-fmpv-wcxw](https://github.com/ggml-org/llama.cpp/security/advisories/GHSA-j8rj-fmpv-wcxw)
+  documents critical unauthenticated RPC remote code execution and lists no
+  patched version. Binding RPC only to the private dwagon--fwuff InfiniBand
+  `/30`, firewalling the port to the peer address, and never exposing it on a
+  general LAN or the Internet are hard requirements, not optional hardening.
+
+Marketplace observations below are asking-price snapshots, not sold
+comparables or performance validation:
+
+| Device | Technical value for this workload | Observed ask on 2026-07-30 | Decision delta |
+|---|---|---:|---|
+| [MI210](https://www.amd.com/en/products/accelerators/instinct/mi200/mi210.html) | 64 GB HBM2e, 1.6 TB/s; attractive cold-expert capacity, but `gfx90a` K3 and mixed-backend operation remain unproved | [used $5,144.99 plus shipping](https://www.ebay.com/itm/306934911271) | More expensive and much higher integration risk than the planned 3090+5090 path; rent-test first |
+| [A100 80 GB PCIe](https://www.nvidia.com/en-eu/data-center/a100/) | 80 GB HBM2e, 1.935 TB/s; strongest single-card capacity/bandwidth option in this sample, but still cannot contain Q2 | [used $18,999](https://www.ebay.com/itm/178013232550) | Technically useful, economically noncompetitive |
+| [RTX A6000](https://www.nvidia.com/content/dam/en-zz/Solutions/design-visualization/quadro-product-literature/proviz-print-nvidia-rtx-a6000-datasheet-us-nvidia-1454980-r9-web%20%281%29.pdf) | 48 GB CUDA/ECC in one active-cooled card, but only 768 GB/s | [used $3,599.99](https://www.ebay.com/itm/115925848642) | Capacity convenience does not offset less VRAM and far less output-device bandwidth than the planned 24-GB 3090 plus 32-GB 5090 |
+| [A40](https://images.nvidia.com/content/Solutions/data-center/a40/nvidia-a40-datasheet.pdf) | 48 GB CUDA/ECC, 696 GB/s, passive 300 W | [used $4,500](https://www.ebay.com/itm/277959875038) | Slower, dearer, and harder to cool than the A6000 example; no advantage over the planned pair |
+
+None of these asks overturns the existing purchase order: add the 3090 and
+5090, exploit their established CUDA paths, and revisit unusual 48--80 GB
+cards only after a materially lower sold price or a K3 benchmark proves a
+specific placement win.
 
 ### Second-hand OAM, SXM, and oddball hardware
 
@@ -1069,6 +1843,75 @@ modules crashing AMDGPU or failing outside their EX235a platform
   generic cache mode and llama.cpp's current non-AMX K3 expert kernels leave
   most of the value unused.
 
+#### PCIe oddballs and the current consumer-GPU market
+
+- Use the already-owned modified 22-GB 2080 Ti before buying an experiment.
+  llama.cpp's CUDA build covers SM75, but the current
+  [KTransformers `kt-kernel`](https://github.com/kvcache-ai/ktransformers/blob/main/kt-kernel/README.md)
+  requires compute capability 8.0 or newer and ships SM80/86/89/90. That makes
+  the card a llama.cpp hot-expert/owned-layer device or an FP16/quantized draft
+  fallback, not the primary KTransformers/DSpark GPU. Fwuff is the first
+  location to try because its 3090 can remain the BF16 draft device.
+- A genuine used RTX 3090 remains the safest incremental purchase. Two recent
+  sold listings were approximately
+  [$960](https://www.ebay.com/itm/366350059267) and
+  [$1,200](https://www.ebay.com/itm/277167673465). Its known 24-GB CUDA path,
+  936-GB/s-class bandwidth, 350-W board power, and existing local build/tests
+  dominate the integration risk of unusual accelerators.
+- Buy the RTX 5090 only near its $1,999 launch price or, at most, roughly
+  $2,500. It supplies 32 GB and 1,792 GB/s but draws 575 W
+  ([NVIDIA specifications](https://www.nvidia.com/en-us/geforce/graphics-cards/50-series/rtx-5090/)).
+  Current in-stock retail around
+  [$4,329](https://www.newegg.com/p/pl?N=100007709+4131+8000+601469153)
+  is poor value for 8 GB more capacity than a 3090. The main value here is
+  output-side bandwidth and future Blackwell kernels, not solving Q2 capacity.
+- The AMD Radeon Pro V620 is the most interesting cheap/returnable cold-expert
+  experiment: 32 GB GDDR6, 512 GB/s, PCIe 4 x16, ECC, passive cooling, and
+  300 W
+  ([AMD specifications](https://www.amd.com/en/products/accelerators/radeon-pro/amd-radeon-pro-v620.html)).
+  An active listing around
+  [$450 with more than 600 sold](https://www.ebay.com/itm/157133307609)
+  is extraordinary capacity per dollar. It still needs server airflow,
+  BAR/MMIO and ROCm/Vulkan validation, and a separate HIP/Vulkan RPC process;
+  it cannot run `kt-kernel`. Low 512-GB/s bandwidth also makes whole-layer
+  pipeline placement risky. Test only with returns and use it for cold/owned
+  experts.
+- A tested PCIe MI100 around
+  [$999](https://www.ebay.com/itm/285394293082) is the stronger AMD experiment:
+  32 GB HBM2, approximately 1.2 TB/s, 300 W, and a current ROCm `gfx908` path
+  ([AMD platform documentation](https://instinct.docs.amd.com/projects/system-acceptance/en/latest/gpus/mi100.html)).
+  It remains passive, adds a separate HIP runtime, and has no KTransformers
+  GPU path. Prefer it over V620 only when bandwidth matters enough to justify
+  roughly twice the price.
+- Intel Data Center GPU Max 1100 is a watch/borrow candidate: 48 GB HBM2e,
+  1,228.8 GB/s, and 300 W
+  ([Intel specifications](https://www.intel.com/content/www/us/en/products/sku/232876/intel-data-center-gpu-max-1100/specifications.html)).
+  llama.cpp's
+  [official SYCL backend](https://github.com/ggml-org/llama.cpp/blob/master/docs/backend/SYCL.md)
+  explicitly validates Max 1100/1550 and now includes fused MoE work. One unit
+  sold for
+  [$1,599.99](https://www.ebay.com/itm/157796596837), while a current
+  no-return listing asks
+  [$1,999.99](https://www.ebay.com/itm/327119960744). The capacity/bandwidth
+  arithmetic is attractive, but K3/SYCL maturity and cross-backend RPC make a
+  no-return purchase unjustified.
+- A complete eight-Gaudi2 system at
+  [$17,500](https://www.ebay.com/itm/168027117930) is remarkable general
+  hardware per dollar: 768 GB HBM and about 4.8 kW of accelerator power. It is
+  still a hard no for this task because llama.cpp/KTransformers have no Gaudi
+  backend and the current Gaudi-vLLM matrix has no K3 path. Hardware value
+  without a runnable software path is zero for this benchmark.
+- Bare MI250X OAM modules around
+  [$1,500](https://www.ebay.com/itm/287342587892) do not change the loose-module
+  conclusion. A usable OAI platform needs the UBB, host interface, power,
+  clocks/reset, control/security/management, and cooling defined by the
+  [OCP Universal Baseboard specification](https://www.opencompute.org/documents/ocp-oai-universal-baseboard-design-specification-v1p0-2-pdf).
+  The approximately
+  [$16,100 plus freight four-MI250 platform](https://www.ebay.com/itm/397928458814)
+  is the minimum kind of listing to evaluate, yet four modules provide only
+  512 GB and cannot contain Q2. Require a boot-tested, returnable complete
+  system and a rented `gfx90a` K3 proof; loose modules are parts.
+
 #### Capacity-first DDR5 remains the rational used purchase
 
 A used dual-EPYC Dell R7625 with 1.5 TB DDR5 sold around $10,888 in late 2025
@@ -1100,3 +1943,207 @@ retimers/switch heatsinks, management boards, bridge cards/cables, cold plates
 or fan shrouds, CDU, rails, and the exact power shelf. Six continuous kilowatts
 is about 20,500 BTU/h and roughly $7,900/year at $0.15/kWh; 10.2 kW is about
 34,800 BTU/h and $13,400/year before cooling overhead.
+
+## 2026-07-30 iteration closeout: result and next steps
+
+This iteration stops without another model launch. The infrastructure,
+research, conversion, and kernel work produced useful results, but the first
+real Q2-plus-DSpark integration did not reach the API and therefore produced no
+honest speculative-decoding benchmark. No K3 DSpark speedup is claimed.
+
+### What is complete
+
+- `UD-Q2_K_XL` and `UD-IQ2_XXS` have their earlier five-run benchmark series,
+  and the file-aware Q2 follow-up has its requested representative run. The
+  incomplete DSpark attempt does not replace those results.
+- Fwuff reads model data directly from its locally attached `/mnt/sanic`;
+  dwagon reads the same inodes through the EDR-mounted `/mnt/sanic-edr`.
+  Model, source, build, draft, and run artifacts on fwuff are under
+  `/mnt/sanic/exo`, not its root filesystem. The strict RPC loader avoids the
+  wasteful `fwuff -> NFS -> dwagon -> RPC -> fwuff` tensor path.
+- The file-aware RPC protocol is fail-closed at v7.0.1. Before the live
+  attempt, all 20 target-plus-draft view files matched client and server
+  `{inode,size,mtime_ns}` identity; the completion receipt SHA-256 was
+  `084a02355154224106cb4445a98148e6c220bca0fbf6027420dab9a25397c5b5`.
+- The official five-layer K3 DSpark draft is pinned, converted, and stored as
+  the 4,782,905,984-byte
+  `/mnt/sanic/exo/models/Inferact-Kimi-K3-DSpark-cf6b8244/Kimi-K3-DSpark-BF16.gguf`.
+  Its SHA-256 is
+  `71989564e0bec353cc0b7f5ee3f333781de072da34a03871ad3a040d68b64de9`.
+  The zero-copy hardlink view combines it with the 19 Q2 shards.
+- Matched CUDA/RPC v7.0.1 source and build trees exist on both hosts. The live
+  binaries included patches through `0006`; `0007` and `0008` are preserved
+  patches but were deliberately not slipped into a resident run.
+- The new fused down-projection/weighted-reduction kernel (`0006`) improves
+  exact K3 RTX 3090 microbenchmarks by 11.34--25.21%, depending on weight
+  format. The register-preserving IQ2 SiTU gate/up kernel (`0007`) improves
+  its exact operation by about 4.18%. These are real kernel wins but have not
+  yet established a visible full-model tokens/second change.
+- The speculative benchmark harness can sweep request-level verifier widths
+  3, 5, and 7 while one target/draft pair remains resident, and records the
+  selected width in its result metadata.
+- The SmallEP-like design, route-profile ownership planner, loader topology,
+  and hardware/OAM survey are captured above. The practical hardware ranking
+  remains software first, then the already planned local 3090 and sensibly
+  priced 5090. A complete, proven platform can merit rental or evaluation;
+  loose OAM/SXM modules are not useful purchases by themselves.
+
+### Full Q2 plus DSpark integration outcome
+
+The one permitted attempt used the strict hardlink view and matched builds:
+
+- target devices `CUDA0,RPC0,CUDA1`, tensor split `2,11,3`, and 16 GPU/RPC
+  layers;
+- fwuff endpoint `CPU,CUDA0` at `10.44.0.2:50052`, mapped as target `RPC0`
+  and draft `RPC1`;
+- draft device `RPC1`, with CUDA graphs disabled and no host-copy fallback.
+
+Tensor materialization was genuinely parallel: fwuff's RPC allocation/read
+stage stabilized while dwagon continued loading its local share. The complete
+target loaded in about 12 minutes 59 seconds. Dwagon's main process reached
+roughly 677 GiB RSS and fwuff's RPC process roughly 95 GiB. The real draft
+artifact then loaded, but draft-context reservation aborted before API
+startup:
+
+```text
+ggml-backend.cpp:898: pre-allocated tensor (output.weight) in a buffer
+(CUDA1) that cannot run the operation (NONE)
+```
+
+This is not a file-loader, memory-capacity, or sequential-load failure.
+DSpark deliberately borrows the target embedding and output head. The
+embedding was CPU-resident and visible, but the 1,247,805,440-byte
+`output.weight` was owned by target `CUDA1`; the draft scheduler had registered
+only `RPC1` plus CPU. It consequently could not schedule the preallocated
+shared head.
+
+The fatal assertion invoked `systemd-coredump` on dwagon for an approximately
+677-GiB process. The handler was stopped after consuming about 52 GiB of root
+space, the failed server exited, and no `llama-server` core remains. Dwagon
+recovered to about 69 GiB free on root with both GPUs released. The launcher
+now wraps both main-server and RPC-server commands in
+`/usr/bin/prlimit --core=0:0 --`, including the CUDA RPC environment form, so
+this failure mode cannot refill a host root filesystem on the next attempt.
+
+At the pause, fwuff still answered ICMP and TCP connection probes on ports 22
+and 50052 but repeatedly timed out before the SSH banner and did not complete
+an RPC application handshake or NFS stat. This is consistent with teardown,
+reclaim, or a remote core handler rather than a dead fabric, but it is not
+proven. Its exact idle RPC process and any coredump handler therefore remain a
+cleanup item once SSH responsiveness returns. No reboot is justified from the
+available evidence.
+
+### Preserved fix and fallback topology
+
+Patch
+`scripts/patches/kimi-k3/0008-kimi-k3-dspark-borrow-ctx-other-backends.patch`
+is the direct fix. For each shared tensor missing from the draft scheduler it
+reuses the exact owning backend handle from `ctx_other`, preserving the live
+RPC session and tensor-ID namespace. Draft-owned backends retain priority;
+borrowed target backends are inserted before CPU fallback. The patch covers
+shared embedding/output cases used by DFlash and Eagle3 and the shared
+embedding case used by the Gemma4 assistant. It also replaces this opaque
+assertion with an explicit owner-visibility error.
+
+Patch `0008` has SHA-256
+`a1d96ee3028789929ec91b4c2b28c0b07e9be0fed1afed9167ea9941068f62ca`
+and stable patch ID
+`c07821423d02ddbf4f672bbfc1969e48cfea2e2d`. The full patch series through
+`0008` apply-checks cleanly, and the modified context plus focused synthetic
+non-CPU shared-tensor test objects compile with CUDA/RPC. The timebox ended
+during the 462-target full build at target 106, so final executable linking,
+the synthetic runtime test, and full-model validation are still required.
+
+If `0008` is temporarily excluded, the least disruptive command-line
+workaround is:
+
+```text
+--device CUDA0,RPC0,CUDA1
+--tensor-split 2,11,3
+--spec-draft-device CUDA1,RPC1
+--spec-draft-ngl all
+```
+
+Adding target `CUDA1` to the draft scheduler exposes the borrowed head while
+keeping draft blocks 1--4 and output normalization on `RPC1`; only draft block
+0 follows the inherited `2,11` split onto `CUDA1`. The current launcher
+deliberately rejects a multi-device draft list, so its validation would need a
+small, tested relaxation before using this fallback. Prefer validating
+`0008`, because automatic owner discovery is more robust than encoding shared
+tensor placement in a launch command.
+
+### Ordered next steps
+
+1. Recover cleanly before building or loading: when fwuff's SSH banner
+   responds, inspect and stop only the exact K3 RPC process from
+   `/mnt/sanic/exo/run/kimi-k3-dspark-v701/rpc-server.pid`, inspect any
+   `systemd-coredump`, and verify root/Sanic free space, NFS, OpenSM, GPU, and
+   EDR health. Keep only the useful live OpenSM service/log; do not recreate
+   deleted failed-unit logs or root-side caches. Restore the two intentionally
+   stopped dwagon TTS containers once K3 GPU work is no longer imminent.
+2. Complete a matched, non-model validation of `0008`: finish the CUDA/RPC
+   link, run its focused scheduler test, and exercise a tiny synthetic
+   target/draft pair where the shared embedding and head live on a non-draft
+   backend. Treat failure here as a code bug; do not spend another 13-minute
+   Q2 load to diagnose it.
+3. Apply `0007` and `0008` to the persistent v7.0.1 source trees on both
+   machines and rebuild matching `llama-server` and `ggml-rpc-server`
+   binaries. Recheck protocol/version parity and retain
+   `GGML_CUDA_DISABLE_GRAPHS=1` for the fwuff CUDA RPC endpoint.
+4. For the next single full load, retain strict same-backing-file attestation,
+   the Sanic/EDR hardlink view, mixed `CPU,CUDA0` RPC, target
+   `CUDA0,RPC0,CUDA1` split `2,11,3`, draft `RPC1`, and the new core-size
+   guards. First require API health and a short semantic comparison with
+   target-only output.
+5. Only while that one load remains healthy and resident, sweep verifier
+   widths 3, 5, and 7 without reloading. Record accepted candidates per target
+   pass, rejection/rollback behavior, request latency, prompt and decode
+   tokens/second, CPU/GPU/RAM/VRAM, RPC bytes, EDR rate, and energy. Select the
+   width from measured throughput, not the published mean acceptance of 3.73
+   at width seven. One coherent representative benchmark is sufficient for
+   this integration run.
+6. After correctness, compare `0007` enabled/disabled in the same resident
+   process if its kill switch permits a fair request-level test. Pursue
+   SmallEP-like expert ownership only as a separate runtime project: first
+   local expert-partial correctness, then CPU RPC, then a profile-guided
+   dwagon/fwuff split.
+7. Put the modified 22-GB 2080 Ti on fwuff first if it is tried: use it for
+   cold/owned experts or a quantized draft fallback while the 3090 remains the
+   BF16 draft device. Move it to dwagon only if measured remote synchronization
+   outweighs the extra local PCIe contention. Do not buy loose OAM modules;
+   rent-test complete MI250X/GH200-class systems before considering them.
+
+## 2026-08-01 cumulative publication
+
+The previously local llama.cpp stack is now committed and published publicly
+as [`ldyeax/exo_llama_cpp`](https://github.com/ldyeax/exo_llama_cpp), branch
+`exo/kimi-k3-cumulative`, commit `651092c60`. It accumulates the strict
+local-file RPC loader, DSpark integration, K3 top-k/SiTU and weighted-reduction
+kernels, recurrent-state work, RPC tests, and the shared-backend fix described
+above. No upstream pull request or maintainer-facing automation was created.
+
+The root repository now tracks that branch directly at `vendor/llama.cpp`, so
+the implementation is not hidden inside another project. KTransformers also
+tracks the same commit from its active llama submodule; its active and archived
+llama URL declarations now use the same fork and branch. The compatible
+KTransformers graph is published as
+[`ldyeax/exo_ktransformers`](https://github.com/ldyeax/exo_ktransformers),
+branch `exo/glm52-osdi26-patched`, commit `f38772417`. Its nested SGLang
+submodule continues to use
+[`ldyeax/exo_sglang`](https://github.com/ldyeax/exo_sglang), branch
+`bundle/glm52-fwuff-sglang`, commit `73e877ac5`.
+
+Modern ggml removed the task-phase structure and split conversion traits used
+by KTransformers' bundled llamafile 0.8.8 kernels. Compatibility is retained
+inside KTransformers: it owns the legacy task ABI, adapts the split generic/CPU
+traits, uses current CPU quantization declarations, calls `ggml_cpu_init()`,
+and adds the moved ggml include roots. Both a CPU-only build and a CUDA 13.1
+SM86 build of `kt_kernel_ext` completed successfully against llama commit
+`651092c60`.
+
+The cumulative llama tree also completed CUDA/NCCL builds of `llama-server`,
+`ggml-rpc-server`, `test-backend-ops`, `test-dflash-plan`, and
+`test-rpc-tensor-source`. The two focused unit tests passed, and the focused
+`MUL_MAT_ID_WEIGHTED_REDUCE`, `SITU`, and `TOP_K` backend suite passed on both
+local RTX 3090 devices. This was build/test validation only; no model was
+launched.

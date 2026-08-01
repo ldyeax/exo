@@ -163,10 +163,7 @@ def read_cpu_stat() -> dict[str, int]:
         "guest",
         "guest_nice",
     )
-    return {
-        name: int(value)
-        for name, value in zip(names, fields[1:], strict=False)
-    }
+    return {name: int(value) for name, value in zip(names, fields[1:], strict=False)}
 
 
 def read_vmstat() -> dict[str, int]:
@@ -382,12 +379,8 @@ def main() -> int:
                 pid=pid,
                 label=label,
                 interfaces=interfaces,
-                include_numa=(
-                    numa_every > 0 and sample_index % numa_every == 0
-                ),
-                include_smaps=(
-                    smaps_every > 0 and sample_index % smaps_every == 0
-                ),
+                include_numa=(numa_every > 0 and sample_index % numa_every == 0),
+                include_smaps=(smaps_every > 0 and sample_index % smaps_every == 0),
             )
             destination.write(
                 json.dumps(sample, separators=(",", ":"), sort_keys=True) + "\n",

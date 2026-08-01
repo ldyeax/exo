@@ -204,8 +204,12 @@ class PeerArtifactTransferPlan(_StrictModel):
             index for index in range(chunk_count) if index not in completed_set
         )
         if tuple(sorted(assignment_indexes)) != expected_assignment_indexes:
-            raise ValueError("transfer assignments must cover every incomplete chunk once")
-        if any(assignment.link_id not in set(link_ids) for assignment in self.assignments):
+            raise ValueError(
+                "transfer assignments must cover every incomplete chunk once"
+            )
+        if any(
+            assignment.link_id not in set(link_ids) for assignment in self.assignments
+        ):
             raise ValueError("a transfer assignment names an unavailable link")
         return self
 
@@ -254,9 +258,7 @@ def _ensure_secure_cache_directory(directory: Path) -> None:
             for component in directory.parts[1:]:
                 next_descriptor = os.open(
                     component,
-                    os.O_RDONLY
-                    | os.O_DIRECTORY
-                    | getattr(os, "O_NOFOLLOW", 0),
+                    os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
                     dir_fd=descriptor,
                 )
                 os.close(descriptor)
@@ -327,9 +329,7 @@ def observe_peer_artifact_storage_availability(
                 f"{storage.memory_cache_directory} is on "
                 f"{filesystem_type or 'an unidentified filesystem'}"
             )
-        filesystem_available = shutil.disk_usage(
-            storage.memory_cache_directory
-        ).free
+        filesystem_available = shutil.disk_usage(storage.memory_cache_directory).free
         memory_available_bytes = min(
             filesystem_available,
             _linux_available_memory_bytes(),
@@ -355,9 +355,9 @@ def _decode_linux_mount_path(encoded_path: str) -> str:
 def _linux_filesystem_type(path: Path) -> str | None:
     try:
         resolved_path = path.resolve(strict=True)
-        mount_lines = Path("/proc/self/mountinfo").read_text(
-            encoding="utf-8"
-        ).splitlines()
+        mount_lines = (
+            Path("/proc/self/mountinfo").read_text(encoding="utf-8").splitlines()
+        )
     except OSError:
         return None
     candidates: list[tuple[int, str]] = []
@@ -683,9 +683,7 @@ def _active_capacity_reservations(
             ):
                 path.unlink(missing_ok=True)
                 continue
-            descriptor = os.open(
-                path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-            )
+            descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
             try:
                 contents = os.read(descriptor, 4097)
             finally:
@@ -745,12 +743,7 @@ def _create_capacity_reservation(
         reserved_bytes=reserved_bytes,
     )
     path = _reservation_directory(storage) / f"{uuid.uuid4().hex}.json"
-    flags = (
-        os.O_WRONLY
-        | os.O_CREAT
-        | os.O_EXCL
-        | getattr(os, "O_NOFOLLOW", 0)
-    )
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
     descriptor = os.open(path, flags, 0o600)
     try:
         contents = reservation.model_dump_json(by_alias=True).encode()
@@ -840,9 +833,7 @@ async def execute_peer_artifact_transfer(
                     "memory storage was selected without a configured path"
                 )
             completed = (
-                disk_completed
-                if storage_kind == "disk_cache"
-                else memory_completed
+                disk_completed if storage_kind == "disk_cache" else memory_completed
             )
             reservation_path = _create_capacity_reservation(
                 storage,
@@ -865,9 +856,7 @@ async def execute_peer_artifact_transfer(
                     0,
                     base_plan,
                 )
-            completed = await _verified_resume_chunk_indexes(
-                manifest, selected_paths
-            )
+            completed = await _verified_resume_chunk_indexes(manifest, selected_paths)
             plan = plan_peer_artifact_transfer(
                 manifest, links, completed_chunk_indexes=completed
             )
@@ -948,9 +937,9 @@ async def _execute_plan(
     descriptor, journal_descriptor = _prepare_partial_artifact(
         plan.manifest, paths, completed_chunk_indexes
     )
-    assignments_by_link: dict[
-        PeerArtifactLinkId, list[PeerArtifactChunkAssignment]
-    ] = {link.link_id: [] for link in plan.links}
+    assignments_by_link: dict[PeerArtifactLinkId, list[PeerArtifactChunkAssignment]] = {
+        link.link_id: [] for link in plan.links
+    }
     for assignment in plan.assignments:
         assignments_by_link[assignment.link_id].append(assignment)
 
@@ -1126,9 +1115,7 @@ async def _verified_resume_chunk_indexes(
     except ValueError:
         return ()
 
-    descriptor = os.open(
-        paths.partial, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-    )
+    descriptor = os.open(paths.partial, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     verified_indexes: list[int] = []
     try:
         for index in sorted(declared_indexes):
@@ -1191,7 +1178,10 @@ async def _sha256_regular_file(path: Path, expected_size_bytes: int) -> str:
     descriptor = os.open(path, os.O_RDONLY | no_follow)
     try:
         file_stat = os.fstat(descriptor)
-        if not stat.S_ISREG(file_stat.st_mode) or file_stat.st_size != expected_size_bytes:
+        if (
+            not stat.S_ISREG(file_stat.st_mode)
+            or file_stat.st_size != expected_size_bytes
+        ):
             raise PeerArtifactIntegrityError(
                 f"cached artifact is not a regular {expected_size_bytes}-byte file: "
                 f"{path}"
@@ -1244,9 +1234,7 @@ async def _validated_published_artifact(
     ):
         return True
 
-    actual_sha256 = await _sha256_regular_file(
-        paths.published, manifest.size_bytes
-    )
+    actual_sha256 = await _sha256_regular_file(paths.published, manifest.size_bytes)
     if actual_sha256 != manifest.sha256:
         return False
     _write_verified_artifact_receipt(manifest, paths)

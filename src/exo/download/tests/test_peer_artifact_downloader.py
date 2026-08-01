@@ -150,9 +150,7 @@ class InMemoryPeerClient:
     ) -> bytes:
         del snapshot_id, artifact_sha256
         self.range_link_ids.append(link.link_id)
-        return self.contents[artifact_path][
-            offset_bytes : offset_bytes + size_bytes
-        ]
+        return self.contents[artifact_path][offset_bytes : offset_bytes + size_bytes]
 
 
 def _links() -> tuple[PeerArtifactLink, ...]:
@@ -276,9 +274,7 @@ async def test_peer_downloader_materializes_verified_snapshot_for_worker_flow(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async def resolve_model_dir_inline(
-        model_id: ModelId, revision: str
-    ) -> Path:
+    async def resolve_model_dir_inline(model_id: ModelId, revision: str) -> Path:
         target = download_utils.build_model_path(model_id, revision)
         target.mkdir(parents=True, exist_ok=True)
         return target
@@ -319,27 +315,28 @@ async def test_peer_downloader_materializes_verified_snapshot_for_worker_flow(
     assert origin.ensure_calls == 0
     assert downloader.supports_offline_download
     assert (result / "config.json").read_bytes() == contents["snapshot/config.json"]
-    assert (
-        result / "model-00001-of-00001.safetensors"
-    ).read_bytes() == contents["snapshot/model-00001-of-00001.safetensors"]
+    assert (result / "model-00001-of-00001.safetensors").read_bytes() == contents[
+        "snapshot/model-00001-of-00001.safetensors"
+    ]
     assert progress[-1].status == "complete"
     assert progress[-1].completed_files == 5
     assert set(client.range_link_ids) == {
         PeerArtifactLinkId("fast"),
         PeerArtifactLinkId("slow"),
     }
-    assert download_utils.resolve_existing_model(
-        ModelId("example/model"), _shard().model_card
-    ) == result
+    assert (
+        download_utils.resolve_existing_model(
+            ModelId("example/model"), _shard().model_card
+        )
+        == result
+    )
 
 
 async def test_unavailable_peer_falls_back_only_when_origin_is_enabled(
     tmp_path: Path,
 ) -> None:
     snapshot, manifests, contents = _peer_fixture(tmp_path)
-    client = InMemoryPeerClient(
-        snapshot, manifests, contents, unavailable=True
-    )
+    client = InMemoryPeerClient(snapshot, manifests, contents, unavailable=True)
     origin_target = tmp_path / "origin"
     origin = RecordingOriginDownloader(origin_target)
     downloader = PeerArtifactShardDownloader(
@@ -378,10 +375,13 @@ async def test_direct_materializer_preserves_sglang_and_ktransformers_paths(
     assert (destination / "model" / "launch.json").read_bytes() == contents[
         "snapshot/model/launch.json"
     ]
-    assert (
-        destination / "ktransformers" / "index.json"
-    ).read_bytes() == contents["snapshot/ktransformers/index.json"]
+    assert (destination / "ktransformers" / "index.json").read_bytes() == contents[
+        "snapshot/ktransformers/index.json"
+    ]
     receipt = destination / PEER_ARTIFACT_SNAPSHOT_RECEIPT_FILENAME
-    assert PeerArtifactSnapshotManifest.model_validate_json(
-        receipt.read_bytes()
-    ).snapshot_id == snapshot.snapshot_id
+    assert (
+        PeerArtifactSnapshotManifest.model_validate_json(
+            receipt.read_bytes()
+        ).snapshot_id
+        == snapshot.snapshot_id
+    )

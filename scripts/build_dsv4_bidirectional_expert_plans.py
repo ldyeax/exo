@@ -102,12 +102,8 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    calls = load_tensor(args.decode_call_profile, "logical_count").to(
-        dtype=torch.int64
-    )
-    gpu_mask = load_tensor(args.gpu_mask_plan, "gpu_experts_mask").to(
-        dtype=torch.bool
-    )
+    calls = load_tensor(args.decode_call_profile, "logical_count").to(dtype=torch.int64)
+    gpu_mask = load_tensor(args.gpu_mask_plan, "gpu_experts_mask").to(dtype=torch.bool)
     if tuple(calls.shape) != tuple(gpu_mask.shape):
         raise ValueError("decode profile and GPU mask shapes differ")
     stage_partition = tuple(
@@ -133,25 +129,13 @@ def main() -> None:
     for layer_idx in range(num_layers):
         frequency = calls[layer_idx]
         available = all_ids[~gpu_mask[layer_idx]]
-        stage_idx = (
-            0
-            if layer_idx < stage0_end
-            else 1
-            if layer_idx < stage1_end
-            else 2
-        )
-        tier_calls["gpu"][stage_idx] += int(
-            frequency[gpu_mask[layer_idx]].sum()
-        )
+        stage_idx = 0 if layer_idx < stage0_end else 1 if layer_idx < stage1_end else 2
+        tier_calls["gpu"][stage_idx] += int(frequency[gpu_mask[layer_idx]].sum())
 
         if layer_idx < stage1_end:
             if args.fwuff_placement == "cold":
-                cold_order = torch.argsort(
-                    frequency[available], stable=True
-                )
-                fwuff_ids = available[
-                    cold_order[: args.fwuff_experts_per_layer]
-                ]
+                cold_order = torch.argsort(frequency[available], stable=True)
+                fwuff_ids = available[cold_order[: args.fwuff_experts_per_layer]]
             else:
                 fwuff_ids = choose_tier(
                     frequency,
@@ -171,24 +155,16 @@ def main() -> None:
             if stage_idx == 0:
                 numa0_ids = opposite_ids
                 numa1_ids = placeholder_ids
-                tier_calls["dwagon_numa0"][0] += int(
-                    frequency[numa0_ids].sum()
-                )
+                tier_calls["dwagon_numa0"][0] += int(frequency[numa0_ids].sum())
             else:
                 numa0_ids = placeholder_ids
                 numa1_ids = opposite_ids
-                tier_calls["dwagon_numa1"][1] += int(
-                    frequency[numa1_ids].sum()
-                )
-            tier_calls["fwuff"][stage_idx] += int(
-                frequency[fwuff_ids].sum()
-            )
+                tier_calls["dwagon_numa1"][1] += int(frequency[numa1_ids].sum())
+            tier_calls["fwuff"][stage_idx] += int(frequency[fwuff_ids].sum())
             owned = gpu_mask[layer_idx].clone()
             owned[fwuff_ids] = True
             owned[opposite_ids] = True
-            tier_calls["local"][stage_idx] += int(
-                frequency[~owned].sum()
-            )
+            tier_calls["local"][stage_idx] += int(frequency[~owned].sum())
             fwuff_rows.append(fwuff_ids)
         else:
             total_cpu_load = int(frequency[available].sum())
@@ -196,18 +172,13 @@ def main() -> None:
                 frequency,
                 available,
                 expert_count=args.dwagon_experts_per_layer,
-                target_load=total_cpu_load
-                / (args.pp2_dwagon_tiers + 1),
+                target_load=total_cpu_load / (args.pp2_dwagon_tiers + 1),
             )
             owned = gpu_mask[layer_idx].clone()
             owned[numa0_ids] = True
-            tier_calls["dwagon_numa0"][2] += int(
-                frequency[numa0_ids].sum()
-            )
+            tier_calls["dwagon_numa0"][2] += int(frequency[numa0_ids].sum())
             if args.pp2_dwagon_tiers == 2:
-                after_numa0 = available[
-                    ~torch.isin(available, numa0_ids)
-                ]
+                after_numa0 = available[~torch.isin(available, numa0_ids)]
                 numa1_ids = choose_tier(
                     frequency,
                     after_numa0,
@@ -215,9 +186,7 @@ def main() -> None:
                     target_load=total_cpu_load / 3,
                 )
                 owned[numa1_ids] = True
-                tier_calls["dwagon_numa1"][2] += int(
-                    frequency[numa1_ids].sum()
-                )
+                tier_calls["dwagon_numa1"][2] += int(frequency[numa1_ids].sum())
             else:
                 # Keep the serialized plan rectangular. These stage-2 rows
                 # are inactive for NUMA 1 and therefore need no ownership.
@@ -289,9 +258,7 @@ def main() -> None:
         f"fwuff={stage1_end * args.fwuff_experts_per_layer}"
     )
     for stage_idx in range(3):
-        stage_total = sum(
-            values[stage_idx] for values in tier_calls.values()
-        )
+        stage_total = sum(values[stage_idx] for values in tier_calls.values())
         print(
             f"stage{stage_idx}: "
             + ", ".join(

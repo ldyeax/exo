@@ -37,9 +37,7 @@ def load_activation_counts(
 ) -> torch.Tensor:
     profile = torch.load(profile_path, map_location="cpu", weights_only=True)
     if not isinstance(profile, dict) or "logical_count" not in profile:
-        raise ValueError(
-            f"{profile_path} must contain a logical_count tensor"
-        )
+        raise ValueError(f"{profile_path} must contain a logical_count tensor")
     logical_count = profile["logical_count"]
     if not isinstance(logical_count, torch.Tensor):
         logical_count = torch.as_tensor(logical_count)
@@ -79,9 +77,7 @@ def main() -> None:
         descending=args.selection == "hot",
         stable=True,
     )[:, : args.remote_experts_per_layer].contiguous()
-    selected_counts = torch.gather(
-        activation_counts, 1, remote_expert_ids
-    )
+    selected_counts = torch.gather(activation_counts, 1, remote_expert_ids)
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     torch.save(

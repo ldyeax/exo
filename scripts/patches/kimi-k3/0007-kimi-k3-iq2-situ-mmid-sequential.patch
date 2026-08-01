@@ -1,0 +1,333 @@
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index e7aadfe29be81f7d31b5a17889b5145a81054c48..4ee7d14df6dfca467cdc05d9a711d2c707c9ff6f 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -1743,18 +1743,32 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
+ 
+     const ggml_glu_op glu_op = ggml_get_glu_op(glu);
+     if (glu_op == GGML_GLU_OP_SITU) {
++        static const bool use_kimi_k3_situ_mmid = [] {
++            const char * value = getenv("GGML_CUDA_KIMI_K3_SITU_MMID");
++            return value == nullptr || atoi(value) != 0;
++        }();
++        if (!use_kimi_k3_situ_mmid) {
++            return false;
++        }
++
+         const ggml_tensor * weights = ffn_up->src[0];
+         const ggml_tensor * input   = ffn_up->src[1];
+         const ggml_tensor * ids     = ffn_up->src[2];
+-        // IQ2_XS uses the four-row small-K specialization on SM86; pairing doubles its
+-        // live dot-product state and is slower than two MMIDs. IQ3_XXS is a measured win.
+-        const bool supported_type = weights->type == GGML_TYPE_IQ3_XXS;
++        // IQ2_XS uses a dedicated two-phase kernel that reuses the dot-product
++        // accumulator and inter-warp scratch. IQ3_XXS benefits from the generic
++        // paired-MMID epilogue.
++        const bool supported_type =
++            weights->type == GGML_TYPE_IQ2_XS || weights->type == GGML_TYPE_IQ3_XXS;
+         const bool kimi_k3_shape =
+             is_mul_mat_id && !has_bias && !has_scale && supported_type &&
+-            weights->ne[0] == 3584 && weights->ne[1] == 3072 && weights->ne[2] == 896 &&
+-            input->ne[0] == 3584 && input->ne[1] == 1 && input->ne[2] == 1 &&
++            weights->ne[0] == 3584 && weights->ne[1] == 3072 &&
++            weights->ne[2] == 896 && weights->ne[3] == 1 &&
++            input->ne[0] == 3584 && input->ne[1] == 1 &&
++            input->ne[2] == 1 && input->ne[3] == 1 &&
+             ids->ne[0] == 16 && ids->ne[1] == 1 &&
+-            ffn_up->ne[0] == 3072 && ffn_up->ne[1] == 16 && ffn_up->ne[2] == 1;
++            ids->ne[2] == 1 && ids->ne[3] == 1 &&
++            ffn_up->ne[0] == 3072 && ffn_up->ne[1] == 16 &&
++            ffn_up->ne[2] == 1 && ffn_up->ne[3] == 1;
+         if (!kimi_k3_shape) {
+             return false;
+         }
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index d431532fb9a0e6871a4c1f4ff8c26f10aadcac95..441c5717ecdad112ec3ffd1a5209f64df4f35289 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -775,6 +775,120 @@ static __global__ void mul_mat_vec_q_moe(
+     }
+ }
+ 
++// Kimi K3 batch-one SiTU specialization. The generic paired-MMID epilogue keeps
++// both projections' per-row accumulators live at once. That is especially
++// expensive for IQ2_XS on SM86, where the ordinary MMVQ kernel uses the
++// small-K four-row schedule. Compute the gate and up projections in two phases
++// instead, reusing the same accumulator and inter-warp scratch storage. Only
++// the four reduced gate scalars survive across phases.
++template <ggml_type type, int c_nwarps, int c_rows_per_block>
++__launch_bounds__(c_nwarps*ggml_cuda_get_physical_warp_size(), 1)
++static __global__ void mul_mat_vec_q_moe_situ_sequential(
++        const void * up_ptr, const void * gate_ptr, const void * vy_ptr, const int32_t * ids_ptr,
++        float * dst_ptr, const uint32_t ncols_x, const uint32_t nrows_x,
++        const uint32_t stride_row_x, const uint32_t stride_channel_x,
++        const uint32_t stride_channel_dst, const float beta, const float linear_beta) {
++    const void    * GGML_CUDA_RESTRICT up   = up_ptr;
++    const void    * GGML_CUDA_RESTRICT gate = gate_ptr;
++    const void    * GGML_CUDA_RESTRICT vy   = vy_ptr;
++    const int32_t * GGML_CUDA_RESTRICT ids  = ids_ptr;
++    float         * GGML_CUDA_RESTRICT dst  = dst_ptr;
++
++    constexpr int qk        = ggml_cuda_type_traits<type>::qk;
++    constexpr int qi        = ggml_cuda_type_traits<type>::qi;
++    constexpr int vdr       = get_vdr_mmvq(type);
++    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
++    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
++
++    __shared__ float partials[c_nwarps > 1 ? c_nwarps - 1 : 1][c_rows_per_block][warp_size];
++    __shared__ float gate_values[c_rows_per_block];
++
++    const int tid = warp_size * threadIdx.y + threadIdx.x;
++    const int row0 = c_rows_per_block * blockIdx.x;
++    const int blocks_per_row_x = ncols_x / qk;
++    constexpr int blocks_per_iter = vdr * c_nwarps * warp_size / qi;
++
++    ggml_cuda_pdl_sync();
++
++    const uint32_t channel_x = ids[blockIdx.y];
++    const block_q8_1 * y = (const block_q8_1 *) vy;
++    const int kbx_offset = channel_x * stride_channel_x + row0 * stride_row_x;
++
++    float dot[c_rows_per_block] = { 0.0f };
++    for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
++        const int kby = kbx * (qk/QK8_1);
++        const int kqs = vdr * (tid % (qi/vdr));
++#pragma unroll
++        for (int row = 0; row < c_rows_per_block; ++row) {
++            dot[row] += vec_dot_q_cuda(
++                gate, &y[kby], kbx_offset + row * stride_row_x + kbx, kqs);
++        }
++    }
++
++    if (threadIdx.y > 0) {
++#pragma unroll
++        for (int row = 0; row < c_rows_per_block; ++row) {
++            partials[threadIdx.y - 1][row][threadIdx.x] = dot[row];
++        }
++    }
++    __syncthreads();
++
++    if (threadIdx.y == 0) {
++#pragma unroll
++        for (int row = 0; row < c_rows_per_block; ++row) {
++#pragma unroll
++            for (int warp = 0; warp < c_nwarps - 1; ++warp) {
++                dot[row] += partials[warp][row][threadIdx.x];
++            }
++            dot[row] = warp_reduce_sum<warp_size>(dot[row]);
++        }
++        if (threadIdx.x < c_rows_per_block && row0 + threadIdx.x < nrows_x) {
++            gate_values[threadIdx.x] = dot[threadIdx.x];
++        }
++    }
++    __syncthreads();
++
++#pragma unroll
++    for (int row = 0; row < c_rows_per_block; ++row) {
++        dot[row] = 0.0f;
++    }
++    for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
++        const int kby = kbx * (qk/QK8_1);
++        const int kqs = vdr * (tid % (qi/vdr));
++#pragma unroll
++        for (int row = 0; row < c_rows_per_block; ++row) {
++            dot[row] += vec_dot_q_cuda(
++                up, &y[kby], kbx_offset + row * stride_row_x + kbx, kqs);
++        }
++    }
++
++    ggml_cuda_pdl_lc();
++
++    if (threadIdx.y > 0) {
++#pragma unroll
++        for (int row = 0; row < c_rows_per_block; ++row) {
++            partials[threadIdx.y - 1][row][threadIdx.x] = dot[row];
++        }
++    }
++    __syncthreads();
++
++    if (threadIdx.y == 0) {
++#pragma unroll
++        for (int row = 0; row < c_rows_per_block; ++row) {
++#pragma unroll
++            for (int warp = 0; warp < c_nwarps - 1; ++warp) {
++                dot[row] += partials[warp][row][threadIdx.x];
++            }
++            dot[row] = warp_reduce_sum<warp_size>(dot[row]);
++        }
++        if (threadIdx.x < c_rows_per_block && row0 + threadIdx.x < nrows_x) {
++            const int row = threadIdx.x;
++            dst[blockIdx.y * stride_channel_dst + row0 + row] =
++                ggml_cuda_op_situ_single(gate_values[row], dot[row], beta, linear_beta);
++        }
++    }
++}
++
+ template <ggml_type type, int c_nwarps, int c_n_expert_used, int c_rows_per_block>
+ __launch_bounds__(c_nwarps*ggml_cuda_get_physical_warp_size(), 1)
+ static __global__ void mul_mat_vec_q_moe_weighted_reduce(
+@@ -849,6 +963,23 @@ static __global__ void mul_mat_vec_q_moe_weighted_reduce(
+     }
+ }
+ 
++template <ggml_type type, int c_nwarps, int c_rows_per_block>
++static void mul_mat_vec_q_moe_situ_sequential_launch(
++        const void * up, const void * gate, const void * vy, const int32_t * ids, float * dst,
++        const uint32_t ncols_x, const uint32_t nrows_x, const uint32_t stride_row_x,
++        const uint32_t stride_channel_x, const uint32_t stride_channel_dst,
++        const float beta, const float linear_beta, const int warp_size, cudaStream_t stream) {
++    const dim3 block_nums((nrows_x + c_rows_per_block - 1) / c_rows_per_block, 16);
++    const dim3 block_dims(warp_size, c_nwarps);
++    const ggml_cuda_kernel_launch_params launch_params =
++        ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
++
++    ggml_cuda_kernel_launch(
++        mul_mat_vec_q_moe_situ_sequential<type, c_nwarps, c_rows_per_block>, launch_params,
++        up, gate, vy, ids, dst, ncols_x, nrows_x, stride_row_x, stride_channel_x,
++        stride_channel_dst, beta, linear_beta);
++}
++
+ template<ggml_type type>
+ static std::pair<dim3, dim3> calc_launch_params(
+         const int ncols_dst, const int nrows_x, const int nchannels_dst, const int nsamples_or_ntokens,
+@@ -1406,6 +1537,30 @@ void ggml_cuda_mul_mat_vec_q(
+     const int64_t s12 = ne11*s11;
+     const int64_t s13 = ne12*s12;
+ 
++    const bool use_kimi_k3_iq2_situ =
++        fusion && fusion->gate && fusion->glu_op == GGML_GLU_OP_SITU &&
++        fusion->x_bias == nullptr && fusion->gate_bias == nullptr &&
++        fusion->x_scale == nullptr && fusion->gate_scale == nullptr &&
++        src0->type == GGML_TYPE_IQ2_XS && ids &&
++        src0->ne[0] == 3584 && src0->ne[1] == 3072 &&
++        src0->ne[2] == 896 && src0->ne[3] == 1 &&
++        src1->ne[0] == 3584 && src1->ne[1] == 1 &&
++        src1->ne[2] == 1 && src1->ne[3] == 1 &&
++        ids->ne[0] == 16 && ids->ne[1] == 1 &&
++        ids->ne[2] == 1 && ids->ne[3] == 1 &&
++        dst->ne[0] == 3072 && dst->ne[1] == 16 &&
++        dst->ne[2] == 1 && dst->ne[3] == 1 &&
++        fusion->gate->type == src0->type && ggml_are_same_shape(fusion->gate, src0) &&
++        ggml_are_same_stride(fusion->gate, src0);
++    if (use_kimi_k3_iq2_situ) {
++        const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
++        mul_mat_vec_q_moe_situ_sequential_launch<GGML_TYPE_IQ2_XS, 4, 4>(
++            src0->data, fusion->gate->data, src1_q8_1.get(), ids_d, dst_d,
++            ne00, ne01, s01, s02, s1, fusion->situ_beta, fusion->situ_linear_beta,
++            warp_size, stream);
++        return;
++    }
++
+     // For MUL_MAT_ID the memory layout is different than for MUL_MAT:
+     const int64_t ncols_dst          = ids ? ne2  : ne1;
+     const int64_t nchannels_y        = ids ? ne11 : ne12;
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index ed666371728f4957ebb02eff419819735153abd4..335aaa886f7196c69e4c1cca7c77c6e075a64ed9 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -2094,7 +2094,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+                 GGML_ASSERT(has_gate);
+                 ggml_tensor * situ = ggml_situ(ctx0, cur, up, hparams.situ_beta, hparams.situ_linear_beta);
+                 const ggml_tensor * placement_weight = gate_exps ? gate_exps : gate_up_exps;
+-                if (placement_weight && placement_weight->type == GGML_TYPE_IQ3_XXS &&
++                const bool situ_mmid_type =
++                    placement_weight &&
++                    (placement_weight->type == GGML_TYPE_IQ2_XS ||
++                     placement_weight->type == GGML_TYPE_IQ3_XXS);
++                if (situ_mmid_type &&
+                     weight_backend_supports_op(placement_weight, situ)) {
+                     cur = situ;
+                 } else {
+diff --git a/src/models/kimi-k3.cpp b/src/models/kimi-k3.cpp
+index 58b7560adb7d628daee88c28659936d916d8a07f..c3a27c7431c257d245b096c657bdafa0202815f8 100644
+--- a/src/models/kimi-k3.cpp
++++ b/src/models/kimi-k3.cpp
+@@ -192,7 +192,11 @@ static ggml_tensor * kimi_k3_situ(
+         float beta,
+         float linear_beta) {
+     ggml_tensor * situ = ggml_situ(ctx0, gate, up, beta, linear_beta);
+-    if (placement_weight && placement_weight->type == GGML_TYPE_IQ3_XXS && placement_weight->buffer) {
++    const bool situ_type =
++        placement_weight &&
++        (placement_weight->type == GGML_TYPE_IQ2_XS ||
++         placement_weight->type == GGML_TYPE_IQ3_XXS);
++    if (situ_type && placement_weight->buffer) {
+         ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(placement_weight->buffer);
+         ggml_backend_dev_t device = ggml_backend_buft_get_device(buft);
+         if (device && ggml_backend_dev_supports_op(device, situ)) {
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 6d329137a82c5c226667909389eb1358f59b9e8b..e512bbbc85f254dc5d998357922ed6847de56a70 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -1575,6 +1575,7 @@ struct test_case {
+         }
+         const bool benchmark_whole_graph =
+             current_op_name == "KIMI_K3_SITU_MMID" ||
++            current_op_name == "KIMI_K3_SITU_MMID_IQ2" ||
+             current_op_name == "KIMI_K3_SITU_MMID_CONTROL" ||
+             current_op_name == "KIMI_K3_SITU_MMID_LEGACY" ||
+             current_op_name == "KIMI_K3_DOWN_MMID_REDUCE_POST" ||
+@@ -4688,9 +4689,12 @@ struct test_kimi_k3_situ_mmid : public test_case {
+         ggml_tensor * input = ggml_get_tensor(ctx, "input");
+         GGML_ASSERT(gate_weights && up_weights && ids && input);
+ 
++        static constexpr std::array<int32_t, 16> selected_ids = {
++            17, 503, 2, 887, 311, 79, 641, 223, 895, 419, 101, 733, 37, 557, 269, 811
++        };
+         std::vector<int32_t> ids_data(896, 0);
+         for (int i = 0; i < n_used; ++i) {
+-            ids_data[i] = i;
++            ids_data[i] = selected_ids[i];
+         }
+         ggml_backend_tensor_set(ids, ids_data.data(), 0, ids_data.size() * sizeof(int32_t));
+ 
+@@ -4722,11 +4726,30 @@ struct test_kimi_k3_situ_mmid : public test_case {
+         const size_t up_size = ggml_quantize_chunk(
+             weight_type, up_matrix.data(), up_quantized.data(), 0, nrows, ncols, imatrix.data());
+         GGML_ASSERT(gate_size == expert_size && up_size == expert_size);
++
++        const size_t quant_block_size = ggml_type_size(weight_type);
++        GGML_ASSERT(expert_size % quant_block_size == 0);
++        auto scale_quant_blocks = [quant_block_size](std::vector<uint8_t> & quantized, float scale) {
++            for (size_t offset = 0; offset < quantized.size(); offset += quant_block_size) {
++                ggml_fp16_t d;
++                memcpy(&d, quantized.data() + offset, sizeof(d));
++                d = ggml_fp32_to_fp16(ggml_fp16_to_fp32(d) * scale);
++                memcpy(quantized.data() + offset, &d, sizeof(d));
++            }
++        };
++
++        std::vector<uint8_t> gate_expert(gate_quantized.size());
++        std::vector<uint8_t> up_expert(up_quantized.size());
+         for (int expert = 0; expert < n_used; ++expert) {
++            const int32_t selected_id = selected_ids[expert];
++            gate_expert = gate_quantized;
++            up_expert = up_quantized;
++            scale_quant_blocks(gate_expert, 0.80f + 0.02f * expert);
++            scale_quant_blocks(up_expert, 1.15f - 0.015f * expert);
+             ggml_backend_tensor_set(
+-                gate_weights, gate_quantized.data(), expert * gate_weights->nb[2], gate_quantized.size());
++                gate_weights, gate_expert.data(), selected_id * gate_weights->nb[2], gate_expert.size());
+             ggml_backend_tensor_set(
+-                up_weights, up_quantized.data(), expert * up_weights->nb[2], up_quantized.size());
++                up_weights, up_expert.data(), selected_id * up_weights->nb[2], up_expert.size());
+         }
+     }
+ 
+@@ -4740,7 +4763,7 @@ struct test_kimi_k3_situ_mmid : public test_case {
+             return "KIMI_K3_SITU_MMID_NEAR_MISS";
+         }
+         if (!decomposed && weight_type == GGML_TYPE_IQ2_XS) {
+-            return "KIMI_K3_SITU_MMID_CONTROL";
++            return "KIMI_K3_SITU_MMID_IQ2";
+         }
+         return decomposed ? "KIMI_K3_SITU_MMID_LEGACY" : "KIMI_K3_SITU_MMID";
+     }
+@@ -8559,6 +8582,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         test_cases.emplace_back(new test_kimi_k3_situ_mmid(GGML_TYPE_IQ3_XXS, 4.0f, 25.0f));
+         test_cases.emplace_back(new test_kimi_k3_situ_mmid(GGML_TYPE_IQ2_XS, 4.0f, 25.0f, true));
+         test_cases.emplace_back(new test_kimi_k3_situ_mmid(GGML_TYPE_IQ3_XXS, 4.0f, 25.0f, true));
++        test_cases.emplace_back(new test_kimi_k3_situ_mmid(GGML_TYPE_IQ2_XS, 4.0f, 25.0f, false, 15));
+         test_cases.emplace_back(new test_kimi_k3_situ_mmid(GGML_TYPE_IQ3_XXS, 4.0f, 25.0f, false, 15));
+         test_cases.emplace_back(new test_kimi_k3_down_mmid_reduce(GGML_TYPE_IQ1_M));
+         test_cases.emplace_back(new test_kimi_k3_down_mmid_reduce(GGML_TYPE_IQ2_XS));

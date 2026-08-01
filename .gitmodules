@@ -2,3 +2,7 @@
 	path = vendor/ktransformers
 	url = https://github.com/ldyeax/exo_ktransformers.git
 	branch = exo/glm52-osdi26-patched
+[submodule "vendor/llama.cpp"]
+	path = vendor/llama.cpp
+	url = https://github.com/ldyeax/exo_llama_cpp.git
+	branch = exo/kimi-k3-cumulative

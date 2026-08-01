@@ -74,7 +74,9 @@ def validate_ordering(path: Path) -> tuple[tuple[int, ...], ...]:
             raise PreparationError(
                 f"expert ordering layer {layer_index} must contain {EXPERT_COUNT} IDs"
             )
-        if any(isinstance(value, bool) or not isinstance(value, int) for value in raw_row):
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) for value in raw_row
+        ):
             raise PreparationError(
                 f"expert ordering layer {layer_index} contains a non-integer ID"
             )
@@ -143,9 +145,7 @@ def validate_model(model_path: Path) -> tuple[int, int]:
     raw_shard_names = tuple(weight_map.values())
     if any(not isinstance(name, str) for name in raw_shard_names):
         raise PreparationError("safetensors index contains a non-string shard name")
-    shard_names = sorted(
-        {name for name in raw_shard_names if isinstance(name, str)}
-    )
+    shard_names = sorted({name for name in raw_shard_names if isinstance(name, str)})
     if len(shard_names) != SHARD_COUNT:
         raise PreparationError(
             f"expected {SHARD_COUNT} unique safetensors shards, got {len(shard_names)}"
@@ -168,13 +168,13 @@ def write_mask_plan(
     gpu_experts_per_layer: int,
 ) -> None:
     if not 0 <= gpu_experts_per_layer <= EXPERT_COUNT:
-        raise PreparationError(
-            f"GPU experts per layer must be in [0, {EXPERT_COUNT}]"
-        )
+        raise PreparationError(f"GPU experts per layer must be in [0, {EXPERT_COUNT}]")
     try:
         import torch
     except ImportError as error:
-        raise PreparationError("torch is required only when writing the mask plan") from error
+        raise PreparationError(
+            "torch is required only when writing the mask plan"
+        ) from error
 
     mask = torch.zeros(
         (ROUTED_LAYER_COUNT, EXPERT_COUNT), dtype=torch.bool, device="cpu"

@@ -52,14 +52,13 @@ def assign_layer(
     )
     for expert_id in ordered_hot:
         eligible = [
-            rank
-            for rank in local_ranks
-            if len(assignments[rank]) < rank_counts[rank]
+            rank for rank in local_ranks if len(assignments[rank]) < rank_counts[rank]
         ]
         if not eligible:
             raise RuntimeError("no rank has capacity for the remaining expert")
         selected_rank = min(
-            eligible, key=lambda rank: (assigned_load[rank], len(assignments[rank]), rank)
+            eligible,
+            key=lambda rank: (assigned_load[rank], len(assignments[rank]), rank),
         )
         assignments[selected_rank].append(expert_id)
         assigned_load[selected_rank] += int(frequency[expert_id])
@@ -105,9 +104,7 @@ def main() -> None:
         )
         for rank in range(len(args.rank_counts))
     ]
-    remote_frequency = frequency.gather(
-        1, expert_ids_by_rank[args.remote_rank]
-    ).sum()
+    remote_frequency = frequency.gather(1, expert_ids_by_rank[args.remote_rank]).sum()
     total_frequency = frequency.sum()
     output = {
         "format": "sglang_kt_cpu_expert_shard_v1",

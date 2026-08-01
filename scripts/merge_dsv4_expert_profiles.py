@@ -56,9 +56,7 @@ def main() -> None:
     torch.save(
         {
             "logical_count": logical_count,
-            "source_profiles": [
-                str(profile.resolve()) for profile in args.profiles
-            ],
+            "source_profiles": [str(profile.resolve()) for profile in args.profiles],
         },
         args.output,
     )

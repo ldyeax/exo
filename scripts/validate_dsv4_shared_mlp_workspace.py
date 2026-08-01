@@ -11,7 +11,6 @@ from types import SimpleNamespace
 
 import torch
 from safetensors import safe_open
-
 from sglang.jit_kernel.dsv4 import silu_and_mul_clamp
 from sglang.srt.layers.quantization.marlin_utils_fp8 import (
     apply_fp8_marlin_linear,

@@ -1,0 +1,79 @@
+diff --git a/tests/test-dflash-plan.cpp b/tests/test-dflash-plan.cpp
+new file mode 100644
+index 000000000..5d879a11b
+--- /dev/null
++++ b/tests/test-dflash-plan.cpp
+@@ -0,0 +1,73 @@
++#include "speculative.h"
++#include "../src/models/dflash-recurrence.h"
++
++#undef NDEBUG
++#include <cassert>
++#include <vector>
++
++int main() {
++    {
++        const auto plan = common_dflash_make_draft_plan(7, true, 3);
++        assert(plan.n_decode == 7);
++        assert(plan.n_return == 3);
++    }
++    {
++        const auto plan = common_dflash_make_draft_plan(7, true, 5);
++        assert(plan.n_decode == 7);
++        assert(plan.n_return == 5);
++    }
++    {
++        const auto plan = common_dflash_make_draft_plan(7, true, 7);
++        assert(plan.n_decode == 7);
++        assert(plan.n_return == 7);
++    }
++    {
++        const auto plan = common_dflash_make_draft_plan(7, true, 99);
++        assert(plan.n_decode == 7);
++        assert(plan.n_return == 7);
++    }
++    {
++        const auto plan = common_dflash_make_draft_plan(7, true, -1);
++        assert(plan.n_decode == 7);
++        assert(plan.n_return == 0);
++    }
++    {
++        const auto plan = common_dflash_make_draft_plan(8, false, 5);
++        assert(plan.n_decode == 5);
++        assert(plan.n_return == 5);
++    }
++    {
++        const auto plan = common_dflash_make_draft_plan(8, false, 99);
++        assert(plan.n_decode == 7);
++        assert(plan.n_return == 7);
++    }
++    {
++        assert(!common_dflash_dspark_block_is_supported(7, 6));
++        assert(common_dflash_dspark_block_is_supported(7, 7));
++        assert(common_dflash_dspark_block_is_supported(7, 8));
++        assert(!common_dflash_dspark_block_is_supported(8, 8));
++    }
++    {
++        assert(llama_dflash::use_markov_chain(false, 1));
++        assert(!llama_dflash::use_markov_chain(false, 2));
++
++        const std::vector<int> noise_tokens = { 3, 999, 999, 999, 999, 999, 999 };
++        std::vector<int> markov_inputs;
++        const auto rows = llama_dflash::build_markov_chain(
++                7,
++                noise_tokens.front(),
++                [&](int row, int previous_token) {
++                    markov_inputs.push_back(previous_token);
++                    return previous_token * 10 + row;
++                },
++                [](int logits) {
++                    return logits + 1;
++                });
++
++        assert((markov_inputs == std::vector<int>{ 3, 31, 312, 3123, 31234, 312345, 3123456 }));
++        assert((rows == std::vector<int>{ 30, 311, 3122, 31233, 312344, 3123455, 31234566 }));
++        for (size_t row = 1; row < markov_inputs.size(); ++row) {
++            assert(markov_inputs[row] != noise_tokens[row]);
++        }
++    }
++}

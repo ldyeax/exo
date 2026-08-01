@@ -88,8 +88,7 @@ def test_exact_topology_has_three_disjoint_ib_rails_and_two_ethernet_rails() -> 
         "ethernet-b",
     ]
     networks = [
-        rail.hosts["dwagon"].address.network
-        for rail in topology.infiniband_rails
+        rail.hosts["dwagon"].address.network for rail in topology.infiniband_rails
     ]
     assert networks == [
         ipaddress.IPv4Network("10.44.0.0/30"),
@@ -135,9 +134,7 @@ def test_guid_pinned_sysfs_observation_resolves_parent_port_netdev(
     (network_device / "ifindex").write_text("12")
     (network_device / "iflink").write_text("12")
 
-    observation = ipoib.observe_hca_port(
-        rail, "dwagon", sysfs_root=sysfs
-    )
+    observation = ipoib.observe_hca_port(rail, "dwagon", sysfs_root=sysfs)
 
     assert observation.interface == "ib-test"
     assert observation.node_guid == endpoint.node_guid
@@ -153,8 +150,7 @@ def test_ipoib_hardware_address_must_end_with_pinned_port_guid(
     interface_root.mkdir(parents=True)
     address_path = interface_root / "address"
     address_path.write_text(
-        "00:00:00:00:fe:80:00:00:00:00:00:00:"
-        "24:8a:07:03:00:95:af:d4"
+        "00:00:00:00:fe:80:00:00:00:00:00:00:24:8a:07:03:00:95:af:d4"
     )
 
     assert ipoib._ipoib_hardware_address(
@@ -190,9 +186,7 @@ def test_rendered_deployment_is_schema_valid_and_uses_all_five_links(
         replace=False,
     )
 
-    source = PeerArtifactDeploymentConfig.model_validate_json(
-        source_path.read_bytes()
-    )
+    source = PeerArtifactDeploymentConfig.model_validate_json(source_path.read_bytes())
     receiver = PeerArtifactDeploymentConfig.model_validate_json(
         receiver_path.read_bytes()
     )
@@ -206,9 +200,11 @@ def test_rendered_deployment_is_schema_valid_and_uses_all_five_links(
         "ethernet-a",
         "ethernet-b",
     ]
-    assert [
-        str(link.local_ip_address) for link in receiver.peers[0].links[:3]
-    ] == ["10.44.0.1", "10.44.1.1", "10.44.2.1"]
+    assert [str(link.local_ip_address) for link in receiver.peers[0].links[:3]] == [
+        "10.44.0.1",
+        "10.44.1.1",
+        "10.44.2.1",
+    ]
     plan = cast(dict[str, object], json.loads(plan_path.read_bytes()))
     assert plan["profile"] == "all"
     assert len(cast(list[object], plan["materializations"])) == 2

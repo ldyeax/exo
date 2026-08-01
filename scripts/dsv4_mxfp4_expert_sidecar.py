@@ -72,9 +72,7 @@ class ExpertShard:
             num_experts_per_tok=shape.topk,
             hidden_size=shape.hidden_size,
             moe_intermediate_size=shape.intermediate_size,
-            gpu_experts_mask=torch.zeros(
-                self.expert_ids.numel(), dtype=torch.bool
-            ),
+            gpu_experts_mask=torch.zeros(self.expert_ids.numel(), dtype=torch.bool),
             cpuinfer_threads=processor_count,
             threadpool_count=1,
             weight_path=model_path,
@@ -88,9 +86,7 @@ class ExpertShard:
             torch.arange(self.expert_ids.numel(), dtype=torch.int64)
         )
 
-    def validate_request(
-        self, *, batch_size: int, hidden_size: int, topk: int
-    ) -> None:
+    def validate_request(self, *, batch_size: int, hidden_size: int, topk: int) -> None:
         if not 0 < batch_size <= self.max_tokens:
             raise ValueError(
                 f"invalid sidecar batch size {batch_size}; "
@@ -122,9 +118,7 @@ class ExpertShard:
             -1,
         ).contiguous()
         output = torch.zeros_like(hidden_states)
-        batch_size = torch.tensor(
-            [hidden_states.shape[0]], dtype=torch.int32
-        )
+        batch_size = torch.tensor([hidden_states.shape[0]], dtype=torch.int32)
         self.wrapper.cpu_infer.submit(
             self.wrapper.moe.forward_task(
                 batch_size.data_ptr(),
@@ -202,23 +196,19 @@ class SidecarServer:
                         connection, batch_size * hidden_size * 2
                     )
                     ids_payload = _recv_exact(connection, batch_size * topk * 8)
-                    weights_payload = _recv_exact(
-                        connection, batch_size * topk * 4
-                    )
+                    weights_payload = _recv_exact(connection, batch_size * topk * 4)
                     hidden_states = torch.frombuffer(
                         hidden_payload, dtype=torch.bfloat16
                     ).reshape(batch_size, hidden_size)
-                    topk_ids = torch.frombuffer(
-                        ids_payload, dtype=torch.int64
-                    ).reshape(batch_size, topk)
+                    topk_ids = torch.frombuffer(ids_payload, dtype=torch.int64).reshape(
+                        batch_size, topk
+                    )
                     topk_weights = torch.frombuffer(
                         weights_payload, dtype=torch.float32
                     ).reshape(batch_size, topk)
                     with self.compute_lock:
                         start_time = time.perf_counter()
-                        output = shard.forward(
-                            hidden_states, topk_ids, topk_weights
-                        )
+                        output = shard.forward(hidden_states, topk_ids, topk_weights)
                         elapsed_ms = (time.perf_counter() - start_time) * 1000
                         self.request_counts[layer_idx] += 1
                         self.token_counts[layer_idx] += batch_size
@@ -235,9 +225,7 @@ class SidecarServer:
                             )
                     payload = output.contiguous().view(torch.uint8).numpy()
                     connection.sendall(
-                        _RESPONSE_HEADER.pack(
-                            _RESPONSE_MAGIC, 0, int(payload.nbytes)
-                        )
+                        _RESPONSE_HEADER.pack(_RESPONSE_MAGIC, 0, int(payload.nbytes))
                     )
                     connection.sendall(memoryview(payload))
             except EOFError:
@@ -247,9 +235,7 @@ class SidecarServer:
                 message = str(error).encode("utf-8")
                 try:
                     connection.sendall(
-                        _RESPONSE_HEADER.pack(
-                            _RESPONSE_MAGIC, 1, len(message)
-                        )
+                        _RESPONSE_HEADER.pack(_RESPONSE_MAGIC, 1, len(message))
                     )
                     connection.sendall(message)
                 except OSError:
@@ -290,16 +276,10 @@ def main() -> None:
     plan = torch.load(args.plan, map_location="cpu", weights_only=True)
     remote_expert_ids = plan["remote_expert_ids"]
     if not isinstance(remote_expert_ids, torch.Tensor):
-        remote_expert_ids = torch.as_tensor(
-            remote_expert_ids, dtype=torch.int64
-        )
+        remote_expert_ids = torch.as_tensor(remote_expert_ids, dtype=torch.int64)
     if remote_expert_ids.ndim != 2:
         raise ValueError("remote_expert_ids must have shape [layers, experts]")
-    layer_end = (
-        remote_expert_ids.shape[0]
-        if args.layer_end is None
-        else args.layer_end
-    )
+    layer_end = remote_expert_ids.shape[0] if args.layer_end is None else args.layer_end
     if not 0 <= args.layer_start < layer_end <= remote_expert_ids.shape[0]:
         raise ValueError(
             "sidecar layer range must satisfy "
@@ -323,8 +303,7 @@ def main() -> None:
             max_tokens=args.max_tokens,
         )
         for layer_idx, expert_ids in enumerate(remote_expert_ids)
-        if args.layer_start <= layer_idx < layer_end
-        and expert_ids.numel() > 0
+        if args.layer_start <= layer_idx < layer_end and expert_ids.numel() > 0
     }
     SidecarServer(
         bind_host=args.bind_host,

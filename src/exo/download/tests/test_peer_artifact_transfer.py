@@ -52,7 +52,10 @@ class InMemoryPeerArtifactReader(PeerArtifactRangeReader):
     ) -> bytes:
         del artifact_path, snapshot_id, artifact_sha256
         await asyncio.sleep(0)
-        if self.fail_after_reads is not None and len(self.calls) >= self.fail_after_reads:
+        if (
+            self.fail_after_reads is not None
+            and len(self.calls) >= self.fail_after_reads
+        ):
             raise ConnectionError("injected interrupted peer transfer")
         self.calls.append((link.link_id, offset_bytes, size_bytes))
         contents = self.contents[offset_bytes : offset_bytes + size_bytes]
@@ -147,9 +150,9 @@ def test_planner_uses_every_explicit_link_and_prefers_faster_links(
     assigned_link_ids = [assignment.link_id for assignment in plan.assignments]
 
     assert set(assigned_link_ids) == {link.link_id for link in _links()}
-    assert assigned_link_ids.count(PeerArtifactLinkId("ib-edr")) > assigned_link_ids.count(
-        PeerArtifactLinkId("ethernet-a")
-    )
+    assert assigned_link_ids.count(
+        PeerArtifactLinkId("ib-edr")
+    ) > assigned_link_ids.count(PeerArtifactLinkId("ethernet-a"))
 
 
 async def test_transfer_verifies_and_atomically_publishes_then_reuses_cache(
@@ -159,9 +162,7 @@ async def test_transfer_verifies_and_atomically_publishes_then_reuses_cache(
     manifest = _manifest(tmp_path, contents)
     reader = InMemoryPeerArtifactReader(contents)
     storage = PeerArtifactStorage(disk_cache_directory=tmp_path / "disk-cache")
-    availability = PeerArtifactStorageAvailability(
-        disk_available_bytes=1024 * 1024
-    )
+    availability = PeerArtifactStorageAvailability(disk_available_bytes=1024 * 1024)
 
     result = await execute_peer_artifact_transfer(
         manifest, _SNAPSHOT_ID, _links(), reader, storage, availability
@@ -192,9 +193,7 @@ async def test_interrupted_transfer_resumes_only_verified_chunks(
     manifest = _manifest(tmp_path, contents, chunk_size_bytes=4)
     single_link = (_links()[0].model_copy(update={"maximum_concurrent_chunks": 1}),)
     storage = PeerArtifactStorage(disk_cache_directory=tmp_path / "disk-cache")
-    availability = PeerArtifactStorageAvailability(
-        disk_available_bytes=1024 * 1024
-    )
+    availability = PeerArtifactStorageAvailability(disk_available_bytes=1024 * 1024)
     interrupted_reader = InMemoryPeerArtifactReader(contents, fail_after_reads=5)
 
     with pytest.raises(ConnectionError, match="injected interrupted"):
@@ -255,13 +254,13 @@ async def test_failed_atomic_publish_leaves_writable_resumable_partial(
     manifest = _manifest(tmp_path, contents)
     cache_root = tmp_path / "disk-cache"
     storage = PeerArtifactStorage(disk_cache_directory=cache_root)
-    availability = PeerArtifactStorageAvailability(
-        disk_available_bytes=1024 * 1024
-    )
+    availability = PeerArtifactStorageAvailability(disk_available_bytes=1024 * 1024)
     original_replace = os.replace
     publish_attempts = 0
 
-    def fail_first_publish(source: os.PathLike[str], destination: os.PathLike[str]) -> None:
+    def fail_first_publish(
+        source: os.PathLike[str], destination: os.PathLike[str]
+    ) -> None:
         nonlocal publish_attempts
         if Path(source).suffix == ".part" and publish_attempts == 0:
             publish_attempts += 1

@@ -8,7 +8,6 @@ import hashlib
 import json
 
 import torch
-
 from sglang.jit_kernel.dsv4 import topk_transform_512
 from sglang.srt.layers.attention.dsv4.tilelang_kernel import (
     tilelang_fp8_bf16_paged_mqa_logits,
@@ -109,18 +108,18 @@ def main() -> None:
         dtype=torch.uint8,
         device="cuda",
     )
-    logits_storage = workspace[
-        output_offset : output_offset + output_bytes
-    ].view(torch.float32)
+    logits_storage = workspace[output_offset : output_offset + output_bytes].view(
+        torch.float32
+    )
     topk_streamed = torch.empty_like(topk_reference)
     caller_pointers_preserved = True
 
     for row_start in range(0, args.rows, args.rows_per_tile):
         row_end = min(row_start + args.rows_per_tile, args.rows)
         tile_rows = row_end - row_start
-        logits_output = logits_storage[
-            : tile_rows * args.max_seq_len
-        ].view(tile_rows, args.max_seq_len)
+        logits_output = logits_storage[: tile_rows * args.max_seq_len].view(
+            tile_rows, args.max_seq_len
+        )
         logits_tile = tilelang_fp8_bf16_paged_mqa_logits(
             q[row_start:row_end],
             cache,
@@ -132,9 +131,7 @@ def main() -> None:
             False,
             logits_output=logits_output,
         )
-        caller_pointers_preserved &= (
-            logits_tile.data_ptr() == logits_output.data_ptr()
-        )
+        caller_pointers_preserved &= logits_tile.data_ptr() == logits_output.data_ptr()
         if not torch.equal(
             logits_reference[row_start:row_end],
             logits_tile,
@@ -155,9 +152,7 @@ def main() -> None:
         torch.sort(topk_streamed, dim=1).values,
     )
     mismatched_elements = int((topk_reference != topk_streamed).sum().item())
-    mismatched_rows = int(
-        (topk_reference != topk_streamed).any(dim=1).sum().item()
-    )
+    mismatched_rows = int((topk_reference != topk_streamed).any(dim=1).sum().item())
     report = {
         "rows": args.rows,
         "max_seq_len": args.max_seq_len,

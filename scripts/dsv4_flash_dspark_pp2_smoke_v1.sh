@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# -ne 1 ]] || [[ ! "$1" =~ ^[01]$ ]]; then
+if [[ $# -ne 1 ]] || [[ ! $1 =~ ^[01]$ ]]; then
   echo "usage: $0 <pipeline-rank: 0|1>" >&2
   exit 2
 fi
