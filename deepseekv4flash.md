@@ -289,6 +289,10 @@ network or mount configuration was changed during this audit.
 
 ## Validation completed
 
+- A fresh GitHub checkout of the published exo branch fetched KTransformers
+  `2521adb0b6b2fc128ed6db533ed9cd5bbb1d5e6c` and nested SGLang
+  `73e877ac5bf60030b8aec16b1c0c890cb65b890c` through the new public HTTPS
+  submodule URLs.
 - exo type checking: 0 errors, 0 warnings, 0 notes.
 - exo-owned tests excluding the optional image suite: 1,169 passed, 5 skipped,
   193 deselected. The image suite could not collect because torch is not
