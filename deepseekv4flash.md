@@ -91,12 +91,14 @@ The tracked KTransformers checkout is `vendor/ktransformers`, branch
 
 | Repository | Published branches | Purpose |
 |---|---|---|
+| `https://github.com/ldyeax/exo` | `agent/linux-cuda-nccl` at `91215c03` | cumulative exo integration and top-level dependency graph |
 | `https://github.com/ldyeax/exo_sglang` | `bundle/glm52-fwuff-sglang` at `73e877ac5`; `exo/dsv4-flash-0731` at `40e43604a` | accumulated reusable SGLang changes and the exact audited 0731 runtime integration |
-| `https://github.com/ldyeax/exo_ktransformers` | `exo/glm52-osdi26-patched` at `2521adb` | accumulated KTransformers changes and public nested SGLang pointer |
+| `https://github.com/ldyeax/exo_ktransformers` | `exo/glm52-osdi26-patched` at `f38772417` | accumulated KTransformers changes and public nested SGLang/llama pointers |
+| `https://github.com/ldyeax/exo_llama_cpp` | `exo/kimi-k3-cumulative` at `651092c60` | cumulative llama.cpp/Kimi K3 inference work shared directly and through KTransformers |
 
-Both repositories are public GitHub forks of their `kvcache-ai` upstreams.
-The exo and KTransformers `.gitmodules` files now use these public HTTPS URLs;
-unmodified third-party submodules continue to use their upstream repositories.
+All four repositories are public GitHub forks. The exo and KTransformers
+`.gitmodules` files use these public HTTPS URLs; unmodified third-party
+submodules continue to use their upstream repositories.
 
 The final reusable release patch has SHA256:
 
@@ -289,9 +291,11 @@ network or mount configuration was changed during this audit.
 
 ## Validation completed
 
-- A fresh GitHub checkout of the published exo branch fetched KTransformers
-  `2521adb0b6b2fc128ed6db533ed9cd5bbb1d5e6c` and nested SGLang
-  `73e877ac5bf60030b8aec16b1c0c890cb65b890c` through the new public HTTPS
+- A fresh GitHub checkout of published exo commit
+  `91215c030813dd46ad343e7c199c6e703ad7de74` fetched KTransformers
+  `f3877241702a99d75fd59f4743733fbbfa633e5e`, direct and nested llama.cpp
+  `651092c60f3832a0e19797083b3feb4c14a40cc5`, and nested SGLang
+  `73e877ac5bf60030b8aec16b1c0c890cb65b890c` through the public HTTPS
   submodule URLs.
 - exo type checking: 0 errors, 0 warnings, 0 notes.
 - exo-owned tests excluding the optional image suite: 1,169 passed, 5 skipped,
@@ -302,21 +306,21 @@ network or mount configuration was changed during this audit.
   DSV4 torch runtime.
 - DeepSeek V4 parser focused test: passed.
 - RunAI streaming loader focused suite: passed.
-- KTransformers port and Python RAWINT4 loader/backend tests: 8 passed.
-- AVX-VNNI per-expert native equivalence test requires rebuilding the KT native
-  extension; the installed pre-audit extension aborts on the new ABI and is
-  therefore not claimed as validated here. It is unrelated to native MXFP4.
+- KTransformers built successfully in CPU-only and CUDA 13.1 SM86 modes
+  against the modern cumulative llama revision. Its system Python extension
+  was then rebuilt against system PyTorch 2.12/CUDA 13.1; focused adapter,
+  loader, expert-mask, auto-release, and shared-host-weight tests report
+  36 passed and 5 skipped.
 - shell syntax, source patch reverse-check, model revision/shards/size, expert
   mask shape/count, and `git diff --check`: passed.
 - No model process, benchmark request, or warmup was run.
 
 Repository-wide Ruff traverses the accumulated vendored SGLang,
-KTransformers, and llama.cpp trees and reports 17,285 pre-existing findings;
-the new preparation helper and its test pass focused Ruff. Unrestricted pytest
-likewise enters vendor test trees and stops during collection on missing
-optional pybind11 and Mooncake test modules. `nix fmt` was requested as required
-by the repository instructions but Nix is not installed on dwagon. No automatic
-formatting rewrite was applied.
+KTransformers, and llama.cpp trees and reports 18,957 findings under exo's
+different lint policy; exo-owned `src`, `scripts`, `tests`, and `tools` paths
+pass focused Ruff. Unrestricted pytest likewise enters independent vendor test
+trees and stops during collection on their optional modules. Nix 2.35.1 is now
+installed system-wide; `nix fmt` completed and a second pass changed no files.
 
 ## Remaining performance validation after an authorized launch
 
@@ -353,8 +357,12 @@ submodule points to `exo_sglang`. Exo also tracks `exo_llama_cpp` directly at
 `vendor/llama.cpp`, preventing the llama work from being siloed under
 KTransformers.
 
-System validation used CUDA 13.1/13.3 from `/opt/cuda`, system-wide ccache
-4.13.5, and system-wide NCCL 2.30.7 installed under `/usr/local`. The cumulative
-llama CUDA/NCCL targets and focused DFlash/RPC/backend tests passed, and
-KTransformers built successfully in both CPU-only and SM86 CUDA modes against
-the new llama revision. No model launch was performed.
+System validation used CUDA 13.1/13.3 from `/opt/cuda`, Nix 2.35.1, ccache
+4.13.5, pytest 9.0.3, NumPy 2.4.6, safetensors 0.7.0, GGUF 0.19.0, and NCCL
+2.30.7 installed system-wide. PyTorch 2.12 was compiled for SM86 against CUDA
+13.1 and cuDNN 9.17; outside the device-restricted sandbox it enumerates both
+RTX 3090s. Gentoo's CUDA Caffe2 ebuild explicitly sets `USE_NCCL=OFF`, so this
+system Torch build does not provide `torch.distributed` NCCL; the installed
+NCCL remains available to SGLang, llama.cpp, and custom builds. The cumulative
+llama runtime and development files are installed under `/usr/local` from the
+verified CUDA build. No model launch was performed.
