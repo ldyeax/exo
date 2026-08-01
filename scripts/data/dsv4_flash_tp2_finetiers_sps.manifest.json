@@ -1,0 +1,150 @@
+{
+  "base_url": "http://127.0.0.1:30010",
+  "tp_size": 2,
+  "dp_size": 1,
+  "verify_num_draft_tokens": 6,
+  "simulate_acc_len": 1.0,
+  "batch_size_per_rank_sweep": [
+    1
+  ],
+  "fracs": [
+    0.16666666666666666,
+    0.3333333333333333,
+    0.5,
+    0.6666666666666666,
+    0.8333333333333334,
+    1.0
+  ],
+  "settings": {
+    "input_len": 8,
+    "temperature": 1.0,
+    "min_steady_steps": 24,
+    "min_steady_seconds": 1.0,
+    "round_timeout_seconds": 120.0,
+    "ramp_token_slack": 16
+  },
+  "repeats": 1,
+  "seed": 42,
+  "timestamp": 1785072922.2382193,
+  "timestamp_iso": "2026-07-26T09:35:22-0400",
+  "conversion_formula": "batch_tokens = num_running_reqs_per_rank * verify_num_draft_tokens; steps_per_sec = 1 / median(server-side step_time over aligned steady steps)",
+  "static_conditioning_caveat": "Profiled with SGLANG_RAGGED_VERIFY_MODE=static: a verify step of B tokens comes from B/(gamma+1) requests, the fewest possible for that B. A compact-mode step with the same B usually spans more requests and reads more KV history, so the table slightly over-estimates steps_per_sec and the scheduler may admit slightly more than optimal. Much smaller bias than the retired non-spec decode proxy, and in the opposite direction.",
+  "records_jsonl": "flash-dspark-v3j-finetiers-sps.records.jsonl",
+  "rounds_jsonl": "flash-dspark-v3j-finetiers-sps.rounds.jsonl",
+  "round_summaries": [
+    {
+      "repeat": 0,
+      "batch_size": 1,
+      "batch_size_per_rank": 1,
+      "frac": 0.16666666666666666,
+      "batch_tokens": 1,
+      "steps_per_sec": 4.8173432063176564,
+      "num_steady_steps": 31,
+      "match_fraction": 1.0,
+      "per_rank_median_step_time": [
+        0.2075833
+      ],
+      "load_info": {
+        "num_requests": 1,
+        "max_new_tokens": 138,
+        "wall_seconds": 8.685,
+        "reached_target": true
+      }
+    },
+    {
+      "repeat": 0,
+      "batch_size": 1,
+      "batch_size_per_rank": 1,
+      "frac": 0.3333333333333333,
+      "batch_tokens": 2,
+      "steps_per_sec": 4.725312839336528,
+      "num_steady_steps": 31,
+      "match_fraction": 1.0,
+      "per_rank_median_step_time": [
+        0.21162620000000001
+      ],
+      "load_info": {
+        "num_requests": 1,
+        "max_new_tokens": 138,
+        "wall_seconds": 8.843,
+        "reached_target": true
+      }
+    },
+    {
+      "repeat": 0,
+      "batch_size": 1,
+      "batch_size_per_rank": 1,
+      "frac": 0.5,
+      "batch_tokens": 3,
+      "steps_per_sec": 4.6142445420408436,
+      "num_steady_steps": 31,
+      "match_fraction": 1.0,
+      "per_rank_median_step_time": [
+        0.2167202
+      ],
+      "load_info": {
+        "num_requests": 1,
+        "max_new_tokens": 138,
+        "wall_seconds": 9.043,
+        "reached_target": true
+      }
+    },
+    {
+      "repeat": 0,
+      "batch_size": 1,
+      "batch_size_per_rank": 1,
+      "frac": 0.6666666666666666,
+      "batch_tokens": 4,
+      "steps_per_sec": 4.541006423253586,
+      "num_steady_steps": 31,
+      "match_fraction": 1.0,
+      "per_rank_median_step_time": [
+        0.22021549999999998
+      ],
+      "load_info": {
+        "num_requests": 1,
+        "max_new_tokens": 138,
+        "wall_seconds": 9.169,
+        "reached_target": true
+      }
+    },
+    {
+      "repeat": 0,
+      "batch_size": 1,
+      "batch_size_per_rank": 1,
+      "frac": 0.8333333333333334,
+      "batch_tokens": 5,
+      "steps_per_sec": 4.488592242814886,
+      "num_steady_steps": 31,
+      "match_fraction": 1.0,
+      "per_rank_median_step_time": [
+        0.222787
+      ],
+      "load_info": {
+        "num_requests": 1,
+        "max_new_tokens": 138,
+        "wall_seconds": 9.266,
+        "reached_target": true
+      }
+    },
+    {
+      "repeat": 0,
+      "batch_size": 1,
+      "batch_size_per_rank": 1,
+      "frac": 1.0,
+      "batch_tokens": 6,
+      "steps_per_sec": 4.414699182397712,
+      "num_steady_steps": 28,
+      "match_fraction": 1.0,
+      "per_rank_median_step_time": [
+        0.226516
+      ],
+      "load_info": {
+        "num_requests": 1,
+        "max_new_tokens": 138,
+        "wall_seconds": 8.734,
+        "reached_target": true
+      }
+    }
+  ]
+}

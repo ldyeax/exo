@@ -1,0 +1,12 @@
+{
+  "artifact": "dsv4_flash_0731_agentic_expert_order.json",
+  "artifact_sha256": "3f893065bf9cc3686a6a4926bf210efc4e7cc2b2035495262db4911f92f22432",
+  "model": "deepseek-ai/DeepSeek-V4-Flash-0731",
+  "model_revision": "7872f01b1d1fe23eabc4c98b48bffcef5a386062",
+  "source_host": "fwuff",
+  "source_path": "/mnt/sanic/projects/deploy-dsv4-general-release/sglang-deploy/benchmarks/dsv4-agentic-hot12-expert-location.json",
+  "source_workload": "agentic",
+  "shape": [43, 256],
+  "semantics": "Each row is a complete hottest-first logical-expert permutation. The dwagon helper selects the first 48 IDs per layer and emits an explicit logical mask.",
+  "copied_read_only": true
+}
