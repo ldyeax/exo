@@ -22,6 +22,7 @@ patch_path="${repo_root}/scripts/patches/dsv4-flash/0001-dsv4-flash-release-audi
 cache_root="${DSV4_CACHE_ROOT:-/var/lib/exo/cache/dsv4-flash-0731-release}"
 context_length="${DSV4_CONTEXT_LENGTH:-65536}"
 tensor_parallel_size="${DSV4_TENSOR_PARALLEL_SIZE:-2}"
+expert_parallel_size="${DSV4_EXPERT_PARALLEL_SIZE:-1}"
 cuda_visible_devices="${DSV4_CUDA_VISIBLE_DEVICES:-}"
 gpu_experts_per_layer="${DSV4_GPU_EXPERTS_PER_LAYER:-48}"
 plan_path="${DSV4_GPU_EXPERT_PLAN:-${cache_root}/agentic-hot${gpu_experts_per_layer}-mask.pt}"
@@ -53,6 +54,10 @@ eager_attn_module_in_bcg="${DSV4_EAGER_ATTN_MODULE_IN_BCG:-}"
 reuse_main_q_shared_mlp="${DSV4_REUSE_MAIN_Q_FOR_SHARED_MLP:-}"
 flashmla_sparse_prefill="${DSV4_FLASHMLA_SPARSE_PREFILL:-}"
 fp8_paged_mqa_logits_torch="${DSV4_FP8_PAGED_MQA_LOGITS_TORCH:-}"
+target_verify_eager="${DSV4_TARGET_VERIFY_EAGER:-}"
+expert_recorder_mode="${DSV4_EXPERT_RECORDER_MODE:-${DSV4_EXPERT_DISTRIBUTION_RECORDER_MODE:-}}"
+expert_recorder_buffer_size="${DSV4_EXPERT_RECORDER_BUFFER_SIZE:-${DSV4_EXPERT_DISTRIBUTION_RECORDER_BUFFER_SIZE:-}}"
+expert_recorder_output_dir="${DSV4_EXPERT_RECORDER_OUTPUT_DIR:-${DSV4_EXPERT_DISTRIBUTION_RECORDER_DIR:-}}"
 # CuTe DSL 4.6 aborts while compiling the SM86 RMSNorm path under the pinned
 # local Python 3.12 runtime. FlashInfer's CUDA JIT implementation is the
 # supported Ampere backend and is also safe for TP graph capture.
@@ -76,11 +81,15 @@ case "$tensor_parallel_size" in
   exit 2
   ;;
 esac
+if [[ ! $expert_parallel_size =~ ^[12]$ ]] || ((tensor_parallel_size % expert_parallel_size != 0)); then
+  echo "DSV4_EXPERT_PARALLEL_SIZE must be 1 or 2 and divide TP size" >&2
+  exit 2
+fi
 read -r -a kt_numa_nodes <<<"$kt_numa_nodes_text"
 case "$expert_location_mode" in
-mask | init) ;;
+mask | init | hybrid) ;;
 *)
-  echo "DSV4_EXPERT_LOCATION_MODE must be mask or init" >&2
+  echo "DSV4_EXPERT_LOCATION_MODE must be mask, init, or hybrid" >&2
   exit 2
   ;;
 esac
@@ -94,6 +103,23 @@ for boolean_value in \
     exit 2
   fi
 done
+if [[ -n $expert_recorder_mode ]]; then
+  case "$expert_recorder_mode" in
+  stat | stat_approx | per_pass | per_token) ;;
+  *)
+    echo "DSV4_EXPERT_RECORDER_MODE must be stat, stat_approx, per_pass, or per_token" >&2
+    exit 2
+    ;;
+  esac
+  if [[ -n $expert_recorder_buffer_size && ! $expert_recorder_buffer_size =~ ^(-1|[1-9][0-9]*)$ ]]; then
+    echo "DSV4_EXPERT_RECORDER_BUFFER_SIZE must be -1 or a positive integer" >&2
+    exit 2
+  fi
+  expert_recorder_output_dir="${expert_recorder_output_dir:-${cache_root}/expert-recorder}"
+elif [[ -n $expert_recorder_buffer_size || -n $expert_recorder_output_dir ]]; then
+  echo "DSV4_EXPERT_RECORDER_MODE is required when recorder buffer or output settings are set" >&2
+  exit 2
+fi
 
 if [[ -n ${DSV4_MODEL_PATH:-} ]]; then
   model_path="$DSV4_MODEL_PATH"
@@ -134,6 +160,9 @@ mkdir -p \
   "${cache_root}/triton" \
   "${cache_root}/flashinfer" \
   "${cache_root}/torchinductor"
+if [[ -n $expert_recorder_mode ]]; then
+  mkdir -p "$expert_recorder_output_dir"
+fi
 "$python_path" "$repo_root/scripts/prepare_dsv4_flash_0731.py" \
   --model "$model_path" \
   --ordering "$ordering_path" \
@@ -188,16 +217,18 @@ export SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1
 export SGLANG_OPT_DEEPGEMM_HC_PRENORM=0
 export SGLANG_RAGGED_VERIFY_MODE="$ragged_verify_mode"
 export SGLANG_ENABLE_CUDA_GRAPH_DEDUP=0
+# The native AMX kernel defaults to eight routed rows.  Keep that parity
+# default while allowing served tuning runs to exercise its accepted small-M
+# path explicitly (for example, threshold five).
+export KT_MXFP4_AMX_MIN_EXPERT_TOKENS="${KT_MXFP4_AMX_MIN_EXPERT_TOKENS:-8}"
 
 if [[ $fwuff_parity_mode == 1 ]]; then
-  unset KT_MXFP4_AMX_MIN_EXPERT_TOKENS
   unset SGLANG_OPT_USE_TILELANG_MHC_PRE SGLANG_OPT_USE_TILELANG_MHC_POST
   unset SGLANG_DSV4_CAPTURE_ATTN_IN_BCG SGLANG_FP8_PAGED_MQA_LOGITS_TORCH
   unset SGLANG_OPT_USE_TOPK_V2 SGLANG_OPT_FLASHMLA_SPARSE_PREFILL
   unset SGLANG_DSV4_TARGET_VERIFY_EAGER SGLANG_KT_DRAFT_GPU_EXPERTS
   unset SGLANG_V4_USE_TRITON_KERNELS
 else
-  export KT_MXFP4_AMX_MIN_EXPERT_TOKENS=8
   export SGLANG_OPT_USE_TILELANG_MHC_PRE=1
   export SGLANG_OPT_USE_TILELANG_MHC_POST=1
   export SGLANG_DSV4_CAPTURE_ATTN_IN_BCG=1
@@ -261,6 +292,14 @@ if [[ -n $fp8_paged_mqa_logits_torch ]]; then
   export SGLANG_FP8_PAGED_MQA_LOGITS_TORCH="$fp8_paged_mqa_logits_torch"
 fi
 
+if [[ -n $target_verify_eager ]]; then
+  if [[ $target_verify_eager != 0 && $target_verify_eager != 1 ]]; then
+    echo "DSV4_TARGET_VERIFY_EAGER must be 0 or 1" >&2
+    exit 2
+  fi
+  export SGLANG_DSV4_TARGET_VERIFY_EAGER="$target_verify_eager"
+fi
+
 if [[ -n $flashinfer_use_cuda_norm ]]; then
   if [[ $flashinfer_use_cuda_norm != 0 && $flashinfer_use_cuda_norm != 1 ]]; then
     echo "DSV4_FLASHINFER_USE_CUDA_NORM must be 0 or 1" >&2
@@ -275,13 +314,34 @@ else
   unset SGLANG_DSV4_FINE_RAGGED_VERIFY_TIERS
 fi
 
+expert_recorder_args=()
+if [[ -n $expert_recorder_mode ]]; then
+  expert_recorder_args=(--expert-distribution-recorder-mode "$expert_recorder_mode")
+  if [[ -n $expert_recorder_buffer_size ]]; then
+    expert_recorder_args+=(
+      --expert-distribution-recorder-buffer-size "$expert_recorder_buffer_size"
+    )
+  fi
+  export SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR="$expert_recorder_output_dir"
+else
+  unset SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR
+fi
+
 expert_location_args=()
 unset SGLANG_KT_EXPERT_PROFILE
 if [[ $expert_location_mode == mask ]]; then
+  unset SGLANG_KT_HYBRID_EXPERT_SHARD_PLAN
   export SGLANG_KT_GPU_EXPERT_MASK_PLAN="$plan_path"
-else
+elif [[ $expert_location_mode == init ]]; then
+  unset SGLANG_KT_HYBRID_EXPERT_SHARD_PLAN
   unset SGLANG_KT_GPU_EXPERT_MASK_PLAN
   expert_location_args=(--init-expert-location "$ordering_path")
+else
+  unset SGLANG_KT_GPU_EXPERT_MASK_PLAN
+  if [[ -z ${SGLANG_KT_HYBRID_EXPERT_SHARD_PLAN:-} ]]; then
+    echo "hybrid expert placement requires SGLANG_KT_HYBRID_EXPERT_SHARD_PLAN" >&2
+    exit 2
+  fi
 fi
 
 radix_cache_args=()
@@ -321,6 +381,8 @@ exec numactl --cpunodebind="$numactl_nodes" --membind="$numactl_nodes" "$python_
   --kt-numa-nodes "${kt_numa_nodes[@]}" \
   --kt-max-deferred-experts-per-token "$max_deferred_experts_per_token" \
   --tensor-parallel-size "$tensor_parallel_size" \
+  --ep-size "$expert_parallel_size" \
+  --moe-a2a-backend none \
   "${expert_location_args[@]}" \
   "${speculative_args[@]}" \
   --context-length "$context_length" \
@@ -341,5 +403,6 @@ exec numactl --cpunodebind="$numactl_nodes" --membind="$numactl_nodes" "$python_
   --cuda-graph-backend-prefill "$prefill_graph_backend" \
   --cuda-graph-max-bs-prefill "$prefill_graph_max" \
   --cuda-graph-bs-prefill "${prefill_graph_tiers[@]}" \
+  "${expert_recorder_args[@]}" \
   "${radix_cache_args[@]}" \
   --skip-server-warmup

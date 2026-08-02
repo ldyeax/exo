@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import importlib.util
 import json
+import sys
 import time
 import urllib.request
 from collections.abc import Callable
@@ -29,6 +30,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input-tokens", type=int, default=2_694)
     parser.add_argument("--output-tokens", type=int, default=512)
     parser.add_argument("--timeout", type=float, default=1800.0)
+    parser.add_argument(
+        "--progress-every",
+        type=int,
+        default=0,
+        help="report every N streamed completion tokens to stderr (0 disables)",
+    )
     parser.add_argument("--output-file", type=Path)
     return parser.parse_args()
 
@@ -99,6 +106,7 @@ def run_benchmark(
     input_ids: list[int],
     output_tokens: int,
     timeout: float,
+    progress_every: int = 0,
 ) -> dict[str, Any]:
     payload = {
         "input_ids": input_ids,
@@ -120,6 +128,7 @@ def run_benchmark(
     arrivals: list[tuple[int, float]] = []
     final_text = ""
     final_metadata: dict[str, Any] = {}
+    next_progress_token = progress_every
     with urllib.request.urlopen(request, timeout=timeout) as response:
         status = response.status
         for raw_line in response:
@@ -136,6 +145,15 @@ def run_benchmark(
                 elapsed = time.perf_counter() - started
                 if not arrivals or completion_tokens > arrivals[-1][0]:
                     arrivals.append((completion_tokens, elapsed))
+                    if progress_every > 0 and completion_tokens >= next_progress_token:
+                        print(
+                            f"completion_tokens={completion_tokens} elapsed={elapsed:.3f}s",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        next_progress_token = (
+                            completion_tokens // progress_every + 1
+                        ) * progress_every
             generated_text = event.get("text")
             if isinstance(generated_text, str):
                 final_text = generated_text
@@ -190,6 +208,7 @@ def main() -> int:
         input_ids,
         args.output_tokens,
         args.timeout,
+        args.progress_every,
     )
     result_json = json.dumps(result, sort_keys=True)
     if args.output_file is not None:

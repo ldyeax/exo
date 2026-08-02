@@ -1,6 +1,6 @@
 # DeepSeek V4 Flash audit, integration, and dwagon handoff
 
-Date: 2026-08-01
+Date: 2026-08-02
 
 Local host: `dwagon`
 
@@ -8,6 +8,44 @@ Reference host: `fwuff`
 Model: `deepseek-ai/DeepSeek-V4-Flash-0731`
 
 ## Final result
+
+The 2026-08-02 continuation reached and exceeded the requested local target.
+The recommended configuration is now TP2/EP2 across both RTX 3090s, with 12
+target experts resident on each GPU and the complementary 116 experts per rank
+served by two socket-local 56-thread AMX pools. The three DSpark draft stages
+remain CPU-offloaded. This is genuine dual-GPU execution plus CPU expert
+offload; it is not a one-GPU result reported under a two-GPU launch.
+
+On the private fwuff workload, repeated fresh-cache runs processed exactly
+2,694 input and 512 output tokens at 12.94 and 12.96 ms mean TPOT. That is
+**77.22 decode tok/s on average**, with a 77.16 tok/s minimum, 6.55 s mean
+TTFT, and 6.80-token mean DSpark acceptance. Against fwuff's recorded 31.088
+tok/s and 25.0995 s TTFT on the same prompt and token shape, dwagon is 2.48x
+faster in decode and reaches the first token 3.83x sooner.
+
+| Runtime / configuration | TTFT | Mean TPOT | Decode rate | DSpark acceptance |
+|---|---:|---:|---:|---:|
+| fwuff best recorded run, private prompt | 25.0995 s | 32.1666 ms | 31.088 tok/s | 5.45 |
+| dwagon August 1 TP1 baseline, same private prompt | 7.8882 s | 32.6061 ms | 30.669 tok/s | 5.375 |
+| dwagon TP2/EP2 hybrid, private prompt, run 1 | 6.5880 s | 12.94 ms | 77.280 tok/s | 6.80 |
+| dwagon TP2/EP2 hybrid, private prompt, run 2 | 6.5044 s | 12.96 ms | 77.160 tok/s | 6.80 |
+
+The public fixed-shape prompt independently produced 75.129, 76.952, and
+81.264 decode tok/s after cache flushes: 77.782 mean and 76.952 median, with
+4.404 s mean TTFT. It has the same 2,694/512 shape but different content, so it
+is supporting reproducibility evidence rather than the direct fwuff comparison.
+
+The key performance unlock was also a correctness fix. A target MoE side
+stream handed a tensor to the consumer stream without recording that consumer,
+allowing allocator reuse while work was still pending. Recording the consumer
+stream closes that lifetime bug. A second overlap path remained timing-sensitive,
+so the hybrid launcher now defaults multi-stream MoE overlap off. With that
+safe path, the blended route placement passed 20/20 deterministic short-output
+runs. Raising the verified DSpark block from five to six then moved the stable
+decode range above 70 tok/s; this also passed 20/20. Every speculative block is
+still checked by the target model.
+
+The earlier audit and parity work follows for provenance.
 
 The fwuff deployment was audited read-only at its moved canonical location,
 `/mnt/sanic/projects/deploy-dsv4-general-release`. No file in Kassie's tree
@@ -20,12 +58,13 @@ recorded on fwuff: **2,694 input tokens and 512 output tokens**. The server had
 128K is now only an optional capacity setting and is not the default benchmark
 or launch shape.
 
-The fastest coherent local configuration found was one GPU, TP1, the fwuff
-hot12 expert ordering, one 60-thread CPU pool on NUMA node 0, two same-layer
-deferred experts, BF16 KV cache, static DSpark verification, DSpark block size
-5, full decode graph, and 256/512/1024/2048 breakable-prefill graph tiers.
+The fastest coherent configuration in the original August 1 audit was one GPU,
+TP1, the fwuff hot12 expert ordering, one 60-thread CPU pool on NUMA node 0,
+two same-layer deferred experts, BF16 KV cache, static DSpark verification,
+DSpark block size 5, full decode graph, and 256/512/1024/2048
+breakable-prefill graph tiers.
 
-On the same 2,694/512 workload:
+That original audit measured:
 
 | Runtime | TTFT | Mean TPOT | Decode rate | DSpark acceptance |
 |---|---:|---:|---:|---:|
@@ -33,12 +72,9 @@ On the same 2,694/512 workload:
 | dwagon exact-parity source/config | 7.8882 s | 32.6061 ms | 30.669 tok/s | 5.375 |
 | dwagon cumulative generic hot12 | 8.1336 s | 32.7127 ms | 30.569 tok/s | 5.375 |
 
-The exact local parity result is 1.37% behind fwuff's best decode TPOT, and the
-reusable cumulative configuration is 1.70% behind. Dwagon's TTFT is much
-lower. The report from memory that fwuff decoded at about 31 tok/s was accurate,
-but it described this short active context, not a 128K prompt.
-
-All model servers were stopped after testing. No model is left running.
+Those numbers established source/configuration parity before the TP2/EP2 work.
+The report from memory that fwuff decoded at about 31 tok/s was accurate, but it
+described this short active context, not a 128K prompt.
 
 ## Reference evidence
 
@@ -77,7 +113,7 @@ integration.
 | Hugging Face revision | `7872f01b1d1fe23eabc4c98b48bffcef5a386062` |
 | architecture | `DeepseekV4ForCausalLM` |
 | layers / routed experts / top-k | 43 / 256 / 6 |
-| DSpark block size | 5 |
+| DSpark block size | checkpoint/default baseline 5; validated hybrid launch 6 |
 | model maximum position length | 1,048,576 |
 | checkpoint | BF16 activations, native MXFP4 routed experts, FP8 dense weights |
 | indexed tensor bytes | 166,878,536,440 |
@@ -170,9 +206,9 @@ capture.
 
 Four focused tests pass, including sentinel routing, invalid protected routes,
 same-layer task ordering, and real CUDA graph capture/replay. The validated
-hot12 benchmark used defer2 with these exact same-layer semantics. TP2 still
-performs better with defer0 than defer2, but both TP2 configurations were far
-behind TP1 because the CPU expert stage remains centralized.
+August 1 hot12 benchmark used defer2 with these exact same-layer semantics.
+The accepted August 2 TP2/EP2 configuration uses defer0 and disjoint CPU expert
+shards, avoiding the centralized stage that made the earlier TP2 runs slow.
 
 ## Optimization campaign
 
@@ -198,17 +234,110 @@ tok/s best row.
 
 Additional controlled checks:
 
-- hot16 on one GPU served but failed deterministic coherency; hot12 remains the
-  largest validated fwuff placement on this checkpoint and hardware;
+- hot16 on one GPU served but failed deterministic coherency; hot12 remained
+  the largest validated placement in the original TP1 campaign;
 - compact ragged verification failed coherency on SM86; static verification is
   retained;
 - a decode-specific route ordering regressed to 28.19 and then 25.37 tok/s and
   changed the coherent result; the generic fwuff ordering is retained;
 - an early cumulative sample measured 39.4148 ms TPOT (25.371 tok/s) with only
-  4.4375 acceptance; the final hot12/static selection restored 32.7127 ms and
-  5.375 acceptance.
+  4.4375 acceptance; the August 1 hot12/static selection restored 32.7127 ms
+  and 5.375 acceptance.
 
-### Interpretation of the observed utilization bursts
+### August 2 TP2/EP2 hybrid campaign
+
+The new path removes the centralized CPU-expert bottleneck from the August 1
+TP2 experiments. Expert parallelism gives each rank a disjoint target shard:
+12 GPU experts and 116 CPU experts per layer, with rank 0 bound to NUMA 0 and
+rank 1 bound to NUMA 1. Both ranks still participate in tensor-parallel dense
+layers and attention. The three draft stages use 128 CPU experts per rank.
+Idle GPU memory after capture was 17,455 MiB on each 24,576 MiB RTX 3090.
+
+Route placement is built from exact distinct decode calls, not aggregate token
+counts alone. Per-pass recorder traces from both replicated ranks are checked
+for agreement and reduced to a 43-by-256 target profile. For every layer the
+GPU union first takes the 12 hottest experts from that live trace, then fills
+the remaining 12 union slots from the older 32K decode profile. The plan is
+disjoint and exhaustive across GPU and CPU owners. On the recorded trace it
+covers 73.36% of distinct expert calls and 87.67% of routed expert instances.
+
+The placement campaign deliberately rejected regressions:
+
+| Change | Fresh 2,694/512 decode result | Decision |
+|---|---:|---|
+| TP2/EP2 legacy target hot12 placement | 30.420 tok/s | coherent baseline; CPU/TP synchronization still dominant |
+| exact-call-only target placement | 28.947 tok/s | reject; low-frequency coverage was too narrow |
+| 16 GPU experts per rank | 30.098 tok/s | reject; extra residency did not repay GPU work |
+| caller-owned in-place MoE output | 23.53-25.31 tok/s | reject and keep default off |
+| lower AMX threshold, smaller GPU sets, eager/full attention variants | slower, invalid, or OOM | reject |
+| blended hot-prefix/fill placement with block 5 and safe streams | 69.24-78.10 tok/s | coherent; established the main speedup |
+| same placement with verified block 6 | 75.13-81.26 tok/s | accept; 77.78 tok/s three-run mean |
+
+The first blended launches exposed an intermittent stream-lifetime failure:
+the same short greedy request produced multiple hashes and occasional runaway
+outputs. Serializing only the KT CPU stream did not fix it. The target shared
+expert path allocated on an alternate CUDA stream, waited before consuming on
+the main stream, but did not register the main stream as a tensor user. The
+implementation now performs producer-to-consumer synchronization followed by
+`Tensor.record_stream(consumer)` in normal and DeepEP joins. PyTorch documents
+that contract in [Tensor.record_stream](https://docs.pytorch.org/docs/stable/generated/torch.Tensor.record_stream.html)
+and its [CUDA semantics note](https://docs.pytorch.org/docs/main/notes/cuda.html).
+
+That allocator fix alone did not eliminate every full-model failure, indicating
+a second overlap-sensitive path. The DSV4 MoE dual-stream branch is therefore
+gated by `SGLANG_OPT_USE_MULTI_STREAM_OVERLAP`, and the hybrid launcher defaults
+it to `0`. This combination passed 20/20 exact short-output runs at block 5 and
+again at block 6. An explicit opt-in remains available for future isolation,
+but it is not a supported performance setting today.
+
+The 512-token public greedy runs completed cleanly but did not have identical
+output SHA256 values across repeats. That is consistent with long-horizon
+numerical sensitivity near greedy decision boundaries, but it means the
+20/20 short gate must not be described as bitwise long-generation determinism.
+The safe-stream configuration eliminated the malformed/runaway behavior seen
+with overlap; a separate long-horizon reference-logit comparison remains useful
+future correctness work.
+
+Block 6 intentionally differs from the checkpoint's advertised block 5. The
+server warns about that gamma mismatch, but speculative correctness is retained
+because all seven proposed/continuation positions are verified by the target
+model. It reduced public benchmark stream events from roughly 88-90 to 77-79
+and raised private-prompt acceptance to 6.80. The repeated private result was
+77.16-77.28 decode tok/s, safely above the requested 70 tok/s.
+
+Draft-hot placement was implemented as a separate, default-off three-stage
+hybrid plan. Its profile covered 97.75% of exact draft calls and 98.90% of draft
+routes at about 459 MiB per GPU, but it failed the earlier overlap-enabled
+coherency gate. It was not mixed into the accepted result; draft experts remain
+CPU-offloaded until that path receives a fresh safe-stream validation.
+
+### Custom-kernel and parallelism findings
+
+A one-expert Any4/TinyGEMM proof was promising: its two GEMMs measured about
+0.031 and 0.019 ms and the full expert about 0.053 ms versus about 0.766 ms for
+the existing eager Triton path, with cosine similarity 1.0. That did not survive
+the real resident/graph shape: 12 separately launched expert kernels took about
+0.405 ms under a CUDA graph versus about 0.373 ms for grouped Triton. The next
+kernel step must therefore be grouped/persistent rather than one launch per
+expert. Any4 is CC-BY-NC-4.0, so its code was not vendored into this Apache
+repository.
+
+This conclusion matches the primary implementation guidance: CUTLASS uses a
+[persistent grouped scheduler](https://docs.nvidia.com/cutlass/4.4.2/media/docs/cpp/grouped_scheduler.html),
+and CUDA graphs reduce launch overhead but do not merge independent kernels
+([NVIDIA CUDA graph launch analysis](https://developer.nvidia.com/blog/constant-time-launch-for-straight-line-cuda-graphs-and-other-performance-enhancements/)).
+NCCL operations remain graph-capturable per the
+[NCCL CUDA Graph guide](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/cudagraph.html),
+so TP/EP communication is not inherently incompatible with the accepted full
+decode graph.
+
+PP was retained as a profiling and multi-host option, but it is a poor fit for
+this single-request two-GPU decode target because it adds bubbles and does not
+solve per-layer expert latency. TP alone had already failed on the centralized
+CPU queue. TP2 plus EP2 is the useful local decomposition: dense work spans both
+GPUs while CPU expert ownership and AMX pools are socket-local.
+
+### Interpretation of the August 1 utilization bursts
 
 The roughly one-second CPU/GPU-on and one-second-off pattern is consistent
 with DSpark blocks and breakable graph segments alternating with a centralized
@@ -217,60 +346,78 @@ often reaches the barrier first. Consequently one GPU can remain saturated
 while the other fluctuates around partial utilization during each burst.
 
 Two identical GPUs do not double this workload automatically. TP2 partitions
-the dense GPU work, but it also adds communication and synchronization around
-a CPU MoE stage that was not expert-parallelized across ranks. Dwagon's extra
-cores and second GPU therefore help TTFT and capacity, but the tested TP2
-shape makes decode slower, not faster. Future multi-GPU work should distribute
-CPU expert ownership or use the implemented remote/CPU-shard tiers instead of
-adding more tensor-parallel ranks around one centralized expert queue.
+the dense GPU work, but the August 1 launch added communication around one
+centralized CPU MoE queue. The accepted August 2 configuration implements the
+remedy anticipated by that finding: EP2 distributes CPU ownership across two
+socket-local queues, then route-aware GPU placement and safe graph execution
+make the second GPU useful during decode.
 
 ## Fastest prepared local launch
 
-The launcher defaults now reproduce the authoritative workload's best expected
-serving shape, not the unrelated 128K capacity target:
+The hybrid launcher now defaults to the accepted local configuration:
 
-- local-only TP1 on physical GPU 0;
-- root `vendor/sglang` cumulative source and `vendor/ktransformers`;
-- 8,192-token context and token capacity, overridable explicitly;
-- hot12 from the complete fwuff 43-by-256 ordering;
-- one 60-thread AMX pool bound to NUMA node 0;
-- defer2 with the corrected same-layer behavior;
-- BF16 KV cache, static DSpark block-5 verification;
+- TP2 and EP2 over physical GPUs 0 and 1;
+- 12 target GPU experts plus 116 socket-local CPU experts on each rank;
+- one 56-thread AMX pool on each of NUMA nodes 0 and 1;
+- all three DSpark draft expert shards on CPU;
+- exact-call hot12 plus 32K-profile fill placement;
+- safe single-stream MoE execution and caller-owned in-place output disabled;
+- BF16 KV cache, static verified DSpark block 6;
 - full decode graph and breakable prefill tiers 256/512/1024/2048;
-- CUDA JIT normalization on SM86;
-- one running request and 2,048-token prefill chunks.
+- 8,192-token context/capacity, one running request, and 2,048-token chunks.
 
-Preparation only; this validates inputs and writes the hot12 plan without
-starting the model:
+The persisted route-count profile is
+`/var/lib/exo/profiles/dsv4-native-mxfp4/flash-v4-agentic-distinct-decode-calls.pt`,
+SHA256 `e0d907f549e1df6658cf92e6755f30efc975e2049e979823d0cf0c927e4b0e35`.
+It contains expert-call counts and recorder provenance, not prompt text. If it
+must be regenerated from a fresh two-rank `per_pass` recording:
 
 ```bash
-scripts/dsv4_flash_fwuff_parity.sh
+scripts/build_dsv4_decode_call_profile.py \
+  --rank-profiles "$RECORDER_RANK0" "$RECORDER_RANK1" \
+  --profile-topology replicated-per-pass \
+  --decode-routes-per-layer 36 \
+  --output /var/lib/exo/profiles/dsv4-native-mxfp4/flash-v4-agentic-distinct-decode-calls.pt
+```
+
+Preparation validates inputs and writes the blended EP2 plan without starting
+the model:
+
+```bash
+scripts/dsv4_flash_hybrid_ep2_dwagon.sh
 ```
 
 Launch when desired:
 
 ```bash
-scripts/dsv4_flash_fwuff_parity.sh --launch
+scripts/dsv4_flash_hybrid_ep2_dwagon.sh --launch
 ```
 
-Then run coherency warm-up before collecting a speed result:
+Gate a changed launch with 20 fresh short requests before measuring it:
 
 ```bash
-scripts/validate_dsv4_flash_coherency.py
+scripts/validate_dsv4_flash_coherency.py \
+  --repetitions 20 --flush-cache-between-runs
 ```
 
 The public-shape benchmark helper defaults to 2,694 input and 512 output
 tokens and does not print generated text:
 
 ```bash
-scripts/benchmark_dsv4_flash_fwuff_baseline.sh
+scripts/benchmark_dsv4_flash_128k.py
 ```
+
+For the direct private comparison, use SGLang's custom dataset benchmark with
+`/tmp/fwuff-agentic-coding.jsonl`, one prompt, `--sharegpt-output-len 512`, no
+warm-up requests, temperature zero, and thinking enabled. Do not publish the
+dataset contents; its identifying SHA256 remains
+`654ed3f540221597965a6f6f9d5486f379d5f70323c17c405f1bb94b5b07934e`.
 
 For capacity testing only, override both limits, for example:
 
 ```bash
 DSV4_CONTEXT_LENGTH=128000 DSV4_MAX_TOTAL_TOKENS=128000 \
-  scripts/dsv4_flash_fwuff_parity.sh --launch
+  scripts/dsv4_flash_hybrid_ep2_dwagon.sh --launch
 ```
 
 That is not the authoritative performance comparison.
@@ -304,28 +451,34 @@ upstream repositories.
   passes; Nix formatting is at a fixed point; pytest reports 1,169 passed,
   6 skipped, and 193 slow tests deselected. Independent vendor trees now use
   their own lint/test policies instead of being recursively collected by exo.
-- SGLang cumulative merge: 46 DSV4/runtime tests passed, 8 platform skips, and
-  10 subtests passed.
-- SGLang KT wrapper: 16 tests passed.
+- Route-profile, shard-plan, and launcher tests: 46 passed.
+- Current focused SGLang DSV4/KT suite: 52 passed, including 33 KT wrapper,
+  eight BCG/stream tests, DSpark synchronization/acceptance, caller-owned MoE
+  output, breakable-graph buffers, frozen draft KV, and SWA cache coverage.
 - DSV4 reasoning parser: 102 tests passed; only counts were exposed during the
   safety review.
-- All changed SGLang Python files compiled; focused lint passed. The inherited
-  upstream files retain their established late-import and lambda conventions.
-- KTransformers deferred experts: 4 tests passed with direct GPU access,
-  including CUDA graph capture/replay.
-- Local exact parity and cumulative hot12 runs passed deterministic coherency.
+- Changed SGLang stream files compile, their focused tests/lint pass, and vendor
+  whitespace checks pass. The inherited production file retains three existing
+  unused local assignments outside this change.
+- KTransformers current-source deferred-expert tests: 5 passed and one CUDA
+  graph test skipped when the final CPU-only test process had no CUDA access.
+- Block-5 blended placement passed 20/20 deterministic short requests;
+  block-6 passed a separate 20/20 gate with the same exact hash.
+- Three public fixed-shape block-6 runs were all above 75 tok/s. Two private
+  fwuff-prompt runs were 77.16-77.28 tok/s with 6.80 acceptance.
 - Model contract, expert ordering, SPS data, shell syntax, and preparation
-  checks pass.
+  checks pass. Default preparation rebuilt a semantically identical persisted
+  GPU/CPU plan from the persisted profile.
 - SPS table SHA256:
   `117b07418b934dd4d3546ab7c32789dfcf1a8648ff6e2ca312076ebd88ff08d2`.
 - CUDA 13.1/13.3 is available under `/opt/cuda`; Nix 2.35.1 and the required
   build/runtime dependencies were installed system-wide rather than hidden in
   project-local workarounds.
-- At handoff, GPU compute-process enumeration is empty.
+- At handoff, all campaign servers are stopped, GPU compute-process enumeration
+  is empty, and the benchmark CPU policy holder verified restoration of all 224
+  cpufreq policies, turbo/pstate state, RAPL limits, and temperature thresholds.
 
-The full-model performance measurements were taken on the validated
-`f829ed5dd` parent of the final cumulative SGLang merge. The final merge keeps
-that implementation as its first parent and adds the older accumulated feature
-line. Its affected compatibility paths have focused regression coverage, but
-the next launch should still begin with the coherency helper before accepting
-any new measurement.
+The August 2 measurements were taken from the current root and vendor working
+trees described here. A future change to placement, DSpark gamma, stream
+overlap, graph capture, or KT output ownership must begin with the 20-run
+coherency gate before its performance result is accepted.

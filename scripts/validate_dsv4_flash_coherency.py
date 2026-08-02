@@ -8,6 +8,7 @@ import hashlib
 import json
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -24,7 +25,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--repetitions", type=int, default=2)
     parser.add_argument("--max-new-tokens", type=int, default=64)
     parser.add_argument("--timeout", type=float, default=300.0)
+    parser.add_argument("--flush-cache-between-runs", action="store_true")
     return parser.parse_args()
+
+
+def flush_cache(completion_url: str, timeout: float) -> None:
+    parsed_url = urllib.parse.urlsplit(completion_url)
+    flush_url = urllib.parse.urlunsplit(
+        (parsed_url.scheme, parsed_url.netloc, "/flush_cache", "timeout=30", "")
+    )
+    request = urllib.request.Request(flush_url, data=b"", method="POST")
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        if response.status != 200:
+            raise RuntimeError(f"cache flush returned HTTP {response.status}")
 
 
 def generate_chat_completion(
@@ -96,19 +109,23 @@ def main() -> int:
 
     expected_marker = "PINEAPPLE"
     try:
-        results = [
-            generate_chat_completion(
-                args.url,
-                args.model_path,
-                expected_marker,
-                args.timeout,
-                args.max_new_tokens,
+        results = []
+        for repetition in range(args.repetitions):
+            if repetition > 0 and args.flush_cache_between_runs:
+                flush_cache(args.url, args.timeout)
+            results.append(
+                generate_chat_completion(
+                    args.url,
+                    args.model_path,
+                    expected_marker,
+                    args.timeout,
+                    args.max_new_tokens,
+                )
             )
-            for _ in range(args.repetitions)
-        ]
     except (
         ImportError,
         OSError,
+        RuntimeError,
         TypeError,
         ValueError,
         urllib.error.HTTPError,
@@ -118,7 +135,7 @@ def main() -> int:
 
     output_hashes = {result["output_sha256"] for result in results}
     deterministic = len(output_hashes) == 1
-    coherent = all(
+    coherent = deterministic and all(
         result["http_status"] == 200 and result["expected_marker_count"] >= 1
         for result in results
     )
