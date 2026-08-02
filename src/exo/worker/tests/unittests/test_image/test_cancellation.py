@@ -9,6 +9,9 @@ from collections.abc import Callable
 from unittest.mock import MagicMock
 
 import mlx.core as mx
+import pytest
+
+pytest.importorskip("torch", reason="image pipeline tests require optional torch")
 
 from exo.shared.types.tasks import CANCEL_ALL_TASKS, TaskId
 from exo.worker.engines.image.pipeline.runner import DiffusionRunner

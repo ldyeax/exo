@@ -6,3 +6,7 @@
 	path = vendor/llama.cpp
 	url = https://github.com/ldyeax/exo_llama_cpp.git
 	branch = exo/kimi-k3-cumulative
+[submodule "vendor/sglang"]
+	path = vendor/sglang
+	url = https://github.com/ldyeax/exo_sglang.git
+	branch = exo/dsv4-cumulative-0801
