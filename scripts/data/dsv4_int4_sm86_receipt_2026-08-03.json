@@ -1,0 +1,253 @@
+{
+  "schema_version": 1,
+  "receipt_id": "dsv4-int4-sm86-2026-08-03",
+  "generated_at_local": "2026-08-03",
+  "scope": "DeepSeek-V4 signed-INT4 latent KV and C4 scorer storage on NVIDIA SM86",
+  "repository": {
+    "exo_head": "268fcabd478a3262352adabe15f35b9640496ad1",
+    "sglang_head": "e2f179cb64714077f9d2ebe0d7ca5fd16923184c",
+    "worktree_state": "dirty shared worktree; paths below are the INT4-track changes, with unrelated concurrent-agent changes intentionally preserved"
+  },
+  "hardware": {
+    "benchmark_gpu": "NVIDIA GeForce RTX 3090",
+    "benchmark_visible_device": 1,
+    "benchmark_logical_device": 0,
+    "compute_capability": "8.6",
+    "gpu_count": 2,
+    "observed_gpu_link": "NV4",
+    "full_multi_gpu_model_run_performed": false
+  },
+  "feature_flags": {
+    "SGLANG_DSV4_INT4_KV_STORAGE": "independent signed-INT4 latent SWA/C4/C128 cache switch",
+    "SGLANG_DSV4_INT4_C4_INDEXER_STORAGE": "independent signed-INT4 C4 indexer/scorer cache switch",
+    "carrier_kv_cache_dtype": "fp8_e4m3",
+    "capability_gate": "exactly CUDA SM86; fail closed on other capabilities",
+    "incompatibilities": [
+      "latent INT4 with HiSparse/unified KV",
+      "C4 indexer INT4 with FP4 indexer"
+    ]
+  },
+  "layouts": {
+    "latent_int4": {
+      "bytes_per_token": 368,
+      "packed_signed_nibbles_bytes": 224,
+      "bf16_rope_bytes": 128,
+      "bf16_group_scale_bytes": 14,
+      "padding_bytes": 2,
+      "nope_dimensions": 448,
+      "group_dimensions": 64,
+      "scale_groups": 7,
+      "quantizer": "symmetric round/clamp to [-7, 7]"
+    },
+    "c4_indexer_int4": {
+      "bytes_per_token": 72,
+      "packed_signed_nibbles_bytes": 64,
+      "bf16_group_scale_bytes": 8,
+      "dimensions": 128,
+      "group_dimensions": 32,
+      "scale_groups": 4,
+      "page_size": 64,
+      "page_bytes": 4608
+    }
+  },
+  "selected_sparse_decode_kernel": {
+    "architecture": "SM86",
+    "block_h": 8,
+    "block_n": 16,
+    "num_warps": 4,
+    "num_stages": 1,
+    "block_d": 512,
+    "scale_load_strategy": "seven scalar BF16 loads per key followed by register broadcast; no per-dimension scale-pointer matrix",
+    "nibble_load_strategy": "one architecture-neutral byte load expression per dimension; an interleave attempt was rejected because it changed 512-D ordering",
+    "tested_variants": [
+      "H16_N16_W4",
+      "H16_N16_W8",
+      "H8_N16_W4",
+      "H8_N16_W8"
+    ],
+    "rejected_variants": {
+      "N8": "Triton compilation error at tl.dot for this tensor-core shape",
+      "interleaved_nibble_tile": "failed exact output parity due to dimension ordering"
+    },
+    "selection_reason": "H8_N16_W4 was the best aggregate geometry across the 21 C4 and 20 C128 compressed layers and across B1/B5; H8_N16_W8 only won the isolated C4 B1 case"
+  },
+  "memory_savings_per_gpu_rank_at_524k": {
+    "pool_configuration": {
+      "layers": 46,
+      "uncompressed_layers": 5,
+      "c4_layers": 21,
+      "c128_layers": 20,
+      "swa_window": 2560,
+      "swa_page_size": 128,
+      "c4_capacity": 131072,
+      "c4_page_size": 64,
+      "c128_capacity": 4096,
+      "c128_page_size": 2
+    },
+    "latent_int4_vs_fp8": {
+      "bytes": 665070528,
+      "mib": 634.2606811523438
+    },
+    "c4_indexer_int4_vs_fp8": {
+      "bytes": 165231360,
+      "mib": 157.576904296875
+    },
+    "combined_vs_fp8": {
+      "bytes": 830301888,
+      "mib": 791.8375854492188
+    }
+  },
+  "validation": [
+    {
+      "name": "combined_kernel_graph_and_pool_suite",
+      "cwd": "/root/exo/vendor/sglang",
+      "command": "FLASHINFER_WORKSPACE_BASE=/tmp/codex-flashinfer PYTHONPATH=/root/exo/vendor/sglang/python CUDA_VISIBLE_DEVICES=1 /var/lib/exo/runtimes/dsv4-native-mxfp4/dwagon/amx-prefill-v1/venv/bin/python -m pytest -q test/registered/kernels/ops/attention/test_dsv4_int4_storage.py test/registered/kernels/ops/attention/test_dsv4_int4_c4_indexer_poc.py test/registered/kernels/ops/attention/test_dsv4_int4_decode.py test/registered/unit/mem_cache/test_dsv4_kv_cache_dtype.py test/registered/unit/model_executor/test_dsv4_pool_configurator_dtype.py --disable-warnings --maxfail=1",
+      "result": {
+        "status": "passed",
+        "passed": 86,
+        "warnings": 5,
+        "seconds": 22.94
+      },
+      "coverage": [
+        "all four independent flag combinations",
+        "capability/carrier/HiSparse/FP4 fail-closed validation",
+        "Triton and CUDA-JIT writers",
+        "negative locations, page edges, and slot reuse",
+        "C4 and C128 sparse decode",
+        "attention sink",
+        "five-row speculative verification geometry",
+        "real CUDA capture and replay",
+        "pool byte accounting and endpoint mode fields"
+      ]
+    },
+    {
+      "name": "targeted_python_lint_and_format",
+      "result": "passed for nine INT4 source/test files; full pre-existing environ.py lint findings were outside this change"
+    },
+    {
+      "name": "python_bytecode_compile_and_scoped_diff_check",
+      "result": "passed for all INT4 Python integration files; scoped git diff --check passed"
+    }
+  ],
+  "benchmarks": {
+    "sparse_decode": {
+      "source": "scripts/bench_dsv4_int4_decode_sm86.py",
+      "source_sha256": "7f480d74d53ef9b4b4a2704ff43071a5bfcfb3fb1dc3a0c8aa47af5cea8dad09",
+      "cwd": "/root/exo",
+      "command": "for batch in 1 5; do for spec in '512 64' '4096 2'; do set -- $spec; FLASHINFER_WORKSPACE_BASE=/tmp/codex-flashinfer PYTHONPATH=/root/exo/vendor/sglang/python CUDA_VISIBLE_DEVICES=1 /var/lib/exo/runtimes/dsv4-native-mxfp4/dwagon/amx-prefill-v1/venv/bin/python /root/exo/scripts/bench_dsv4_int4_decode_sm86.py --batch \"$batch\" --extra-topk \"$1\" --extra-page-size \"$2\"; done; done",
+      "warmup_ms": 500,
+      "measurement_ms": 500,
+      "heads": 16,
+      "head_dimension": 512,
+      "swa_topk": 128,
+      "attention_sink": true,
+      "results": [
+        {
+          "shape": "C4_B1",
+          "extra_topk": 512,
+          "extra_page_size": 64,
+          "int4_ms": 0.223716,
+          "fp8_ms": 0.181158,
+          "bf16_ms": 0.117064,
+          "int4_over_fp8": 1.234922
+        },
+        {
+          "shape": "C128_B1",
+          "extra_topk": 4096,
+          "extra_page_size": 2,
+          "int4_ms": 1.448997,
+          "fp8_ms": 1.159261,
+          "bf16_ms": 0.744418,
+          "int4_over_fp8": 1.249931
+        },
+        {
+          "shape": "C4_B5",
+          "extra_topk": 512,
+          "extra_page_size": 64,
+          "int4_ms": 0.225768,
+          "fp8_ms": 0.180443,
+          "bf16_ms": 0.116368,
+          "int4_over_fp8": 1.251186
+        },
+        {
+          "shape": "C128_B5",
+          "extra_topk": 4096,
+          "extra_page_size": 2,
+          "int4_ms": 1.439343,
+          "fp8_ms": 1.150226,
+          "bf16_ms": 0.740496,
+          "int4_over_fp8": 1.251357
+        }
+      ],
+      "interpretation": "scale hoisting materially improved INT4, but production INT4 sparse decode remains about 23-25% slower than byte-FP8 and is currently a memory-capacity candidate rather than a decode-speed candidate"
+    },
+    "c4_indexer_scorer": {
+      "source": "vendor/sglang/test/registered/kernels/benchmark/attention/bench_dsv4_int4_c4_indexer_poc.py",
+      "source_sha256": "480aaaa06f7ee61d6878cec340464584e1703c2fc19b24805a074c800519015d",
+      "cwd": "/root/exo/vendor/sglang",
+      "command": "FLASHINFER_WORKSPACE_BASE=/tmp/codex-flashinfer PYTHONPATH=/root/exo/vendor/sglang/python CUDA_VISIBLE_DEVICES=1 /var/lib/exo/runtimes/dsv4-native-mxfp4/dwagon/amx-prefill-v1/venv/bin/python test/registered/kernels/benchmark/attention/bench_dsv4_int4_c4_indexer_poc.py --lengths 131072 524288 --batch-size 1 --warmup 50 --repetitions 100 --device 0",
+      "results": [
+        {
+          "live_length": 131072,
+          "int4_ms": 0.07475200295448303,
+          "fp8_ms": 0.06963200122117996,
+          "bf16_ms": 4.819968223571777,
+          "int4_over_fp8": 1.073529435367509
+        },
+        {
+          "live_length": 524288,
+          "int4_ms": 0.23552000522613525,
+          "fp8_ms": 0.24166400730609894,
+          "bf16_ms": 19.24198341369629,
+          "int4_over_fp8": 0.9745762633482217
+        }
+      ]
+    }
+  },
+  "test_source_sha256": {
+    "vendor/sglang/test/registered/kernels/ops/attention/test_dsv4_int4_storage.py": "4d0ff10fdb780da99e440d7ac1347220569378e3d2b50a26791d75e099728de1",
+    "vendor/sglang/test/registered/kernels/ops/attention/test_dsv4_int4_c4_indexer_poc.py": "cbb65808d127401390f74d98f937558584dc7226a3ebc42bdef0482c7d13db88",
+    "vendor/sglang/test/registered/kernels/ops/attention/test_dsv4_int4_decode.py": "4d1ba0d42f7140d6701200a7282f6f8cb73d42f47c987a174056799e359eb300",
+    "vendor/sglang/test/registered/unit/mem_cache/test_dsv4_kv_cache_dtype.py": "b26e1411bf465b1cdcac3c7c6ea0cae62aa74e803adb799f56321e9b9d988d01",
+    "vendor/sglang/test/registered/unit/model_executor/test_dsv4_pool_configurator_dtype.py": "01145aa2950b32eec8d181f1f3bb2871e4d9230878bd181e76ff5d2b095064ac"
+  },
+  "changed_files": [
+    "scripts/bench_dsv4_int4_decode_sm86.py",
+    "scripts/data/dsv4_int4_sm86_receipt_2026-08-03.json",
+    "vendor/sglang/python/sglang/kernels/jit/csrc/deepseek_v4/fused_norm_rope_v2.cuh",
+    "vendor/sglang/python/sglang/kernels/jit/csrc/deepseek_v4/main_norm_rope.cuh",
+    "vendor/sglang/python/sglang/kernels/jit/csrc/deepseek_v4/store.cuh",
+    "vendor/sglang/python/sglang/kernels/ops/attention/dsv4/attn.py",
+    "vendor/sglang/python/sglang/kernels/ops/attention/dsv4/compress.py",
+    "vendor/sglang/python/sglang/kernels/ops/attention/dsv4/dequant_k_cache.py",
+    "vendor/sglang/python/sglang/kernels/ops/attention/dsv4/elementwise.py",
+    "vendor/sglang/python/sglang/kernels/ops/attention/dsv4/int4_c4_indexer_poc.py",
+    "vendor/sglang/python/sglang/kernels/ops/attention/dsv4/int4_decode.py",
+    "vendor/sglang/python/sglang/kernels/ops/attention/dsv4/int4_storage.py",
+    "vendor/sglang/python/sglang/srt/environ.py",
+    "vendor/sglang/python/sglang/srt/layers/attention/deepseek_v4_backend.py",
+    "vendor/sglang/python/sglang/srt/layers/attention/dsv4/compressor.py",
+    "vendor/sglang/python/sglang/srt/layers/attention/dsv4/compressor_v2.py",
+    "vendor/sglang/python/sglang/srt/layers/attention/dsv4/indexer.py",
+    "vendor/sglang/python/sglang/srt/managers/scheduler.py",
+    "vendor/sglang/python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py",
+    "vendor/sglang/python/sglang/srt/mem_cache/dsv4_kv_cache_dtype.py",
+    "vendor/sglang/python/sglang/srt/model_executor/pool_configurator.py",
+    "vendor/sglang/test/registered/kernels/benchmark/attention/bench_dsv4_int4_c4_indexer_poc.py",
+    "vendor/sglang/test/registered/kernels/ops/attention/test_dsv4_int4_c4_indexer_poc.py",
+    "vendor/sglang/test/registered/kernels/ops/attention/test_dsv4_int4_decode.py",
+    "vendor/sglang/test/registered/kernels/ops/attention/test_dsv4_int4_storage.py",
+    "vendor/sglang/test/registered/unit/mem_cache/test_dsv4_kv_cache_dtype.py",
+    "vendor/sglang/test/registered/unit/model_executor/test_dsv4_pool_configurator_dtype.py"
+  ],
+  "untested_or_unaccepted_risks": [
+    "No full DeepSeek-V4 server/model-weight launch was performed for this receipt.",
+    "No end-to-end dual-GPU throughput, TTFT, concurrency, OpenCode, or coherency run was performed; the observed NV4 topology alone does not prove active NVLink traffic in a model run.",
+    "Plain symmetric per-64 latent INT4 is outlier-sensitive and has not passed long-context quality/coherency acceptance. It can perturb QK top-k selection and PV output more than byte-FP8.",
+    "The C4 indexer path is lower risk because its existing normalized H128 rotation precedes per-32 INT4 scoring, but it still requires full-model selection-recall and coherency validation.",
+    "An H64 latent rotation would preserve QK only if applied to both Q and K; because DeepSeek-V4 shares K/V, PV output would remain in the rotated basis unless an inverse is fused or exactly absorbed into wo_a. H64/H32 rotation is therefore not enabled.",
+    "OSCAR-style learned rotations require calibration data and acceptance testing and are not enabled.",
+    "INT4 sparse decode is slower than the Ampere byte-FP8 path in isolated production-shape microbenchmarks; promotion should be based on memory headroom enabling a better whole-model configuration, not an assumed kernel speedup."
+  ],
+  "disposition": "complete, CUDA-graph-safe SM86 implementation; hold behind opt-in flags as a memory-capacity candidate until full-server coherency and long-context quality gates pass"
+}

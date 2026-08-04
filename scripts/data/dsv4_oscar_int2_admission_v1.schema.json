@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "dsv4_oscar_int2_admission_v1.schema.json",
+  "title": "DeepSeek-V4 Flash OSCAR INT2 model admission receipt",
+  "description": "Produced only after rehashing config.json, the safetensors index, and every referenced checkpoint shard, then fully validating the current OSCAR artifact ABI (v2: compressed layers 2..42 only) and its exact model geometry. The admission_sha256 is SHA-256 over canonical sorted compact JSON of every other field.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "format",
+    "format_version",
+    "admitted",
+    "model_id",
+    "artifact_path",
+    "artifact_file_sha256",
+    "artifact_provenance_sha256",
+    "checkpoint_path",
+    "checkpoint_sha256",
+    "config_sha256",
+    "checkpoint_fingerprint_path",
+    "checkpoint_fingerprint_sha256",
+    "validation_policy",
+    "admission_sha256"
+  ],
+  "properties": {
+    "format": {"const": "dsv4-oscar-int2-admission"},
+    "format_version": {"const": 1},
+    "admitted": {"const": true},
+    "model_id": {"type": "string", "minLength": 1},
+    "artifact_path": {"type": "string", "minLength": 1},
+    "artifact_file_sha256": {"$ref": "#/$defs/sha256"},
+    "artifact_provenance_sha256": {"$ref": "#/$defs/sha256"},
+    "checkpoint_path": {"type": "string", "minLength": 1},
+    "checkpoint_sha256": {"$ref": "#/$defs/sha256"},
+    "config_sha256": {"$ref": "#/$defs/sha256"},
+    "checkpoint_fingerprint_path": {"type": "string", "minLength": 1},
+    "checkpoint_fingerprint_sha256": {"$ref": "#/$defs/sha256"},
+    "validation_policy": {
+      "const": "rehash-config-index-and-all-referenced-shards-v1"
+    },
+    "admission_sha256": {"$ref": "#/$defs/sha256"}
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}

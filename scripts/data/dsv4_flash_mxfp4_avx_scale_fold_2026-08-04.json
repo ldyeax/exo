@@ -1,0 +1,339 @@
+{
+  "format": "dsv4-mxfp4-avx-scale-fold-selection-v1",
+  "schema_version": 1,
+  "date": "2026-08-04",
+  "decision": {
+    "status": "admitted",
+    "mode": "lut-v1",
+    "n_block": 128,
+    "reason": "Two alternating checkpoint-backed repetitions improved every high-weight M1-M4 arm and reduced g14-weighted latency by 20.8425 and 22.9150 percent with bit-identical M1-M6 outputs and zero unsafe, rejected, invalid, or fallback counts.",
+    "rejected_modes": {
+      "off": "control",
+      "exponent-v1": "neutral under the two-repetition g14-weighted screen"
+    },
+    "rejected_n_blocks": {
+      "64": "1080.029337 us g14-weighted versus 1004.450386 us for the adjacent N128 first pass",
+      "96": "1384.956807 us g14-weighted; M3/M4 gains did not compensate large M1/M2 regressions",
+      "256": "1182.657648 us g14-weighted versus 1004.450386 us for N128"
+    }
+  },
+  "checkpoint": {
+    "path": "/tmp/dsv4-local-checkpoint-0731",
+    "index_sha256": "98efab455cf08dfbbbaaba6f570e1bf10bf927d2b4c3c453a59c2f6f0e3be92b",
+    "layer": 20,
+    "expert_ids": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23
+    ],
+    "selected_native_tensor_sha256": "80ddefe3283a14c11378cf2aa473570f6710bae17d1855e6220f3bdcee7a561b",
+    "full_scale_domain_receipt": {
+      "path": "scripts/data/dsv4_flash_mxfp4_scale_domain_2026-08-04.json",
+      "sha256": "1b027325b31524de03c6a7b580e5304125adb8154bff4a96c8ded4d6d349499c",
+      "tensor_count": 33024,
+      "scale_bytes": 8657043456,
+      "minimum": 118,
+      "maximum": 126,
+      "unsafe_scale_bytes": 0,
+      "e8m0_nan_count": 0,
+      "scale_content_sha256": "64a6d022552946e6c6bbe3e31f89370582c3df362aba78442da48f60d89e663f"
+    }
+  },
+  "methodology": {
+    "cpu_binding": "0-55",
+    "memory_binding": 0,
+    "worker_threads": 56,
+    "single_numa_inline_dispatch": true,
+    "worker_spin_us": 1000,
+    "route_case_count": 24,
+    "warmup_rounds": 2,
+    "timed_rounds": 5,
+    "iterations_per_round": 24,
+    "samples_per_m_per_arm": 120,
+    "g14_fixed_verify_4_weights_m1_to_m6": [
+      395,
+      349,
+      293,
+      363,
+      0,
+      0
+    ],
+    "weighted_latency_formula": "sum(median_us[m] * weight[m]) / 1400",
+    "fresh_process_per_arm": true,
+    "alternating_mode_order": [
+      "off-1",
+      "lut-v1-1",
+      "exponent-v1-1",
+      "off-2",
+      "lut-v1-2",
+      "exponent-v1-2"
+    ]
+  },
+  "mode_screen_n128": {
+    "off-1": {
+      "median_us_m1_to_m6": [
+        999.103,
+        1076.968,
+        1328.5525,
+        1698.9615,
+        1929.278,
+        2189.526
+      ],
+      "g14_weighted_mean_us": 1268.926017,
+      "receipt_sha256": "b7473d0fcd89482f549052865740129f74ab7654ebc71c97a07764e829f986f5"
+    },
+    "lut-v1-1": {
+      "median_us_m1_to_m6": [
+        523.4885,
+        880.392,
+        1158.068,
+        1523.0905,
+        1714.718,
+        2005.5995
+      ],
+      "g14_weighted_mean_us": 1004.450386,
+      "speedup_over_adjacent_off": 1.263303827,
+      "latency_reduction_fraction": 0.208424784,
+      "receipt_sha256": "ba109093ca9f3de6830400c22c44daab1d4c566b80dcb20c8cb94190149ce9d0"
+    },
+    "exponent-v1-1": {
+      "median_us_m1_to_m6": [
+        999.1395,
+        1139.786,
+        1394.7095,
+        1810.583,
+        2014.889,
+        2307.644
+      ],
+      "g14_weighted_mean_us": 1327.383521,
+      "receipt_sha256": "f6d5b12e7768d75b96731133937995f2a817b8b6876ad496372ac0fff5f87694"
+    },
+    "off-2": {
+      "median_us_m1_to_m6": [
+        998.976,
+        1042.595,
+        1320.605,
+        1734.662,
+        1928.628,
+        2163.5275
+      ],
+      "g14_weighted_mean_us": 1267.914819,
+      "receipt_sha256": "77d7f72eee46d53224d3175861e966c087e93a73fe29d471b5bfed03db9256bd"
+    },
+    "lut-v1-2": {
+      "median_us_m1_to_m6": [
+        475.6355,
+        854.2505,
+        1153.1235,
+        1499.8505,
+        1721.942,
+        1951.56
+      ],
+      "g14_weighted_mean_us": 977.371689,
+      "speedup_over_adjacent_off": 1.297269845,
+      "latency_reduction_fraction": 0.229150354,
+      "receipt_sha256": "a36e451684916a2edd00286f0dd782040a7a83b9f7be61a322758232e38c4912"
+    },
+    "exponent-v1-2": {
+      "median_us_m1_to_m6": [
+        600.51,
+        1091.9405,
+        1400.3005,
+        1817.072,
+        2037.5405,
+        2301.908
+      ],
+      "g14_weighted_mean_us": 1205.838476,
+      "receipt_sha256": "57c327d96fd1d0f4fbba040aebc4f1a18fc76587b440f434931a6db2ebee6c1b"
+    },
+    "two_repetition_aggregate": {
+      "off_g14_weighted_mean_us": 1268.420418,
+      "lut_v1_g14_weighted_mean_us": 990.911038,
+      "lut_v1_speedup": 1.280055,
+      "exponent_v1_g14_weighted_mean_us": 1266.611,
+      "exponent_v1_speedup": 1.001429
+    }
+  },
+  "n_block_screen_lut_v1": {
+    "64": {
+      "median_us_m1_to_m6": [
+        559.385,
+        964.1555,
+        1244.5155,
+        1625.2085,
+        1800.617,
+        2069.6485
+      ],
+      "g14_weighted_mean_us": 1080.029337,
+      "receipt_sha256": "1885ba32069519b89073aee1b0ca2f45e04b06169da42c43125644bfc96e534e"
+    },
+    "96": {
+      "median_us_m1_to_m6": [
+        999.193,
+        1964.3595,
+        1135.241,
+        1449.232,
+        1725.7745,
+        1963.421
+      ],
+      "g14_weighted_mean_us": 1384.956807,
+      "receipt_sha256": "ab1c5430583faf5e16aea408e4ad3120d2ac86178246a1af60db0d64c4477c1a"
+    },
+    "128": {
+      "median_us_m1_to_m6": [
+        523.4885,
+        880.392,
+        1158.068,
+        1523.0905,
+        1714.718,
+        2005.5995
+      ],
+      "g14_weighted_mean_us": 1004.450386,
+      "receipt_sha256": "ba109093ca9f3de6830400c22c44daab1d4c566b80dcb20c8cb94190149ce9d0"
+    },
+    "256": {
+      "median_us_m1_to_m6": [
+        999.2615,
+        931.2635,
+        1144.581,
+        1654.6535,
+        1709.0545,
+        1921.034
+      ],
+      "g14_weighted_mean_us": 1182.657648,
+      "receipt_sha256": "2f22465751c015ca2111fb10c1e8222813345d14422e2514a347522e0a941767"
+    }
+  },
+  "final_combined_artifact": {
+    "path": "/tmp/dsv4-mxfp4-scale-fold-combined-n128-static/lib/kt_kernel/kt_kernel_ext.cpython-312-x86_64-linux-gnu.so",
+    "sha256": "7886a0e7cde36263ac57005aea572fd99a401a8b3107f60d949d0dff97292043",
+    "size_bytes": 9182424,
+    "python_abi": "cp312",
+    "cuda_architectures": [
+      86
+    ],
+    "build_shared_libs": false,
+    "temporary_llama_or_ggml_dependencies": false,
+    "mode": "lut-v1",
+    "n_block": 128,
+    "lut_identity": "mxfp4-e2m1-bf16-ue8m0-lut-v1",
+    "lut_fnv1a64_le": "06d1a83dbf20f545",
+    "rejected_dynamic_artifact_sha256": "b805b7b8624448bfd2c35b5efde7b0299b0738d63122b0cb698a8975d92d0293"
+  },
+  "final_checkpoint_proof": {
+    "receipt_path": "/tmp/dsv4-mxfp4-scale-fold-combined-n128-static/final-checkpoint-telemetry.json",
+    "receipt_sha256": "81de586dfc5e177e0bfbf7bebe6a8914126b9e71a3ecbf1b1324b2fa28252c53",
+    "median_us_m1_to_m6": [
+      510.227,
+      878.0615,
+      1145.445,
+      1487.921,
+      1712.0915,
+      1910.6885
+    ],
+    "g14_weighted_mean_us": 988.367026,
+    "output_sha256_m1_to_m6": [
+      "9a24bb2f6251ff132fcc7f9766715b072163eb6d73662a5adccbad78a4f4ebc1",
+      "9befdc8a12645141410b1fe3c164af72b6423fd6b6ee606c53fd6f6983dfb2d3",
+      "d209d41c5b78b6a411e8d5200d78cc15dbf214e7ad06fbe7be2b84865e80bd60",
+      "9de6e7ebe9399355a395c438ecb34a025f5fbbb4b4c5649cf61f47cbd3cc28fc",
+      "6d35d18a659a424d250322f93db5d0c914895d9eece9d6ac1e598d11703a3e12",
+      "26d88843a29f53a3dcd08e7b7dc4f318dde63f5d74bf375693198c6ce807a305"
+    ],
+    "scale_fold_telemetry": {
+      "buffers_constructed": 72,
+      "buffers_finalized": 72,
+      "buffers_admitted": 72,
+      "buffers_rejected": 0,
+      "scale_bytes_audited": 18874368,
+      "observed_scale_minimum": 119,
+      "observed_scale_maximum": 125,
+      "unsafe_scale_bytes": 0,
+      "nan_scale_bytes": 0,
+      "invalid_mode_requests": 0,
+      "decode_dispatch_count": 572032,
+      "prefill_dispatch_count": 338944,
+      "real_dispatch_count": 910976,
+      "scale_fold_dispatch_count": 910976,
+      "fallback_dispatch_count": 0,
+      "execution_mode": "lut-v1",
+      "whole_buffer_domain_admitted": true,
+      "zero_invalid_or_fallback_counts": true
+    },
+    "cpu_dispatch_telemetry": {
+      "single_numa_inline_dispatch_active": true,
+      "collision_free_worker_zero": true,
+      "logical_worker_zero_proven": true,
+      "task_queue_affinity_active": true,
+      "worker_bindings_active": true,
+      "worker_cpu_ids_unique": true,
+      "workers_on_expected_numa": true,
+      "exception_count": 0
+    },
+    "first_decode_dispatch_log": "[KT][MXFP4] first AVX-512 decode dispatch (pid=2 m=1 n=2048 k=4096 group=32 thread=0/16 scale_fold=lut-v1 domain_finalized=1 n_block=128)"
+  },
+  "binding_contract": {
+    "module": [
+      "mxfp4_avx_scale_fold_telemetry"
+    ],
+    "cpuinfer": [
+      "probe_single_numa_inline_dispatch",
+      "single_numa_inline_dispatch",
+      "task_queue_affinity",
+      "worker_pool_affinity"
+    ],
+    "all_present_in_final_artifact": true,
+    "telemetry_schema_version": 1
+  },
+  "native_source_sha256": {
+    "vendor/ktransformers/kt-kernel/CMakeLists.txt": "6ab281571c037f737a3d17a05d100177bf55c6a177503f78b8997242a004a3a8",
+    "vendor/ktransformers/kt-kernel/ext_bindings.cpp": "d44b0ed0f0511ecbe0b8fb863ae79bcb9012c07ce4b15136a9cd355474ac557e",
+    "vendor/ktransformers/kt-kernel/operators/amx/fp4-moe.hpp": "b4d1595a79aabec6a51060d4678d91883269398708b35c6621b2b70781a8b2b3",
+    "vendor/ktransformers/kt-kernel/operators/amx/test/test_mxfp4_avx_scale_fold.cpp": "bee0332359002da5b331793d0c653b88a4afaa56f56b966d15bc11a49b05b8bb",
+    "vendor/ktransformers/kt-kernel/cpu_backend/cpuinfer.h": "9a015920dd79e257b41b5b725234155f9e780007f7ec80f5237b0ea9665a5484",
+    "vendor/ktransformers/kt-kernel/cpu_backend/task_queue.cpp": "08b5ab61d61240327af668a6b669342aef5d2a3e422890ca5fe498359a46285a",
+    "vendor/ktransformers/kt-kernel/cpu_backend/task_queue.h": "617f81bf808a66edea89f842ca55d03d9a6744bad15777318af14faf9c31d196",
+    "vendor/ktransformers/kt-kernel/cpu_backend/worker_pool.cpp": "299884a458b98e2585c6d8df23f55a4ddc4447a9ac661e9f2bef285bb4a538d2",
+    "vendor/ktransformers/kt-kernel/cpu_backend/worker_pool.h": "aca8662d864e5c3b8339eebe059dfd9c3eedcb83363f0c7e29c570c7dc2e550b",
+    "vendor/ktransformers/kt-kernel/operators/amx/moe_base.hpp": "84d752437bd0ec48d86d8f49842e396c413d86c17b559d622091184cbda1086a"
+  },
+  "validation": {
+    "native_exhaustive_safe_scales": 251,
+    "native_exhaustive_packed_code_pairs_per_scale": 256,
+    "native_m1_to_m6_vec_and_tiled_bitwise_parity": true,
+    "unsafe_encodings_rejected": [
+      0,
+      1,
+      253,
+      254,
+      255
+    ],
+    "ocp_e8m0_byte_0_is_2_pow_minus_127": true,
+    "ocp_e8m0_byte_255_is_nan": true,
+    "scanner_tests": "9 passed",
+    "ruff": "passed",
+    "static_dependency_gate": "passed",
+    "final_checkpoint_output_parity": "bit-identical M1-M6"
+  }
+}

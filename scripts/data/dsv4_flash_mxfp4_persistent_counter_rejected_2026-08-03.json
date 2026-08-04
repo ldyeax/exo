@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "experiment": "dsv4_flash_mxfp4_persistent_aligned_counter",
+  "date": "2026-08-03",
+  "decision": "rejected_default_off",
+  "reason": "The candidate improved only M1 and regressed M2 through M6; geometric throughput was 2.73 percent slower.",
+  "shape": {"hidden_size": 4096, "intermediate_size": 2048, "top_k": 6, "batch_sizes": [1, 2, 3, 4, 5, 6], "expert_count": 12},
+  "methodology": {"numa_node": 0, "worker_threads": 56, "samples_per_shape": 120, "fused_activation": false},
+  "baseline": {
+    "sha256": "32cbe088f6263bfb02c08eb1d7279de1d800147f25bfab5fa293888b2cddc0df",
+    "median_us_m1_to_m6": [2116.3235, 2475.8995, 2732.6855, 2941.401, 3190.643, 3331.044]
+  },
+  "candidate": {
+    "path": "/tmp/dsv4-kt-persistent-counter-a40796696a1181bb/lib/kt_kernel/kt_kernel_ext.cpython-312-x86_64-linux-gnu.so",
+    "sha256": "a40796696a1181bb680379a94d80753345b8f4d979e865b9a49e06ee1c965373",
+    "median_us_m1_to_m6": [2078.245, 2524.871, 2807.107, 3069.4135, 3281.3285, 3563.475]
+  },
+  "baseline_over_candidate_speedup_m1_to_m6": [1.018322, 0.980604, 0.973488, 0.958294, 0.972363, 0.934774],
+  "geometric_speedup": 0.9726515899837883
+}

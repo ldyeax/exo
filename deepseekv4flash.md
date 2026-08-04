@@ -7,7 +7,37 @@ Local host: `dwagon`
 Reference host: `fwuff`
 Model: `deepseek-ai/DeepSeek-V4-Flash-0731`
 
-## Final result
+## 2026-08-02 correction: prior performance acceptance is retracted
+
+The “Final result” section below is retained as historical campaign context,
+but its 75--81 tok/s and 77.22 tok/s claims are **not valid coherent-model
+performance results**. The old public harness used repeated filler input,
+forced 512 output tokens with `ignore_eos`, hid generated text, and did not
+score semantics. Two supposed 90+ tok/s follow-up outputs were exactly 512
+copies of the filler token. The earlier 20/20 gate checked determinism and the
+presence of a marker, not an exact answer or the absence of trailing garbage.
+
+A real OpenCode request subsequently produced corrupt text. The fundamental
+prefill bug was graph-bucket padding writing repeated zero cache locations into
+KV slot 0. The repaired breakable-prefill path now executes the complete DSV4
+attention module on only the live replay rows; target decode, target verify,
+and draft graphs remain enabled. A strict cold-cache gate now requires exact
+semantic content, complete stream termination, and a structurally exact tool
+call.
+
+The checkpoint-trained DSpark block is 5, not the campaign's blocks 6 or 8.
+After restoring block 5 and semantic validation, the first honest 2,694-token
+greedy runs measured 16.90--19.35 decode tok/s with 5.78--6.42 s TTFT. The
+subsequent coherent g13 placement, model-side MoE overlap, qualified FP32
+Markov projection, and pinned AVX small-row CPU tail brought the exact
+no-override launcher to a three-run median of **30.1764 decode tok/s at 4.9368
+s TTFT**. All three outputs stopped naturally and passed semantic gates; three
+cold 42,125-byte OpenCode challenges plus a forced tool call also passed. No
+70, 80, or 90 tok/s coherent result is established. See
+[dsv4flash_opencode.md](dsv4flash_opencode.md) for the incident analysis,
+current configuration, PP concurrency follow-up, and future work.
+
+## Retracted historical result
 
 The 2026-08-02 continuation reached and exceeded the requested local target.
 The recommended configuration is now TP2/EP2 across both RTX 3090s, with 12

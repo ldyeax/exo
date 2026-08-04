@@ -1,0 +1,584 @@
+{
+  "baseline": {
+    "artifacts": [],
+    "description": "Admitted OSCAR INT2 g14 TP2/EP2 baseline with qualified small-row, SM86 small-batch, CARv2, AMX decode, DSpark, and repeated exact/near hotspot gates",
+    "environment": {
+      "DSV4_GPU_EXPERTS_MAX_PER_LAYER": "14"
+    },
+    "expected_plan": "scripts/data/dsv4_flash_opencode_g14_p28_frozen_plan.pt",
+    "expected_plan_sha256": "a0af145d1e127c758c159ba22af44556240940ce52ed6d4c3c0c3438e1909a87",
+    "expected_server_info": {
+      "dsv4_custom_all_reduce_v2_configured": true,
+      "dsv4_small_row_routing_configured": true,
+      "kt_amx_fine_grained_decode_configured": true,
+      "kt_gpu_expert_admission_ceiling": 14,
+      "kt_hybrid_expert_plan_format": "sglang_kt_hybrid_expert_shard_v1",
+      "kt_hybrid_max_gpu_experts_per_rank_per_layer": 14,
+      "kt_hybrid_min_gpu_experts_per_rank_per_layer": 14,
+      "kt_hybrid_placement_semantics_sha256": "c86ba036d3a5076f8d6f8e0a0745c8df4fdd4e460aa45c558cb91c903c722836",
+      "kt_hybrid_total_gpu_expert_layers_by_rank": [
+        602,
+        602
+      ],
+      "kt_mxfp4_amx_min_expert_tokens": 5,
+      "kt_mxfp4_avx_tiled_min_expert_tokens": 2
+    },
+    "id": "g14-oscar-int2-baseline",
+    "plan_materialized_at_launch": false,
+    "policy": "baseline",
+    "predicted": {
+      "decode_tokens_per_second": null,
+      "post_graph_physical_headroom_gib": null,
+      "requires_real_oscar_baseline_receipt": true,
+      "uncached_ttft_seconds": null
+    },
+    "prerequisites": [],
+    "priority": 0
+  },
+  "candidates": [
+    {
+      "artifacts": [
+        {
+          "path": "/var/lib/exo/experiments/dsv4-cpu-inline-scale-lut-n128-v1/lib/kt_kernel/kt_kernel_ext.cpython-312-x86_64-linux-gnu.so",
+          "sha256": "7886a0e7cde36263ac57005aea572fd99a401a8b3107f60d949d0dff97292043"
+        },
+        {
+          "path": "scripts/data/dsv4_flash_mxfp4_avx_scale_fold_2026-08-04.json",
+          "sha256": "c0ec50a98958a767ab1353aa51a10372de21901b259805c94531c033faef1ed6"
+        },
+        {
+          "path": "scripts/data/dsv4_flash_single_numa_inline_dispatch_layer20_2026-08-04.json",
+          "sha256": "cb63ca6db86aa0a46e24f001485306d44da3199f3d241dede344ed61c10c8667"
+        },
+        {
+          "path": "scripts/data/dsv4_flash_mxfp4_scale_domain_2026-08-04.json",
+          "sha256": "1b027325b31524de03c6a7b580e5304125adb8154bff4a96c8ded4d6d349499c"
+        }
+      ],
+      "description": "OSCAR-preserving g14 CPU candidate coupling the 56-worker collision-free inline dispatcher with N128 LUT-folded native MXFP4 AVX decode",
+      "environment": {
+        "DSV4_GPU_EXPERTS_MAX_PER_LAYER": "14",
+        "DSV4_KT_CPU_OPTIMIZED_CACHE_ROOT": "/var/lib/exo/cache/dsv4-cpu-optimized-serving-overlays",
+        "DSV4_KT_CPU_OPTIMIZED_CANDIDATE": "/var/lib/exo/experiments/dsv4-cpu-inline-scale-lut-n128-v1/lib/kt_kernel/kt_kernel_ext.cpython-312-x86_64-linux-gnu.so",
+        "DSV4_STAGE_KT_AVX_TAIL_OVERLAY": "0",
+        "DSV4_STAGE_KT_CPU_OPTIMIZED_OVERLAY": "1",
+        "KT_MXFP4_AVX_SCALE_FOLD_MODE": "lut-v1",
+        "KT_SINGLE_NUMA_INLINE_DISPATCH": "1",
+        "KT_TASK_QUEUE_PIN_FIRST_CORE": "1"
+      },
+      "expected_plan": "scripts/data/dsv4_flash_opencode_g14_p28_frozen_plan.pt",
+      "expected_plan_sha256": "a0af145d1e127c758c159ba22af44556240940ce52ed6d4c3c0c3438e1909a87",
+      "expected_server_info": {
+        "dsv4_custom_all_reduce_v2_configured": true,
+        "dsv4_small_row_routing_configured": true,
+        "kt_amx_fine_grained_decode_configured": true,
+        "kt_gpu_expert_admission_ceiling": 14,
+        "kt_hybrid_expert_plan_format": "sglang_kt_hybrid_expert_shard_v1",
+        "kt_hybrid_max_gpu_experts_per_rank_per_layer": 14,
+        "kt_hybrid_min_gpu_experts_per_rank_per_layer": 14,
+        "kt_hybrid_placement_semantics_sha256": "c86ba036d3a5076f8d6f8e0a0745c8df4fdd4e460aa45c558cb91c903c722836",
+        "kt_hybrid_total_gpu_expert_layers_by_rank": [
+          602,
+          602
+        ],
+        "kt_mxfp4_amx_min_expert_tokens": 5,
+        "kt_mxfp4_avx_scale_fold_configured": true,
+        "kt_mxfp4_avx_scale_fold_expected_n_block": 128,
+        "kt_mxfp4_avx_scale_fold_requested_mode": "lut-v1",
+        "kt_mxfp4_avx_tiled_min_expert_tokens": 2,
+        "kt_single_numa_inline_dispatch_configured": true,
+        "kt_task_queue_affinity_configured": true
+      },
+      "id": "g14-oscar-int2-cpu-inline-scale-lut-n128",
+      "plan_materialized_at_launch": false,
+      "policy": "speed",
+      "predicted": {
+        "checkpoint_scale_domain": [
+          118,
+          126
+        ],
+        "g14_route_weighted_native_latency_reduction_fraction_runs": [
+          0.208424784,
+          0.229150354
+        ],
+        "g14_route_weighted_native_speedup": 1.280055,
+        "post_graph_physical_headroom_gib": null,
+        "requires_real_oscar_baseline_receipt": true
+      },
+      "prerequisites": [
+        "g14-oscar-int2-baseline"
+      ],
+      "priority": 10
+    },
+    {
+      "artifacts": [
+        {
+          "path": "scripts/data/dsv4_flash_residency_k86_routes72.pt.receipt.json",
+          "sha256": "e435135f66a7e48a528efb35de12a9b67f0713fc0cfea3a3b03b9107a91df83f"
+        }
+      ],
+      "description": "OSCAR-preserving variable per-rank/per-layer residency with 86 additional expert slots per rank",
+      "environment": {
+        "DSV4_GPU_EXPERTS_MAX_PER_LAYER": "22"
+      },
+      "expected_plan": "scripts/data/dsv4_flash_residency_k86_routes72.pt",
+      "expected_plan_sha256": "f375eeb413f3a6246d6ef9bf7f90b4e7e308acca2bdfba235683f72c0e1e40e9",
+      "expected_server_info": {
+        "dsv4_custom_all_reduce_v2_configured": true,
+        "dsv4_small_row_routing_configured": true,
+        "kt_amx_fine_grained_decode_configured": true,
+        "kt_gpu_expert_admission_ceiling": 22,
+        "kt_hybrid_expert_plan_format": "sglang_kt_hybrid_expert_shard_v2_variable",
+        "kt_hybrid_max_gpu_experts_per_rank_per_layer": 22,
+        "kt_hybrid_min_gpu_experts_per_rank_per_layer": 14,
+        "kt_hybrid_placement_semantics_sha256": "f91ebe0152b0176403ebaf3c62a2e4f8387a12ba73a85f1aacd09cce1958a105",
+        "kt_hybrid_total_gpu_expert_layers_by_rank": [
+          688,
+          688
+        ],
+        "kt_mxfp4_amx_min_expert_tokens": 5,
+        "kt_mxfp4_avx_tiled_min_expert_tokens": 2
+      },
+      "id": "residency-k86-oscar-int2",
+      "plan_materialized_at_launch": false,
+      "policy": "speed",
+      "predicted": {
+        "offline_mean_critical_tail_reduction_percent": 14.2842,
+        "offline_min_fold_critical_tail_reduction_percent": 13.7067,
+        "post_graph_physical_headroom_gib": null,
+        "requires_real_oscar_baseline_receipt": true,
+        "selected_extra_expert_slots_per_rank": 86
+      },
+      "prerequisites": [
+        "g14-oscar-int2-baseline"
+      ],
+      "priority": 20
+    },
+    {
+      "artifacts": [
+        {
+          "path": "scripts/data/dsv4_flash_residency_k172_routes72.pt.receipt.json",
+          "sha256": "708a2867a8c6ada2131f88e8d652716fe5c6bdbd2573e398b18213ca97cb6c6e"
+        }
+      ],
+      "description": "OSCAR-preserving variable per-rank/per-layer residency with 172 additional expert slots per rank",
+      "environment": {
+        "DSV4_GPU_EXPERTS_MAX_PER_LAYER": "22"
+      },
+      "expected_plan": "scripts/data/dsv4_flash_residency_k172_routes72.pt",
+      "expected_plan_sha256": "fc3540f0a1df6297eb9ebb1abe8c2b3e88465c98012de9cd89ab6b3f469dbebc",
+      "expected_server_info": {
+        "dsv4_custom_all_reduce_v2_configured": true,
+        "dsv4_small_row_routing_configured": true,
+        "kt_amx_fine_grained_decode_configured": true,
+        "kt_gpu_expert_admission_ceiling": 22,
+        "kt_hybrid_expert_plan_format": "sglang_kt_hybrid_expert_shard_v2_variable",
+        "kt_hybrid_max_gpu_experts_per_rank_per_layer": 22,
+        "kt_hybrid_min_gpu_experts_per_rank_per_layer": 14,
+        "kt_hybrid_placement_semantics_sha256": "8a65de3faa322e32db018224e68ec445c8f2a7a2146a616af6d9865a129a9982",
+        "kt_hybrid_total_gpu_expert_layers_by_rank": [
+          774,
+          774
+        ],
+        "kt_mxfp4_amx_min_expert_tokens": 5,
+        "kt_mxfp4_avx_tiled_min_expert_tokens": 2
+      },
+      "id": "residency-k172-oscar-int2",
+      "plan_materialized_at_launch": false,
+      "policy": "speed",
+      "predicted": {
+        "offline_mean_critical_tail_reduction_percent": 22.6882,
+        "offline_min_fold_critical_tail_reduction_percent": 22.0747,
+        "post_graph_physical_headroom_gib": null,
+        "requires_real_oscar_baseline_receipt": true,
+        "selected_extra_expert_slots_per_rank": 172
+      },
+      "prerequisites": [
+        "g14-oscar-int2-baseline"
+      ],
+      "priority": 30
+    },
+    {
+      "artifacts": [
+        {
+          "path": "scripts/data/dsv4_flash_residency_k172_routes72.pt.receipt.json",
+          "sha256": "708a2867a8c6ada2131f88e8d652716fe5c6bdbd2573e398b18213ca97cb6c6e"
+        }
+      ],
+      "description": "OSCAR-preserving nonlinear DSpark test of the confirmed k172 residency plan at fixed verify tier 5",
+      "environment": {
+        "DSV4_DSPARK_FIXED_VERIFY_LEN": "5",
+        "DSV4_GPU_EXPERTS_MAX_PER_LAYER": "22"
+      },
+      "expected_plan": "scripts/data/dsv4_flash_residency_k172_routes72.pt",
+      "expected_plan_sha256": "fc3540f0a1df6297eb9ebb1abe8c2b3e88465c98012de9cd89ab6b3f469dbebc",
+      "expected_server_info": {
+        "dsv4_custom_all_reduce_v2_configured": true,
+        "dsv4_small_row_routing_configured": true,
+        "kt_amx_fine_grained_decode_configured": true,
+        "kt_gpu_expert_admission_ceiling": 22,
+        "kt_hybrid_expert_plan_format": "sglang_kt_hybrid_expert_shard_v2_variable",
+        "kt_hybrid_max_gpu_experts_per_rank_per_layer": 22,
+        "kt_hybrid_min_gpu_experts_per_rank_per_layer": 14,
+        "kt_hybrid_placement_semantics_sha256": "8a65de3faa322e32db018224e68ec445c8f2a7a2146a616af6d9865a129a9982",
+        "kt_hybrid_total_gpu_expert_layers_by_rank": [
+          774,
+          774
+        ],
+        "kt_mxfp4_amx_min_expert_tokens": 5,
+        "kt_mxfp4_avx_tiled_min_expert_tokens": 2,
+        "speculative_dspark_block_size": 5,
+        "speculative_dspark_fixed_verify_len": 5
+      },
+      "id": "residency-k172-oscar-int2-verify5",
+      "plan_materialized_at_launch": false,
+      "policy": "speed",
+      "predicted": {
+        "fixed_verify_len": 5,
+        "hypothesis": "One additional accepted position may repay the larger target-verification row after CPU-tail reduction",
+        "post_graph_physical_headroom_gib": null,
+        "requires_real_oscar_baseline_receipt": true
+      },
+      "prerequisites": [
+        "residency-k172-oscar-int2"
+      ],
+      "priority": 90
+    },
+    {
+      "artifacts": [
+        {
+          "path": "scripts/data/dsv4_flash_residency_k172_routes72.pt.receipt.json",
+          "sha256": "708a2867a8c6ada2131f88e8d652716fe5c6bdbd2573e398b18213ca97cb6c6e"
+        }
+      ],
+      "description": "OSCAR-preserving nonlinear DSpark test of the confirmed k172 residency plan at fixed verify tier 6",
+      "environment": {
+        "DSV4_DSPARK_FIXED_VERIFY_LEN": "6",
+        "DSV4_GPU_EXPERTS_MAX_PER_LAYER": "22"
+      },
+      "expected_plan": "scripts/data/dsv4_flash_residency_k172_routes72.pt",
+      "expected_plan_sha256": "fc3540f0a1df6297eb9ebb1abe8c2b3e88465c98012de9cd89ab6b3f469dbebc",
+      "expected_server_info": {
+        "dsv4_custom_all_reduce_v2_configured": true,
+        "dsv4_small_row_routing_configured": true,
+        "kt_amx_fine_grained_decode_configured": true,
+        "kt_gpu_expert_admission_ceiling": 22,
+        "kt_hybrid_expert_plan_format": "sglang_kt_hybrid_expert_shard_v2_variable",
+        "kt_hybrid_max_gpu_experts_per_rank_per_layer": 22,
+        "kt_hybrid_min_gpu_experts_per_rank_per_layer": 14,
+        "kt_hybrid_placement_semantics_sha256": "8a65de3faa322e32db018224e68ec445c8f2a7a2146a616af6d9865a129a9982",
+        "kt_hybrid_total_gpu_expert_layers_by_rank": [
+          774,
+          774
+        ],
+        "kt_mxfp4_amx_min_expert_tokens": 5,
+        "kt_mxfp4_avx_tiled_min_expert_tokens": 2,
+        "speculative_dspark_block_size": 5,
+        "speculative_dspark_fixed_verify_len": 6
+      },
+      "id": "residency-k172-oscar-int2-verify6",
+      "plan_materialized_at_launch": false,
+      "policy": "speed",
+      "predicted": {
+        "fixed_verify_len": 6,
+        "hypothesis": "The full gamma-plus-one window wins only if acceptance repays sixth-row target and draft overhead",
+        "post_graph_physical_headroom_gib": null,
+        "requires_real_oscar_baseline_receipt": true
+      },
+      "prerequisites": [
+        "residency-k172-oscar-int2"
+      ],
+      "priority": 100
+    }
+  ],
+  "controlled_environment_keys": [
+    "DSV4_CAPTURE_ATTN_IN_BCG",
+    "DSV4_CHUNKED_PREFILL_SIZE",
+    "DSV4_CONTEXT_LENGTH",
+    "DSV4_CPUINFER_THREADS",
+    "DSV4_CUDA_VISIBLE_DEVICES",
+    "DSV4_DECODE_GRAPH_BACKEND",
+    "DSV4_DISABLE_SPECULATIVE",
+    "DSV4_DSPARK_BLOCK_SIZE",
+    "DSV4_DSPARK_FIXED_VERIFY_LEN",
+    "DSV4_EAGER_ATTN_MODULE_IN_BCG",
+    "DSV4_EXPERT_PARALLEL_SIZE",
+    "DSV4_FINE_RAGGED_VERIFY_TIERS",
+    "DSV4_GPU_EXPERTS_MAX_PER_LAYER",
+    "DSV4_GPU_EXPERTS_PER_LAYER",
+    "DSV4_HOTSPOT_EXPERT_CACHE",
+    "DSV4_HYBRID_EXPERT_SHARD_PLAN",
+    "DSV4_KT_CPU_OPTIMIZED_CACHE_ROOT",
+    "DSV4_KT_CPU_OPTIMIZED_CANDIDATE",
+    "DSV4_KT_NUMA_NODES",
+    "DSV4_KT_THREADPOOL_COUNT",
+    "DSV4_KV_CACHE_DTYPE",
+    "DSV4_MAX_DEFERRED_EXPERTS_PER_TOKEN",
+    "DSV4_MAX_TOTAL_TOKENS",
+    "DSV4_MODEL_PATH",
+    "DSV4_NCCL_P2P_LEVEL",
+    "DSV4_NUMACTL_NODES",
+    "DSV4_OPENCODE_WARMUPS",
+    "DSV4_OSCAR_ADMISSION_RECEIPT_PATH",
+    "DSV4_OSCAR_CALIBRATION_PATH",
+    "DSV4_OSCAR_CHECKPOINT_FINGERPRINT_PATH",
+    "DSV4_OSCAR_MODEL_ID",
+    "DSV4_PIPELINE_PARALLEL_SIZE",
+    "DSV4_PREFILL_GRAPH_BACKEND",
+    "DSV4_PREFILL_GRAPH_MAX",
+    "DSV4_PREFILL_GRAPH_TIERS",
+    "DSV4_RAGGED_VERIFY_MODE",
+    "DSV4_SKIP_SERVER_WARMUP",
+    "DSV4_SPS_TABLE",
+    "DSV4_STAGE_KT_AVX_TAIL_OVERLAY",
+    "DSV4_STAGE_KT_CPU_OPTIMIZED_OVERLAY",
+    "DSV4_STAGE_KT_PERSISTENT_COUNTER_OVERLAY",
+    "DSV4_STAGE_KT_TASK_QUEUE_PIN_OVERLAY",
+    "DSV4_SWA_FULL_TOKENS_RATIO",
+    "DSV4_TENSOR_PARALLEL_SIZE",
+    "DSV4_TARGET_VERIFY_EAGER",
+    "KT_AMX_FINE_GRAINED_DECODE",
+    "KT_MXFP4_AMX_MIN_EXPERT_TOKENS",
+    "KT_MXFP4_AVX_SCALE_FOLD_MODE",
+    "KT_MXFP4_AVX_TILED_MIN_EXPERT_TOKENS",
+    "KT_SINGLE_NUMA_INLINE_DISPATCH",
+    "KT_TASK_QUEUE_PIN_FIRST_CORE",
+    "KT_WORKER_SPIN_US",
+    "NCCL_P2P_LEVEL",
+    "SGLANG_DSPARK_DEBUG_DUMP",
+    "SGLANG_DSV4_INT4_C4_INDEXER_STORAGE",
+    "SGLANG_DSV4_INT4_KV_STORAGE",
+    "SGLANG_DSV4_OSCAR_INT2_KV_STORAGE",
+    "SGLANG_DSV4_SM86_C128_BF16_STORAGE",
+    "SGLANG_KT_HYBRID_EXPERT_PLAN_SHA256",
+    "SGLANG_KT_HYBRID_EXPERT_SHARD_PLAN",
+    "SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2",
+    "SGLANG_OPT_USE_MULTI_STREAM_OVERLAP",
+    "SGLANG_V4_MXFP4_SMALL_ROW_ROUTING",
+    "SGLANG_V4_MXFP4_SM86_SMALL_BATCH_GEMM"
+  ],
+  "fixed_environment": {
+    "DSV4_CAPTURE_ATTN_IN_BCG": "0",
+    "DSV4_CHUNKED_PREFILL_SIZE": "1024",
+    "DSV4_CONTEXT_LENGTH": "524288",
+    "DSV4_CPUINFER_THREADS": "56",
+    "DSV4_CUDA_VISIBLE_DEVICES": "0,1",
+    "DSV4_DECODE_GRAPH_BACKEND": "full",
+    "DSV4_DISABLE_SPECULATIVE": "0",
+    "DSV4_DSPARK_BLOCK_SIZE": "5",
+    "DSV4_DSPARK_FIXED_VERIFY_LEN": "4",
+    "DSV4_EAGER_ATTN_MODULE_IN_BCG": "1",
+    "DSV4_EXPERT_PARALLEL_SIZE": "2",
+    "DSV4_FINE_RAGGED_VERIFY_TIERS": "1",
+    "DSV4_GPU_EXPERTS_PER_LAYER": "14",
+    "DSV4_HOTSPOT_EXPERT_CACHE": "0",
+    "DSV4_KT_NUMA_NODES": "0 1",
+    "DSV4_KT_THREADPOOL_COUNT": "1",
+    "DSV4_KV_CACHE_DTYPE": "fp8_e4m3",
+    "DSV4_MAX_DEFERRED_EXPERTS_PER_TOKEN": "0",
+    "DSV4_MAX_TOTAL_TOKENS": "524288",
+    "DSV4_MODEL_PATH": "/tmp/dsv4-local-checkpoint-0731",
+    "DSV4_NCCL_P2P_LEVEL": "NVL",
+    "DSV4_NUMACTL_NODES": "0,1",
+    "DSV4_OPENCODE_WARMUPS": "dsv4_opencode_2694",
+    "DSV4_OSCAR_ADMISSION_RECEIPT_PATH": "/var/lib/exo/cache/dsv4-flash-hybrid-ep2/oscar-int2/admission.json",
+    "DSV4_OSCAR_CALIBRATION_PATH": "/var/lib/exo/cache/dsv4-flash-hybrid-ep2/oscar-int2/dsv4-oscar-int2-calibration.pt",
+    "DSV4_OSCAR_CHECKPOINT_FINGERPRINT_PATH": "/var/lib/exo/cache/dsv4-flash-hybrid-ep2/oscar-int2/checkpoint-fingerprint.json",
+    "DSV4_OSCAR_MODEL_ID": "deepseek-ai/DeepSeek-V4-Flash",
+    "DSV4_PIPELINE_PARALLEL_SIZE": "1",
+    "DSV4_PREFILL_GRAPH_BACKEND": "breakable",
+    "DSV4_PREFILL_GRAPH_MAX": "1024",
+    "DSV4_PREFILL_GRAPH_TIERS": "256 512 1024",
+    "DSV4_RAGGED_VERIFY_MODE": "compact",
+    "DSV4_SKIP_SERVER_WARMUP": "0",
+    "DSV4_SPS_TABLE": "/root/exo/scripts/data/dsv4_flash_tp2_finetiers_sps.json",
+    "DSV4_STAGE_KT_AVX_TAIL_OVERLAY": "1",
+    "DSV4_STAGE_KT_CPU_OPTIMIZED_OVERLAY": "0",
+    "DSV4_STAGE_KT_PERSISTENT_COUNTER_OVERLAY": "0",
+    "DSV4_STAGE_KT_TASK_QUEUE_PIN_OVERLAY": "0",
+    "DSV4_SWA_FULL_TOKENS_RATIO": "0.0048828125",
+    "DSV4_TARGET_VERIFY_EAGER": "0",
+    "DSV4_TENSOR_PARALLEL_SIZE": "2",
+    "KT_AMX_FINE_GRAINED_DECODE": "1",
+    "KT_MXFP4_AMX_MIN_EXPERT_TOKENS": "5",
+    "KT_MXFP4_AVX_SCALE_FOLD_MODE": "off",
+    "KT_MXFP4_AVX_TILED_MIN_EXPERT_TOKENS": "2",
+    "KT_SINGLE_NUMA_INLINE_DISPATCH": "0",
+    "KT_TASK_QUEUE_PIN_FIRST_CORE": "0",
+    "KT_WORKER_SPIN_US": "1000",
+    "SGLANG_DSPARK_DEBUG_DUMP": "core,reqs,step_cpu_time,step_gpu_time,draft_gpu_time,target_verify_gpu_time",
+    "SGLANG_DSV4_INT4_C4_INDEXER_STORAGE": "0",
+    "SGLANG_DSV4_INT4_KV_STORAGE": "0",
+    "SGLANG_DSV4_OSCAR_INT2_KV_STORAGE": "1",
+    "SGLANG_DSV4_SM86_C128_BF16_STORAGE": "0",
+    "SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2": "1",
+    "SGLANG_OPT_USE_MULTI_STREAM_OVERLAP": "1",
+    "SGLANG_V4_MXFP4_SM86_SMALL_BATCH_GEMM": "1",
+    "SGLANG_V4_MXFP4_SMALL_ROW_ROUTING": "1"
+  },
+  "format": "dsv4_candidate_campaign_v1",
+  "gates": {
+    "agents_path": "AGENTS.md",
+    "baseline_repetitions": 3,
+    "bootstrap_samples": 10000,
+    "chat_url": "http://127.0.0.1:30010/v1/chat/completions",
+    "coherency_repetitions": 2,
+    "confirmation_repetitions": 3,
+    "input_tokens": 2694,
+    "maximum_median_ttft_seconds": 7,
+    "maximum_target_verify_ratio": 1.05,
+    "minimum_acceptance_ratio": 0.97,
+    "minimum_confirm_ci_ratio": 0.94,
+    "minimum_headroom_mib": 1536,
+    "minimum_screen_decode_ratio": 0.96,
+    "model_path": "/tmp/dsv4-local-checkpoint-0731",
+    "output_tokens": 512,
+    "request_timeout_seconds": 1800,
+    "screen_repetitions": 1,
+    "server_url": "http://127.0.0.1:30010/server_info",
+    "shutdown_timeout_seconds": 120,
+    "startup_timeout_seconds": 1800
+  },
+  "launcher": "scripts/dsv4_flash_hybrid_ep2_dwagon_opencode.sh",
+  "launcher_sha256": "eec7a8818a3c7b31ade949bcba8e02110814ab18aa216e78242e9df6f81eca9d",
+  "offline_variants": [
+    {
+      "description": "OSCAR-preserving offline interpolation point retained for residency analysis but omitted from executable launches",
+      "expected_plan": "scripts/data/dsv4_flash_residency_k43_routes72.pt",
+      "expected_plan_sha256": "2980d3332a8297b3d5ae362259f868a0a6f1bed9fa97014fb79d6fad458507d1",
+      "id": "residency-k43-oscar-int2",
+      "predicted": {
+        "offline_mean_critical_tail_reduction_percent": 9.2275,
+        "offline_min_fold_critical_tail_reduction_percent": 8.8349,
+        "post_graph_physical_headroom_gib": null,
+        "requires_real_oscar_baseline_receipt": true,
+        "selected_extra_expert_slots_per_rank": 43
+      },
+      "receipt": "scripts/data/dsv4_flash_residency_k43_routes72.pt.receipt.json",
+      "receipt_sha256": "ce7c96446666a0db9ec12c481bbeb00fe65b56a32cc1e3c2e639c0e0e0cf7cdd"
+    }
+  ],
+  "oscar_contract": {
+    "admission_receipt": {
+      "path": "/var/lib/exo/cache/dsv4-flash-hybrid-ep2/oscar-int2/admission.json",
+      "sha256": "6608e24d425cced7100e8e96bb5d31e1b80efce5861fb5fd37f9c027cf04c40e"
+    },
+    "calibration_artifact": {
+      "path": "/var/lib/exo/cache/dsv4-flash-hybrid-ep2/oscar-int2/dsv4-oscar-int2-calibration.pt",
+      "sha256": "b7439a92abde1db65673264422eaa1b09762d48243dc98e54789d72939504ed4"
+    },
+    "checkpoint_fingerprint": {
+      "path": "/var/lib/exo/cache/dsv4-flash-hybrid-ep2/oscar-int2/checkpoint-fingerprint.json",
+      "sha256": "ec313105239a17db2487343729769d7ebcc36f4540f16464e8045a5a81436f15"
+    },
+    "model_id": "deepseek-ai/DeepSeek-V4-Flash"
+  },
+  "source_artifacts": [
+    {
+      "path": "AGENTS.md",
+      "sha256": "39765816689b9984e638bf70b4a1bdd1e6aa46d45316003ddf224f4d41787ed9"
+    },
+    {
+      "path": "scripts/run_dsv4_flash_candidate_campaign.py",
+      "sha256": "1f373e70f0eeea3df5db6674e571ac58c2a8ea9fea49109e376ad5abb5a5619e"
+    },
+    {
+      "path": "scripts/dsv4_flash_hybrid_ep2_dwagon.sh",
+      "sha256": "b133279ee3be0135dc8060d5c10f4d9a8c7cc64e79631aec344c42fc946fff6c"
+    },
+    {
+      "path": "scripts/dsv4_flash_fwuff_parity.sh",
+      "sha256": "af32cc8e680a1bc30f06fe6c7355000e2cdb5ac5decb80b96ac500fd7223c1dc"
+    },
+    {
+      "path": "scripts/dsv4_flash_0731_tp2_dwagon.sh",
+      "sha256": "749dc7ae2d6ec4dfaf8a2b05262f3ceb5efd53a4103b8c53e458f5c0cdb96108"
+    },
+    {
+      "path": "scripts/refresh_dsv4_candidate_campaign_manifest.py",
+      "sha256": "74c15f88c979595068736d33426ce3099bb62f9f8711d0ac3dfdc072a528614e"
+    },
+    {
+      "path": "scripts/dsv4_oscar_int2_calibration.py",
+      "sha256": "e54ef961c3726576f515bc86e0e079f83981a11b38a3d26f346d063c07900142"
+    },
+    {
+      "path": "scripts/data/dsv4_oscar_int2_artifact_v2.schema.json",
+      "sha256": "40d788bdb4396a84538b488d7d1cfc52400b0cabf7c7f682c4f2c43fb22ccb84"
+    },
+    {
+      "path": "scripts/data/dsv4_oscar_int2_admission_v1.schema.json",
+      "sha256": "8fd1a350051a42aaa954c50dc9646ce21a244f5f62385d474d194267e0218678"
+    },
+    {
+      "path": "scripts/benchmark_dsv4_flash_hotspot.py",
+      "sha256": "1c4617a44443357cf26f3b1085b4dd8be9d88c0332e38f6782b5ce8d49d91f2d"
+    },
+    {
+      "path": "scripts/validate_dsv4_flash_coherency.py",
+      "sha256": "aac5842e4dec69f6f5bfd91c58f3f775821eaa88dbb8871ac565dc7e83cf376e"
+    },
+    {
+      "path": "scripts/build_dsv4_variable_residency_plan.py",
+      "sha256": "fb842e9550d808aca5485b57cef8ec92c39fe411de575058fdffc05ebe6bf7f2"
+    },
+    {
+      "path": "scripts/compact_dsv4_expert_profiles.py",
+      "sha256": "0e13d5cb9c49d299d3105e9b82276c668478d8b6d4f7fa6547f6f292faeb3600"
+    },
+    {
+      "path": "scripts/benchmark_dsv4_mxfp4_small_batch_gemm.py",
+      "sha256": "254f119574312ec7e71633921ccb419550e3583372f59d630aad183a2eced999"
+    },
+    {
+      "path": "scripts/materialize_dsv4_frozen_hybrid_plan.py",
+      "sha256": "985d960518519e3cc693aa9123a0220ab2dd9859f090d405a91edf888e8893df"
+    },
+    {
+      "path": "scripts/stage_dsv4_kt_avx_tail_overlay.py",
+      "sha256": "26f85ddefbdaac6aff43b101d96aade9c053b081542f5637bfa38b5e69f16b11"
+    },
+    {
+      "path": "scripts/data/dsv4_flash_opencode_g14_p28_frozen_plan.json",
+      "sha256": "1109946e9b1ba3c237cd96a7b5823fef4cf8f47c00697647392df5ef85e416c6"
+    },
+    {
+      "path": "scripts/data/dsv4_flash_opencode_g14_p28_frozen_plan.pt",
+      "sha256": "a0af145d1e127c758c159ba22af44556240940ce52ed6d4c3c0c3438e1909a87"
+    },
+    {
+      "path": "scripts/data/dsv4_flash_small_row_router_e14_e22_2026-08-03.json",
+      "sha256": "a4ae1018f42f0c8db19d704ac08283280473411e9d8ff9ae6eee8ebc9136a3d8"
+    },
+    {
+      "path": "scripts/data/dsv4_flash_mxfp4_sm86_small_batch_gemm_2026-08-03.json",
+      "sha256": "8f6b2c4ad0709ac109625659a627d36d79ac6cd1e6ec5a53475b1dac159989fe"
+    },
+    {
+      "path": "scripts/data/dsv4_flash_tp2_finetiers_sps.json",
+      "sha256": "3fa3ac99873c782831970569156d1b5125aaf87fe7472f81b71805894d6c3e34"
+    },
+    {
+      "path": "scripts/data/dsv4_flash_opencode_target_distinct_decode_calls_sparse.json",
+      "sha256": "dc6234afa538f65f5ec7a75d8da0dfa736b9d65f45a1fa96e09efdfdd0965ddb"
+    },
+    {
+      "path": "scripts/data/dsv4_flash_draft_distinct_decode_calls_sparse.json",
+      "sha256": "9100d1ef47685c50bc2eb3e47c34a62e39070103626479eeb398c2f5e43e4425"
+    },
+    {
+      "path": "scripts/data/dsv4_flash_0731_agentic_expert_order.json",
+      "sha256": "3f893065bf9cc3686a6a4926bf210efc4e7cc2b2035495262db4911f92f22432"
+    },
+    {
+      "kind": "source_tree",
+      "path": "vendor/sglang/python/sglang",
+      "sha256": "2dc549ae5e2a22e8f88a0d89a365879461a1ed6b3ecef67b8314a126931b89c4"
+    },
+    {
+      "kind": "source_tree",
+      "path": "vendor/ktransformers/kt-kernel",
+      "sha256": "29bcbf79eae0a35c947e555ab745a263755db0f98110a1771a1a0de555f4ddbd"
+    }
+  ]
+}

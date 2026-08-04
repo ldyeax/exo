@@ -4,6 +4,8 @@ import os
 import subprocess
 from pathlib import Path
 
+import pytest
+
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 LAUNCHER = REPOSITORY_ROOT / "scripts" / "dsv4_flash_hybrid_ep2_dwagon.sh"
 
@@ -15,6 +17,13 @@ def launcher_environment(tmp_path: Path) -> tuple[dict[str, str], Path]:
         if not name.startswith("DSV4_")
         and name
         not in {
+            "SGLANG_DSV4_INT4_C4_INDEXER_STORAGE",
+            "SGLANG_DSV4_INT4_KV_STORAGE",
+            "SGLANG_DSV4_OSCAR_ADMISSION_RECEIPT_PATH",
+            "SGLANG_DSV4_OSCAR_CALIBRATION_PATH",
+            "SGLANG_DSV4_OSCAR_CAPTURE_CONFIG",
+            "SGLANG_DSV4_OSCAR_INT2_KV_STORAGE",
+            "SGLANG_DSV4_SM86_C128_BF16_STORAGE",
             "SGLANG_KT_DRAFT_HYBRID_EXPERT_SHARD_PLAN",
             "SGLANG_KT_HYBRID_EXPERT_SHARD_PLAN",
             "SGLANG_OPT_USE_MULTI_STREAM_OVERLAP",
@@ -25,9 +34,11 @@ def launcher_environment(tmp_path: Path) -> tuple[dict[str, str], Path]:
     fake_python.write_text(
         "#!/usr/bin/env bash\n"
         "set -euo pipefail\n"
-        "printf 'multi_stream=%s block_size=%s args=%s\\n' "
+        "printf 'multi_stream=%s block_size=%s bcg_capture=%s bcg_eager=%s args=%s\\n' "
         '"${SGLANG_OPT_USE_MULTI_STREAM_OVERLAP-<unset>}" '
-        '"${DSV4_DSPARK_BLOCK_SIZE-<unset>}" "$*" '
+        '"${DSV4_DSPARK_BLOCK_SIZE-<unset>}" '
+        '"${DSV4_CAPTURE_ATTN_IN_BCG-<unset>}" '
+        '"${DSV4_EAGER_ATTN_MODULE_IN_BCG-<unset>}" "$*" '
         '>>"$DSV4_TEST_PYTHON_INVOCATIONS"\n',
         encoding="utf-8",
     )
@@ -42,9 +53,11 @@ def launcher_environment(tmp_path: Path) -> tuple[dict[str, str], Path]:
     return environment, invocation_log
 
 
-def run_launcher(environment: dict[str, str]) -> subprocess.CompletedProcess[str]:
+def run_launcher(
+    environment: dict[str, str], arguments: tuple[str, ...] = ()
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        ["bash", str(LAUNCHER)],
+        ["bash", str(LAUNCHER), *arguments],
         cwd=REPOSITORY_ROOT,
         env=environment,
         check=False,
@@ -52,6 +65,164 @@ def run_launcher(environment: dict[str, str]) -> subprocess.CompletedProcess[str
         text=True,
         timeout=30,
     )
+
+
+def install_fake_launch_tools(tmp_path: Path, environment: dict[str, str]) -> None:
+    binary_directory = tmp_path / "bin"
+    binary_directory.mkdir()
+    fake_ss = binary_directory / "ss"
+    fake_ss.write_text("#!/usr/bin/env bash\nexit 1\n", encoding="utf-8")
+    fake_ss.chmod(0o755)
+    fake_nvidia_smi = binary_directory / "nvidia-smi"
+    fake_nvidia_smi.write_text(
+        "#!/usr/bin/env bash\nprintf '24576\\n24576\\n'\n",
+        encoding="utf-8",
+    )
+    fake_nvidia_smi.chmod(0o755)
+    fake_numactl = binary_directory / "numactl"
+    fake_numactl.write_text(
+        '#!/usr/bin/env bash\nset -euo pipefail\nshift 2\nexec "$@"\n',
+        encoding="utf-8",
+    )
+    fake_numactl.chmod(0o755)
+    environment["PATH"] = f"{binary_directory}:{environment['PATH']}"
+
+
+def test_actual_launch_requires_oscar_or_calibration_capture(tmp_path: Path) -> None:
+    environment, invocation_log = launcher_environment(tmp_path)
+
+    result = run_launcher(environment, ("--launch",))
+
+    assert result.returncode == 2
+    assert "serving requires SGLANG_DSV4_OSCAR_INT2_KV_STORAGE=1" in result.stderr
+    assert not invocation_log.exists()
+
+
+@pytest.mark.parametrize(
+    ("variable", "invalid_value", "expected_error"),
+    (
+        ("DSV4_CONTEXT_LENGTH", "8192", "DSV4_CONTEXT_LENGTH=524288"),
+        ("DSV4_MAX_TOTAL_TOKENS", "8192", "DSV4_MAX_TOTAL_TOKENS=524288"),
+        ("DSV4_KV_CACHE_DTYPE", "bfloat16", "DSV4_KV_CACHE_DTYPE=fp8_e4m3"),
+        ("DSV4_DECODE_GRAPH_BACKEND", "disabled", "requires decode CUDA graphs"),
+        (
+            "DSV4_DISABLE_SPECULATIVE",
+            "1",
+            "requires graph-backed DSpark speculation",
+        ),
+        (
+            "DSV4_TARGET_VERIFY_EAGER",
+            "1",
+            "requires graph-backed target verification",
+        ),
+    ),
+)
+def test_actual_oscar_launch_rejects_serving_contract_bypasses(
+    tmp_path: Path,
+    variable: str,
+    invalid_value: str,
+    expected_error: str,
+) -> None:
+    environment, invocation_log = launcher_environment(tmp_path)
+    environment.update(
+        {
+            "DSV4_CONTEXT_LENGTH": "524288",
+            "DSV4_MAX_TOTAL_TOKENS": "524288",
+            "DSV4_KV_CACHE_DTYPE": "fp8_e4m3",
+            "SGLANG_DSV4_OSCAR_INT2_KV_STORAGE": "1",
+            variable: invalid_value,
+        }
+    )
+
+    result = run_launcher(environment, ("--launch",))
+
+    assert result.returncode == 2
+    assert expected_error in result.stderr
+    assert not invocation_log.exists()
+
+
+def test_calibration_launch_requires_absolute_regular_capture_config(
+    tmp_path: Path,
+) -> None:
+    environment, invocation_log = launcher_environment(tmp_path)
+    environment["SGLANG_DSV4_OSCAR_CAPTURE_CONFIG"] = "relative-config.json"
+
+    result = run_launcher(environment, ("--launch",))
+
+    assert result.returncode == 2
+    assert "absolute, readable, non-symlink regular config" in result.stderr
+    assert not invocation_log.exists()
+
+
+def test_calibration_launch_rejects_symlinked_capture_config(tmp_path: Path) -> None:
+    environment, invocation_log = launcher_environment(tmp_path)
+    capture_config = tmp_path / "capture.json"
+    capture_config.write_text("{}\n", encoding="utf-8")
+    capture_symlink = tmp_path / "capture-link.json"
+    capture_symlink.symlink_to(capture_config)
+    environment["SGLANG_DSV4_OSCAR_CAPTURE_CONFIG"] = str(capture_symlink)
+
+    result = run_launcher(environment, ("--launch",))
+
+    assert result.returncode == 2
+    assert "absolute, readable, non-symlink regular config" in result.stderr
+    assert not invocation_log.exists()
+
+
+def test_calibration_launch_rejects_oscar_runtime_artifacts(tmp_path: Path) -> None:
+    environment, invocation_log = launcher_environment(tmp_path)
+    capture_config = tmp_path / "capture.json"
+    capture_config.write_text("{}\n", encoding="utf-8")
+    environment["SGLANG_DSV4_OSCAR_CAPTURE_CONFIG"] = str(capture_config)
+    environment["SGLANG_DSV4_OSCAR_CALIBRATION_PATH"] = str(
+        tmp_path / "artifact.pt"
+    )
+
+    result = run_launcher(environment, ("--launch",))
+
+    assert result.returncode == 2
+    assert "must be unset during OSCAR calibration capture" in result.stderr
+    assert not invocation_log.exists()
+
+
+def test_calibration_launch_rejects_non_oscar_compressed_prototype(
+    tmp_path: Path,
+) -> None:
+    environment, invocation_log = launcher_environment(tmp_path)
+    capture_config = tmp_path / "capture.json"
+    capture_config.write_text("{}\n", encoding="utf-8")
+    environment["SGLANG_DSV4_OSCAR_CAPTURE_CONFIG"] = str(capture_config)
+    environment["SGLANG_DSV4_INT4_KV_STORAGE"] = "1"
+
+    result = run_launcher(environment, ("--launch",))
+
+    assert result.returncode == 2
+    assert "is forbidden for OSCAR serving and calibration" in result.stderr
+    assert not invocation_log.exists()
+
+
+def test_calibration_capture_is_the_only_non_oscar_launch_exception(
+    tmp_path: Path,
+) -> None:
+    environment, invocation_log = launcher_environment(tmp_path)
+    capture_config = tmp_path / "capture.json"
+    capture_config.write_text("{}\n", encoding="utf-8")
+    prebuilt_plan = tmp_path / "prebuilt-hybrid-plan.pt"
+    prebuilt_plan.write_bytes(b"test plan")
+    environment.update(
+        {
+            "DSV4_HYBRID_EXPERT_SHARD_PLAN": str(prebuilt_plan),
+            "SGLANG_DSV4_OSCAR_CAPTURE_CONFIG": str(capture_config),
+            "SGLANG_DSV4_OSCAR_INT2_KV_STORAGE": "0",
+        }
+    )
+    install_fake_launch_tools(tmp_path, environment)
+
+    result = run_launcher(environment, ("--launch",))
+
+    assert result.returncode == 0, result.stderr
+    launch = invocation_log.read_text(encoding="utf-8").splitlines()[-1]
+    assert "-m sglang.launch_server" in launch
 
 
 def test_launcher_rejects_gpu_arithmetic_expansion_before_evaluation(
@@ -172,15 +343,16 @@ def test_launcher_defaults_to_validated_dspark_block_size(tmp_path: Path) -> Non
 
     assert result.returncode == 0, result.stderr
     prepare_invocation = invocation_log.read_text(encoding="utf-8").splitlines()[-1]
-    assert " block_size=6 " in prepare_invocation
+    assert " block_size=5 " in prepare_invocation
+    assert " bcg_capture=0 bcg_eager=1 " in prepare_invocation
 
 
 def test_launcher_preserves_explicit_dspark_block_size(tmp_path: Path) -> None:
     environment, invocation_log = launcher_environment(tmp_path)
-    environment["DSV4_DSPARK_BLOCK_SIZE"] = "5"
+    environment["DSV4_DSPARK_BLOCK_SIZE"] = "4"
 
     result = run_launcher(environment)
 
     assert result.returncode == 0, result.stderr
     prepare_invocation = invocation_log.read_text(encoding="utf-8").splitlines()[-1]
-    assert " block_size=5 " in prepare_invocation
+    assert " block_size=4 " in prepare_invocation

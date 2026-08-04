@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -11,11 +12,157 @@ from scripts.build_dsv4_kt_hybrid_shard_plan import (
     GpuSelectionStrategy,
     assign_hybrid_layer,
     load_hottest_first_ordering,
+    load_profile_frequency,
     main,
     reduce_profile,
     select_hottest_first,
     sha256_file,
 )
+
+REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+DRAFT_SPARSE_PROFILE = (
+    REPOSITORY_ROOT
+    / "scripts"
+    / "data"
+    / "dsv4_flash_draft_distinct_decode_calls_sparse.json"
+)
+DRAFT_SOURCE_PROFILE_SHA256 = (
+    "0378abd58ea88b66ef531a96192704af83d3ab50e665b0cfd16b25784f5b1f7f"
+)
+DRAFT_REFERENCE_PLACEMENT_SHA256 = (
+    "e53bbf97ee65b3ae11623965c79c427a03784a0d4556a73a9232a278e0e2260a"
+)
+
+
+def placement_semantics_sha256(plan: dict[str, object]) -> str:
+    gpu_masks = plan["gpu_experts_mask_by_rank"]
+    cpu_expert_ids = plan["cpu_expert_ids_by_rank"]
+    assert isinstance(gpu_masks, torch.Tensor)
+    assert isinstance(cpu_expert_ids, list)
+    semantic_plan = {
+        "gpu_experts_mask_by_rank": gpu_masks.to(torch.uint8).tolist(),
+        "cpu_expert_ids_by_rank": [
+            expert_ids.tolist()
+            for expert_ids in cpu_expert_ids
+            if isinstance(expert_ids, torch.Tensor)
+        ],
+    }
+    serialized = json.dumps(
+        semantic_plan, sort_keys=True, separators=(",", ":")
+    ).encode()
+    return hashlib.sha256(serialized).hexdigest()
+
+
+def test_repo_draft_sparse_profile_preserves_validated_counts() -> None:
+    frequency = load_profile_frequency(DRAFT_SPARSE_PROFILE, label="profile")
+    stored_profile = json.loads(DRAFT_SPARSE_PROFILE.read_text(encoding="utf-8"))
+
+    assert tuple(frequency.shape) == (3, 256)
+    assert frequency.sum(dim=1).tolist() == [1197, 1145, 865]
+    assert (frequency != 0).sum(dim=1).tolist() == [41, 39, 33]
+    assert stored_profile["source_profile_sha256"] == DRAFT_SOURCE_PROFILE_SHA256
+
+
+@pytest.mark.parametrize(
+    ("logical_count", "error_type", "message"),
+    [
+        (
+            {"shape": [1, 4], "rows": [[[2, 1], [1, 2]]]},
+            ValueError,
+            "strictly increasing",
+        ),
+        (
+            {"shape": [1, 4], "rows": [[[1, True]]]},
+            TypeError,
+            "must be an integer",
+        ),
+        (
+            {"shape": [1, 4], "rows": [[[1, 0]]]},
+            ValueError,
+            "positive int64",
+        ),
+        (
+            {"shape": [2, 4], "rows": [[]]},
+            ValueError,
+            "must contain 2 rows",
+        ),
+    ],
+)
+def test_sparse_json_profile_strictly_validates_logical_count(
+    tmp_path: Path,
+    logical_count: dict[str, object],
+    error_type: type[Exception],
+    message: str,
+) -> None:
+    profile_path = tmp_path / "profile.json"
+    profile_path.write_text(
+        json.dumps(
+            {
+                "format": "dsv4_sparse_logical_count_v1",
+                "source_profile_sha256": "0" * 64,
+                "logical_count": logical_count,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(error_type, match=message):
+        load_profile_frequency(profile_path, label="profile")
+
+
+def test_sparse_json_profile_rejects_unrecognized_metadata(tmp_path: Path) -> None:
+    profile_path = tmp_path / "profile.json"
+    profile_path.write_text(
+        json.dumps(
+            {
+                "format": "dsv4_sparse_logical_count_v1",
+                "source_profile_sha256": "0" * 64,
+                "logical_count": {"shape": [1, 1], "rows": [[]]},
+                "unexpected": "silently ignored metadata is not allowed",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="must contain exactly"):
+        load_profile_frequency(profile_path, label="profile")
+
+
+def test_repo_draft_sparse_profile_reproduces_reference_placement(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    output_path = tmp_path / "draft-hybrid.pt"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "build_dsv4_kt_hybrid_shard_plan.py",
+            "--profile",
+            str(DRAFT_SPARSE_PROFILE),
+            "--ordering",
+            str(
+                REPOSITORY_ROOT
+                / "scripts"
+                / "data"
+                / "dsv4_flash_0731_agentic_expert_order.json"
+            ),
+            "--ordering-layer-indices",
+            "40,41,42",
+            "--output",
+            str(output_path),
+            "--gpu-rank-counts",
+            "12,12",
+            "--cpu-rank-counts",
+            "116,116",
+            "--gpu-selection",
+            "profile-hot",
+        ],
+    )
+
+    main()
+
+    plan = torch.load(output_path, map_location="cpu", weights_only=True)
+    assert placement_semantics_sha256(plan) == DRAFT_REFERENCE_PLACEMENT_SHA256
 
 
 def test_ordering_can_select_rows_for_a_short_draft_profile(tmp_path: Path) -> None:

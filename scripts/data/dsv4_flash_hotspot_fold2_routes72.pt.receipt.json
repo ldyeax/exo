@@ -1,0 +1,14 @@
+{
+  "format": "dsv4_compact_logical_count_profile_receipt_v1",
+  "profile": "/root/exo/scripts/data/dsv4_flash_hotspot_fold2_routes72.pt",
+  "profile_sha256": "4467593c296a77085848462c6f74583a28a3e625b5d7737e33cbfb48b7ae6cb1",
+  "routes_per_layer": 72,
+  "sample_count": 95,
+  "semantic_sha256": "34ac37b9c0edecedf64c06ad80cd192231e5fe44187eed4f295fac4b5e9cccbd",
+  "shape": [
+    43,
+    256
+  ],
+  "source": "/tmp/dsv4-hotspot-campaign.nCvGsi/recorder/expert_distribution_recorder_1785774322.9161453.pt",
+  "source_sha256": "468c0de098ace47b752e2602e0c54fa873a0964914c8a47b0c4a83d50b517122"
+}

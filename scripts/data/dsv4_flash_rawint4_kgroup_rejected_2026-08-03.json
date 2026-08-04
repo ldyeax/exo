@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "experiment": "dsv4_flash_signed_rawint4_kgroup32_cpu",
+  "date": "2026-08-03",
+  "decision": "rejected_no_artifact_conversion",
+  "reason": "The existing bound AMX signed-INT4 group-32 kernel was slower than native MXFP4 and still introduced excessive expert-output error.",
+  "extension": {
+    "path": "/var/lib/exo/experiments/dsv4-avx-tail23-nblock128/lib/kt_kernel/kt_kernel_ext.cpython-312-x86_64-linux-gnu.so",
+    "sha256": "32cbe088f6263bfb02c08eb1d7279de1d800147f25bfab5fa293888b2cddc0df"
+  },
+  "source": {
+    "checkpoint": "/tmp/dsv4-local-checkpoint-0731",
+    "index_sha256": "98efab455cf08dfbbbaaba6f570e1bf10bf927d2b4c3c453a59c2f6f0e3be92b",
+    "layer": 21,
+    "expert_ids": [0, 7, 23, 41, 64, 89, 113, 137, 166, 193, 224, 255],
+    "selected_native_tensor_sha256": "d892241b65890b3d888db0da636917453c13b2ef940fbc1767c493b2a5c863ae"
+  },
+  "shape": {"hidden_size": 4096, "intermediate_size": 2048, "top_k": 6, "group_size": 32, "batch_sizes": [1, 2, 3, 4, 5, 6], "expert_count": 12, "route_bank_packed_bytes": 160432128},
+  "methodology": {"numa_node": 0, "worker_threads": 56, "route_cases": 12, "warmup_rounds": 2, "timed_rounds": 5, "iterations_per_round": 24, "samples_per_shape_backend": 120, "swiglu_limit": 10.0, "fused_activation": false, "quantization": "signed symmetric int4, per-output-row per-K-group amax/7 BF16 scale"},
+  "mxfp4_median_us_m1_to_m6": [2094.3545, 2462.7925, 2784.8305, 2933.3415, 3247.9835, 3377.126],
+  "rawint4_median_us_m1_to_m6": [2095.12, 2352.6595, 2760.838, 4155.901, 4071.9525, 4258.9255],
+  "rawint4_speedup_over_mxfp4_m1_to_m6": [0.9996346271, 1.046812129, 1.0086902962, 0.7058256441, 0.7976476887, 0.7929525886],
+  "rawint4_geometric_speedup": 0.8821395105086414,
+  "rawint4_vs_mxfp4_cosine_m1_to_m6": [0.9876905719, 0.9874568814, 0.9871556205, 0.9872352903, 0.9875297612, 0.9869981539],
+  "rawint4_vs_mxfp4_relative_l1_m1_to_m6": [0.1580165629, 0.1598019933, 0.1606373469, 0.160597347, 0.1591099397, 0.1631654253]
+}

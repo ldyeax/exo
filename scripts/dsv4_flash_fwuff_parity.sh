@@ -28,21 +28,22 @@ export DSV4_PREFILL_GRAPH_BACKEND="${DSV4_PREFILL_GRAPH_BACKEND:-breakable}"
 # Preserve the exact deployed graph shape. The authoritative request uses the
 # 2,048 tier followed by a sub-1K tail, while the smaller tiers remain useful
 # for warm-up and shorter prompts.
-export DSV4_PREFILL_GRAPH_TIERS="256 512 1024 2048"
-export DSV4_PREFILL_GRAPH_MAX=2048
+export DSV4_PREFILL_GRAPH_TIERS="${DSV4_PREFILL_GRAPH_TIERS:-256 512 1024 2048}"
+export DSV4_PREFILL_GRAPH_MAX="${DSV4_PREFILL_GRAPH_MAX:-2048}"
 export DSV4_RAGGED_VERIFY_MODE="${DSV4_RAGGED_VERIFY_MODE:-static}"
 export DSV4_FINE_RAGGED_VERIFY_TIERS="${DSV4_FINE_RAGGED_VERIFY_TIERS:-0}"
 export DSV4_EXPERT_LOCATION_MODE="${DSV4_EXPERT_LOCATION_MODE:-init}"
 export DSV4_DISABLE_RADIX_CACHE="${DSV4_DISABLE_RADIX_CACHE:-0}"
-# 0.10 rounds down to three 256-token SWA pages at the default 8K capacity.
-# The authoritative 2,694/512 request can require a fourth page while a
-# chunk is retired, so retain the TP2 launcher's 0.15 headroom.
-export DSV4_SWA_FULL_TOKENS_RATIO="${DSV4_SWA_FULL_TOKENS_RATIO:-0.15}"
+# A 2,048-token prefill chunk requires one paging allowance plus two complete
+# chunks: 256 + 2 * 2,048 = 4,352 SWA slots.  Reserve exactly that floor at
+# the default 8,192-token capacity instead of silently clamping chunks.
+export DSV4_SWA_FULL_TOKENS_RATIO="${DSV4_SWA_FULL_TOKENS_RATIO:-0.53125}"
 export DSV4_FWUFF_PARITY_MODE=1
-# fwuff captures attention projections and breaks around only the backend
-# attention call.  Select the equivalent boundary in the evolved local source.
+# Keep projections and cache preparation out of breakable prefill replay along
+# with the backend attention call.  The older narrow fwuff boundary let padded
+# graph rows overwrite KV slot zero before the eager attention break.
 export DSV4_CAPTURE_ATTN_IN_BCG="${DSV4_CAPTURE_ATTN_IN_BCG:-0}"
-export DSV4_EAGER_ATTN_MODULE_IN_BCG="${DSV4_EAGER_ATTN_MODULE_IN_BCG:-0}"
+export DSV4_EAGER_ATTN_MODULE_IN_BCG="${DSV4_EAGER_ATTN_MODULE_IN_BCG:-1}"
 export DSV4_REUSE_MAIN_Q_FOR_SHARED_MLP=0
 export DSV4_FLASHMLA_SPARSE_PREFILL=0
 export DSV4_FP8_PAGED_MQA_LOGITS_TORCH=1
@@ -50,7 +51,7 @@ export DSV4_FP8_PAGED_MQA_LOGITS_TORCH=1
 # 3.12 runtime.  FlashInfer's CUDA JIT norm is its supported Ampere fallback;
 # it preserves the operation while avoiding a non-serving startup.
 export DSV4_FLASHINFER_USE_CUDA_NORM=1
-export DSV4_SPS_TABLE="${repo_root}/scripts/data/dsv4_flash_fwuff_sm86_sps.json"
+export DSV4_SPS_TABLE="${DSV4_SPS_TABLE:-${repo_root}/scripts/data/dsv4_flash_fwuff_sm86_sps.json}"
 export DSV4_CACHE_ROOT="${DSV4_CACHE_ROOT:-/var/lib/exo/cache/dsv4-flash-fwuff-parity}"
 
 exec "${repo_root}/scripts/dsv4_flash_0731_tp2_dwagon.sh" "$@"

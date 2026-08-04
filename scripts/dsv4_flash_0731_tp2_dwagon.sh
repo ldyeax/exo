@@ -22,12 +22,15 @@ patch_path="${repo_root}/scripts/patches/dsv4-flash/0001-dsv4-flash-release-audi
 cache_root="${DSV4_CACHE_ROOT:-/var/lib/exo/cache/dsv4-flash-0731-release}"
 context_length="${DSV4_CONTEXT_LENGTH:-65536}"
 tensor_parallel_size="${DSV4_TENSOR_PARALLEL_SIZE:-2}"
+pipeline_parallel_size="${DSV4_PIPELINE_PARALLEL_SIZE:-1}"
 expert_parallel_size="${DSV4_EXPERT_PARALLEL_SIZE:-1}"
 cuda_visible_devices="${DSV4_CUDA_VISIBLE_DEVICES:-}"
 gpu_experts_per_layer="${DSV4_GPU_EXPERTS_PER_LAYER:-48}"
+gpu_experts_max_per_layer="${DSV4_GPU_EXPERTS_MAX_PER_LAYER:-$gpu_experts_per_layer}"
 plan_path="${DSV4_GPU_EXPERT_PLAN:-${cache_root}/agentic-hot${gpu_experts_per_layer}-mask.pt}"
 max_deferred_experts_per_token="${DSV4_MAX_DEFERRED_EXPERTS_PER_TOKEN:-2}"
 dspark_block_size="${DSV4_DSPARK_BLOCK_SIZE:-5}"
+dspark_fixed_verify_len="${DSV4_DSPARK_FIXED_VERIFY_LEN:-}"
 chunked_prefill_size="${DSV4_CHUNKED_PREFILL_SIZE:-2048}"
 max_total_tokens="${DSV4_MAX_TOTAL_TOKENS:-$((context_length + chunked_prefill_size))}"
 cpuinfer_parallel="${DSV4_CPUINFER_PARALLEL:-16}"
@@ -41,6 +44,8 @@ if [[ $kv_cache_dtype == bf16 ]]; then
   kv_cache_dtype=bfloat16
 fi
 decode_graph_backend="${DSV4_DECODE_GRAPH_BACKEND:-breakable}"
+read -r -a decode_graph_batch_sizes <<<"${DSV4_DECODE_GRAPH_BATCH_SIZES:-1}"
+decode_graph_max_batch_size="${DSV4_DECODE_GRAPH_MAX_BATCH_SIZE:-${decode_graph_batch_sizes[-1]:-}}"
 prefill_graph_backend="${DSV4_PREFILL_GRAPH_BACKEND:-breakable}"
 ragged_verify_mode="${DSV4_RAGGED_VERIFY_MODE:-compact}"
 fine_ragged_verify_tiers="${DSV4_FINE_RAGGED_VERIFY_TIERS:-1}"
@@ -49,12 +54,24 @@ disable_radix_cache="${DSV4_DISABLE_RADIX_CACHE:-1}"
 swa_full_tokens_ratio="${DSV4_SWA_FULL_TOKENS_RATIO:-0.15}"
 fwuff_parity_mode="${DSV4_FWUFF_PARITY_MODE:-0}"
 disable_speculative="${DSV4_DISABLE_SPECULATIVE:-0}"
-capture_attn_in_bcg="${DSV4_CAPTURE_ATTN_IN_BCG:-}"
-eager_attn_module_in_bcg="${DSV4_EAGER_ATTN_MODULE_IN_BCG:-}"
+skip_server_warmup="${DSV4_SKIP_SERVER_WARMUP:-1}"
+max_running_requests="${DSV4_MAX_RUNNING_REQUESTS:-1}"
+pp_max_micro_batch_size="${DSV4_PP_MAX_MICRO_BATCH_SIZE:-}"
+pp_async_batch_depth="${DSV4_PP_ASYNC_BATCH_DEPTH:-0}"
+pipeline_layer_partition="${DSV4_PIPELINE_LAYER_PARTITION:-}"
+# The narrow captured-projection/eager-kernel boundary is not safe when a
+# breakable prefill graph replays into a padded bucket: padded rows can update
+# KV slot zero before the attention break.  Default every direct entrypoint to
+# the requalified full-attention eager bridge.  Callers can still override both
+# switches explicitly for diagnostics.
+capture_attn_in_bcg="${DSV4_CAPTURE_ATTN_IN_BCG:-0}"
+eager_attn_module_in_bcg="${DSV4_EAGER_ATTN_MODULE_IN_BCG:-1}"
+allow_unsafe_prefill_graph_boundary="${DSV4_ALLOW_UNSAFE_PREFILL_GRAPH_BOUNDARY:-0}"
 reuse_main_q_shared_mlp="${DSV4_REUSE_MAIN_Q_FOR_SHARED_MLP:-}"
 flashmla_sparse_prefill="${DSV4_FLASHMLA_SPARSE_PREFILL:-}"
 fp8_paged_mqa_logits_torch="${DSV4_FP8_PAGED_MQA_LOGITS_TORCH:-}"
 target_verify_eager="${DSV4_TARGET_VERIFY_EAGER:-}"
+shared_experts_fusion="${DSV4_SHARED_EXPERTS_FUSION:-disabled}"
 expert_recorder_mode="${DSV4_EXPERT_RECORDER_MODE:-${DSV4_EXPERT_DISTRIBUTION_RECORDER_MODE:-}}"
 expert_recorder_buffer_size="${DSV4_EXPERT_RECORDER_BUFFER_SIZE:-${DSV4_EXPERT_DISTRIBUTION_RECORDER_BUFFER_SIZE:-}}"
 expert_recorder_output_dir="${DSV4_EXPERT_RECORDER_OUTPUT_DIR:-${DSV4_EXPERT_DISTRIBUTION_RECORDER_DIR:-}}"
@@ -62,10 +79,101 @@ expert_recorder_output_dir="${DSV4_EXPERT_RECORDER_OUTPUT_DIR:-${DSV4_EXPERT_DIS
 # local Python 3.12 runtime. FlashInfer's CUDA JIT implementation is the
 # supported Ampere backend and is also safe for TP graph capture.
 flashinfer_use_cuda_norm="${DSV4_FLASHINFER_USE_CUDA_NORM:-1}"
+flashinfer_cuda_arch_list="${DSV4_FLASHINFER_CUDA_ARCH_LIST:-8.6}"
+torch_cuda_arch_list="${DSV4_TORCH_CUDA_ARCH_LIST:-8.6}"
+if [[ -v DSV4_NCCL_P2P_LEVEL ]]; then
+  nccl_p2p_level="$DSV4_NCCL_P2P_LEVEL"
+else
+  nccl_p2p_level=NVL
+fi
 read -r -a prefill_graph_tiers <<<"${DSV4_PREFILL_GRAPH_TIERS:-256 512 1024 2048}"
 prefill_graph_max="${DSV4_PREFILL_GRAPH_MAX:-${prefill_graph_tiers[-1]}}"
 
-case "$tensor_parallel_size" in
+if [[ ! $gpu_experts_per_layer =~ ^(0|[1-9][0-9]{0,2})$ ]]; then
+  echo "DSV4_GPU_EXPERTS_PER_LAYER must be a decimal integer between 0 and 256" >&2
+  exit 2
+fi
+gpu_experts_per_layer=$((10#$gpu_experts_per_layer))
+if ((gpu_experts_per_layer > 256)); then
+  echo "DSV4_GPU_EXPERTS_PER_LAYER must be a decimal integer between 0 and 256" >&2
+  exit 2
+fi
+if [[ ! $gpu_experts_max_per_layer =~ ^(0|[1-9][0-9]{0,2})$ ]]; then
+  echo "DSV4_GPU_EXPERTS_MAX_PER_LAYER must be a decimal integer between 0 and 256" >&2
+  exit 2
+fi
+gpu_experts_max_per_layer=$((10#$gpu_experts_max_per_layer))
+if ((gpu_experts_max_per_layer > 256 || gpu_experts_max_per_layer < gpu_experts_per_layer)); then
+  echo "DSV4_GPU_EXPERTS_MAX_PER_LAYER must be between DSV4_GPU_EXPERTS_PER_LAYER and 256" >&2
+  exit 2
+fi
+
+case "$flashinfer_cuda_arch_list" in
+8.6 | 12.0 | "8.6 12.0" | "12.0 8.6") ;;
+*)
+  echo "DSV4_FLASHINFER_CUDA_ARCH_LIST must be 8.6, 12.0, or the space-separated SM86/SM120 pair" >&2
+  exit 2
+  ;;
+esac
+case "$torch_cuda_arch_list" in
+8.6 | 12.0 | "8.6;12.0" | "12.0;8.6") ;;
+*)
+  echo "DSV4_TORCH_CUDA_ARCH_LIST must be 8.6, 12.0, or the semicolon-separated SM86/SM120 pair" >&2
+  exit 2
+  ;;
+esac
+case "$nccl_p2p_level" in
+"" | LOC | NVL | PIX | PXB | PHB | SYS) ;;
+*)
+  echo "DSV4_NCCL_P2P_LEVEL must be empty (NCCL auto), LOC, NVL, PIX, PXB, PHB, or SYS" >&2
+  exit 2
+  ;;
+esac
+
+if [[ $allow_unsafe_prefill_graph_boundary != 0 && $allow_unsafe_prefill_graph_boundary != 1 ]]; then
+  echo "DSV4_ALLOW_UNSAFE_PREFILL_GRAPH_BOUNDARY must be 0 or 1" >&2
+  exit 2
+fi
+
+case "$shared_experts_fusion" in
+disabled)
+  shared_experts_fusion_args=(--disable-shared-experts-fusion)
+  ;;
+enforced)
+  # KT plans and runtime mappings cover only the 256 routed experts.  The V4
+  # fused layout appends shared expert 256 and requires it to be replicated on
+  # both EP ranks; neither the KT CPU loader nor its GPU/CPU routing tables can
+  # represent that slot yet.  Reject before a multi-minute model allocation.
+  echo "DSV4_SHARED_EXPERTS_FUSION=enforced is unsupported by the KTransformers EP launcher; use disabled (auto also resolves to disabled for DeepSeek V4)" >&2
+  exit 2
+  ;;
+auto)
+  shared_experts_fusion_args=()
+  ;;
+*)
+  echo "DSV4_SHARED_EXPERTS_FUSION must be disabled, enforced, or auto" >&2
+  exit 2
+  ;;
+esac
+if [[ $prefill_graph_backend == breakable && ($capture_attn_in_bcg != 0 || $eager_attn_module_in_bcg != 1) && $allow_unsafe_prefill_graph_boundary != 1 ]]; then
+  echo "breakable DSV4 prefill graphs require DSV4_CAPTURE_ATTN_IN_BCG=0 and DSV4_EAGER_ATTN_MODULE_IN_BCG=1; set DSV4_ALLOW_UNSAFE_PREFILL_GRAPH_BOUNDARY=1 only for an isolated diagnostic" >&2
+  exit 2
+fi
+
+if [[ ! $tensor_parallel_size =~ ^[12]$ ]]; then
+  echo "DSV4_TENSOR_PARALLEL_SIZE must be 1 or 2 on dwagon" >&2
+  exit 2
+fi
+if [[ ! $pipeline_parallel_size =~ ^[12]$ ]]; then
+  echo "DSV4_PIPELINE_PARALLEL_SIZE must be 1 or 2 on dwagon" >&2
+  exit 2
+fi
+model_process_count=$((tensor_parallel_size * pipeline_parallel_size))
+if ((model_process_count > 2)); then
+  echo "TP size times PP size cannot exceed the two local dwagon GPUs" >&2
+  exit 2
+fi
+case "$model_process_count" in
 1)
   cuda_visible_devices="${cuda_visible_devices:-0}"
   kt_numa_nodes_text="${kt_numa_nodes_text:-0}"
@@ -75,10 +183,6 @@ case "$tensor_parallel_size" in
   cuda_visible_devices="${cuda_visible_devices:-0,1}"
   kt_numa_nodes_text="${kt_numa_nodes_text:-0 1}"
   numactl_nodes="${numactl_nodes:-0,1}"
-  ;;
-*)
-  echo "DSV4_TENSOR_PARALLEL_SIZE must be 1 or 2 on dwagon" >&2
-  exit 2
   ;;
 esac
 if [[ ! $expert_parallel_size =~ ^[12]$ ]] || ((tensor_parallel_size % expert_parallel_size != 0)); then
@@ -97,12 +201,77 @@ for boolean_value in \
   "$fine_ragged_verify_tiers" \
   "$disable_radix_cache" \
   "$fwuff_parity_mode" \
-  "$disable_speculative"; do
+  "$disable_speculative" \
+  "$skip_server_warmup"; do
   if [[ $boolean_value != 0 && $boolean_value != 1 ]]; then
     echo "DSV4 boolean settings must be 0 or 1" >&2
     exit 2
   fi
 done
+if [[ ! $dspark_block_size =~ ^[1-9][0-9]*$ ]]; then
+  echo "DSV4_DSPARK_BLOCK_SIZE must be a positive decimal integer" >&2
+  exit 2
+fi
+dspark_block_size=$((10#$dspark_block_size))
+if [[ -n $dspark_fixed_verify_len ]]; then
+  if [[ ! $dspark_fixed_verify_len =~ ^[2-9][0-9]*$ ]]; then
+    echo "DSV4_DSPARK_FIXED_VERIFY_LEN must be a decimal integer of at least 2, or empty" >&2
+    exit 2
+  fi
+  dspark_fixed_verify_len=$((10#$dspark_fixed_verify_len))
+  if ((dspark_fixed_verify_len > dspark_block_size + 1)); then
+    echo "DSV4_DSPARK_FIXED_VERIFY_LEN cannot exceed DSV4_DSPARK_BLOCK_SIZE + 1" >&2
+    exit 2
+  fi
+  if [[ $disable_speculative == 1 ]]; then
+    echo "DSV4_DSPARK_FIXED_VERIFY_LEN requires speculative decoding" >&2
+    exit 2
+  fi
+  if [[ $ragged_verify_mode != compact ]]; then
+    echo "DSV4_DSPARK_FIXED_VERIFY_LEN requires DSV4_RAGGED_VERIFY_MODE=compact" >&2
+    exit 2
+  fi
+fi
+if [[ ! $max_running_requests =~ ^[1-9][0-9]*$ ]]; then
+  echo "DSV4_MAX_RUNNING_REQUESTS must be a positive decimal integer" >&2
+  exit 2
+fi
+if ((${#decode_graph_batch_sizes[@]} == 0)); then
+  echo "DSV4_DECODE_GRAPH_BATCH_SIZES must contain at least one batch size" >&2
+  exit 2
+fi
+largest_decode_graph_batch_size=0
+for decode_graph_batch_size in "${decode_graph_batch_sizes[@]}"; do
+  if [[ ! $decode_graph_batch_size =~ ^[1-9][0-9]*$ ]]; then
+    echo "DSV4_DECODE_GRAPH_BATCH_SIZES must contain positive decimal integers" >&2
+    exit 2
+  fi
+  decode_graph_batch_size=$((10#$decode_graph_batch_size))
+  if ((decode_graph_batch_size > largest_decode_graph_batch_size)); then
+    largest_decode_graph_batch_size=$decode_graph_batch_size
+  fi
+done
+if [[ ! $decode_graph_max_batch_size =~ ^[1-9][0-9]*$ ]]; then
+  echo "DSV4_DECODE_GRAPH_MAX_BATCH_SIZE must be a positive decimal integer" >&2
+  exit 2
+fi
+decode_graph_max_batch_size=$((10#$decode_graph_max_batch_size))
+if ((decode_graph_max_batch_size < largest_decode_graph_batch_size)); then
+  echo "DSV4_DECODE_GRAPH_MAX_BATCH_SIZE cannot be smaller than a captured decode batch size" >&2
+  exit 2
+fi
+if [[ -n $pp_max_micro_batch_size && ! $pp_max_micro_batch_size =~ ^[1-9][0-9]*$ ]]; then
+  echo "DSV4_PP_MAX_MICRO_BATCH_SIZE must be a positive decimal integer" >&2
+  exit 2
+fi
+if [[ ! $pp_async_batch_depth =~ ^(0|[1-9][0-9]*)$ ]]; then
+  echo "DSV4_PP_ASYNC_BATCH_DEPTH must be a non-negative decimal integer" >&2
+  exit 2
+fi
+if ((pipeline_parallel_size > 1)) && ((disable_speculative == 0)); then
+  echo "SGLang pipeline parallelism does not support speculative decoding; set DSV4_DISABLE_SPECULATIVE=1" >&2
+  exit 2
+fi
 if [[ -n $expert_recorder_mode ]]; then
   case "$expert_recorder_mode" in
   stat | stat_approx | per_pass | per_token) ;;
@@ -127,6 +296,12 @@ elif [[ -f /mnt/sanic-edr/llm_models/DeepSeek-V4-Flash-0731/config.json ]]; then
   model_path=/mnt/sanic-edr/llm_models/DeepSeek-V4-Flash-0731
 else
   model_path=/mnt/sanic/llm_models/DeepSeek-V4-Flash-0731
+fi
+kt_weight_path="${DSV4_KT_WEIGHT_PATH:-$model_path}"
+kt_method="${DSV4_KT_METHOD:-MXFP4}"
+if [[ -z $kt_weight_path || -z $kt_method ]]; then
+  echo "DSV4_KT_WEIGHT_PATH and DSV4_KT_METHOD must be non-empty" >&2
+  exit 2
 fi
 
 for required_path in \
@@ -185,11 +360,11 @@ mapfile -t gpu_free_mib < <(
 )
 minimum_gpu_free_mib="${DSV4_MINIMUM_GPU_FREE_MIB:-22000}"
 IFS=',' read -r -a visible_gpu_ids <<<"$cuda_visible_devices"
-if [[ ${#visible_gpu_ids[@]} -lt $tensor_parallel_size ]]; then
-  echo "CUDA device list has fewer entries than the requested TP size" >&2
+if [[ ${#visible_gpu_ids[@]} -lt $model_process_count ]]; then
+  echo "CUDA device list has fewer entries than the requested TP-by-PP process count" >&2
   exit 1
 fi
-for ((local_rank = 0; local_rank < tensor_parallel_size; local_rank++)); do
+for ((local_rank = 0; local_rank < model_process_count; local_rank++)); do
   gpu_index="${visible_gpu_ids[$local_rank]//[[:space:]]/}"
   if [[ ! $gpu_index =~ ^[0-9]+$ ]] || ((gpu_index >= ${#gpu_free_mib[@]})); then
     echo "invalid physical GPU index in DSV4_CUDA_VISIBLE_DEVICES: $gpu_index" >&2
@@ -217,6 +392,10 @@ export SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1
 export SGLANG_OPT_DEEPGEMM_HC_PRENORM=0
 export SGLANG_RAGGED_VERIFY_MODE="$ragged_verify_mode"
 export SGLANG_ENABLE_CUDA_GRAPH_DEDUP=0
+# SGLang's model-side MoE overlap flag has changed defaults across source
+# revisions.  Fail safe on the single-stream path unless a wrapper or caller
+# deliberately enables and requalifies it.
+export SGLANG_OPT_USE_MULTI_STREAM_OVERLAP="${SGLANG_OPT_USE_MULTI_STREAM_OVERLAP:-0}"
 # The native AMX kernel defaults to eight routed rows.  Keep that parity
 # default while allowing served tuning runs to exercise its accepted small-M
 # path explicitly (for example, threshold five).
@@ -240,10 +419,8 @@ else
   export SGLANG_V4_USE_TRITON_KERNELS=1
 fi
 
-# The evolved DSV4 model can capture the full attention module in BCG.  An
-# explicit launch override is applied after the parity/default environment so
-# wrappers can reproduce the older fwuff branch's effective graph boundary
-# (captured projections with only its attention kernel outside the graph).
+# Apply the safe default or an explicit diagnostic override after the
+# parity/default environment has been assembled.
 if [[ -n $capture_attn_in_bcg ]]; then
   if [[ $capture_attn_in_bcg != 0 && $capture_attn_in_bcg != 1 ]]; then
     echo "DSV4_CAPTURE_ATTN_IN_BCG must be 0 or 1" >&2
@@ -314,6 +491,12 @@ else
   unset SGLANG_DSV4_FINE_RAGGED_VERIFY_TIERS
 fi
 
+if [[ -n $pipeline_layer_partition ]]; then
+  export SGLANG_PP_LAYER_PARTITION="$pipeline_layer_partition"
+else
+  unset SGLANG_PP_LAYER_PARTITION
+fi
+
 expert_recorder_args=()
 if [[ -n $expert_recorder_mode ]]; then
   expert_recorder_args=(--expert-distribution-recorder-mode "$expert_recorder_mode")
@@ -342,11 +525,31 @@ else
     echo "hybrid expert placement requires SGLANG_KT_HYBRID_EXPERT_SHARD_PLAN" >&2
     exit 2
   fi
+  if [[ ! -f $SGLANG_KT_HYBRID_EXPERT_SHARD_PLAN ||
+    ! -r $SGLANG_KT_HYBRID_EXPERT_SHARD_PLAN ]]; then
+    echo "hybrid expert shard plan is not a readable file: $SGLANG_KT_HYBRID_EXPERT_SHARD_PLAN" >&2
+    exit 2
+  fi
+  read -r hybrid_expert_plan_sha256 _ < <(
+    sha256sum -- "$SGLANG_KT_HYBRID_EXPERT_SHARD_PLAN"
+  )
+  if [[ ! $hybrid_expert_plan_sha256 =~ ^[0-9a-f]{64}$ ]]; then
+    echo "could not compute hybrid expert shard plan SHA-256" >&2
+    exit 1
+  fi
+  export SGLANG_KT_HYBRID_EXPERT_PLAN_SHA256="$hybrid_expert_plan_sha256"
+fi
+if [[ $expert_location_mode != hybrid ]]; then
+  unset SGLANG_KT_HYBRID_EXPERT_PLAN_SHA256
 fi
 
 radix_cache_args=()
 if [[ $disable_radix_cache == 1 ]]; then
   radix_cache_args=(--disable-radix-cache)
+fi
+server_warmup_args=()
+if [[ $skip_server_warmup == 1 ]]; then
+  server_warmup_args=(--skip-server-warmup)
 fi
 speculative_args=()
 if [[ $disable_speculative == 0 ]]; then
@@ -356,9 +559,21 @@ if [[ $disable_speculative == 0 ]]; then
     --speculative-dspark-align-verify-tokens-to-graph-tier
     --speculative-dspark-sps-table-path "$sps_table_path"
   )
+  if [[ -n $dspark_fixed_verify_len ]]; then
+    speculative_args+=(
+      --speculative-dspark-fixed-verify-len "$dspark_fixed_verify_len"
+    )
+  fi
 fi
-export FLASHINFER_CUDA_ARCH_LIST=8.6
-export TORCH_CUDA_ARCH_LIST=8.6
+pipeline_args=(--pp-size "$pipeline_parallel_size")
+if [[ -n $pp_max_micro_batch_size ]]; then
+  pipeline_args+=(--pp-max-micro-batch-size "$pp_max_micro_batch_size")
+fi
+if ((pp_async_batch_depth > 0)); then
+  pipeline_args+=(--pp-async-batch-depth "$pp_async_batch_depth")
+fi
+export FLASHINFER_CUDA_ARCH_LIST="$flashinfer_cuda_arch_list"
+export TORCH_CUDA_ARCH_LIST="$torch_cuda_arch_list"
 export TORCHINDUCTOR_COMPILE_THREADS=1
 export TILELANG_LIBCUDART_PATH="${DSV4_TILELANG_LIBCUDART_PATH:-/opt/cuda/lib64/libcudart.so.13}"
 export XDG_CACHE_HOME="${cache_root}/xdg"
@@ -366,21 +581,26 @@ export TRITON_CACHE_DIR="${cache_root}/triton"
 export FLASHINFER_WORKSPACE_BASE="${cache_root}/flashinfer"
 export TORCHINDUCTOR_CACHE_DIR="${cache_root}/torchinductor"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export NCCL_P2P_LEVEL=NVL
+if [[ -n $nccl_p2p_level ]]; then
+  export NCCL_P2P_LEVEL="$nccl_p2p_level"
+else
+  unset NCCL_P2P_LEVEL
+fi
 
 exec numactl --cpunodebind="$numactl_nodes" --membind="$numactl_nodes" "$python_path" -u -m sglang.launch_server \
   --host 127.0.0.1 \
   --port 30010 \
   --model-path "$model_path" \
   --trust-remote-code \
-  --kt-weight-path "$model_path" \
-  --kt-method MXFP4 \
-  --kt-num-gpu-experts "$gpu_experts_per_layer" \
+  --kt-weight-path "$kt_weight_path" \
+  --kt-method "$kt_method" \
+  --kt-num-gpu-experts "$gpu_experts_max_per_layer" \
   --kt-cpuinfer "$cpuinfer_threads" \
   --kt-threadpool-count "$threadpool_count" \
   --kt-numa-nodes "${kt_numa_nodes[@]}" \
   --kt-max-deferred-experts-per-token "$max_deferred_experts_per_token" \
   --tensor-parallel-size "$tensor_parallel_size" \
+  "${pipeline_args[@]}" \
   --ep-size "$expert_parallel_size" \
   --moe-a2a-backend none \
   "${expert_location_args[@]}" \
@@ -394,15 +614,15 @@ exec numactl --cpunodebind="$numactl_nodes" --membind="$numactl_nodes" "$python_
   --mem-fraction-static "$mem_fraction_static" \
   --chunked-prefill-size "$chunked_prefill_size" \
   --max-prefill-tokens "$chunked_prefill_size" \
-  --max-running-requests 1 \
+  --max-running-requests "$max_running_requests" \
   --watchdog-timeout 1200 \
-  --disable-shared-experts-fusion \
+  "${shared_experts_fusion_args[@]}" \
   --cuda-graph-backend-decode "$decode_graph_backend" \
-  --cuda-graph-max-bs-decode 1 \
-  --cuda-graph-bs-decode 1 \
+  --cuda-graph-max-bs-decode "$decode_graph_max_batch_size" \
+  --cuda-graph-bs-decode "${decode_graph_batch_sizes[@]}" \
   --cuda-graph-backend-prefill "$prefill_graph_backend" \
   --cuda-graph-max-bs-prefill "$prefill_graph_max" \
   --cuda-graph-bs-prefill "${prefill_graph_tiers[@]}" \
   "${expert_recorder_args[@]}" \
   "${radix_cache_args[@]}" \
-  --skip-server-warmup
+  "${server_warmup_args[@]}"

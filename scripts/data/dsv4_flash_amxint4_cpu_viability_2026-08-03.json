@@ -1,0 +1,81 @@
+{
+  "schema_version": 1,
+  "experiment": "dsv4_flash_amxint4_cpu_viability",
+  "date": "2026-08-03",
+  "decision": "experimental_plumbing_only_rejected_for_promotion",
+  "reason": "AMXINT4 is materially faster, but its expert-output error is too large for coherent serving; no full checkpoint artifact was produced.",
+  "extension": {
+    "path": "/var/lib/exo/experiments/dsv4-avx-tail23-nblock128/lib/kt_kernel/kt_kernel_ext.cpython-312-x86_64-linux-gnu.so",
+    "sha256": "32cbe088f6263bfb02c08eb1d7279de1d800147f25bfab5fa293888b2cddc0df"
+  },
+  "shape": {
+    "hidden_size": 4096,
+    "intermediate_size": 2048,
+    "top_k": 6,
+    "batch_sizes": [1, 2, 3, 4, 5, 6],
+    "expert_count": 12,
+    "route_bank_packed_bytes": 160432128
+  },
+  "methodology": {
+    "numa_node": 0,
+    "worker_threads": 56,
+    "route_cases": 12,
+    "warmup_rounds": 2,
+    "timed_rounds": 5,
+    "iterations_per_round": 24,
+    "samples_per_shape_backend": 120,
+    "swiglu_limit": 10.0,
+    "fused_activation": false,
+    "fine_grained_decode": true,
+    "worker_spin_us": 1000,
+    "mxfp4_amx_min_expert_tokens": 5,
+    "mxfp4_avx_tiled_min_expert_tokens": 2,
+    "source_contract": "native MXFP4 bytes decoded exactly to BF16, then the same BF16 source was consumed by the official AMXINT4 online converter"
+  },
+  "synthetic": {
+    "mxfp4_median_us_m1_to_m6": [2116.3235, 2475.8995, 2732.6855, 2941.401, 3190.643, 3331.044],
+    "amxint4_median_us_m1_to_m6": [1987.8265, 2110.456, 2099.087, 2156.983, 2441.537, 2589.836],
+    "speedup_m1_to_m6": [1.064642, 1.173159, 1.301845, 1.363664, 1.306817, 1.286199],
+    "geometric_speedup": 1.245159550891351,
+    "amxint4_vs_mxfp4_cosine_m1_to_m6": [0.969729, 0.970049, 0.968087, 0.969117, 0.968795, 0.969315],
+    "amxint4_vs_mxfp4_relative_l1_m1_to_m6": [0.319361, 0.337946, 0.343097, 0.342442, 0.332581, 0.340588]
+  },
+  "checkpoint": {
+    "path": "/tmp/dsv4-local-checkpoint-0731",
+    "index_sha256": "98efab455cf08dfbbbaaba6f570e1bf10bf927d2b4c3c453a59c2f6f0e3be92b",
+    "expert_ids": [0, 7, 23, 41, 64, 89, 113, 137, 166, 193, 224, 255],
+    "layers": [
+      {
+        "layer": 0,
+        "selected_native_tensor_sha256": "c16436ae66c58b74acb4f57dff1259b7ce5cc5a3d829c3d8fcd99deb2dab4725",
+        "geometric_speedup": 1.2334536400840137,
+        "amxint4_vs_mxfp4_cosine_m1_to_m6": [0.9662025, 0.9664064, 0.9663788, 0.9654569, 0.9648024, 0.9653494],
+        "amxint4_vs_mxfp4_relative_l1_m1_to_m6": [0.3501147, 0.3456191, 0.3344808, 0.3483495, 0.3390677, 0.3478108]
+      },
+      {
+        "layer": 21,
+        "selected_native_tensor_sha256": "d892241b65890b3d888db0da636917453c13b2ef940fbc1767c493b2a5c863ae",
+        "geometric_speedup": 1.2296603208096573,
+        "amxint4_vs_mxfp4_cosine_m1_to_m6": [0.9696581, 0.9687762, 0.9664178, 0.9687644, 0.9675338, 0.9666098],
+        "amxint4_vs_mxfp4_relative_l1_m1_to_m6": [0.3258564, 0.3510958, 0.3513238, 0.339964, 0.3501061, 0.3451669]
+      },
+      {
+        "layer": 42,
+        "selected_native_tensor_sha256": "37f2a945098fb36f674fb9a8556ef7343fd388d691d948b66783d1371bc89f4c",
+        "geometric_speedup": 1.1696803840642096,
+        "amxint4_vs_mxfp4_cosine_m1_to_m6": [0.9688341, 0.9668444, 0.9723851, 0.9693738, 0.9717516, 0.9700749],
+        "amxint4_vs_mxfp4_relative_l1_m1_to_m6": [0.3644432, 0.355242, 0.3446903, 0.374755, 0.3449405, 0.3568271]
+      }
+    ]
+  },
+  "serving_gate": {
+    "default_enabled": false,
+    "opt_in": "DSV4_EXPERIMENTAL_AMXINT4_CPU_WEIGHT_PATH",
+    "requirements": [
+      "separate top-level AMXINT4 safetensors artifact",
+      "one full-width NUMA table for each rank-local thread pool",
+      "native MXFP4 DSpark path pinned separately",
+      "MXFP4 hotspot cache disabled"
+    ]
+  }
+}

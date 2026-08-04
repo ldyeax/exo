@@ -1,0 +1,82 @@
+{
+  "schema_version": 1,
+  "status": "rejected",
+  "candidate": "KT_AMX_FUSED_ACTIVATION=1",
+  "host": "dwagon",
+  "model_checkpoint": "/tmp/dsv4-local-checkpoint-0731",
+  "layer": 10,
+  "shape": {
+    "hidden_size": 4096,
+    "intermediate_size": 2048,
+    "top_k": 6,
+    "quantization": "MXFP4 group32"
+  },
+  "runtime": {
+    "cpu_threads": 56,
+    "numa_node": 0,
+    "worker_spin_us": 1000,
+    "fine_grained_decode": true,
+    "extension_sha256": "1bf4c8be2df386498f977a03f4514bebccf7516b6692f28d210329960918ccbe"
+  },
+  "fixed_route_per_expert_rows": [
+    {
+      "rows": 1,
+      "repeats": 160,
+      "baseline_median_ms": 0.6061859894543886,
+      "candidate_median_ms": 0.6095834978623316,
+      "baseline_over_candidate": 0.994427,
+      "bit_exact": true
+    },
+    {
+      "rows": 2,
+      "repeats": 160,
+      "baseline_median_ms": 1.1337049945723265,
+      "candidate_median_ms": 1.1593584931688383,
+      "baseline_over_candidate": 0.977873,
+      "bit_exact": true
+    },
+    {
+      "rows": 3,
+      "repeats": 160,
+      "baseline_median_ms": 1.605434503289871,
+      "candidate_median_ms": 1.5926844935165718,
+      "baseline_over_candidate": 1.008005,
+      "bit_exact": true
+    },
+    {
+      "rows": 4,
+      "repeats": 160,
+      "baseline_median_ms": 1.0795210109790787,
+      "candidate_median_ms": 1.0438375029480085,
+      "baseline_over_candidate": 1.034185,
+      "bit_exact": true
+    },
+    {
+      "rows": 5,
+      "repeats": 160,
+      "baseline_median_ms": 1.574242502101697,
+      "candidate_median_ms": 1.5054585092002526,
+      "baseline_over_candidate": 1.045689,
+      "bit_exact": true
+    },
+    {
+      "rows": 6,
+      "repeats": 160,
+      "baseline_median_ms": 1.6888525133254007,
+      "candidate_median_ms": 1.670768004260026,
+      "baseline_over_candidate": 1.010824,
+      "bit_exact": true
+    }
+  ],
+  "representative_random_q4": {
+    "resident_cpu_experts": 32,
+    "active_experts": 18,
+    "repeats": 120,
+    "baseline_median_ms": 2.1285159891704097,
+    "candidate_median_ms": 2.173147498979233,
+    "baseline_over_candidate": 0.979461,
+    "output_sha256": "eb5cc77877d752cc8fe7673de1d4c8676093af07cea8220b8facd31227380004",
+    "bit_exact": true
+  },
+  "decision": "Keep disabled. It helps rows 4-6, but 98.91% of observed CPU expert calls have rows 1-4 and the representative mixed q4 route regressed 2.05%."
+}

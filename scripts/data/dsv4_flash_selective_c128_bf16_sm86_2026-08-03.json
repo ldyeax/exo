@@ -1,0 +1,327 @@
+{
+  "cases": [
+    {
+      "batch_size": 1,
+      "cuda_graph": {
+        "fp8": {
+          "median_ms": 0.04915200173854828,
+          "p20_ms": 0.04915200173854828,
+          "p80_ms": 0.04915200173854828
+        },
+        "mixed": {
+          "median_ms": 0.043007999658584595,
+          "p20_ms": 0.04198399931192398,
+          "p80_ms": 0.043007999658584595
+        }
+      },
+      "cuda_graph_speedup": 1.1428571923534536,
+      "eager": {
+        "fp8": {
+          "median_ms": 0.04915200173854828,
+          "p20_ms": 0.04915200173854828,
+          "p80_ms": 0.050175998359918594
+        },
+        "mixed": {
+          "median_ms": 0.043007999658584595,
+          "p20_ms": 0.04198399931192398,
+          "p80_ms": 0.043007999658584595
+        }
+      },
+      "eager_speedup": 1.1428571923534536,
+      "error_vs_bf16_extra_reference": {
+        "fp8_max_abs": 0.010899215936660767,
+        "fp8_mean_abs": 0.001092722755856812,
+        "mixed_max_abs": 0.0018849372863769531,
+        "mixed_mean_abs": 0.0002129313797922805
+      },
+      "extra_index_width": 4096,
+      "extra_length": 21,
+      "output_delta_vs_fp8": {
+        "max_abs": 0.0107421875,
+        "mean_abs": 0.0010855661239475012
+      },
+      "swa_length": 128
+    },
+    {
+      "batch_size": 1,
+      "cuda_graph": {
+        "fp8": {
+          "median_ms": 1.1653120517730713,
+          "p20_ms": 1.1653120517730713,
+          "p80_ms": 1.1663360595703125
+        },
+        "mixed": {
+          "median_ms": 0.6369280219078064,
+          "p20_ms": 0.6369280219078064,
+          "p80_ms": 0.6379520297050476
+        }
+      },
+      "cuda_graph_speedup": 1.829582011924335,
+      "eager": {
+        "fp8": {
+          "median_ms": 1.1653120517730713,
+          "p20_ms": 1.1652735948562623,
+          "p80_ms": 1.1663360595703125
+        },
+        "mixed": {
+          "median_ms": 0.6379360258579254,
+          "p20_ms": 0.6369280219078064,
+          "p80_ms": 0.6379520297050476
+        }
+      },
+      "eager_speedup": 1.8266910858434535,
+      "error_vs_bf16_extra_reference": {
+        "fp8_max_abs": 0.005714848637580872,
+        "fp8_mean_abs": 0.0007187706651166081,
+        "mixed_max_abs": 0.000563204288482666,
+        "mixed_mean_abs": 6.716362258885056e-05
+      },
+      "extra_index_width": 4096,
+      "extra_length": 4096,
+      "output_delta_vs_fp8": {
+        "max_abs": 0.005859375,
+        "mean_abs": 0.0007158548105508089
+      },
+      "swa_length": 128
+    },
+    {
+      "batch_size": 5,
+      "cuda_graph": {
+        "fp8": {
+          "median_ms": 0.04915200173854828,
+          "p20_ms": 0.04915200173854828,
+          "p80_ms": 0.04915200173854828
+        },
+        "mixed": {
+          "median_ms": 0.043007999658584595,
+          "p20_ms": 0.043007999658584595,
+          "p80_ms": 0.04403200000524521
+        }
+      },
+      "cuda_graph_speedup": 1.1428571923534536,
+      "eager": {
+        "fp8": {
+          "median_ms": 0.04915200173854828,
+          "p20_ms": 0.04915200173854828,
+          "p80_ms": 0.04915200173854828
+        },
+        "mixed": {
+          "median_ms": 0.04403200000524521,
+          "p20_ms": 0.043007999658584595,
+          "p80_ms": 0.04403200000524521
+        }
+      },
+      "eager_speedup": 1.1162791091182132,
+      "error_vs_bf16_extra_reference": {
+        "fp8_max_abs": 0.018888235092163086,
+        "fp8_mean_abs": 0.0012076623970642686,
+        "mixed_max_abs": 0.003840923309326172,
+        "mixed_mean_abs": 0.00021565663337241858
+      },
+      "extra_index_width": 4096,
+      "extra_length": 21,
+      "output_delta_vs_fp8": {
+        "max_abs": 0.01904296875,
+        "mean_abs": 0.0011979833943769336
+      },
+      "swa_length": 128
+    },
+    {
+      "batch_size": 5,
+      "cuda_graph": {
+        "fp8": {
+          "median_ms": 1.1663360595703125,
+          "p20_ms": 1.1653120517730713,
+          "p80_ms": 1.1663360595703125
+        },
+        "mixed": {
+          "median_ms": 0.634880006313324,
+          "p20_ms": 0.6338559985160828,
+          "p80_ms": 0.634880006313324
+        }
+      },
+      "cuda_graph_speedup": 1.837096849754481,
+      "eager": {
+        "fp8": {
+          "median_ms": 1.1655999422073364,
+          "p20_ms": 1.1653120517730713,
+          "p80_ms": 1.1663360595703125
+        },
+        "mixed": {
+          "median_ms": 0.634880006313324,
+          "p20_ms": 0.6340479850769043,
+          "p80_ms": 0.6349120140075684
+        }
+      },
+      "eager_speedup": 1.8359373907139442,
+      "error_vs_bf16_extra_reference": {
+        "fp8_max_abs": 0.004801154136657715,
+        "fp8_mean_abs": 0.0007081535295583308,
+        "mixed_max_abs": 0.0007348060607910156,
+        "mixed_mean_abs": 6.834873784100637e-05
+      },
+      "extra_index_width": 4096,
+      "extra_length": 4096,
+      "output_delta_vs_fp8": {
+        "max_abs": 0.0048828125,
+        "mean_abs": 0.0007056495524011552
+      },
+      "swa_length": 128
+    }
+  ],
+  "device": "NVIDIA GeForce RTX 3090",
+  "device_capability": [
+    8,
+    6
+  ],
+  "feature_flag": {
+    "default": false,
+    "enable_value": "1",
+    "hardware_gate": "exact CUDA SM86",
+    "name": "SGLANG_DSV4_SM86_C128_BF16_STORAGE",
+    "requirements": "FP8 E4M3 carrier cache; mutually exclusive with main DSV4 INT4 storage",
+    "storage_scope": "C128 compressed latent pages only; SWA and C4 latent pages remain packed E4M3, and C4 indexer storage remains independently configurable"
+  },
+  "geometry": {
+    "c128_layers_per_tp_rank": 20,
+    "c128_page_size": 2,
+    "context_tokens": 524288,
+    "head_dim": 512,
+    "heads": 64,
+    "swa_page_size": 128
+  },
+  "hostname": "dwagon",
+  "provenance": {
+    "changed_files": [
+      {
+        "path": "scripts/benchmark_dsv4_selective_c128_bf16.py",
+        "role": "B1/B5 eager and CUDA-graph benchmark",
+        "sha256": "0a2fe687eec62172dc03c469f24675504117f19f2134e85edd3ac6f0b41d29a9"
+      },
+      {
+        "path": "vendor/sglang/python/sglang/srt/environ.py",
+        "role": "default-off environment feature flag",
+        "sha256": "107caad8de5066c6c2f754555764e25da7b5eff79406305512bfb17992b0e43c"
+      },
+      {
+        "path": "vendor/sglang/python/sglang/srt/mem_cache/dsv4_kv_cache_dtype.py",
+        "role": "exact-SM86 capability contract",
+        "sha256": "7a437f1c7a0fed7eac1f1d295ac97a51245b89b6052a7a8f1ebb887e7fbc2b4b"
+      },
+      {
+        "path": "vendor/sglang/python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py",
+        "role": "selective C128 allocation and BF16 writer dispatch",
+        "sha256": "847f7c9a069412b03ee41150b3360c950c2898d6965e42610430d95f6d285e6d"
+      },
+      {
+        "path": "vendor/sglang/python/sglang/srt/model_executor/pool_configurator.py",
+        "role": "physical memory-capacity accounting",
+        "sha256": "982e5d7c46ec3f7ef1430dc3db7d880a8c0ceba548c0efc89a5ccbae426b8775"
+      },
+      {
+        "path": "vendor/sglang/python/sglang/srt/layers/attention/deepseek_v4_backend.py",
+        "role": "mixed decode dispatch and prefill cache-type propagation",
+        "sha256": "f0778168e8a31f18268049d4cfe7c5d47c68e537a0d1626bc41fdc33802ed77d"
+      },
+      {
+        "path": "vendor/sglang/python/sglang/srt/layers/attention/nsa/v4_mixed_c128_bf16_kernel.py",
+        "role": "SM86 FP8-SWA plus BF16-C128 sparse decode kernel",
+        "sha256": "4df87fec8ecd1b75191ddbacd2dc05130190de38bc51945edaf77def593bc1f2"
+      },
+      {
+        "path": "vendor/sglang/python/sglang/srt/managers/scheduler.py",
+        "role": "server-info storage observability",
+        "sha256": "36a448297b7c383d73c15ef8e1766b90a96d7eb8fd2d3694b66fc3c3ade0279a"
+      },
+      {
+        "path": "vendor/sglang/python/sglang/kernels/jit/csrc/deepseek_v4/main_norm_rope.cuh",
+        "role": "exact unpadded BF16 FlashMLA page stride",
+        "sha256": "fba537f98ce439c84ec32b1818629daad5452f4e1a6f7a4daa2700a05523f722"
+      },
+      {
+        "path": "vendor/sglang/python/sglang/kernels/jit/csrc/deepseek_v4/fused_norm_rope_v2.cuh",
+        "role": "exact unpadded BF16 compressor page stride",
+        "sha256": "4074f2798f11f78231dcb3c15e6c8449f50a4e25e7ea5a83904960be79f0b2a8"
+      },
+      {
+        "path": "vendor/sglang/test/registered/unit/mem_cache/test_dsv4_kv_cache_dtype.py",
+        "role": "capability-gate unit tests",
+        "sha256": "b26e1411bf465b1cdcac3c7c6ea0cae62aa74e803adb799f56321e9b9d988d01"
+      },
+      {
+        "path": "vendor/sglang/test/registered/unit/model_executor/test_dsv4_pool_configurator_dtype.py",
+        "role": "allocator accounting unit tests",
+        "sha256": "01145aa2950b32eec8d181f1f3bb2871e4d9230878bd181e76ff5d2b095064ac"
+      },
+      {
+        "path": "vendor/sglang/test/registered/unit/mem_cache/test_dsv4_selective_c128_storage.py",
+        "role": "524K physical delta and server-info contract tests",
+        "sha256": "9d7bafd08961528fc746ccb6f1f84dff3b0a48970f0b797eac31e0a3447c43dd"
+      },
+      {
+        "path": "vendor/sglang/test/registered/kernels/ops/attention/test_dsv4_ampere_fp8_storage.py",
+        "role": "selective pool and fused compressor graph tests",
+        "sha256": "527ef542ae5f1777658975a8b7090b822ada07b93ca098d53c99d318932af2d8"
+      },
+      {
+        "path": "vendor/sglang/test/registered/kernels/ops/attention/test_dsv4_mixed_c128_bf16_decode.py",
+        "role": "mixed B1/B5 decode, speculative, sink, and live graph tests",
+        "sha256": "0b44ec9489c7656d4756dedec457bc330daa3f2993b63e445762a28d1b51cfbd"
+      },
+      {
+        "path": "vendor/sglang/test/registered/kernels/ops/attention/test_dsv4_int4_storage.py",
+        "role": "shared exact-BF16-stride and INT4 coexistence regression test",
+        "sha256": "1907ea7b891472dd4fccb7920dad3c0a6429be417cfccdaf846733f4dc9a17d5"
+      }
+    ],
+    "hash_scope": "Whole-file SHA-256 values from the shared dirty worktree at final validation time"
+  },
+  "runtime_observability": {
+    "dsv4_c128_kv_bytes_per_token": 1024,
+    "dsv4_c4_indexer_bytes_per_token": 132,
+    "dsv4_kv_storage_mode": "fp8_e4m3+sparse_c128_bfloat16",
+    "dsv4_latent_kv_bytes_per_token": 584,
+    "dsv4_sm86_c128_bf16_storage": true
+  },
+  "schema": "dsv4_selective_c128_bf16_sm86_benchmark_v1",
+  "storage": {
+    "bf16_c128_page_bytes": 2048,
+    "c128_pages_including_allocator_padding": 2049,
+    "fp8_c128_page_bytes": 1728,
+    "per_gpu_delta_bytes": 13113600
+  },
+  "summary": {
+    "median_cuda_graph_speedup": 1.4862196021388943,
+    "minimum_cuda_graph_speedup": 1.1428571923534536
+  },
+  "validation": {
+    "benchmark": {
+      "command": "env CUDA_VISIBLE_DEVICES=0 FLASHINFER_WORKSPACE_BASE=/tmp/dsv4-selective-flashinfer-gpu0 TORCH_EXTENSIONS_DIR=/tmp/dsv4-selective-torch-extensions-gpu0 XDG_CACHE_HOME=/tmp/dsv4-selective-xdg-gpu0 PYTHONPATH=/root/exo/vendor/sglang/python:/root/exo/vendor/ktransformers /var/lib/exo/runtimes/dsv4-native-mxfp4/dwagon/amx-prefill-v1/venv/bin/python scripts/benchmark_dsv4_selective_c128_bf16.py --output scripts/data/dsv4_flash_selective_c128_bf16_sm86_2026-08-03.json",
+      "device_scope": "CUDA_VISIBLE_DEVICES=0",
+      "result": "completed four B1/B5 short/full cases"
+    },
+    "cpu_tests": {
+      "command": "env FLASHINFER_WORKSPACE_BASE=/tmp/dsv4-selective-flashinfer-gpu0 TORCH_EXTENSIONS_DIR=/tmp/dsv4-selective-torch-extensions-gpu0 XDG_CACHE_HOME=/tmp/dsv4-selective-xdg-gpu0 PYTHONPATH=/root/exo/vendor/sglang/python:/root/exo/vendor/ktransformers /var/lib/exo/runtimes/dsv4-native-mxfp4/dwagon/amx-prefill-v1/venv/bin/python -m pytest -q vendor/sglang/test/registered/unit/mem_cache/test_dsv4_selective_c128_storage.py vendor/sglang/test/registered/unit/mem_cache/test_dsv4_kv_cache_dtype.py vendor/sglang/test/registered/unit/model_executor/test_dsv4_pool_configurator_dtype.py",
+      "passed": 58,
+      "result": "58 passed"
+    },
+    "full_server": {
+      "performed": false,
+      "risk": "Kernel, allocator, compressor, and CUDA-graph parity are validated, but a complete 524K model launch has not yet validated real prefill/decode coherence, long-context quality, TP2 inter-GPU behavior, end-to-end tokens/s or TTFT, CUDA-graph capture headroom, or interaction with the complete production launcher. Treat this as a campaign candidate, not a default configuration."
+    },
+    "gpu_tests": {
+      "command": "env CUDA_VISIBLE_DEVICES=0 FLASHINFER_WORKSPACE_BASE=/tmp/dsv4-selective-flashinfer-gpu0 TORCH_EXTENSIONS_DIR=/tmp/dsv4-selective-torch-extensions-gpu0 XDG_CACHE_HOME=/tmp/dsv4-selective-xdg-gpu0 PYTHONPATH=/root/exo/vendor/sglang/python:/root/exo/vendor/ktransformers /var/lib/exo/runtimes/dsv4-native-mxfp4/dwagon/amx-prefill-v1/venv/bin/python -m pytest -q vendor/sglang/test/registered/kernels/ops/attention/test_dsv4_ampere_fp8_storage.py vendor/sglang/test/registered/kernels/ops/attention/test_dsv4_mixed_c128_bf16_decode.py vendor/sglang/test/registered/kernels/ops/attention/test_dsv4_int4_storage.py",
+      "device_scope": "CUDA_VISIBLE_DEVICES=0",
+      "passed": 26,
+      "result": "26 passed"
+    },
+    "static_checks": {
+      "command": ".venv/bin/ruff check --select F,E9,I scripts/benchmark_dsv4_selective_c128_bf16.py vendor/sglang/test/registered/unit/mem_cache/test_dsv4_selective_c128_storage.py vendor/sglang/test/registered/kernels/ops/attention/test_dsv4_ampere_fp8_storage.py vendor/sglang/test/registered/kernels/ops/attention/test_dsv4_int4_storage.py && python -m py_compile scripts/benchmark_dsv4_selective_c128_bf16.py vendor/sglang/test/registered/unit/mem_cache/test_dsv4_selective_c128_storage.py vendor/sglang/test/registered/kernels/ops/attention/test_dsv4_ampere_fp8_storage.py vendor/sglang/test/registered/kernels/ops/attention/test_dsv4_int4_storage.py",
+      "result": "passed"
+    },
+    "total_tests_passed": 84
+  },
+  "timestamp_unix": 1785798483.9420598,
+  "torch_version": "2.9.1+cu128",
+  "triton_version": "3.5.1"
+}

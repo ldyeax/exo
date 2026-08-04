@@ -16,6 +16,92 @@ draft_shard_plan="${DSV4_DRAFT_HYBRID_EXPERT_SHARD_PLAN:-${SGLANG_KT_DRAFT_HYBRI
 draft_ordering_layer_indices="${DSV4_DRAFT_ORDERING_LAYER_INDICES:-40,41,42}"
 multi_stream_overlap="${SGLANG_OPT_USE_MULTI_STREAM_OVERLAP:-0}"
 
+# This lower-level entrypoint remains available for the one bootstrap operation
+# that OSCAR itself needs: collecting an unquantized calibration capture.  Every
+# actual serving launch must already carry the OSCAR flag set by the admitted
+# OpenCode wrapper.  Keeping the exception explicit prevents a direct invocation
+# of this historically generic launcher from restoring the slower FP8/INT4
+# prototypes by accident.
+launch_requested=0
+for launcher_argument in "$@"; do
+  if [[ $launcher_argument == --launch ]]; then
+    launch_requested=1
+    break
+  fi
+done
+if [[ $launch_requested == 1 ]]; then
+  oscar_capture_config="${SGLANG_DSV4_OSCAR_CAPTURE_CONFIG:-}"
+  if [[ -n $oscar_capture_config ]]; then
+    if [[ ${oscar_capture_config:0:1} != / || ! -f $oscar_capture_config ||
+      ! -r $oscar_capture_config || -L $oscar_capture_config ]]; then
+      echo "OSCAR calibration capture requires an absolute, readable, non-symlink regular config" >&2
+      exit 2
+    fi
+    case "${SGLANG_DSV4_OSCAR_INT2_KV_STORAGE:-0}" in
+    0 | false | FALSE | no | NO | n | N | "") ;;
+    *)
+      echo "OSCAR calibration capture requires SGLANG_DSV4_OSCAR_INT2_KV_STORAGE=0" >&2
+      exit 2
+      ;;
+    esac
+    for oscar_runtime_path_setting in \
+      SGLANG_DSV4_OSCAR_CALIBRATION_PATH \
+      SGLANG_DSV4_OSCAR_ADMISSION_RECEIPT_PATH \
+      DSV4_OSCAR_CALIBRATION_PATH \
+      DSV4_OSCAR_ADMISSION_RECEIPT_PATH; do
+      if [[ -n ${!oscar_runtime_path_setting:-} ]]; then
+        echo "$oscar_runtime_path_setting must be unset during OSCAR calibration capture" >&2
+        exit 2
+      fi
+    done
+  else
+    case "${SGLANG_DSV4_OSCAR_INT2_KV_STORAGE:-0}" in
+    1 | true | TRUE | yes | YES | y | Y) ;;
+    *)
+      echo "DSV4 serving requires SGLANG_DSV4_OSCAR_INT2_KV_STORAGE=1" >&2
+      exit 2
+      ;;
+    esac
+    if [[ ${DSV4_CONTEXT_LENGTH:-} != 524288 ]]; then
+      echo "OSCAR serving requires DSV4_CONTEXT_LENGTH=524288" >&2
+      exit 2
+    fi
+    if [[ ${DSV4_MAX_TOTAL_TOKENS:-} != 524288 ]]; then
+      echo "OSCAR serving requires DSV4_MAX_TOTAL_TOKENS=524288" >&2
+      exit 2
+    fi
+    if [[ ${DSV4_KV_CACHE_DTYPE:-} != fp8_e4m3 ]]; then
+      echo "OSCAR serving requires DSV4_KV_CACHE_DTYPE=fp8_e4m3 as its byte carrier" >&2
+      exit 2
+    fi
+    if [[ ${DSV4_DECODE_GRAPH_BACKEND:-full} == disabled ]]; then
+      echo "OSCAR serving requires decode CUDA graphs" >&2
+      exit 2
+    fi
+    if [[ ${DSV4_DISABLE_SPECULATIVE:-0} != 0 ]]; then
+      echo "EP2 OSCAR serving requires graph-backed DSpark speculation" >&2
+      exit 2
+    fi
+    if [[ ${DSV4_TARGET_VERIFY_EAGER:-0} != 0 ]]; then
+      echo "EP2 OSCAR serving requires graph-backed target verification" >&2
+      exit 2
+    fi
+  fi
+  for non_oscar_setting in \
+    SGLANG_DSV4_INT4_KV_STORAGE \
+    SGLANG_DSV4_INT4_C4_INDEXER_STORAGE \
+    SGLANG_DSV4_SM86_C128_BF16_STORAGE; do
+    non_oscar_value="${!non_oscar_setting:-0}"
+    case "$non_oscar_value" in
+    0 | false | FALSE | no | NO | n | N | "") ;;
+    *)
+      echo "$non_oscar_setting is forbidden for OSCAR serving and calibration" >&2
+      exit 2
+      ;;
+    esac
+  done
+fi
+
 if [[ $gpu_selection_strategy == "profile-hot-prefix-profile-fill" ]]; then
   profile_hot_prefix_experts_per_layer="${profile_hot_prefix_experts_per_layer:-12}"
   fill_profile_path="${fill_profile_path:-/var/lib/exo/profiles/dsv4-native-mxfp4/flash-v16-32k-decode-experts.pt}"
@@ -163,9 +249,9 @@ else
 fi
 export KT_WORKER_SPIN_US="${KT_WORKER_SPIN_US:-1000}"
 export KT_AMX_FINE_GRAINED_DECODE="${KT_AMX_FINE_GRAINED_DECODE:-1}"
-# On the validated TP2/EP2 placement, gamma 6 amortizes target verification
-# while retaining the target-model verification step for every draft block.
-export DSV4_DSPARK_BLOCK_SIZE="${DSV4_DSPARK_BLOCK_SIZE:-6}"
+# Match the checkpoint's trained semi-autoregressive block geometry.  Longer
+# blocks remain an explicit experiment, not a serving default.
+export DSV4_DSPARK_BLOCK_SIZE="${DSV4_DSPARK_BLOCK_SIZE:-5}"
 # The DSV4 MoE side-stream path is not yet coherent on this hybrid Ampere
 # configuration.  Keep the safe single-stream path as the launcher default,
 # while preserving an explicit caller override for future revalidation.

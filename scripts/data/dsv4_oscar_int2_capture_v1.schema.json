@@ -1,0 +1,87 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "dsv4_oscar_int2_capture_v1.schema.json",
+  "title": "DeepSeek-V4 Flash OSCAR INT2 capture manifest",
+  "description": "Raw tensor files plus a strict JSON provenance envelope. The v2 calibrator consumes compressed_latent only for shared INT2 history fitting; swa_latent belongs to the protected BF16 window and is never mixed into that distribution. Ratio-0 layers are capture diagnostics, not calibration consumers.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["format", "format_version", "model", "prompts", "chunks"],
+  "properties": {
+    "format": {"const": "dsv4-oscar-int2-capture"},
+    "format_version": {"const": 1},
+    "model": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "model_id",
+        "checkpoint_path",
+        "checkpoint_fingerprint_path",
+        "checkpoint_fingerprint_sha256"
+      ],
+      "properties": {
+        "model_id": {"type": "string", "minLength": 1},
+        "checkpoint_path": {"type": "string", "minLength": 1},
+        "checkpoint_fingerprint_path": {"type": "string", "minLength": 1},
+        "checkpoint_fingerprint_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "prompts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "chunks": {
+      "type": "array",
+      "minItems": 86,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "layer_id",
+          "split",
+          "prompt_ids",
+          "attention_query_nope",
+          "swa_latent"
+        ],
+        "properties": {
+          "layer_id": {"type": "integer", "minimum": 0, "maximum": 42},
+          "split": {"enum": ["train", "heldout"]},
+          "prompt_ids": {
+            "type": "array",
+            "minItems": 1,
+            "uniqueItems": true,
+            "items": {"type": "string", "minLength": 1}
+          },
+          "attention_query_nope": {"$ref": "#/$defs/tensorFile"},
+          "swa_latent": {"$ref": "#/$defs/tensorFile"},
+          "compressed_latent": {"$ref": "#/$defs/tensorFile"},
+          "c4_scorer_query": {"$ref": "#/$defs/tensorFile"},
+          "c4_scorer_key": {"$ref": "#/$defs/tensorFile"}
+        }
+      }
+    }
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "tensorFile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256", "shape"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "shape": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 3,
+          "items": {"type": "integer", "minimum": 1}
+        }
+      }
+    }
+  },
+  "description": "Semantic checks not expressible in JSON Schema are fail-closed in the collector: exact 43-layer coverage for train and heldout; attention Q [N,64,448]; SWA/compressed shared latent [N,448]; C4 scorer Q [N,64,128] and K [N,128] only on ratio-4 layers; compressed tensors required on ratio-4/128 layers and forbidden on ratio-0 layers. The 64-D RoPE tail is intentionally never captured for OSCAR quantization."
+}

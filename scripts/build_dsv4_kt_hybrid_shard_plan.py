@@ -8,13 +8,20 @@ import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, Sequence, final
+from typing import Literal, Sequence, cast, final
 
 import torch
 
 type GpuSelectionStrategy = Literal[
     "profile-hot", "ordering", "profile-hot-prefix-profile-fill"
 ]
+type JsonValue = (
+    None | bool | int | float | str | list[JsonValue] | dict[str, JsonValue]
+)
+
+SPARSE_PROFILE_FORMAT = "dsv4_sparse_logical_count_v1"
+SPARSE_PROFILE_KEYS = frozenset({"format", "source_profile_sha256", "logical_count"})
+SPARSE_LOGICAL_COUNT_KEYS = frozenset({"shape", "rows"})
 
 
 @final
@@ -82,7 +89,105 @@ def reduce_profile(raw_counts: torch.Tensor) -> torch.Tensor:
     return frequency
 
 
+def parse_json_integer(value: object, *, label: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{label} must be an integer")
+    return value
+
+
+def load_sparse_json_profile(profile_path: Path, *, label: str) -> torch.Tensor:
+    with profile_path.open("r", encoding="utf-8") as profile_file:
+        loaded_profile = cast(JsonValue, json.load(profile_file))
+    if not isinstance(loaded_profile, dict):
+        raise TypeError(f"{label} JSON profile must be an object")
+    if frozenset(loaded_profile) != SPARSE_PROFILE_KEYS:
+        raise ValueError(
+            f"{label} JSON profile must contain exactly {sorted(SPARSE_PROFILE_KEYS)}"
+        )
+    if loaded_profile["format"] != SPARSE_PROFILE_FORMAT:
+        raise ValueError(
+            f"{label} JSON profile format must be {SPARSE_PROFILE_FORMAT!r}"
+        )
+    source_profile_sha256 = loaded_profile["source_profile_sha256"]
+    if (
+        not isinstance(source_profile_sha256, str)
+        or len(source_profile_sha256) != 64
+        or any(
+            character not in "0123456789abcdef" for character in source_profile_sha256
+        )
+    ):
+        raise ValueError(
+            f"{label} JSON profile source_profile_sha256 must be a lowercase SHA-256"
+        )
+
+    logical_count = loaded_profile["logical_count"]
+    if not isinstance(logical_count, dict):
+        raise TypeError(f"{label} JSON profile logical_count must be an object")
+    if frozenset(logical_count) != SPARSE_LOGICAL_COUNT_KEYS:
+        raise ValueError(
+            f"{label} JSON profile logical_count must contain exactly "
+            f"{sorted(SPARSE_LOGICAL_COUNT_KEYS)}"
+        )
+    shape = logical_count["shape"]
+    if not isinstance(shape, list) or len(shape) != 2:
+        raise ValueError(
+            f"{label} JSON profile logical_count.shape must be [layers, experts]"
+        )
+    num_layers = parse_json_integer(shape[0], label="logical_count layer count")
+    num_experts = parse_json_integer(shape[1], label="logical_count expert count")
+    if num_layers <= 0 or num_experts <= 0:
+        raise ValueError(
+            f"{label} JSON profile logical_count dimensions must be positive"
+        )
+
+    rows = logical_count["rows"]
+    if not isinstance(rows, list) or len(rows) != num_layers:
+        raise ValueError(
+            f"{label} JSON profile logical_count.rows must contain {num_layers} rows"
+        )
+    frequency = torch.zeros((num_layers, num_experts), dtype=torch.int64)
+    maximum_count = torch.iinfo(torch.int64).max
+    for layer_index, row in enumerate(rows):
+        if not isinstance(row, list):
+            raise TypeError(
+                f"{label} JSON profile logical_count row {layer_index} must be a list"
+            )
+        previous_expert_id = -1
+        for entry_index, entry in enumerate(row):
+            if not isinstance(entry, list) or len(entry) != 2:
+                raise ValueError(
+                    f"{label} JSON profile row {layer_index} entry {entry_index} "
+                    "must be [expert_id, count]"
+                )
+            expert_id = parse_json_integer(
+                entry[0], label=f"row {layer_index} entry {entry_index} expert ID"
+            )
+            count = parse_json_integer(
+                entry[1], label=f"row {layer_index} entry {entry_index} count"
+            )
+            if not 0 <= expert_id < num_experts:
+                raise ValueError(
+                    f"{label} JSON profile row {layer_index} expert ID {expert_id} "
+                    f"is outside [0, {num_experts})"
+                )
+            if expert_id <= previous_expert_id:
+                raise ValueError(
+                    f"{label} JSON profile row {layer_index} expert IDs must be "
+                    "strictly increasing"
+                )
+            if not 0 < count <= maximum_count:
+                raise ValueError(
+                    f"{label} JSON profile row {layer_index} expert {expert_id} "
+                    "count must be a positive int64"
+                )
+            frequency[layer_index, expert_id] = count
+            previous_expert_id = expert_id
+    return frequency
+
+
 def load_profile_frequency(profile_path: Path, *, label: str) -> torch.Tensor:
+    if profile_path.suffix.lower() == ".json":
+        return load_sparse_json_profile(profile_path, label=label)
     loaded_profile = torch.load(profile_path, map_location="cpu", weights_only=True)
     if not isinstance(loaded_profile, dict) or not isinstance(
         loaded_profile.get("logical_count"), torch.Tensor

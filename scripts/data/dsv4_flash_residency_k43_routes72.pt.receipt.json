@@ -1,0 +1,1490 @@
+{
+  "baseline": {
+    "path": "/root/exo/scripts/data/dsv4_flash_opencode_g14_p28_frozen_plan.pt",
+    "sha256": "a0af145d1e127c758c159ba22af44556240940ce52ed6d4c3c0c3438e1909a87"
+  },
+  "budget": {
+    "expert_weight_bytes": 13369344,
+    "extra_bytes_per_rank": 575143936,
+    "selected_bytes_per_rank": 574881792,
+    "selected_slots_per_rank": 43,
+    "slot_budget_per_rank": 43,
+    "unused_bytes_per_rank": 262144
+  },
+  "critical_tail_summary": {
+    "mean_after": 8.548035530510969,
+    "mean_before": 9.416983170089958,
+    "mean_gpu_route_cost_fraction_after": 0.6156191964243058,
+    "mean_gpu_route_cost_fraction_before": 0.5939417267444776,
+    "mean_reduction_ratio": 0.0922745240045585,
+    "worst_after": 8.650245722449704,
+    "worst_before": 9.610289721611602,
+    "worst_reduction_ratio": 0.09989750850101362
+  },
+  "format": "dsv4_variable_residency_plan_v1",
+  "gpu_width": {
+    "by_rank_and_layer": [
+      [
+        14,
+        14,
+        14,
+        14,
+        14,
+        14,
+        16,
+        14,
+        14,
+        14,
+        20,
+        14,
+        14,
+        15,
+        16,
+        14,
+        14,
+        15,
+        15,
+        14,
+        14,
+        15,
+        16,
+        14,
+        18,
+        16,
+        14,
+        20,
+        14,
+        14,
+        14,
+        14,
+        14,
+        14,
+        14,
+        14,
+        17,
+        19,
+        15,
+        15,
+        17,
+        14,
+        16
+      ],
+      [
+        17,
+        14,
+        14,
+        14,
+        14,
+        15,
+        14,
+        19,
+        14,
+        22,
+        14,
+        15,
+        14,
+        14,
+        14,
+        16,
+        19,
+        14,
+        14,
+        14,
+        14,
+        14,
+        14,
+        16,
+        14,
+        14,
+        14,
+        14,
+        16,
+        16,
+        15,
+        17,
+        19,
+        15,
+        14,
+        16,
+        14,
+        14,
+        14,
+        14,
+        14,
+        14,
+        14
+      ]
+    ],
+    "maximum": 22,
+    "minimum": 14,
+    "rank_symmetric": false
+  },
+  "placement_semantics_sha256": "f2c6bbaf95af9740414601b9aeb2a25c10d3b2a53d092f16709edbb4c8b3a9ad",
+  "plan": "/root/exo/scripts/data/dsv4_flash_residency_k43_routes72.pt",
+  "plan_sha256": "2980d3332a8297b3d5ae362259f868a0a6f1bed9fa97014fb79d6fad458507d1",
+  "profiles": [
+    {
+      "critical_tail_after": 8.534571765352572,
+      "critical_tail_before": 9.361891258575866,
+      "gpu_route_cost_fraction_after": 0.6174412739397162,
+      "gpu_route_cost_fraction_before": 0.5966539049251408,
+      "label": "fold1",
+      "path": "/root/exo/scripts/data/dsv4_flash_hotspot_fold1_routes72.pt",
+      "predicted_reduction": 0.8273194932232943,
+      "predicted_reduction_ratio": 0.08837097872349635,
+      "sample_count": 93,
+      "sha256": "b6ae6f8167b9070a8370cc5450b0df8475c5f2cfdf07fec71cae91c8ca236989",
+      "source_kind": "compact_sampled_logical_count"
+    },
+    {
+      "critical_tail_after": 8.433226879513517,
+      "critical_tail_before": 9.264348791182645,
+      "gpu_route_cost_fraction_after": 0.6219632371136293,
+      "gpu_route_cost_fraction_before": 0.6005596140779467,
+      "label": "fold2",
+      "path": "/root/exo/scripts/data/dsv4_flash_hotspot_fold2_routes72.pt",
+      "predicted_reduction": 0.8311219116691273,
+      "predicted_reduction_ratio": 0.08971185459469624,
+      "sample_count": 95,
+      "sha256": "4467593c296a77085848462c6f74583a28a3e625b5d7737e33cbfb48b7ae6cb1",
+      "source_kind": "compact_sampled_logical_count"
+    },
+    {
+      "critical_tail_after": 8.47240490988067,
+      "critical_tail_before": 9.360404662867149,
+      "gpu_route_cost_fraction_after": 0.6189334866278053,
+      "gpu_route_cost_fraction_before": 0.5972812072696209,
+      "label": "fold3",
+      "path": "/root/exo/scripts/data/dsv4_flash_hotspot_fold3_routes72.pt",
+      "predicted_reduction": 0.8879997529864792,
+      "predicted_reduction_ratio": 0.09486766704747136,
+      "sample_count": 112,
+      "sha256": "750afef100bf537c32bd17dd79fc945daf618bd034e84efa7426907207ca4d7f",
+      "source_kind": "compact_sampled_logical_count"
+    },
+    {
+      "critical_tail_after": 8.649728375358382,
+      "critical_tail_before": 9.487981416212529,
+      "gpu_route_cost_fraction_after": 0.6098148578385455,
+      "gpu_route_cost_fraction_before": 0.5884191805854384,
+      "label": "fold4",
+      "path": "/root/exo/scripts/data/dsv4_flash_hotspot_fold4_routes72.pt",
+      "predicted_reduction": 0.8382530408541466,
+      "predicted_reduction_ratio": 0.08834893367537451,
+      "sample_count": 96,
+      "sha256": "407a814dd54e395804eba5059380564e46c48fadbf4fcc17575450fa15e420be",
+      "source_kind": "compact_sampled_logical_count"
+    },
+    {
+      "critical_tail_after": 8.650245722449704,
+      "critical_tail_before": 9.610289721611602,
+      "gpu_route_cost_fraction_after": 0.6099431266018328,
+      "gpu_route_cost_fraction_before": 0.5867947268642413,
+      "label": "fold5",
+      "path": "/root/exo/scripts/data/dsv4_flash_hotspot_fold5_routes72.pt",
+      "predicted_reduction": 0.9600439991618988,
+      "predicted_reduction_ratio": 0.09989750850101362,
+      "sample_count": 91,
+      "sha256": "972e897227a010a7f17f79ed268329af9707e4b9694fb240d3565b5fc4f0cc7b",
+      "source_kind": "compact_sampled_logical_count"
+    }
+  ],
+  "promotions": [
+    {
+      "critical_tail_reduction_by_profile": [
+        0.013330419580418251,
+        0.017046268442916457,
+        0.01680315438277269,
+        0.013935810810810523,
+        0.01671142942405268
+      ],
+      "expert_id": 9,
+      "layer": 9,
+      "objective_after": 18.994996045749314,
+      "objective_before": 19.02727289170156,
+      "rank": 1,
+      "step": 0
+    },
+    {
+      "critical_tail_reduction_by_profile": [
+        0.011089367253749316,
+        0.011415033383588735,
+        0.014708552751045545,
+        0.013417632595714934,
+        0.014896324575193631
+      ],
+      "expert_id": 237,
+      "layer": 10,
+      "objective_after": 18.96699433906226,
+      "objective_before": 18.994996045749314,
+      "rank": 0,
+      "step": 1
+    },
+    {
+      "critical_tail_reduction_by_profile": [
+        0.013257575757576134,
+        0.011316430310843728,
+        0.0120715802244451,
+        0.012246621621621046,
+        0.016189197254551146
+      ],
+      "expert_id": 80,
+      "layer": 9,
+      "objective_after": 18.937788860773903,
+      "objective_before": 18.96699433906226,
+      "rank": 1,
+      "step": 2
+    },
+    {
+      "critical_tail_reduction_by_profile": [
+        0.008697542944119618,
+        0.013209849953334185,
+        0.015132255916711301,
+        0.009202669476643166,
+        0.015195748184742897
+      ],
+      "expert_id": 50,
+      "layer": 10,
+      "objective_after": 18.91030549929405,
+      "objective_before": 18.937788860773903,
+      "rank": 0,
+      "step": 3
+    },
+    {
+      "critical_tail_reduction_by_profile": [
+        0.011494252873562871,
+        0.014456836018172936,
+        0.005167048323645673,
+        0.015296108291030563,
+        0.016498758942912417
+      ],
+      "expert_id": 84,
+      "layer": 35,
+      "objective_after": 18.881224139461274,
+      "objective_before": 18.91030549929405,
+      "rank": 1,
+      "step": 4
+    },
+    {
+      "critical_tail_reduction_by_profile": [
+        0.01544769016765457,
+        0.015682062298603583,
+        0.011840555452234724,
+        0.015652418052923167,
+        0.01281474820143913
+      ],
+      "expert_id": 120,
+      "layer": 39,
+      "objective_after": 18.854121896425262,
+      "objective_before": 18.881224139461274,
+      "rank": 0,
+      "step": 5
+    },
+    {
+      "critical_tail_reduction_by_profile": [
+        0.014016130295200213,
+        0.014689006196924481,
+        0.013194852701026605,
+        0.01411336216708392,
+        0.013549479796756358
+      ],
+      "expert_id": 98,
+      "layer": 29,
+      "objective_after": 18.826659850397107,
+      "objective_before": 18.854121896425262,
+      "rank": 1,
+      "step": 6
+    },
+    {
+      "critical_tail_reduction_by_profile": [
+        0.009637987776210721,
+        0.010874595094863437,
+        0.011738002594032793,
+        0.009019081693500297,
+        0.015438764898807023
+      ],
+      "expert_id": 2,
+      "layer": 22,
+      "objective_after": 18.79987939908682,
+      "objective_before": 18.826659850397107,
+      "rank": 0,
+      "step": 7
+    },
+    {
+      "critical_tail_reduction_by_profile": [
+        0.008407624845979456,
+        0.010122765453370874,
+        0.01367955934870757,
+        0.012223393045310615,
+        0.014896324575193631
+      ],
+      "expert_id": 150,
+      "layer": 10,
+      "objective_after": 18.77311714105791,
+      "objective_before": 18.79987939908682,
+      "rank": 0,
+      "step": 8
+    },
+    {
+      "critical_tail_reduction_by_profile": [
+        0.01486013986014001,
+        0.01833548202263202,
+        0.010979678495603551,
+        0.013302364864864913,
+        0.012533572068038623
+      ],
+      "expert_id": 162,
+      "layer": 9,
+      "objective_after": 18.746581321527618,
+      "objective_before": 18.77311714105791,
+      "rank": 1,
+      "step": 9
+    },
+    {
+      "critical_tail_reduction_by_profile": [
+        0.01726398601398671,
+        0.012892135797164528,
+        0.01298149833181661,
+        0.017947635135135087,
+        0.01186213070725195
+      ],
+      "expert_id": 130,
+      "layer": 9,
+      "objective_after": 18.720129713623294,
+      "objective_before": 18.746581321527618,
+      "rank": 1,
+      "step": 10
+    },
+    {
+      "critical_tail_reduction_by_profile": [
+        0.014793375140698117,
+        0.010957598856599304,
+        0.012144390767579338,
+        0.012253180363693161,
+        0.013211882488102233
+      ],
+      "expert_id": 155,
+      "layer": 27,
+      "objective_after": 18.69424574561186,
+      "objective_before": 18.720129713623294,
+      "rank": 0,
+      "step": 11
+    },
+    {
+      "critical_tail_reduction_by_profile": [
+        0.014489437962327045,
+        0.01564701520207734,
+        0.012793314046929183,
+        0.015316315205327058,
+        0.012114014251782379
+      ],
+      "expert_id": 182,
+      "layer": 7,
+      "objective_after": 18.668059712026388,
+      "objective_before": 18.69424574561186,
+      "rank": 1,
+      "step": 12
+    },
+    {
+      "critical_tail_reduction_by_profile": [
+        0.001133529811834677,
+        0.01487700692296201,
+        0.015094339622642394,
+        0.004905143186901384,
+        0.01537629423582132
+      ],
+      "expert_id": 122,
+      "layer": 21,
+      "objective_after": 18.642406155034532,
+      "objective_before": 18.668059712026388,
+      "rank": 0,
+      "step": 13
+    },
+    {
+      "critical_tail_reduction_by_profile": [
+        0.015328300160145858,
+        0.01186503522432325,
+        0.011121825779492056,
+        0.009174990751018797,
+        0.013697545526524024
+      ],
+      "expert_id": 151,
+      "layer": 7,
+      "objective_after": 18.61647107001971,
+      "objective_before": 18.642406155034532,
+      "rank": 1,
+      "step": 14
+    },
+    {
+      "critical_tail_reduction_by_profile": [
+        0.009204768371812833,
+        0.008980924812588498,
+        0.006768189509307021,
+        0.011883931175269424,
+        0.015155029768809669
+      ],
+      "expert_id": 86,
+      "layer": 6,
+      "objective_after": 18.59091747152334,
+      "objective_before": 18.61647107001971,
+      "rank": 0,
+      "step": 15
+    },
+    {
+      "critical_tail_reduction_by_profile": [
+        0.0112558289114002,
+        0.015483563601714323,
+        0.014224369296833572,
+        0.012253180363693161,
+        0.012227145905136183
+      ],
+      "expert_id": 33,
+      "layer": 27,
+      "objective_after": 18.56560150800245,
+      "objective_before": 18.59091747152334,
+      "rank": 0,
+      "step": 16
+    },
+    {
+      "critical_tail_reduction_by_profile": [
+        0.010635198135197754,
+        0.011531299240795434,
+        0.009281164695176258,
+        0.009923986486487735,
+        0.01402566398090066
+      ],
+      "expert_id": 102,
+      "layer": 9,
+      "objective_after": 18.540496381513837,
+      "objective_before": 18.56560150800245,
+      "rank": 1,
+      "step": 17
+    },
+    {
+      "critical_tail_reduction_by_profile": [
+        0.010272213662045004,
+        0.010709166034235551,
+        0.0045671876115029875,
+        0.008277460475127896,
+        0.01516339869281147
+      ],
+      "expert_id": 158,
+      "layer": 24,
+      "objective_after": 18.51553509752588,
+      "objective_before": 18.540496381513837,
+      "rank": 0,
+      "step": 18
+    },
+    {
+      "critical_tail_reduction_by_profile": [
+        0.007939976689975481,
+        0.010600200544335081,
+        0.006005459508644506,
+        0.01238738738738654,
+        0.014249477767830143
+      ],
+      "expert_id": 235,
+      "layer": 9,
+      "objective_after": 18.491049119378417,
+      "objective_before": 18.51553509752588,
+      "rank": 1,
+      "step": 19
+    },
+    {
+      "critical_tail_reduction_by_profile": [
+        0.012326656394453295,
+        0.012395648874273135,
+        0.010276172125884386,
+        0.011836768479430049,
+        0.012636165577340819
+      ],
+      "expert_id": 155,
+      "layer": 24,
+      "objective_after": 18.466518671510798,
+      "objective_before": 18.491049119378417,
+      "rank": 0,
+      "step": 20
+    },
+    {
+      "critical_tail_reduction_by_profile": [
+        0.009333011505351152,
+        0.009656146961846801,
+        0.012306679828890665,
+        0.010001562744177406,
+        0.0132320509678987
+      ],
+      "expert_id": 209,
+      "layer": 16,
+      "objective_after": 18.44238073014127,
+      "objective_before": 18.466518671510798,
+      "rank": 1,
+      "step": 21
+    },
+    {
+      "critical_tail_reduction_by_profile": [
+        0.011596723925492824,
+        0.01062531409290024,
+        0.015495430058713566,
+        0.010115911485774731,
+        0.01242607979639132
+      ],
+      "expert_id": 101,
+      "layer": 10,
+      "objective_after": 18.417902758473023,
+      "objective_before": 18.44238073014127,
+      "rank": 0,
+      "step": 22
+    },
+    {
+      "critical_tail_reduction_by_profile": [
+        0.015023259360939178,
+        0.009714497589914828,
+        0.013436194149791802,
+        0.01132075471698002,
+        0.011638954869358287
+      ],
+      "expert_id": 139,
+      "layer": 7,
+      "objective_after": 18.394037071466265,
+      "objective_before": 18.417902758473023,
+      "rank": 1,
+      "step": 23
+    },
+    {
+      "critical_tail_reduction_by_profile": [
+        0.0,
+        0.012578616352200811,
+        0.012030172974379028,
+        0.010970844604749175,
+        0.013982102908276062
+      ],
+      "expert_id": 60,
+      "layer": 18,
+      "objective_after": 18.37014262119007,
+      "objective_before": 18.394037071466265,
+      "rank": 0,
+      "step": 24
+    },
+    {
+      "critical_tail_reduction_by_profile": [
+        0.01384032634032728,
+        0.011173184357541999,
+        0.013588110403397025,
+        0.011190878378378954,
+        0.0111906893464635
+      ],
+      "expert_id": 187,
+      "layer": 9,
+      "objective_after": 18.346755294078385,
+      "objective_before": 18.37014262119007,
+      "rank": 1,
+      "step": 25
+    },
+    {
+      "critical_tail_reduction_by_profile": [
+        0.0,
+        0.0047899489595604194,
+        0.0068177260878279355,
+        0.006100815984138919,
+        0.01670351265045511
+      ],
+      "expert_id": 95,
+      "layer": 13,
+      "objective_after": 18.323169380691535,
+      "objective_before": 18.346755294078385,
+      "rank": 0,
+      "step": 26
+    },
+    {
+      "critical_tail_reduction_by_profile": [
+        0.016899766899767243,
+        0.013608365563673175,
+        0.011707612981497917,
+        0.009360923423423984,
+        0.010444643390034258
+      ],
+      "expert_id": 96,
+      "layer": 9,
+      "objective_after": 18.30032047484982,
+      "objective_before": 18.32316938069153,
+      "rank": 1,
+      "step": 27
+    },
+    {
+      "critical_tail_reduction_by_profile": [
+        0.013748191027495693,
+        0.011434016198190733,
+        0.013352120236177711,
+        0.012097088894092778,
+        0.010914163794518927
+      ],
+      "expert_id": 34,
+      "layer": 27,
+      "objective_after": 18.277097195025206,
+      "objective_before": 18.30032047484982,
+      "rank": 0,
+      "step": 28
+    },
+    {
+      "critical_tail_reduction_by_profile": [
+        0.0099766674712356,
+        0.007929031245092588,
+        0.009345179335308984,
+        0.012189404594469266,
+        0.011843502409540463
+      ],
+      "expert_id": 110,
+      "layer": 16,
+      "objective_after": 18.254996935604538,
+      "objective_before": 18.277097195025206,
+      "rank": 1,
+      "step": 29
+    },
+    {
+      "critical_tail_reduction_by_profile": [
+        0.014104372355431494,
+        0.013342588307882153,
+        0.012775616083009922,
+        0.010807990459152705,
+        0.010799136069115534
+      ],
+      "expert_id": 190,
+      "layer": 22,
+      "objective_after": 18.231831858880504,
+      "objective_before": 18.254996935604538,
+      "rank": 0,
+      "step": 30
+    },
+    {
+      "critical_tail_reduction_by_profile": [
+        0.013215859030838217,
+        0.009112818195511352,
+        0.01051341589267274,
+        0.012003901267911843,
+        0.010568136670640271
+      ],
+      "expert_id": 35,
+      "layer": 31,
+      "objective_after": 18.21018089599835,
+      "objective_before": 18.231831858880504,
+      "rank": 1,
+      "step": 31
+    },
+    {
+      "critical_tail_reduction_by_profile": [
+        0.013479780329506141,
+        0.011539729640619,
+        0.014791224345364284,
+        0.005607020965383569,
+        0.011658582248319505
+      ],
+      "expert_id": 76,
+      "layer": 38,
+      "objective_after": 18.187107046244186,
+      "objective_before": 18.21018089599835,
+      "rank": 0,
+      "step": 32
+    },
+    {
+      "critical_tail_reduction_by_profile": [
+        0.009428858489835434,
+        0.01302907064316905,
+        0.01186790505676072,
+        0.005851901868107134,
+        0.011283273738577293
+      ],
+      "expert_id": 44,
+      "layer": 31,
+      "objective_after": 18.16553157054632,
+      "objective_before": 18.187107046244186,
+      "rank": 1,
+      "step": 33
+    },
+    {
+      "critical_tail_reduction_by_profile": [
+        0.008284858099770531,
+        0.011963163783457631,
+        0.010074270166922972,
+        0.013670363683258913,
+        0.011888799499418568
+      ],
+      "expert_id": 250,
+      "layer": 36,
+      "objective_after": 18.142466480000337,
+      "objective_before": 18.16553157054632,
+      "rank": 0,
+      "step": 34
+    },
+    {
+      "critical_tail_reduction_by_profile": [
+        0.012003474690041926,
+        0.002004780630734615,
+        0.007985217448689852,
+        0.01176199261992572,
+        0.012171372930867008
+      ],
+      "expert_id": 68,
+      "layer": 11,
+      "objective_after": 18.12110973940542,
+      "objective_before": 18.142466480000337,
+      "rank": 1,
+      "step": 35
+    },
+    {
+      "critical_tail_reduction_by_profile": [
+        0.0067960370097441825,
+        0.007959248646926653,
+        0.009173683850209002,
+        0.004089979550103706,
+        0.014511094237745326
+      ],
+      "expert_id": 187,
+      "layer": 14,
+      "objective_after": 18.098092636508728,
+      "objective_before": 18.12110973940542,
+      "rank": 0,
+      "step": 36
+    },
+    {
+      "critical_tail_reduction_by_profile": [
+        0.008850269530935151,
+        0.011383262678599237,
+        0.0099374794340239,
+        0.008751367401155008,
+        0.011190067793842573
+      ],
+      "expert_id": 124,
+      "layer": 16,
+      "objective_after": 18.076880079347173,
+      "objective_before": 18.098092636508728,
+      "rank": 1,
+      "step": 37
+    },
+    {
+      "critical_tail_reduction_by_profile": [
+        0.01507574110313925,
+        0.010050972790580204,
+        0.012529507899037284,
+        0.013066385669125324,
+        0.010554682236694646
+      ],
+      "expert_id": 41,
+      "layer": 10,
+      "objective_after": 18.054069939170766,
+      "objective_before": 18.076880079347177,
+      "rank": 0,
+      "step": 38
+    },
+    {
+      "critical_tail_reduction_by_profile": [
+        0.006362584696745444,
+        0.004989538065347077,
+        0.012062972807196815,
+        0.007333014506615498,
+        0.012531328320802615
+      ],
+      "expert_id": 120,
+      "layer": 32,
+      "objective_after": 18.03288272317062,
+      "objective_before": 18.054069939170766,
+      "rank": 1,
+      "step": 39
+    },
+    {
+      "critical_tail_reduction_by_profile": [
+        0.010871928680147747,
+        0.009189460837102814,
+        0.0073845408873562945,
+        0.007376185458376483,
+        0.01287521521071966
+      ],
+      "expert_id": 216,
+      "layer": 10,
+      "objective_after": 18.010468041745156,
+      "objective_before": 18.03288272317062,
+      "rank": 0,
+      "step": 40
+    },
+    {
+      "critical_tail_reduction_by_profile": [
+        0.007767311188231929,
+        0.006599066473523152,
+        0.008450896203912706,
+        0.004941814124023836,
+        0.012865497076022692
+      ],
+      "expert_id": 175,
+      "layer": 32,
+      "objective_after": 17.989477627655994,
+      "objective_before": 18.01046804174516,
+      "rank": 1,
+      "step": 41
+    },
+    {
+      "critical_tail_reduction_by_profile": [
+        0.007695789950203036,
+        0.011207600385956695,
+        0.013536379018612266,
+        0.01531058617672798,
+        0.010670378102528133
+      ],
+      "expert_id": 3,
+      "layer": 6,
+      "objective_after": 17.967123102826662,
+      "objective_before": 17.989477627655994,
+      "rank": 0,
+      "step": 42
+    },
+    {
+      "critical_tail_reduction_by_profile": [
+        0.013220955214015007,
+        0.009174311926605228,
+        0.012131125195937287,
+        0.011557468515862368,
+        0.009690893901421305
+      ],
+      "expert_id": 22,
+      "layer": 32,
+      "objective_after": 17.946277257974472,
+      "objective_before": 17.96712310282666,
+      "rank": 1,
+      "step": 43
+    },
+    {
+      "critical_tail_reduction_by_profile": [
+        0.00967167218121645,
+        0.006090947017105108,
+        0.008840794964283916,
+        0.012916767578913024,
+        0.012265135699374596
+      ],
+      "expert_id": 114,
+      "layer": 25,
+      "objective_after": 17.92405505878692,
+      "objective_before": 17.946277257974472,
+      "rank": 0,
+      "step": 44
+    },
+    {
+      "critical_tail_reduction_by_profile": [
+        0.014955759141805913,
+        0.004513809195930918,
+        0.007381278986217765,
+        0.01115410880946932,
+        0.010968626502137369
+      ],
+      "expert_id": 109,
+      "layer": 29,
+      "objective_after": 17.903291715757668,
+      "objective_before": 17.924055058786916,
+      "rank": 1,
+      "step": 45
+    },
+    {
+      "critical_tail_reduction_by_profile": [
+        0.007155491236533251,
+        0.009131332380498236,
+        0.009728931830380816,
+        0.009989854054474279,
+        0.012145084523222494
+      ],
+      "expert_id": 175,
+      "layer": 27,
+      "objective_after": 17.88151649242942,
+      "objective_before": 17.903291715757668,
+      "rank": 0,
+      "step": 46
+    },
+    {
+      "critical_tail_reduction_by_profile": [
+        0.013421795165104555,
+        0.012680756395994308,
+        0.009707489553198556,
+        0.007547169811321197,
+        0.010055423594614865
+      ],
+      "expert_id": 248,
+      "layer": 7,
+      "objective_after": 17.860778541930763,
+      "objective_before": 17.881516492429427,
+      "rank": 1,
+      "step": 47
+    },
+    {
+      "critical_tail_reduction_by_profile": [
+        0.008153026026967325,
+        0.012542320714064914,
+        0.011133200795228504,
+        0.009825982598259841,
+        0.011156267431667644
+      ],
+      "expert_id": 62,
+      "layer": 37,
+      "objective_after": 17.839060114985855,
+      "objective_before": 17.860778541930763,
+      "rank": 0,
+      "step": 48
+    },
+    {
+      "critical_tail_reduction_by_profile": [
+        0.011042944785275566,
+        0.00987713803902679,
+        0.007016826759315364,
+        0.0,
+        0.011895910780669539
+      ],
+      "expert_id": 161,
+      "layer": 23,
+      "objective_after": 17.81919764013233,
+      "objective_before": 17.839060114985855,
+      "rank": 1,
+      "step": 49
+    },
+    {
+      "critical_tail_reduction_by_profile": [
+        0.0060465116279075914,
+        0.010201020102011071,
+        0.00858734841035691,
+        0.01269414575866179,
+        0.011047528214909619
+      ],
+      "expert_id": 74,
+      "layer": 42,
+      "objective_after": 17.79843480109465,
+      "objective_before": 17.81919764013233,
+      "rank": 0,
+      "step": 50
+    },
+    {
+      "critical_tail_reduction_by_profile": [
+        0.00974512743628253,
+        0.010140660778541033,
+        0.008521933500977852,
+        0.011068023913393787,
+        0.009204301075268262
+      ],
+      "expert_id": 237,
+      "layer": 15,
+      "objective_after": 17.779494490678488,
+      "objective_before": 17.79843480109465,
+      "rank": 1,
+      "step": 51
+    },
+    {
+      "critical_tail_reduction_by_profile": [
+        0.006959796937689333,
+        0.009073543457498445,
+        0.013144382830150292,
+        0.0006292276230919214,
+        0.012486290390619104
+      ],
+      "expert_id": 127,
+      "layer": 14,
+      "objective_after": 17.75854955204006,
+      "objective_before": 17.779494490678488,
+      "rank": 0,
+      "step": 52
+    },
+    {
+      "critical_tail_reduction_by_profile": [
+        0.008367527556520926,
+        0.0058093892290784765,
+        0.011977624218491911,
+        0.008126269729645585,
+        0.010046557216368157
+      ],
+      "expert_id": 231,
+      "layer": 16,
+      "objective_after": 17.739637521233668,
+      "objective_before": 17.75854955204006,
+      "rank": 1,
+      "step": 53
+    },
+    {
+      "critical_tail_reduction_by_profile": [
+        0.01199435559736628,
+        0.01169590643274887,
+        0.01245858184227977,
+        0.013201320132013805,
+        0.008765638696310418
+      ],
+      "expert_id": 253,
+      "layer": 37,
+      "objective_after": 17.719248721997218,
+      "objective_before": 17.739637521233668,
+      "rank": 0,
+      "step": 54
+    },
+    {
+      "critical_tail_reduction_by_profile": [
+        0.0038836555941159645,
+        0.009979076130694153,
+        0.014175696858174547,
+        0.005340347521121558,
+        0.010025062656641381
+      ],
+      "expert_id": 86,
+      "layer": 32,
+      "objective_after": 17.700542891588427,
+      "objective_before": 17.719248721997218,
+      "rank": 1,
+      "step": 55
+    },
+    {
+      "critical_tail_reduction_by_profile": [
+        0.01083150093655938,
+        0.008845326320823688,
+        0.010045476141995024,
+        0.011762872945391578,
+        0.010032605969401587
+      ],
+      "expert_id": 197,
+      "layer": 17,
+      "objective_after": 17.68020672915619,
+      "objective_before": 17.700542891588427,
+      "rank": 0,
+      "step": 56
+    },
+    {
+      "critical_tail_reduction_by_profile": [
+        0.008631512868801039,
+        0.009114583333333925,
+        0.00729166666666714,
+        0.00690335305720069,
+        0.010240283825188712
+      ],
+      "expert_id": 209,
+      "layer": 33,
+      "objective_after": 17.66242678929789,
+      "objective_before": 17.68020672915619,
+      "rank": 1,
+      "step": 57
+    },
+    {
+      "critical_tail_reduction_by_profile": [
+        0.01004984724232294,
+        0.013260282674290025,
+        0.011607622114869542,
+        0.012565363302895705,
+        0.008616445100935621
+      ],
+      "expert_id": 177,
+      "layer": 27,
+      "objective_after": 17.641693808192763,
+      "objective_before": 17.66242678929789,
+      "rank": 0,
+      "step": 58
+    },
+    {
+      "critical_tail_reduction_by_profile": [
+        0.00648755376912824,
+        0.0,
+        0.0,
+        0.009137055837564745,
+        0.012483574244415152
+      ],
+      "expert_id": 48,
+      "layer": 35,
+      "objective_after": 17.623882821300143,
+      "objective_before": 17.641693808192763,
+      "rank": 1,
+      "step": 59
+    },
+    {
+      "critical_tail_reduction_by_profile": [
+        0.007369081216682005,
+        0.00946445060018597,
+        0.01066931742876065,
+        0.010501050105009568,
+        0.010359391186547384
+      ],
+      "expert_id": 94,
+      "layer": 37,
+      "objective_after": 17.603709113087696,
+      "objective_before": 17.623882821300143,
+      "rank": 0,
+      "step": 60
+    },
+    {
+      "critical_tail_reduction_by_profile": [
+        0.01123010560761628,
+        0.0,
+        0.012523364485980792,
+        0.013336232514314261,
+        0.007766243752403312
+      ],
+      "expert_id": 180,
+      "layer": 5,
+      "objective_after": 17.586819114859676,
+      "objective_before": 17.603709113087696,
+      "rank": 1,
+      "step": 61
+    },
+    {
+      "critical_tail_reduction_by_profile": [
+        0.007928559505925747,
+        0.00713484046817392,
+        0.007458048477316126,
+        0.008589440504334078,
+        0.011814982403217655
+      ],
+      "expert_id": 122,
+      "layer": 40,
+      "objective_after": 17.566418958184666,
+      "objective_before": 17.58681911485968,
+      "rank": 0,
+      "step": 62
+    },
+    {
+      "critical_tail_reduction_by_profile": [
+        0.006666666666667709,
+        0.0018914968618339856,
+        0.006320836965999277,
+        0.008314436885866527,
+        0.01036958255783027
+      ],
+      "expert_id": 85,
+      "layer": 28,
+      "objective_after": 17.549336771639197,
+      "objective_before": 17.566418958184666,
+      "rank": 1,
+      "step": 63
+    },
+    {
+      "critical_tail_reduction_by_profile": [
+        0.014031007751936997,
+        0.010576057605760525,
+        0.011537200917732804,
+        0.014411589008362924,
+        0.007868383404865398
+      ],
+      "expert_id": 193,
+      "layer": 42,
+      "objective_after": 17.5297835404966,
+      "objective_before": 17.549336771639197,
+      "rank": 0,
+      "step": 64
+    },
+    {
+      "critical_tail_reduction_by_profile": [
+        0.003555143365021607,
+        0.012125320078324009,
+        0.012577399380804266,
+        0.002175707104809632,
+        0.008820023837902369
+      ],
+      "expert_id": 92,
+      "layer": 31,
+      "objective_after": 17.513112797905322,
+      "objective_before": 17.5297835404966,
+      "rank": 1,
+      "step": 65
+    },
+    {
+      "critical_tail_reduction_by_profile": [
+        0.008936970837252645,
+        0.01061865189288902,
+        0.010603048376408353,
+        0.011851185118512575,
+        0.009243764443382929
+      ],
+      "expert_id": 208,
+      "layer": 37,
+      "objective_after": 17.49361830932825,
+      "objective_before": 17.513112797905322,
+      "rank": 0,
+      "step": 66
+    },
+    {
+      "critical_tail_reduction_by_profile": [
+        0.008912210561385692,
+        0.004824991822047764,
+        0.011385861972618372,
+        0.00840200355469456,
+        0.008258064516128982
+      ],
+      "expert_id": 203,
+      "layer": 15,
+      "objective_after": 17.477003618326748,
+      "objective_before": 17.493618309328255,
+      "rank": 1,
+      "step": 67
+    },
+    {
+      "critical_tail_reduction_by_profile": [
+        0.011984249272384062,
+        0.009444303904206919,
+        0.011560693641618158,
+        0.008856882708384362,
+        0.010021786492375284
+      ],
+      "expert_id": 47,
+      "layer": 24,
+      "objective_after": 17.45660824863058,
+      "objective_before": 17.477003618326748,
+      "rank": 0,
+      "step": 68
+    },
+    {
+      "critical_tail_reduction_by_profile": [
+        0.006620011348591248,
+        0.007741935483871032,
+        0.0075070378479829,
+        0.007312061880590193,
+        0.007503719516138929
+      ],
+      "expert_id": 150,
+      "layer": 0,
+      "objective_after": 17.441767575899007,
+      "objective_before": 17.45660824863058,
+      "rank": 1,
+      "step": 69
+    },
+    {
+      "critical_tail_reduction_by_profile": [
+        0.012621511445594535,
+        0.01146506617420684,
+        0.007355864811133372,
+        0.010201020102009295,
+        0.009084389194358167
+      ],
+      "expert_id": 80,
+      "layer": 37,
+      "objective_after": 17.422537616359186,
+      "objective_before": 17.441767575899007,
+      "rank": 0,
+      "step": 70
+    },
+    {
+      "critical_tail_reduction_by_profile": [
+        0.00598953407729752,
+        0.005652841781873974,
+        0.006307997080595484,
+        0.0052574329224075456,
+        0.007956530176596033
+      ],
+      "expert_id": 25,
+      "layer": 0,
+      "objective_after": 17.4085002621693,
+      "objective_before": 17.422537616359186,
+      "rank": 1,
+      "step": 71
+    },
+    {
+      "critical_tail_reduction_by_profile": [
+        0.0,
+        0.011931581143095116,
+        0.009760237640568548,
+        0.012028739807863786,
+        0.010264439805148129
+      ],
+      "expert_id": 128,
+      "layer": 25,
+      "objective_after": 17.389286779490355,
+      "objective_before": 17.408500262169305,
+      "rank": 0,
+      "step": 72
+    },
+    {
+      "critical_tail_reduction_by_profile": [
+        0.012482886365466683,
+        0.009916451940345183,
+        0.010966232029421263,
+        0.008418288538770469,
+        0.003943800838056788
+      ],
+      "expert_id": 84,
+      "layer": 30,
+      "objective_after": 17.376197446709885,
+      "objective_before": 17.389286779490355,
+      "rank": 1,
+      "step": 73
+    },
+    {
+      "critical_tail_reduction_by_profile": [
+        0.010451841132013584,
+        0.00801969191678431,
+        0.008387010198603662,
+        0.010145945524078215,
+        0.009601181683899895
+      ],
+      "expert_id": 203,
+      "layer": 27,
+      "objective_after": 17.35727513093491,
+      "objective_before": 17.376197446709885,
+      "rank": 0,
+      "step": 74
+    },
+    {
+      "critical_tail_reduction_by_profile": [
+        0.0,
+        0.0,
+        0.00464981110142304,
+        0.008734357940706872,
+        0.007267570681555924
+      ],
+      "expert_id": 232,
+      "layer": 28,
+      "objective_after": 17.345877212308615,
+      "objective_before": 17.35727513093491,
+      "rank": 1,
+      "step": 75
+    },
+    {
+      "critical_tail_reduction_by_profile": [
+        0.010135730653974662,
+        0.00809019709097214,
+        0.010294874623134831,
+        0.00876966726850803,
+        0.009475283811568147
+      ],
+      "expert_id": 118,
+      "layer": 36,
+      "objective_after": 17.327048777807416,
+      "objective_before": 17.345877212308615,
+      "rank": 0,
+      "step": 76
+    },
+    {
+      "critical_tail_reduction_by_profile": [
+        0.0003271983640082965,
+        0.00273026579940705,
+        0.010831800531372338,
+        0.0,
+        0.009830648492357597
+      ],
+      "expert_id": 75,
+      "layer": 23,
+      "objective_after": 17.314912116104754,
+      "objective_before": 17.327048777807416,
+      "rank": 1,
+      "step": 77
+    },
+    {
+      "critical_tail_reduction_by_profile": [
+        0.008372994888066643,
+        0.009983647473966073,
+        0.0094124567982945,
+        0.011950821081590846,
+        0.008402610172520752
+      ],
+      "expert_id": 102,
+      "layer": 36,
+      "objective_after": 17.29444703042222,
+      "objective_before": 17.314912116104754,
+      "rank": 0,
+      "step": 78
+    },
+    {
+      "critical_tail_reduction_by_profile": [
+        0.009091640518143151,
+        0.0,
+        0.004672589667654492,
+        0.011876855758712779,
+        0.004165645675080043
+      ],
+      "expert_id": 175,
+      "layer": 16,
+      "objective_after": 17.28432003842322,
+      "objective_before": 17.29444703042222,
+      "rank": 1,
+      "step": 79
+    },
+    {
+      "critical_tail_reduction_by_profile": [
+        0.008388974490669554,
+        0.007336200354162159,
+        0.010632983658030781,
+        0.009270755732142533,
+        0.009673202614379761
+      ],
+      "expert_id": 228,
+      "layer": 24,
+      "objective_after": 17.265586412438964,
+      "objective_before": 17.28432003842322,
+      "rank": 0,
+      "step": 80
+    },
+    {
+      "critical_tail_reduction_by_profile": [
+        0.005040489175343055,
+        0.006116207951070152,
+        0.007428610372793187,
+        0.0,
+        0.006349206349206327
+      ],
+      "expert_id": 99,
+      "layer": 32,
+      "objective_after": 17.254250303320077,
+      "objective_before": 17.265586412438964,
+      "rank": 1,
+      "step": 81
+    },
+    {
+      "critical_tail_reduction_by_profile": [
+        0.00534134535135955,
+        0.010181176847844142,
+        0.009322560596643825,
+        0.0077226162332557635,
+        0.010055304172951196
+      ],
+      "expert_id": 186,
+      "layer": 40,
+      "objective_after": 17.235933288112275,
+      "objective_before": 17.254250303320077,
+      "rank": 0,
+      "step": 82
+    },
+    {
+      "critical_tail_reduction_by_profile": [
+        0.009456264775412393,
+        0.008453837597331315,
+        0.012086145933782433,
+        0.01154273029966646,
+        0.0003958828186867436
+      ],
+      "expert_id": 203,
+      "layer": 7,
+      "objective_after": 17.226887543403052,
+      "objective_before": 17.235933288112275,
+      "rank": 1,
+      "step": 83
+    },
+    {
+      "critical_tail_reduction_by_profile": [
+        0.00817893506927092,
+        0.01058201058200936,
+        0.009115392583384008,
+        0.005673758865247791,
+        0.009636333165744304
+      ],
+      "expert_id": 30,
+      "layer": 40,
+      "objective_after": 17.208613924184178,
+      "objective_before": 17.226887543403052,
+      "rank": 0,
+      "step": 84
+    },
+    {
+      "critical_tail_reduction_by_profile": [
+        0.00435029317192992,
+        0.007741935483871032,
+        0.0011469085601092388,
+        0.0,
+        0.006404036483601772
+      ],
+      "expert_id": 88,
+      "layer": 0,
+      "objective_after": 17.198281252960673,
+      "objective_before": 17.208613924184178,
+      "rank": 1,
+      "step": 85
+    }
+  ],
+  "runtime_requirements": [
+    "hybrid v2 padded CPU shard loading with per-layer counts",
+    "--kt-num-gpu-experts interpreted as a per-layer admission ceiling",
+    "rank-specific per-layer GPU widths with equal total rank bytes",
+    "target plan SHA-256 bound by launcher and loader"
+  ]
+}

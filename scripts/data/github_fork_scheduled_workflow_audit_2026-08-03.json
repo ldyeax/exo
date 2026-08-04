@@ -1,0 +1,249 @@
+{
+  "format": "github_fork_scheduled_workflow_audit_v1",
+  "audited_at_utc": "2026-08-03T19:51:12Z",
+  "account": "ldyeax",
+  "scope": {
+    "repository_selector": "all forks visible to the authenticated GitHub account",
+    "visible_fork_count": 15,
+    "all_visible_forks_public": true,
+    "credential_limitation": "Does not cover repositories invisible to the authenticated account or forks owned by another account or organization.",
+    "repositories": [
+      "ldyeax/Desktop-Ponies-XP",
+      "ldyeax/FontEdit",
+      "ldyeax/drivetest64",
+      "ldyeax/exo",
+      "ldyeax/exo_ktransformers",
+      "ldyeax/exo_llama_cpp",
+      "ldyeax/exo_sglang",
+      "ldyeax/gif320",
+      "ldyeax/hay_say_ui",
+      "ldyeax/keystone",
+      "ldyeax/philomena",
+      "ldyeax/ponydriland-tts-reader",
+      "ldyeax/pytorch-benchmark",
+      "ldyeax/vtparse",
+      "ldyeax/wastelandprogrammersnotepad"
+    ]
+  },
+  "result": {
+    "scheduled_workflow_count": 35,
+    "scheduled_workflows_enabled": 0,
+    "scheduled_workflows_disabled_manually": 35,
+    "queued_scheduled_runs": 0,
+    "in_progress_scheduled_runs": 0,
+    "cancellation_action_required": false,
+    "cancelled_run_ids": []
+  },
+  "scheduled_workflows": [
+    {
+      "repository": "ldyeax/exo_sglang",
+      "workflow_id": 325384218,
+      "path": ".github/workflows/amd-aiter-scout.yml",
+      "state": "disabled_manually"
+    },
+    {
+      "repository": "ldyeax/exo_sglang",
+      "workflow_id": 325384219,
+      "path": ".github/workflows/amd-ci-job-monitor.yml",
+      "state": "disabled_manually"
+    },
+    {
+      "repository": "ldyeax/exo_sglang",
+      "workflow_id": 325384232,
+      "path": ".github/workflows/ci-coverage-overview.yml",
+      "state": "disabled_manually"
+    },
+    {
+      "repository": "ldyeax/exo_sglang",
+      "workflow_id": 325384233,
+      "path": ".github/workflows/ci-failure-monitor.yml",
+      "state": "disabled_manually"
+    },
+    {
+      "repository": "ldyeax/exo_sglang",
+      "workflow_id": 325384234,
+      "path": ".github/workflows/ci-model-inventory.yml",
+      "state": "disabled_manually"
+    },
+    {
+      "repository": "ldyeax/exo_sglang",
+      "workflow_id": 325384235,
+      "path": ".github/workflows/close-inactive-issues.yml",
+      "state": "disabled_manually"
+    },
+    {
+      "repository": "ldyeax/exo_sglang",
+      "workflow_id": 325384243,
+      "path": ".github/workflows/nightly-72-gpu-gb200.yml",
+      "state": "disabled_manually"
+    },
+    {
+      "repository": "ldyeax/exo_sglang",
+      "workflow_id": 325384244,
+      "path": ".github/workflows/nightly-amd-mi355x-disagg.yml",
+      "state": "disabled_manually"
+    },
+    {
+      "repository": "ldyeax/exo_sglang",
+      "workflow_id": 325384245,
+      "path": ".github/workflows/nightly-experimental-sgl-router-docker.yml",
+      "state": "disabled_manually"
+    },
+    {
+      "repository": "ldyeax/exo_sglang",
+      "workflow_id": 325384247,
+      "path": ".github/workflows/nightly-link-check.yml",
+      "state": "disabled_manually"
+    },
+    {
+      "repository": "ldyeax/exo_sglang",
+      "workflow_id": 325384248,
+      "path": ".github/workflows/nightly-release-gateway.yml",
+      "state": "disabled_manually"
+    },
+    {
+      "repository": "ldyeax/exo_sglang",
+      "workflow_id": 325384249,
+      "path": ".github/workflows/nightly-test-amd-miles-rocm720.yml",
+      "state": "disabled_manually"
+    },
+    {
+      "repository": "ldyeax/exo_sglang",
+      "workflow_id": 325384250,
+      "path": ".github/workflows/nightly-test-amd-rocm720.yml",
+      "state": "disabled_manually"
+    },
+    {
+      "repository": "ldyeax/exo_sglang",
+      "workflow_id": 325384251,
+      "path": ".github/workflows/nightly-test-amd.yml",
+      "state": "disabled_manually"
+    },
+    {
+      "repository": "ldyeax/exo_sglang",
+      "workflow_id": 325384252,
+      "path": ".github/workflows/nightly-test-intel.yml",
+      "state": "disabled_manually"
+    },
+    {
+      "repository": "ldyeax/exo_sglang",
+      "workflow_id": 325384253,
+      "path": ".github/workflows/nightly-test-musa.yml",
+      "state": "disabled_manually"
+    },
+    {
+      "repository": "ldyeax/exo_sglang",
+      "workflow_id": 325384257,
+      "path": ".github/workflows/nightly-test-npu.yml",
+      "state": "disabled_manually"
+    },
+    {
+      "repository": "ldyeax/exo_sglang",
+      "workflow_id": 325384258,
+      "path": ".github/workflows/nightly-test-nvidia.yml",
+      "state": "disabled_manually"
+    },
+    {
+      "repository": "ldyeax/exo_sglang",
+      "workflow_id": 325384267,
+      "path": ".github/workflows/pr-test-amd-rocm720.yml",
+      "state": "disabled_manually"
+    },
+    {
+      "repository": "ldyeax/exo_sglang",
+      "workflow_id": 325384268,
+      "path": ".github/workflows/pr-test-amd.yml",
+      "state": "disabled_manually"
+    },
+    {
+      "repository": "ldyeax/exo_sglang",
+      "workflow_id": 325384285,
+      "path": ".github/workflows/pr-test.yml",
+      "state": "disabled_manually"
+    },
+    {
+      "repository": "ldyeax/exo_sglang",
+      "workflow_id": 325384287,
+      "path": ".github/workflows/release-docker-amd-miles-rocm700-nightly.yml",
+      "state": "disabled_manually"
+    },
+    {
+      "repository": "ldyeax/exo_sglang",
+      "workflow_id": 325384288,
+      "path": ".github/workflows/release-docker-amd-miles-rocm720-nightly.yml",
+      "state": "disabled_manually"
+    },
+    {
+      "repository": "ldyeax/exo_sglang",
+      "workflow_id": 325384289,
+      "path": ".github/workflows/release-docker-amd-nightly.yml",
+      "state": "disabled_manually"
+    },
+    {
+      "repository": "ldyeax/exo_sglang",
+      "workflow_id": 325384291,
+      "path": ".github/workflows/release-docker-amd-rocm720-nightly.yml",
+      "state": "disabled_manually"
+    },
+    {
+      "repository": "ldyeax/exo_sglang",
+      "workflow_id": 325384294,
+      "path": ".github/workflows/release-docker-dev.yml",
+      "state": "disabled_manually"
+    },
+    {
+      "repository": "ldyeax/exo_sglang",
+      "workflow_id": 325384297,
+      "path": ".github/workflows/release-docker-intel-xpu-nightly.yml",
+      "state": "disabled_manually"
+    },
+    {
+      "repository": "ldyeax/exo_sglang",
+      "workflow_id": 325384298,
+      "path": ".github/workflows/release-docker-npu-nightly.yml",
+      "state": "disabled_manually"
+    },
+    {
+      "repository": "ldyeax/exo_sglang",
+      "workflow_id": 325384305,
+      "path": ".github/workflows/release-pypi-nightly.yml",
+      "state": "disabled_manually"
+    },
+    {
+      "repository": "ldyeax/exo_sglang",
+      "workflow_id": 325384314,
+      "path": ".github/workflows/runner-utilization.yml",
+      "state": "disabled_manually"
+    },
+    {
+      "repository": "ldyeax/exo_sglang",
+      "workflow_id": 325384319,
+      "path": ".github/workflows/sync-lmsys-sglang-blogs.yml",
+      "state": "disabled_manually"
+    },
+    {
+      "repository": "ldyeax/exo_sglang",
+      "workflow_id": 325384320,
+      "path": ".github/workflows/trivy-scan-dev.yml",
+      "state": "disabled_manually"
+    },
+    {
+      "repository": "ldyeax/exo_sglang",
+      "workflow_id": 325384322,
+      "path": ".github/workflows/weekly-test-nvidia.yml",
+      "state": "disabled_manually"
+    },
+    {
+      "repository": "ldyeax/exo_sglang",
+      "workflow_id": 325384323,
+      "path": ".github/workflows/weekly-update-est-time.yml",
+      "state": "disabled_manually"
+    },
+    {
+      "repository": "ldyeax/exo_sglang",
+      "workflow_id": 325384324,
+      "path": ".github/workflows/xpu-ci-job-monitor.yml",
+      "state": "disabled_manually"
+    }
+  ]
+}

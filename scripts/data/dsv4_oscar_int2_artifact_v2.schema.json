@@ -1,0 +1,145 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "dsv4_oscar_int2_artifact_v2.schema.json",
+  "title": "DeepSeek-V4 Flash OSCAR INT2 torch artifact contract",
+  "description": "The artifact is a weights_only-safe torch dictionary rather than JSON. x-torch-tensor annotations specify exact tensor dtype and shape. Runtime validation additionally recomputes the canonical tree digest, all 41 compressed-layer rotation orthogonality proofs, clip index arithmetic, compression topology, consumer coverage, and expected checkpoint/config/prompt/statistics hashes. Ratio-0 layers 0 and 1 remain BF16 and are deliberately absent.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "format",
+    "format_version",
+    "algorithm",
+    "model",
+    "quantization",
+    "provenance",
+    "layers",
+    "artifact_provenance_sha256"
+  ],
+  "properties": {
+    "format": {"const": "dsv4-oscar-int2-calibration"},
+    "format_version": {"const": 2},
+    "algorithm": {"const": "oscar-dsv4-compressed-history-shared-v-sst-u-pbr-h64x7-c4-k-qqt-u-h128-pbr"},
+    "model": {
+      "type": "object",
+      "description": "Exact DeepSeek-V4 Flash geometry: 43 layers, 64 Q heads, one shared KV head, 448 noPE latent, exact BF16 RoPE64, C4 scorer128, and compression ratios [0,0,4,128,...,4]."
+    },
+    "quantization": {
+      "const": {
+        "bits": 2,
+        "group_size": 64,
+        "num_groups": 7,
+        "storage_layout": "oscar-int2-asym-g64-v1",
+        "codes_bytes_per_token": 112,
+        "scale_zero_bytes_per_token": 28,
+        "rope_bytes_per_token": 128,
+        "logical_bytes_per_token": 268,
+        "padded_bytes_per_token": 272
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "description": "SHA-256 bindings for checkpoint, config, prompt set, capture manifest, every consumed capture input as a set, sufficient statistics, calibrator source, and recovered official OSCAR rotation/clip sources. Frozen provenance also records compressed_history_only as the shared-latent source, attention_weighted_value_sst as the shared OSCAR objective, query_qqt as the C4 key objective, target_compressed_history_layers as consumer scope, shared u-pbr-h64x7 and C4 u-h128-pbr composition policies, and train/heldout sample and token counts.",
+      "required": [
+        "shared_latent_source",
+        "shared_rotation_objective",
+        "c4_rotation_objective",
+        "consumer_scope",
+        "shared_rotation_composition",
+        "c4_rotation_composition"
+      ],
+      "properties": {
+        "shared_latent_source": {"const": "compressed_history_only"},
+        "shared_rotation_objective": {"const": "attention_weighted_value_sst"},
+        "c4_rotation_objective": {"const": "query_qqt"},
+        "consumer_scope": {"const": "target_compressed_history_layers"},
+        "shared_rotation_composition": {"const": "u-pbr-h64x7"},
+        "c4_rotation_composition": {"const": "u-h128-pbr"}
+      }
+    },
+    "layers": {
+      "type": "object",
+      "minProperties": 41,
+      "maxProperties": 41,
+      "description": "Integer-keyed torch mapping for exactly compressed layers 2..42. Every entry has attention_shared_latent; exactly C4 layers 2,4,...,42 additionally have c4_scorer. Ratio-0 layers 0 and 1 are not artifact consumers.",
+      "additionalProperties": {"$ref": "#/$defs/layer"}
+    },
+    "artifact_provenance_sha256": {"$ref": "#/$defs/sha256"}
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "layer": {
+      "type": "object",
+      "required": ["layer_id", "compress_ratio", "attention_shared_latent"],
+      "properties": {
+        "layer_id": {"type": "integer", "minimum": 2, "maximum": 42},
+        "compress_ratio": {"enum": [4, 128]},
+        "attention_shared_latent": {"$ref": "#/$defs/sharedDomain"},
+        "c4_scorer": {"$ref": "#/$defs/c4Domain"}
+      }
+    },
+    "commonDomain": {
+      "type": "object",
+      "required": [
+        "domain",
+        "rotation_objective",
+        "rotation_composition",
+        "rotation",
+        "eigenvalues",
+        "clip_mode",
+        "clip_ratios",
+        "clip_indices",
+        "clip_thresholds",
+        "clip_semantics",
+        "clip_calibration",
+        "orthogonality_max_abs",
+        "heldout_metrics",
+        "provenance_sha256"
+      ],
+      "properties": {
+        "clip_mode": {"const": "per_row_quantile"},
+        "clip_semantics": {"const": "per_row_per_group_abs_order_stat_then_affine_u2_v1"},
+        "clip_calibration": {
+          "type": "object",
+          "description": "Primary rotated clip sweep plus an independently optimized unrotated baseline. Runtime validation requires candidate_ratios, train_group_relative_error, and unrotated_baseline; the baseline contains its own errors and FP32 selected_ratios with the domain's exact group count."
+        },
+        "orthogonality_max_abs": {"type": "number", "minimum": 0},
+        "heldout_metrics": {"type": "object"},
+        "provenance_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "sharedDomain": {
+      "allOf": [
+        {"$ref": "#/$defs/commonDomain"},
+        {
+          "properties": {
+            "domain": {"const": "attention_shared_latent"},
+            "rotation_objective": {"const": "attention_weighted_value_sst"},
+            "rotation_composition": {"const": "u-pbr-h64x7"},
+            "rotation": {"x-torch-tensor": {"dtype": "torch.float32", "shape": [448, 448]}},
+            "eigenvalues": {"x-torch-tensor": {"dtype": "torch.float32", "shape": [448]}},
+            "clip_ratios": {"x-torch-tensor": {"dtype": "torch.float32", "shape": [7]}},
+            "clip_indices": {"x-torch-tensor": {"dtype": "torch.int16", "shape": [7]}},
+            "clip_thresholds": {"x-torch-tensor": {"dtype": "torch.float32", "shape": [7]}}
+          }
+        }
+      ]
+    },
+    "c4Domain": {
+      "allOf": [
+        {"$ref": "#/$defs/commonDomain"},
+        {
+          "properties": {
+            "domain": {"const": "c4_scorer"},
+            "rotation_objective": {"const": "query_qqt"},
+            "rotation_composition": {"const": "u-h128-pbr"},
+            "rotation": {"x-torch-tensor": {"dtype": "torch.float32", "shape": [128, 128]}},
+            "eigenvalues": {"x-torch-tensor": {"dtype": "torch.float32", "shape": [128]}},
+            "clip_ratios": {"x-torch-tensor": {"dtype": "torch.float32", "shape": [1]}},
+            "clip_indices": {"x-torch-tensor": {"dtype": "torch.int16", "shape": [1]}},
+            "clip_thresholds": {"x-torch-tensor": {"dtype": "torch.float32", "shape": [1]}}
+          }
+        }
+      ]
+    }
+  }
+}
