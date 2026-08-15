@@ -14,8 +14,7 @@ from scripts import audit_dsv4_mxfp4_scale_domain as audit
 TensorValue = tuple[str, tuple[int, ...], bytes]
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 CHECKPOINT_RECEIPT = (
-    REPOSITORY_ROOT
-    / "scripts/data/dsv4_flash_mxfp4_scale_domain_2026-08-04.json"
+    REPOSITORY_ROOT / "scripts/data/dsv4_flash_mxfp4_scale_domain_2026-08-04.json"
 )
 CHECKPOINT_RECEIPT_SHA256 = (
     "1b027325b31524de03c6a7b580e5304125adb8154bff4a96c8ded4d6d349499c"
@@ -38,9 +37,9 @@ def _write_safetensors(path: Path, tensors: Mapping[str, TensorValue]) -> None:
             "dtype": dtype,
             "shape": list(shape),
         }
-    raw_header = json.dumps(
-        header, sort_keys=True, separators=(",", ":")
-    ).encode("utf-8")
+    raw_header = json.dumps(header, sort_keys=True, separators=(",", ":")).encode(
+        "utf-8"
+    )
     raw_header += b" " * (-len(raw_header) % 8)
     path.write_bytes(struct.pack("<Q", len(raw_header)) + raw_header + contents)
 
@@ -72,20 +71,13 @@ def _checkpoint(
         tensors: dict[str, TensorValue] = {}
         for expert in range(expert_count):
             for projection_index, projection in enumerate(audit.PROJECTIONS):
-                key = (
-                    f"layers.{layer}.ffn.experts.{expert}."
-                    f"{projection}.scale"
-                )
+                key = f"layers.{layer}.ffn.experts.{expert}.{projection}.scale"
                 value = (
                     values(layer, expert, projection)
                     if values is not None
                     else bytes(
                         [
-                            118
-                            + (
-                                layer + expert + projection_index + element
-                            )
-                            % 9
+                            118 + (layer + expert + projection_index + element) % 9
                             for element in range(scale_elements)
                         ]
                     )
@@ -158,28 +150,26 @@ def test_scale_content_digest_changes_when_one_scale_byte_changes(
             return bytes((120, 120, 120, 121))
         return bytes((120, 120, 120, 120))
 
-    second_checkpoint = _checkpoint(
-        tmp_path / "second", values=changed_values
-    )
+    second_checkpoint = _checkpoint(tmp_path / "second", values=changed_values)
     baseline_checkpoint = _checkpoint(
         tmp_path / "baseline",
         values=lambda _layer, _expert, _projection: bytes((120,) * 4),
     )
 
     first_digest = _object(
-        audit.audit_checkpoint(
-            first_checkpoint, expectations=_expectations()
-        )["scale_domain"]
+        audit.audit_checkpoint(first_checkpoint, expectations=_expectations())[
+            "scale_domain"
+        ]
     )["scale_content_sha256"]
     baseline_digest = _object(
-        audit.audit_checkpoint(
-            baseline_checkpoint, expectations=_expectations()
-        )["scale_domain"]
+        audit.audit_checkpoint(baseline_checkpoint, expectations=_expectations())[
+            "scale_domain"
+        ]
     )["scale_content_sha256"]
     changed_digest = _object(
-        audit.audit_checkpoint(
-            second_checkpoint, expectations=_expectations()
-        )["scale_domain"]
+        audit.audit_checkpoint(second_checkpoint, expectations=_expectations())[
+            "scale_domain"
+        ]
     )["scale_content_sha256"]
 
     assert first_digest != baseline_digest

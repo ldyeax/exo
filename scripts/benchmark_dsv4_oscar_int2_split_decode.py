@@ -201,9 +201,7 @@ def _benchmark_shape(
         dtype=torch.uint8,
         device=device,
     )
-    swa_values = swa_storage.view(torch.bfloat16).view(
-        1, SWA_PAGE_SIZE, HEAD_DIM
-    )
+    swa_values = swa_storage.view(torch.bfloat16).view(1, SWA_PAGE_SIZE, HEAD_DIM)
     swa_values[:, :SWA_LENGTH].copy_(
         torch.randn(
             (1, SWA_LENGTH, HEAD_DIM),
@@ -212,9 +210,9 @@ def _benchmark_shape(
             device=device,
         )
     )
-    swa_indices = torch.arange(
-        SWA_LENGTH, dtype=torch.int32, device=device
-    ).expand(num_tokens, -1)
+    swa_indices = torch.arange(SWA_LENGTH, dtype=torch.int32, device=device).expand(
+        num_tokens, -1
+    )
     swa_lengths = torch.full(
         (num_tokens,), SWA_LENGTH, dtype=torch.int32, device=device
     )
@@ -289,7 +287,9 @@ def main() -> int:
     device = torch.device("cuda", arguments.device)
     capability = torch.cuda.get_device_capability(device)
     if capability != (8, 6):
-        raise RuntimeError(f"Oscar split-history benchmark requires SM86, got {capability}")
+        raise RuntimeError(
+            f"Oscar split-history benchmark requires SM86, got {capability}"
+        )
 
     generator = torch.Generator(device=device).manual_seed(arguments.seed)
     storage = torch.empty(
@@ -323,14 +323,12 @@ def main() -> int:
         c4 = by_shape["c4_512"]["timing"]
         c128 = by_shape["c128_short_21"]["timing"]
         assert isinstance(c4, dict) and isinstance(c128, dict)
-        monolithic_ms = (
-            C4_LAYER_COUNT * float(c4["monolithic_graph_ms"])
-            + C128_LAYER_COUNT * float(c128["monolithic_graph_ms"])
-        )
-        split_ms = (
-            C4_LAYER_COUNT * float(c4["split_graph_ms"])
-            + C128_LAYER_COUNT * float(c128["split_graph_ms"])
-        )
+        monolithic_ms = C4_LAYER_COUNT * float(
+            c4["monolithic_graph_ms"]
+        ) + C128_LAYER_COUNT * float(c128["monolithic_graph_ms"])
+        split_ms = C4_LAYER_COUNT * float(
+            c4["split_graph_ms"]
+        ) + C128_LAYER_COUNT * float(c128["split_graph_ms"])
         weighted_current_prompt[str(num_tokens)] = {
             "monolithic_41_layer_ms": monolithic_ms,
             "split_41_layer_ms": split_ms,
@@ -345,7 +343,9 @@ def main() -> int:
         "seed": arguments.seed,
         "workspace_bytes": SPLIT_HISTORY_WORKSPACE_BYTES,
         "workspace_fixed_address": workspace.fixed_data_ptr,
-        "split_map": {str(key): value for key, value in SPLIT_HISTORY_SPLIT_MAP.items()},
+        "split_map": {
+            str(key): value for key, value in SPLIT_HISTORY_SPLIT_MAP.items()
+        },
         "warmup": arguments.warmup,
         "iterations_per_sample": arguments.iterations,
         "samples": arguments.samples,

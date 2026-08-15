@@ -165,9 +165,7 @@ def make_ep_confirmation(
             "KT_SINGLE_NUMA_INLINE_DISPATCH": "1",
             "KT_MXFP4_AVX_SCALE_FOLD_MODE": "lut-v1",
             "DSV4_STAGE_KT_CPU_OPTIMIZED_OVERLAY": "1",
-            "DSV4_KT_CPU_OPTIMIZED_CANDIDATE": str(
-                transfer.QUALIFIED_NATIVE_ARTIFACT
-            ),
+            "DSV4_KT_CPU_OPTIMIZED_CANDIDATE": str(transfer.QUALIFIED_NATIVE_ARTIFACT),
         },
         "kt_single_numa_inline_dispatch_server_proof": {
             "kt_single_numa_inline_dispatch_all_workers_active": True,
@@ -714,9 +712,7 @@ def test_transfer_binds_final_ep_receipt_and_confirmed_native_tuple(
     staged = torch.load(output, map_location="cpu", weights_only=True)
     receipt = staged["transfer_receipt"]
     assert receipt["source_ep_confirmation_receipt"] == str(confirmation)
-    assert receipt["source_ep_confirmation_receipt_sha256"] == sha256_file(
-        confirmation
-    )
+    assert receipt["source_ep_confirmation_receipt_sha256"] == sha256_file(confirmation)
     assert receipt["source_ep_coherency_receipt"] == str(coherency)
     assert receipt["source_ep_coherency_receipt_sha256"] == sha256_file(coherency)
     assert receipt["qualified_native_artifact"] == str(
@@ -760,9 +756,7 @@ def test_direct_final_ep_proofs_fail_closed(
     make_source_plan(source_path, source_gpu_experts_per_rank=14)
     confirmation = tmp_path / "split-history-confirm-hotspot.json"
     coherency = tmp_path / "split-history-confirm-coherency.json"
-    hotspot = make_direct_hotspot_confirmation(
-        confirmation, source_plan=source_path
-    )
+    hotspot = make_direct_hotspot_confirmation(confirmation, source_plan=source_path)
     coherency_document = make_direct_coherency_receipt(coherency)
     if mutation == "workspace":
         contract = hotspot["server_contract"]

@@ -101,7 +101,9 @@ def main() -> int:
         for rows in row_counts:
             route_ids, route_weights = make_routes(rows, expert_count)
             baseline_graph, baseline_output = capture(
-                lambda route_ids=route_ids, route_weights=route_weights, expert_count=expert_count: (
+                lambda route_ids=route_ids,
+                route_weights=route_weights,
+                expert_count=expert_count: (
                     v4_moe._make_routing_data_v4(route_ids, route_weights, expert_count)
                 )
             )
@@ -115,7 +117,9 @@ def main() -> int:
             torch.cuda.empty_cache()
 
             candidate_graph, candidate_output = capture(
-                lambda route_ids=route_ids, route_weights=route_weights, expert_count=expert_count: (
+                lambda route_ids=route_ids,
+                route_weights=route_weights,
+                expert_count=expert_count: (
                     v4_moe._make_small_row_routing_data_v4(
                         route_ids, route_weights, expert_count
                     )

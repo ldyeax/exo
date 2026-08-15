@@ -50,8 +50,7 @@ def test_inline_dispatch_receipt_is_internally_consistent() -> None:
         assert len(medians) == 6
         assert all(type(latency) in (int, float) and latency > 0 for latency in medians)
         weighted = sum(
-            latency * weight
-            for latency, weight in zip(medians, weights, strict=True)
+            latency * weight for latency, weight in zip(medians, weights, strict=True)
         ) / sum(weights)
         assert math.isclose(
             result["production_weighted_mean_us"], weighted, rel_tol=1e-14
@@ -87,9 +86,12 @@ def test_inline_dispatch_receipt_binds_command_source_and_quality() -> None:
 
     assert command["common_environment"]["CUDA_VISIBLE_DEVICES"] == ""
     assert command["common_environment"]["KT_TASK_QUEUE_PIN_FIRST_CORE"] is None
-    assert arms["same_binary_default56_spin1000"]["environment"][
-        "KT_SINGLE_NUMA_INLINE_DISPATCH"
-    ] is None
+    assert (
+        arms["same_binary_default56_spin1000"]["environment"][
+            "KT_SINGLE_NUMA_INLINE_DISPATCH"
+        ]
+        is None
+    )
     assert arms["inline56_spin1000"] == {
         "physical_cpu_binding": "0-55",
         "threads": 56,
@@ -102,9 +104,7 @@ def test_inline_dispatch_receipt_binds_command_source_and_quality() -> None:
     assert arms["inline72_spin1000"]["threads"] == 72
 
     benchmark_path = REPOSITORY_ROOT / command["benchmark_script"]
-    assert _sha256(benchmark_path) == receipt["artifacts"][
-        "benchmark_script_sha256"
-    ]
+    assert _sha256(benchmark_path) == receipt["artifacts"]["benchmark_script_sha256"]
     for digest in (
         receipt["artifacts"]["extension"]["sha256"],
         receipt["artifacts"]["overlay_json_sha256"],

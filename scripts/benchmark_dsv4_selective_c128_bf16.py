@@ -91,9 +91,9 @@ def _build_case(batch_size: int, extra_length: int, seed: int) -> dict[str, obje
         page_size=SWA_PAGE_SIZE,
         type="flashmla",
     )
-    swa_decoded = dequantize_k_cache_paged(
-        swa_cache, swa_locations, SWA_PAGE_SIZE
-    )[:, 0]
+    swa_decoded = dequantize_k_cache_paged(swa_cache, swa_locations, SWA_PAGE_SIZE)[
+        :, 0
+    ]
 
     extra_values = torch.randn(
         (MAX_C128_TOKENS, HEAD_DIM), generator=generator, dtype=torch.float32
@@ -109,9 +109,7 @@ def _build_case(batch_size: int, extra_length: int, seed: int) -> dict[str, obje
         device=device,
         dtype=torch.uint8,
     )
-    extra_locations = torch.arange(
-        MAX_C128_TOKENS, device=device, dtype=torch.int32
-    )
+    extra_locations = torch.arange(MAX_C128_TOKENS, device=device, dtype=torch.int32)
     fused_store_cache(
         extra_values,
         extra_fp8,
@@ -128,9 +126,9 @@ def _build_case(batch_size: int, extra_length: int, seed: int) -> dict[str, obje
         generator=generator,
         dtype=torch.float32,
     ).to(device=device, dtype=torch.bfloat16)
-    swa_indices = torch.arange(
-        SWA_PAGE_SIZE, device=device, dtype=torch.int32
-    ).expand(batch_size, -1)
+    swa_indices = torch.arange(SWA_PAGE_SIZE, device=device, dtype=torch.int32).expand(
+        batch_size, -1
+    )
     swa_lens = torch.full(
         (batch_size,), SWA_PAGE_SIZE, device=device, dtype=torch.int32
     )
@@ -219,9 +217,7 @@ def _run_case(
     fp8()
     mixed()
     torch.cuda.synchronize()
-    difference = (
-        case["out_mixed"].float() - case["out_fp8"].float()
-    ).abs()
+    difference = (case["out_mixed"].float() - case["out_fp8"].float()).abs()
     selected = torch.cat(
         (case["extra_values"][:extra_length], case["swa_decoded"]), dim=0
     ).float()
@@ -274,7 +270,9 @@ def main() -> None:
     torch.cuda.set_device(0)
     capability = torch.cuda.get_device_capability(0)
     if capability != (8, 6):
-        raise SystemExit(f"exact SM86 is required, got SM{capability[0]}{capability[1]}")
+        raise SystemExit(
+            f"exact SM86 is required, got SM{capability[0]}{capability[1]}"
+        )
     prime_e4m3fn_decode_lut(torch.device("cuda", 0))
 
     started = time.time()

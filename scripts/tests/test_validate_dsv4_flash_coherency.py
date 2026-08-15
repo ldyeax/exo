@@ -231,6 +231,11 @@ class FakeUrlOpen:
             return FakeResponse(
                 lines=_tool_lines(gate._canonical_json(gate.expected_facts()))
             )
+        messages = cast(list[dict[str, Any]], payload.get("messages", []))
+        if messages and gate.FOLLOWUP_FINAL_CONTENT in str(
+            messages[-1].get("content", "")
+        ):
+            return FakeResponse(lines=_semantic_lines(gate.FOLLOWUP_FINAL_CONTENT, ""))
         content = (
             gate._canonical_json(gate.expected_facts())
             if self.corrupt_content is None
@@ -408,6 +413,84 @@ def test_run_gate_flushes_every_request_and_receipt_never_contains_output(
     )
     assert VALID_REASONING not in serialized_report
     assert gate._canonical_json(gate.expected_facts()) not in serialized_report
+
+
+def test_realistic_followups_retain_context_tool_call_and_tool_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_urlopen = FakeUrlOpen()
+    monkeypatch.setattr(gate.urllib.request, "urlopen", fake_urlopen)
+
+    report = gate.run_gate(
+        completion_url="http://127.0.0.1:30010/v1/chat/completions",
+        flush_url="http://127.0.0.1:30010/flush_cache",
+        model="deepseek-v4-flash",
+        agents_context="repository policy line\n" * 400,
+        repetitions=2,
+        maximum_tokens=256,
+        tool_maximum_tokens=128,
+        timeout_seconds=5.0,
+        flush_timeout_seconds=2.0,
+        validate_tool_call=False,
+        validate_followups=True,
+    )
+
+    followups = cast(dict[str, Any], report["opencode_followup_sequence"])
+    assert report["coherent"] is True
+    assert followups["accepted"] is True
+    assert fake_urlopen.paths == [
+        "/flush_cache",
+        "/v1/chat/completions",
+        "/flush_cache",
+        "/v1/chat/completions",
+        "/flush_cache",
+        "/v1/chat/completions",
+        "/v1/chat/completions",
+        "/v1/chat/completions",
+    ]
+    sequence_initial, sequence_tool, sequence_final = fake_urlopen.payloads[-3:]
+    assert len(cast(list[object], sequence_initial["messages"])) == 2
+    assert len(cast(list[object], sequence_tool["messages"])) == 4
+    final_messages = cast(list[dict[str, Any]], sequence_final["messages"])
+    assert [message["role"] for message in final_messages[-4:]] == [
+        "user",
+        "assistant",
+        "tool",
+        "user",
+    ]
+    assert final_messages[-2]["tool_call_id"] == "call_coherence"
+    serialized_report = gate._canonical_json(report)
+    assert gate.FOLLOWUP_FINAL_CONTENT not in serialized_report
+    assert gate._canonical_json(gate.expected_facts()) not in serialized_report
+
+
+def test_tool_result_followup_rejects_prose_and_repeated_tool_call() -> None:
+    exact = gate.StreamCapture(
+        http_status=200,
+        elapsed_seconds=0.5,
+        time_to_first_output_seconds=0.25,
+        content=gate.FOLLOWUP_FINAL_CONTENT,
+        reasoning_content="",
+        finish_reason="stop",
+        tool_calls={},
+        completion_tokens=8,
+        event_count=3,
+        saw_done=True,
+        protocol_issue_codes=(),
+    )
+    accepted = gate.validate_tool_result_followup_capture(exact)
+    rejected = gate.validate_tool_result_followup_capture(
+        replace(
+            exact,
+            content=gate.FOLLOWUP_FINAL_CONTENT + " extra",
+            tool_calls={0: gate.ToolCallParts()},
+        )
+    )
+
+    assert accepted["accepted"] is True
+    assert rejected["accepted"] is False
+    assert "followup_content_not_exact" in rejected["issue_codes"]
+    assert "followup_unexpected_tool_call" in rejected["issue_codes"]
 
 
 def test_flush_cache_retries_transient_scheduler_busy_response(

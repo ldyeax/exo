@@ -40,9 +40,7 @@ DEFAULT_SCALE_ELEMENTS: Final = 262_144
 FOLD_SAFE_MINIMUM: Final = 2
 FOLD_SAFE_MAXIMUM: Final = 252
 E8M0_NAN_ENCODING: Final = 255
-OCP_MX_SPECIFICATION: Final = (
-    "https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf"
-)
+OCP_MX_SPECIFICATION: Final = "https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf"
 MAXIMUM_JSON_BYTES: Final = 256 * 1024 * 1024
 SCALE_KEY_PATTERN: Final = re.compile(
     r"^layers\.(?P<layer>[0-9]+)\.ffn\.experts\."
@@ -114,9 +112,7 @@ def _load_json_object(path: Path, *, label: str) -> JsonObject:
     except OSError as error:
         raise ScaleDomainAuditError(f"cannot stat {label}: {path}") from error
     if size <= 0 or size > MAXIMUM_JSON_BYTES:
-        raise ScaleDomainAuditError(
-            f"{label} has invalid size {size}: {path}"
-        )
+        raise ScaleDomainAuditError(f"{label} has invalid size {size}: {path}")
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
@@ -189,7 +185,9 @@ def _selected_tensors(
         projection = match.group("projection")
         coordinate = (layer, expert, projection)
         if coordinate in coverage:
-            raise ScaleDomainAuditError(f"duplicate routed scale coordinate: {coordinate}")
+            raise ScaleDomainAuditError(
+                f"duplicate routed scale coordinate: {coordinate}"
+            )
         coverage.add(coordinate)
         _validate_shard_name(checkpoint, raw_shard)
         selected.append(
@@ -428,7 +426,10 @@ def audit_checkpoint(
         expectations.layer_count * expectations.expert_count * len(PROJECTIONS)
     )
     expected_scale_bytes = expected_tensor_count * expectations.scale_elements
-    if len(tensors) != expected_tensor_count or total_scale_bytes != expected_scale_bytes:
+    if (
+        len(tensors) != expected_tensor_count
+        or total_scale_bytes != expected_scale_bytes
+    ):
         raise ScaleDomainAuditError(
             "audited scale totals do not match the expected geometry: "
             f"tensors={len(tensors)}/{expected_tensor_count} "
@@ -521,7 +522,9 @@ def publish_receipt(path: Path, receipt: Mapping[str, object]) -> str:
         try:
             existing = path.read_bytes()
         except OSError as error:
-            raise ScaleDomainAuditError(f"cannot read existing receipt: {path}") from error
+            raise ScaleDomainAuditError(
+                f"cannot read existing receipt: {path}"
+            ) from error
         if existing != contents:
             raise ScaleDomainAuditError(
                 f"refusing to overwrite different scale-domain evidence: {path}"
@@ -565,9 +568,7 @@ def _positive_integer(value: str) -> int:
 
 def parse_arguments(arguments: list[str] | None = None) -> _CliArguments:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--checkpoint", required=True, type=_absolute_normalized_path
-    )
+    parser.add_argument("--checkpoint", required=True, type=_absolute_normalized_path)
     parser.add_argument("--output", required=True, type=_absolute_normalized_path)
     parser.add_argument(
         "--expected-layers", type=_positive_integer, default=DEFAULT_LAYER_COUNT
@@ -618,9 +619,9 @@ def main(arguments: list[str] | None = None) -> int:
                 "scale_content_sha256": cast(
                     Mapping[str, object], receipt["scale_domain"]
                 )["scale_content_sha256"],
-                "total_scale_bytes": cast(
-                    Mapping[str, object], receipt["coverage"]
-                )["total_scale_bytes"],
+                "total_scale_bytes": cast(Mapping[str, object], receipt["coverage"])[
+                    "total_scale_bytes"
+                ],
             },
             sort_keys=True,
         )

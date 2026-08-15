@@ -174,9 +174,7 @@ def test_calibration_launch_rejects_oscar_runtime_artifacts(tmp_path: Path) -> N
     capture_config = tmp_path / "capture.json"
     capture_config.write_text("{}\n", encoding="utf-8")
     environment["SGLANG_DSV4_OSCAR_CAPTURE_CONFIG"] = str(capture_config)
-    environment["SGLANG_DSV4_OSCAR_CALIBRATION_PATH"] = str(
-        tmp_path / "artifact.pt"
-    )
+    environment["SGLANG_DSV4_OSCAR_CALIBRATION_PATH"] = str(tmp_path / "artifact.pt")
 
     result = run_launcher(environment, ("--launch",))
 

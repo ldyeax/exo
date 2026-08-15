@@ -1370,3 +1370,149 @@ No third PP2 model launch is permitted through this campaign entrypoint. This
 is deliberately not a host-wide security boundary: a root operator can invoke
 SGLang or a generic lower-level launcher directly. The coherent EP2
 split-history launcher remains the handoff configuration.
+
+## 2026-08-04: graph-safe timing, fused-path trials, and final verify sweep
+
+This pass kept the production constraints fixed: local EP2/TP2 on both RTX
+3090s, CPUInfer offload, PP1, exact 524,288 context and token limits, Oscar
+INT2 physical history, breakable prefill CUDA graphs, and full target/draft
+verification graphs. No PP2 or remote-host run was performed.
+
+### Internal graph-safe timing
+
+`SGLANG_DSV4_INTERNAL_TIMING=1` now enables category timing for both target and
+draft execution without allocating, synchronizing, or reading events inside a
+captured graph. Persistent CUDA events are recorded into fixed slots during
+replay and resolved only at the DSpark cycle snapshot boundary. The categories
+are attention/indexer, routed MoE, shared MoE, projections/norms, collectives,
+and final head. Timing is diagnostic-only and remains disabled by default
+because the extra event recording reduced observed decode to roughly 38--39
+token/s.
+
+The diagnostic receipt is
+`/tmp/dsv4-oscar-int2/timing-v1/hotspot.json`, SHA-256
+`9a78d2d07cb4574f1cfc4376927d02f21f69dd022a354f183ecc2db046389d4f`.
+A representative cold fixed-4 cycle attributed the following mean GPU time:
+
+| Target category | Mean GPU time |
+|---|---:|
+| Routed MoE | 32.278 ms |
+| Projections/norms | 10.002 ms |
+| Collectives | 7.584 ms |
+| Attention/indexer | 5.288 ms |
+| Shared MoE | 1.971 ms |
+| Final head | 0.726 ms |
+
+The draft adds 3.894 ms of routed MoE and less than 2.1 ms across its other
+categories. Target routed MoE is therefore the largest remaining measured
+component, not Oscar attention, CPU queue wait, or the final head.
+
+### Fused T≈5 MoE trial
+
+`SGLANG_V4_MXFP4_FUSED_T5_MOE=1` enables an experimental small-row path. It
+interleaves gate/up W13 rows and E8M0 scales, applies the activation in the W13
+kernel, keeps W2 scatter/gamma/merge caller-owned, and fuses the KT
+logical-to-local route mask/remap into the small routing kernel. The production
+`Mxfp4TritonKernelsMoEMethod` adapter was fixed to carry these capabilities;
+previously only the unused `DeepSeekMxfp4MoEMethod` adapter supplied them.
+Live two-rank proof after full graph capture recorded 46 conversions per rank,
+1,342 fused applies per rank after warmup, and 826 KT-fused routing applies per
+rank. Minimal coherence passed.
+
+The isolated receipts are
+`/tmp/dsv4-oscar-int2/moe-t5-baseline-bench-v1.json` and
+`/tmp/dsv4-oscar-int2/moe-t5-fused-bench-v1.json`, SHA-256
+`9eb40b819954533d1db9ca360c4b659324f44b2326960a2ce0ea50757b5f5d9d`
+and
+`6973ff6c388698f5e1ad8b902b2d7515d887cfd7336769531eb8eca3e71b908c`.
+At T=5/E=14, one-, two-, and three-route microcases improved by 7.5%, 2.4%,
+and 2.8%, respectively. The full-model candidate nevertheless regressed: the
+receipt
+`/tmp/dsv4-oscar-int2/fused-t5-c4-v1/production-fixed4-v2.json`, SHA-256
+`1adc9f4ec1be93ae3ea9010bf76070a493f190880e810ca5bca279a0984f25d3`,
+measured **41.069 committed token/s** from 1,138 committed tokens over
+27,709.387 ms of whole GPU cycles. That is 7.3% below the reconstructed
+44.319-token/s coherent split-history reference. The path remains opt-in and
+is not a production default.
+
+### C4/Oscar fusion trial
+
+`SGLANG_DSV4_OSCAR_FUSED_C4_PIPELINE=1` enables an experimental C4 pipeline.
+Exact global top-k remains a synchronization boundary: no exact implementation
+can feed the final attention consumer until every active C4 page has
+contributed to top-k. The selected hybrid therefore bypasses RoPE and scoring
+entirely when the static sequence length is already at or below top-k, while
+retaining the original narrow RoPE plus Oscar scorer for longer history. The
+short path improved the whole C4-plus-top-k CUDA graph by about 2.25--2.58x,
+or only 0.0073--0.0092 ms per affected layer. A fused long-history RoPE kernel
+was 7--9% slower and was rejected.
+
+The rejected long-RoPE and selected-hybrid micro receipts are
+`/tmp/dsv4-oscar-int2/c4-fused-rope-rejected-bench-v1.json` and
+`/tmp/dsv4-oscar-int2/c4-hybrid-pipeline-bench-v1.json`, SHA-256
+`b82ccd0767c157531cc980e779db09efc54cfd637e69223d29cd349f8716b3a5`
+and
+`e1b6327282aed996f4f90c758caa47f3ead21c1a85c848b0f55e01dc6d1ef0d4`.
+The 2,694-token production workload cannot use the <=512-token bypass. Its
+C4-only receipt,
+`/tmp/dsv4-oscar-int2/c4-only-v1/production-fixed4.json`, SHA-256
+`17f5e59972f7c6cb8b87b3a4f5e1e02c0f65ed16bffe83c31a19841c31c65c31`,
+measured **42.494 committed token/s**, 4.1% below the same split-history
+reference. This path also remains opt-in and disabled in production.
+
+### Whole-cycle DSpark verify-length sweep
+
+The final sweep used the uninstrumented, unfused Oscar split-history baseline.
+Every tier used the same 2,694-token exact/near prompt pair, a 256-token cap,
+greedy sampling, natural EOS validation, and five phases. The selection metric
+is the requested aggregate: total committed tokens divided by the sum of all
+whole GPU cycle time, never the mean of per-phase rates.
+
+| Verify length | Committed tokens | Cycles | Whole GPU time | Objective | Max flushed TTFT |
+|---:|---:|---:|---:|---:|---:|
+| 2 | 1,110 | 645 | 31,144.008 ms | 35.641 token/s | 5.198 s |
+| 3 | 1,133 | 534 | 28,334.897 ms | 39.986 token/s | 5.209 s |
+| **4** | **1,156** | **476** | **26,887.047 ms** | **42.995 token/s** | **5.203 s** |
+| 5 | 1,130 | 462 | 27,574.997 ms | 40.979 token/s | 5.189 s |
+| 6 | 1,135 | 454 | 29,767.433 ms | 38.129 token/s | 5.196 s |
+
+The tier receipts are
+`/tmp/dsv4-oscar-int2/final-baseline-v1/verify-{2,3,4,5,6}.json`; their
+respective SHA-256 values are
+`a158191e1c0c9682474d5ad1936d5643be71bc078c353c9ab6e29d00a5d587da`,
+`99785d54aa3f256ac2676ff6992071e919e83997e654cfe32abc9fb5dceed090`,
+`5377d32266796bab48b6d5e69aae96e3f21e85dd955eae15b7bb43b5544573b2`,
+`39efa6cb347f639acfcc4e8b0f1aed9522d6b8a243aa1676e184c91d5c8fdeb5`,
+and
+`989c031e27829fe4de9e9e3bfb8926088e4e007cfb17d078bcbc502b5609406e`.
+Fixed-4 remains the launcher default. Its five HTTP decode rates average
+43.425 token/s, and its controlled fresh-prompt TTFT remains below 7 s. The
+canonical selected receipt is
+`/tmp/dsv4-oscar-int2/final-baseline-v1/production-selected.json`, SHA-256
+`5377d32266796bab48b6d5e69aae96e3f21e85dd955eae15b7bb43b5544573b2`.
+
+### Final OpenCode follow-up qualification
+
+The final retained server exposed 524,288 context and total tokens, FP8 as the
+public byte carrier, the admitted Oscar INT2 split-history execution on both
+ranks, EP2/TP2/PP1, full decode/speculative graphs, breakable prefill graphs,
+and 5.06 GB free after graph capture. Both experimental fused flags and
+internal timing were disabled.
+
+The realistic receipt is
+`/tmp/dsv4-oscar-int2/final-baseline-v1/opencode-followups.json`, SHA-256
+`88ecc3c85e9bd3567420f9aa5c58ae1462f7b46ab366f995d242f2e10daeed8d`.
+Three separately cache-flushed 42,125-byte OpenCode semantic requests produced
+the exact expected content and reasoning hashes. The standalone forced tool
+call passed. A retained-context sequence then passed its initial semantic
+answer, forced follow-up tool call, and exact post-tool-result continuation;
+the latter two reached first output in 2.180 and 2.183 s. The full 42K initial
+requests took roughly 20.45--21.91 s to first output, so they do not contradict
+the <=7 s controlled 2,694-token TTFT claim.
+
+The requested 80/90-token/s goal is not met. The graph-safe trace now localizes
+the plateau: roughly 32 ms/cycle remains in target routed MoE, followed by
+about 10 ms of projections/norms and 7.6 ms of collectives. The two new fused
+ideas are retained as tested opt-ins but rejected as defaults because the
+model-scale receipts, not their microbenchmarks, regressed the whole-cycle
+objective.

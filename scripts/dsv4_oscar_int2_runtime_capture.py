@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ruff: noqa: E402
 """Drive and finalize real-model DSV4 OSCAR INT2 calibration capture.
 
 This program never launches the model itself.  ``prepare`` creates a bounded
@@ -34,6 +35,8 @@ if str(REPO_ROOT) not in sys.path:
 if str(SGLANG_PYTHON) not in sys.path:
     sys.path.insert(0, str(SGLANG_PYTHON))
 
+# The local SGLang and repository roots must be inserted before importing the
+# capture implementations below.
 from sglang.srt.layers.attention.dsv4.oscar_int2_capture import (
     CONFIG_FORMAT,
     CONTROL_FORMAT,

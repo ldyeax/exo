@@ -70,7 +70,9 @@ def build_long_prompt_document(
         for split in SPLITS
     }
     if len(prompts_by_split["train"]) != 8 or len(prompts_by_split["heldout"]) != 4:
-        raise ValueError("OSCAR long corpus requires exactly eight train and four heldout prompts")
+        raise ValueError(
+            "OSCAR long corpus requires exactly eight train and four heldout prompts"
+        )
 
     generated_prompts: list[dict[str, object]] = []
     for split in SPLITS:
@@ -95,8 +97,7 @@ def build_long_prompt_document(
                 "Work through the following four independent engineering cases in "
                 "order. Keep their assumptions separate, identify cross-case lessons "
                 "only after each analysis, and finish with a short synthesis that does "
-                "not invent tool results.\n\n"
-                + "\n\n".join(sections)
+                "not invent tool results.\n\n" + "\n\n".join(sections)
             )
             token_count = count_tokens(text)
             if token_count < 768:
@@ -134,9 +135,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     tokenizer_path = arguments.tokenizer_json.resolve()
     output = arguments.output.resolve()
     if not source.is_file() or not tokenizer_path.is_file():
-        raise FileNotFoundError("source manifest and tokenizer JSON must be regular files")
+        raise FileNotFoundError(
+            "source manifest and tokenizer JSON must be regular files"
+        )
     if output == source:
-        raise ValueError("long prompt output must not overwrite its short source corpus")
+        raise ValueError(
+            "long prompt output must not overwrite its short source corpus"
+        )
     tokenizer = Tokenizer.from_file(str(tokenizer_path))
     document = build_long_prompt_document(
         _load_document(source),

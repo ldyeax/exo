@@ -291,9 +291,7 @@ def _dequantize_projection(
                 row_end - row_start, input_features
             )
             decoded = E2M1_VALUES[codes.to(torch.int64)]
-            scale_bits = (
-                scales[expert_id, row_start:row_end].to(torch.int32) << 23
-            )
+            scale_bits = scales[expert_id, row_start:row_end].to(torch.int32) << 23
             scale_values = scale_bits.view(torch.float32).repeat_interleave(
                 GROUP_SIZE, dim=-1
             )
@@ -481,14 +479,14 @@ def _quantize_rawint4_projection(
     for expert_id in range(expert_count):
         for row_start in range(0, output_features, row_chunk):
             row_end = min(row_start + row_chunk, output_features)
-            blocks = weight[expert_id, row_start:row_end].to(torch.float32).reshape(
-                row_end - row_start, input_features // GROUP_SIZE, GROUP_SIZE
+            blocks = (
+                weight[expert_id, row_start:row_end]
+                .to(torch.float32)
+                .reshape(row_end - row_start, input_features // GROUP_SIZE, GROUP_SIZE)
             )
             block_scales = blocks.abs().amax(dim=-1).div_(7.0)
             block_scales.masked_fill_(block_scales == 0, 1.0)
-            scales[expert_id, row_start:row_end].copy_(
-                block_scales.to(torch.bfloat16)
-            )
+            scales[expert_id, row_start:row_end].copy_(block_scales.to(torch.bfloat16))
             encoded = (
                 torch.round(blocks / block_scales.unsqueeze(-1))
                 .clamp_(-8, 7)
@@ -504,9 +502,7 @@ def _quantize_rawint4_projection(
     return RawInt4Projection(packed=packed.contiguous(), scales=scales.contiguous())
 
 
-def _quantize_rawint4(
-    weights: SourceWeights, *, row_chunk: int
-) -> RawInt4Weights:
+def _quantize_rawint4(weights: SourceWeights, *, row_chunk: int) -> RawInt4Weights:
     return RawInt4Weights(
         gate=_quantize_rawint4_projection(weights.gate.bf16, row_chunk=row_chunk),
         up=_quantize_rawint4_projection(weights.up.bf16, row_chunk=row_chunk),
@@ -695,7 +691,9 @@ def _parse_expert_ids(value: str) -> tuple[int, ...]:
     try:
         expert_ids = tuple(int(item.strip()) for item in value.split(","))
     except ValueError as error:
-        raise argparse.ArgumentTypeError("expert IDs must be decimal integers") from error
+        raise argparse.ArgumentTypeError(
+            "expert IDs must be decimal integers"
+        ) from error
     if not expert_ids or len(set(expert_ids)) != len(expert_ids):
         raise argparse.ArgumentTypeError("expert IDs must be a non-empty unique list")
     if any(expert_id < 0 or expert_id >= 256 for expert_id in expert_ids):
@@ -705,7 +703,9 @@ def _parse_expert_ids(value: str) -> tuple[int, ...]:
 
 def _arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--backends", type=_parse_backends, default=("mxfp4", "amxint4"))
+    parser.add_argument(
+        "--backends", type=_parse_backends, default=("mxfp4", "amxint4")
+    )
     parser.add_argument("--expert-count", type=int, default=12)
     parser.add_argument("--route-cases", type=int, default=12)
     parser.add_argument("--warmup-rounds", type=int, default=2)
@@ -865,9 +865,7 @@ def main() -> None:
             speedups = []
             quality_rows: dict[str, Any] = {}
             for batch_size in M_VALUES:
-                baseline_us = results["mxfp4"][str(batch_size)]["timing"][
-                    "median_us"
-                ]
+                baseline_us = results["mxfp4"][str(batch_size)]["timing"]["median_us"]
                 candidate_us = results[candidate][str(batch_size)]["timing"][
                     "median_us"
                 ]
@@ -883,12 +881,9 @@ def main() -> None:
             )
             candidate_quality[candidate] = quality_rows
 
-    packed_bytes_per_expert = (
-        HIDDEN_SIZE * INTERMEDIATE_SIZE * 3 // 2
-        + (
-            INTERMEDIATE_SIZE * (HIDDEN_SIZE // GROUP_SIZE) * 2
-            + HIDDEN_SIZE * (INTERMEDIATE_SIZE // GROUP_SIZE)
-        )
+    packed_bytes_per_expert = HIDDEN_SIZE * INTERMEDIATE_SIZE * 3 // 2 + (
+        INTERMEDIATE_SIZE * (HIDDEN_SIZE // GROUP_SIZE) * 2
+        + HIDDEN_SIZE * (INTERMEDIATE_SIZE // GROUP_SIZE)
     )
     scale_fold_telemetry = (
         kt_kernel_ext.mxfp4_avx_scale_fold_telemetry()
@@ -921,8 +916,7 @@ def main() -> None:
             "expert_count": expert_count,
             "mxfp4_group_size": GROUP_SIZE,
             "packed_bytes_per_expert_including_scales": packed_bytes_per_expert,
-            "route_bank_packed_bytes": packed_bytes_per_expert
-            * expert_count,
+            "route_bank_packed_bytes": packed_bytes_per_expert * expert_count,
         },
         "methodology": {
             "source": weights.metadata,
@@ -934,8 +928,7 @@ def main() -> None:
             "timing_clock": "time.perf_counter_ns around CPUInfer submit+sync",
             "swiglu_limit": arguments.swiglu_limit,
             "fused_activation": False,
-            "fine_grained_decode": os.environ["KT_AMX_FINE_GRAINED_DECODE"]
-            == "1",
+            "fine_grained_decode": os.environ["KT_AMX_FINE_GRAINED_DECODE"] == "1",
             "worker_spin_us": int(os.environ["KT_WORKER_SPIN_US"]),
             "mxfp4_amx_min_expert_tokens": int(
                 os.environ["KT_MXFP4_AMX_MIN_EXPERT_TOKENS"]

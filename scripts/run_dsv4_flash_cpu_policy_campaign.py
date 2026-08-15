@@ -31,9 +31,7 @@ except ModuleNotFoundError:
 
 RECEIPT_FORMAT: Final = "dsv4_cpu_performance_policy_campaign_v1"
 _WRAPPER_PATH: Final = Path(__file__).resolve()
-_CAMPAIGN_PATH: Final = _WRAPPER_PATH.with_name(
-    "run_dsv4_flash_candidate_campaign.py"
-)
+_CAMPAIGN_PATH: Final = _WRAPPER_PATH.with_name("run_dsv4_flash_candidate_campaign.py")
 _POLICY_HELPER_PATH: Final = _WRAPPER_PATH.with_name("cpu_performance_policy.py")
 _DEFAULT_MANIFEST_PATH: Final = (
     _WRAPPER_PATH.parent / "data" / "dsv4_flash_candidate_campaign_v1.json"
@@ -110,7 +108,9 @@ class CampaignInvocation:
                     "execute-candidate requires screen or confirm stage"
                 )
             assert self.candidate is not None
-            command.extend(("--execute-candidate", self.candidate, "--stage", self.stage))
+            command.extend(
+                ("--execute-candidate", self.candidate, "--stage", self.stage)
+            )
         return tuple(command)
 
 
@@ -134,9 +134,7 @@ def _canonical_sha256(value: object) -> str:
 
 
 def _json_copy(value: object) -> object:
-    return cast(
-        object, json.loads(json.dumps(value, allow_nan=False, sort_keys=True))
-    )
+    return cast(object, json.loads(json.dumps(value, allow_nan=False, sort_keys=True)))
 
 
 def _mapping(value: object, label: str) -> Mapping[str, object]:
@@ -248,7 +246,13 @@ def run_policy_campaign(
                 raise CpuPolicyCampaignError(
                     f"candidate campaign exited with status {completed.returncode}"
                 )
-    except (CpuPolicyCampaignError, OSError, RuntimeError, TypeError, ValueError) as error:
+    except (
+        CpuPolicyCampaignError,
+        OSError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+    ) as error:
         failure = error
 
     restored_evidence: dict[str, object] | None = None
@@ -310,8 +314,7 @@ def run_policy_campaign(
     _write_json_atomic(receipt_path, payload)
     if failures:
         raise CpuPolicyCampaignError(
-            "CPU-policy campaign failed; restoration evidence is in "
-            f"{receipt_path}"
+            f"CPU-policy campaign failed; restoration evidence is in {receipt_path}"
         ) from failures[0]
     return payload
 

@@ -190,7 +190,9 @@ def _replace_json(path: Path, document: dict[str, object]) -> None:
         finally:
             os.close(directory_descriptor)
     except OSError as error:
-        raise LaunchLedgerError(f"cannot publish launch ledger {path}: {error}") from error
+        raise LaunchLedgerError(
+            f"cannot publish launch ledger {path}: {error}"
+        ) from error
     finally:
         if not replaced and temporary.exists():
             temporary.unlink()
@@ -289,9 +291,7 @@ def _validate_first_benchmark(
     if not isinstance(provenance, dict):
         raise LaunchLedgerError("first PP2 benchmark provenance is missing")
     if not isinstance(launch_authorization, dict):
-        raise LaunchLedgerError(
-            "first PP2 benchmark launch authorization is missing"
-        )
+        raise LaunchLedgerError("first PP2 benchmark launch authorization is missing")
     if (
         not isinstance(server_contract, dict)
         or not isinstance(native_generate, dict)
@@ -387,9 +387,13 @@ def authorize_launch(
     if pp_async_batch_depth not in (0, 1):
         raise LaunchLedgerError("PP async batch depth must be zero or one")
     if chunked_prefill_size != 1024:
-        raise LaunchLedgerError("both receipt-bound PP2 launches must use chunk size 1024")
+        raise LaunchLedgerError(
+            "both receipt-bound PP2 launches must use chunk size 1024"
+        )
     if native_artifact != QUALIFIED_NATIVE_ARTIFACT:
-        raise LaunchLedgerError("PP2 launch does not name the qualified native artifact")
+        raise LaunchLedgerError(
+            "PP2 launch does not name the qualified native artifact"
+        )
     if native_artifact_sha256 != QUALIFIED_NATIVE_ARTIFACT_SHA256:
         raise LaunchLedgerError("PP2 launch does not use the qualified native digest")
 
@@ -401,7 +405,9 @@ def authorize_launch(
         )
     except PlanTransferError as error:
         raise LaunchLedgerError(str(error)) from error
-    resolved_plan = _resolve_regular_file(transferred_plan, label="transferred PP2 plan")
+    resolved_plan = _resolve_regular_file(
+        transferred_plan, label="transferred PP2 plan"
+    )
     transferred_plan_sha256 = sha256_file(resolved_plan)
     prepared_ledger = _prepare_output_parent(ledger_path, label="PP2 launch ledger")
     prepared_output = _prepare_output_parent(
@@ -415,7 +421,9 @@ def authorize_launch(
         launches = cast(list[dict[str, object]], ledger["launches"])
         ordinal = len(launches) + 1
         if ordinal > MAXIMUM_MODEL_LAUNCHES:
-            raise LaunchLedgerError("the two permitted PP2 model launches are exhausted")
+            raise LaunchLedgerError(
+                "the two permitted PP2 model launches are exhausted"
+            )
         expected_role = "transfer" if ordinal == 1 else "optimized"
         if run_role != expected_role:
             raise LaunchLedgerError(
@@ -446,8 +454,7 @@ def authorize_launch(
                 (
                     pipeline_layer_partition
                     != first_configuration["pipeline_layer_partition"],
-                    pp_async_batch_depth
-                    != first_configuration["pp_async_batch_depth"],
+                    pp_async_batch_depth != first_configuration["pp_async_batch_depth"],
                 )
             )
             if changed_pp_knobs != 1:
@@ -527,8 +534,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--pipeline-layer-partition", choices=("21,22", "22,21"), required=True
     )
-    parser.add_argument("--pp-async-batch-depth", type=int, choices=(0, 1), required=True)
-    parser.add_argument("--chunked-prefill-size", type=int, choices=(1024,), required=True)
+    parser.add_argument(
+        "--pp-async-batch-depth", type=int, choices=(0, 1), required=True
+    )
+    parser.add_argument(
+        "--chunked-prefill-size", type=int, choices=(1024,), required=True
+    )
     parser.add_argument("--first-benchmark-receipt", type=Path)
     parser.add_argument(
         "--native-artifact", type=Path, default=QUALIFIED_NATIVE_ARTIFACT

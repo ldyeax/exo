@@ -18,9 +18,7 @@ TARGET_SPARSE_PROFILE = (
     / "data"
     / "dsv4_flash_opencode_target_distinct_decode_calls_sparse.json"
 )
-PRODUCTION_CONTROLLER_ROOT = Path(
-    "/var/lib/exo/cache/dsv4-flash-hybrid-pp2-opencode"
-)
+PRODUCTION_CONTROLLER_ROOT = Path("/var/lib/exo/cache/dsv4-flash-hybrid-pp2-opencode")
 
 
 def isolated_launcher(tmp_path: Path) -> tuple[Path, Path]:
@@ -29,10 +27,10 @@ def isolated_launcher(tmp_path: Path) -> tuple[Path, Path]:
     controller_root = tmp_path / "cache"
     launcher_source = LAUNCHER.read_text(encoding="utf-8")
     production_root_assignment = (
-        "readonly canonical_cache_root=" f"{PRODUCTION_CONTROLLER_ROOT}"
+        f"readonly canonical_cache_root={PRODUCTION_CONTROLLER_ROOT}"
     )
     test_root_assignment = (
-        "readonly canonical_cache_root=" f"{shlex.quote(str(controller_root))}"
+        f"readonly canonical_cache_root={shlex.quote(str(controller_root))}"
     )
     repository_assignment = 'repo_root="$(cd "${script_dir}/.." && pwd)"'
     test_repository_assignment = f"repo_root={shlex.quote(str(REPOSITORY_ROOT))}"
@@ -354,8 +352,7 @@ def test_pp2_launcher_prepares_concurrency_control_without_starting_model(
     ) in prepare
     assert "|task_pin=1|inline=1|scale_fold=lut-v1|" in prepare
     assert (
-        "|native_sha="
-        "7886a0e7cde36263ac57005aea572fd99a401a8b3107f60d949d0dff97292043|"
+        "|native_sha=7886a0e7cde36263ac57005aea572fd99a401a8b3107f60d949d0dff97292043|"
     ) in prepare
 
 
@@ -496,10 +493,7 @@ def test_pp2_launcher_rejects_unadmitted_model_id(tmp_path: Path) -> None:
     result = run_launcher(environment, ("--launch",))
 
     assert result.returncode == 2
-    assert (
-        "requires DSV4_OSCAR_MODEL_ID=deepseek-ai/DeepSeek-V4-Flash"
-        in result.stderr
-    )
+    assert "requires DSV4_OSCAR_MODEL_ID=deepseek-ai/DeepSeek-V4-Flash" in result.stderr
     if invocation_log.exists():
         assert "-m sglang.launch_server" not in invocation_log.read_text(
             encoding="utf-8"
@@ -728,9 +722,7 @@ def test_pp2_launch_command_captures_bs1_and_bs2_decode_graphs_and_disables_spec
     assert "--kt-cpuinfer 56 --kt-threadpool-count 2 --kt-numa-nodes 0 1" in launch
     assert "--served-model-name deepseek-v4-flash" in launch
     assert "--tool-call-parser deepseekv4" in launch
-    assert (
-        f"|auth={environment['DSV4_PP_LAUNCH_AUTHORIZATION_OUTPUT']}" in launch
-    )
+    assert f"|auth={environment['DSV4_PP_LAUNCH_AUTHORIZATION_OUTPUT']}" in launch
 
 
 @pytest.mark.parametrize(
@@ -836,9 +828,7 @@ def test_pp2_private_shim_rejects_effective_oscar_environment_tampering(
     result = run_launcher(environment, ("--launch",))
 
     assert result.returncode == 2
-    assert (
-        "requires SGLANG_DSV4_OSCAR_INT2_KV_STORAGE=1" in result.stderr
-    )
+    assert "requires SGLANG_DSV4_OSCAR_INT2_KV_STORAGE=1" in result.stderr
     invocation = invocation_log.read_text(encoding="utf-8")
     assert "dsv4_pp2_followup_ledger.py" not in invocation
     assert "-m sglang.launch_server" not in invocation

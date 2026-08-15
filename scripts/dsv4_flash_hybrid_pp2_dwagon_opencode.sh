@@ -85,7 +85,7 @@ pp2_assert_private_shim_descriptor() {
     stat -Lc '%u|%a|%F' "/proc/$$/fd/$descriptor"
   )
   if [[ $descriptor_uid != "$(id -u)" || $descriptor_mode != 600 ||
-    $descriptor_type != "regular file" ]]; then
+  $descriptor_type != "regular file" ]]; then
     echo "PP2 recursive Python capability has unsafe ownership or permissions" >&2
     exit 2
   fi

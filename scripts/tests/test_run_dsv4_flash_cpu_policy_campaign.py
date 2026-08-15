@@ -93,8 +93,7 @@ def test_policy_campaign_publishes_only_after_verified_restore(
         receipt_path,
         policy_factory=lambda: session,
         child_runner=lambda _command: (
-            observed_lifecycles.append(session.evidence["lifecycle"])
-            or _Completed(0)
+            observed_lifecycles.append(session.evidence["lifecycle"]) or _Completed(0)
         ),
     )
 

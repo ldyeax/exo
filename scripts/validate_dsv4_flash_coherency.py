@@ -26,6 +26,8 @@ DEFAULT_COMPLETION_URL = "http://127.0.0.1:30010/v1/chat/completions"
 DEFAULT_MODEL_PATH = Path("/tmp/dsv4-local-checkpoint-0731")
 DEFAULT_AGENTS_PATH = Path(__file__).resolve().parents[1] / "AGENTS.md"
 TOOL_NAME = "record_coherence_decision"
+FOLLOWUP_RECEIPT = "coherence-followup-7f3a"
+FOLLOWUP_FINAL_CONTENT = f"FOLLOWUP_COMPLETE:{FOLLOWUP_RECEIPT}"
 MINIMUM_REASONING_BYTES = 24
 CACHE_FLUSH_RETRY_INTERVAL_SECONDS = 0.1
 
@@ -62,6 +64,7 @@ class ParsedArguments(argparse.Namespace):
     timeout: float
     flush_timeout: float
     validate_tool_call: bool
+    validate_followups: bool
     flush_cache_between_runs: bool
 
 
@@ -224,6 +227,14 @@ def build_semantic_user_prompt() -> str:
     )
 
 
+def build_tool_user_prompt() -> str:
+    return (
+        f"Copy the four coherence facts and call {TOOL_NAME} exactly once with "
+        "those four key/value pairs. Do not emit prose.\n\n"
+        f"{build_extraction_task()}"
+    )
+
+
 def semantic_payload(
     *,
     model: str,
@@ -260,11 +271,7 @@ def tool_payload(
             {"role": "system", "content": system_prompt},
             {
                 "role": "user",
-                "content": (
-                    f"Copy the four coherence facts and call {TOOL_NAME} exactly "
-                    "once with those four key/value pairs. Do not emit prose.\n\n"
-                    f"{build_extraction_task()}"
-                ),
+                "content": build_tool_user_prompt(),
             },
         ],
         "tools": [
@@ -288,6 +295,99 @@ def tool_payload(
         ],
         "tool_choice": {"type": "function", "function": {"name": TOOL_NAME}},
         "parallel_tool_calls": False,
+        "temperature": 0.0,
+        "max_tokens": maximum_tokens,
+        "stream": True,
+        "stream_options": {"include_usage": True},
+        "chat_template_kwargs": {"thinking": False},
+    }
+
+
+def followup_tool_payload(
+    *,
+    model: str,
+    system_prompt: str,
+    initial_assistant_content: str,
+    maximum_tokens: int,
+) -> dict[str, object]:
+    """Build a realistic second-turn tool request retaining the first answer."""
+
+    payload = tool_payload(
+        model=model,
+        system_prompt=system_prompt,
+        maximum_tokens=maximum_tokens,
+    )
+    messages = cast(list[dict[str, object]], payload["messages"])
+    initial_user = build_semantic_user_prompt()
+    tool_user = cast(str, messages[-1]["content"])
+    payload["messages"] = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": initial_user},
+        {"role": "assistant", "content": initial_assistant_content},
+        {
+            "role": "user",
+            "content": (
+                f"Follow up on the immediately preceding verified answer. {tool_user}"
+            ),
+        },
+    ]
+    return payload
+
+
+def tool_result_followup_payload(
+    *,
+    model: str,
+    system_prompt: str,
+    initial_assistant_content: str,
+    tool_capture: StreamCapture,
+    maximum_tokens: int,
+) -> dict[str, object]:
+    """Continue the same conversation after injecting the validated tool result."""
+
+    parts = tool_capture.tool_calls[0]
+    assert parts.identifier is not None
+    tool_name = "".join(parts.name_fragments)
+    arguments = "".join(parts.argument_fragments)
+    tool_result = _canonical_json({"accepted": True, "receipt": FOLLOWUP_RECEIPT})
+    return {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": build_semantic_user_prompt()},
+            {"role": "assistant", "content": initial_assistant_content},
+            {
+                "role": "user",
+                "content": (
+                    "Follow up on the immediately preceding verified answer. "
+                    f"{build_tool_user_prompt()}"
+                ),
+            },
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": parts.identifier,
+                        "type": "function",
+                        "function": {"name": tool_name, "arguments": arguments},
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": parts.identifier,
+                "name": tool_name,
+                "content": tool_result,
+            },
+            {
+                "role": "user",
+                "content": (
+                    "Acknowledge the tool result by emitting exactly "
+                    f"{FOLLOWUP_FINAL_CONTENT} with no Markdown, reasoning, "
+                    "whitespace, or other text."
+                ),
+            },
+        ],
         "temperature": 0.0,
         "max_tokens": maximum_tokens,
         "stream": True,
@@ -664,6 +764,118 @@ def validate_tool_capture(capture: StreamCapture) -> dict[str, object]:
     return report
 
 
+def validate_tool_result_followup_capture(
+    capture: StreamCapture,
+) -> dict[str, object]:
+    """Require an exact normal assistant continuation after a tool result."""
+
+    issue_codes = set(capture.protocol_issue_codes)
+    if capture.content != FOLLOWUP_FINAL_CONTENT:
+        if FOLLOWUP_FINAL_CONTENT in capture.content:
+            issue_codes.add("followup_content_not_exact")
+        else:
+            issue_codes.add("followup_content_mismatch")
+    if capture.finish_reason != "stop":
+        issue_codes.add("followup_finish_reason_not_stop")
+    if capture.reasoning_content:
+        issue_codes.add("followup_unexpected_reasoning")
+    if capture.tool_calls:
+        issue_codes.add("followup_unexpected_tool_call")
+    if "\ufffd" in capture.content or "\ufffd" in capture.reasoning_content:
+        issue_codes.add("unicode_replacement_character_present")
+    report = _base_capture_report(capture)
+    report.update(
+        {
+            "accepted": not issue_codes,
+            "issue_codes": sorted(issue_codes),
+            "expected_content_sha256": _sha256_text(FOLLOWUP_FINAL_CONTENT),
+        }
+    )
+    return report
+
+
+def run_followup_sequence(
+    *,
+    completion_url: str,
+    flush_url: str,
+    model: str,
+    system_prompt: str,
+    semantic_maximum_tokens: int,
+    tool_maximum_tokens: int,
+    timeout_seconds: float,
+    flush_timeout_seconds: float,
+) -> dict[str, object]:
+    """Run initial answer -> tool follow-up -> tool-result continuation."""
+
+    flush_report = flush_cache(flush_url, flush_timeout_seconds)
+    initial_payload = semantic_payload(
+        model=model,
+        system_prompt=system_prompt,
+        maximum_tokens=semantic_maximum_tokens,
+    )
+    initial_capture = collect_stream(
+        url=completion_url,
+        payload=initial_payload,
+        timeout_seconds=timeout_seconds,
+    )
+    initial_report = validate_semantic_capture(initial_capture)
+    report: dict[str, object] = {
+        "accepted": False,
+        "cache_policy": "single_flush_before_sequence",
+        "flush": flush_report,
+        "initial_semantic": initial_report,
+        "tool_followup": None,
+        "tool_result_followup": None,
+        "request_sha256": {
+            "initial": _sha256_text(_canonical_json(initial_payload)),
+            "tool_followup": None,
+            "tool_result_followup": None,
+        },
+    }
+    if initial_report["accepted"] is not True:
+        return report
+
+    tool_followup_payload = followup_tool_payload(
+        model=model,
+        system_prompt=system_prompt,
+        initial_assistant_content=initial_capture.content,
+        maximum_tokens=tool_maximum_tokens,
+    )
+    tool_capture = collect_stream(
+        url=completion_url,
+        payload=tool_followup_payload,
+        timeout_seconds=timeout_seconds,
+    )
+    tool_report = validate_tool_capture(tool_capture)
+    report["tool_followup"] = tool_report
+    request_hashes = cast(dict[str, object], report["request_sha256"])
+    request_hashes["tool_followup"] = _sha256_text(
+        _canonical_json(tool_followup_payload)
+    )
+    if tool_report["accepted"] is not True:
+        return report
+
+    final_payload = tool_result_followup_payload(
+        model=model,
+        system_prompt=system_prompt,
+        initial_assistant_content=initial_capture.content,
+        tool_capture=tool_capture,
+        maximum_tokens=tool_maximum_tokens,
+    )
+    final_capture = collect_stream(
+        url=completion_url,
+        payload=final_payload,
+        timeout_seconds=timeout_seconds,
+    )
+    final_report = validate_tool_result_followup_capture(final_capture)
+    report["tool_result_followup"] = final_report
+    request_hashes["tool_result_followup"] = _sha256_text(
+        _canonical_json(final_payload)
+    )
+    report["accepted"] = final_report["accepted"] is True
+    return report
+
+
 def run_gate(
     *,
     completion_url: str,
@@ -676,6 +888,7 @@ def run_gate(
     timeout_seconds: float,
     flush_timeout_seconds: float,
     validate_tool_call: bool,
+    validate_followups: bool = False,
 ) -> dict[str, object]:
     if repetitions < 2:
         raise GateError("repetitions_below_two")
@@ -718,15 +931,36 @@ def run_gate(
             )
         )
 
+    followup_report: dict[str, object] | None = None
+    if validate_followups:
+        followup_report = run_followup_sequence(
+            completion_url=completion_url,
+            flush_url=flush_url,
+            model=model,
+            system_prompt=system_prompt,
+            semantic_maximum_tokens=maximum_tokens,
+            tool_maximum_tokens=tool_maximum_tokens,
+            timeout_seconds=timeout_seconds,
+            flush_timeout_seconds=flush_timeout_seconds,
+        )
+
     content_hashes = {cast(str, run["content_sha256"]) for run in semantic_runs}
     deterministic = len(content_hashes) == 1
     semantics_accepted = all(cast(bool, run["accepted"]) for run in semantic_runs)
     tool_accepted = tool_report is None or cast(bool, tool_report["accepted"])
+    followups_accepted = followup_report is None or cast(
+        bool, followup_report["accepted"]
+    )
     agents_bytes = agents_context.encode("utf-8")
     system_bytes = system_prompt.encode("utf-8")
     return {
         "schema_version": 2,
-        "coherent": semantics_accepted and deterministic and tool_accepted,
+        "coherent": (
+            semantics_accepted
+            and deterministic
+            and tool_accepted
+            and followups_accepted
+        ),
         "deterministic_final_content": deterministic,
         "cache_policy": "flush_before_every_request",
         "challenge": {
@@ -741,6 +975,7 @@ def run_gate(
         "flushes": flushes,
         "semantic_runs": semantic_runs,
         "forced_tool_call": tool_report,
+        "opencode_followup_sequence": followup_report,
     }
 
 
@@ -761,6 +996,14 @@ def parse_args(argv: Sequence[str] | None = None) -> ParsedArguments:
     parser.add_argument("--timeout", type=float, default=300.0)
     parser.add_argument("--flush-timeout", type=float, default=60.0)
     parser.add_argument("--validate-tool-call", action="store_true")
+    parser.add_argument(
+        "--validate-followups",
+        action="store_true",
+        help=(
+            "run an OpenCode-shaped multi-turn tool call and tool-result "
+            "continuation after the repeated basic gate"
+        ),
+    )
     parser.add_argument(
         "--flush-cache-between-runs",
         action="store_true",
@@ -787,6 +1030,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             timeout_seconds=args.timeout,
             flush_timeout_seconds=args.flush_timeout,
             validate_tool_call=args.validate_tool_call,
+            validate_followups=args.validate_followups,
         )
     except (OSError, urllib.error.URLError, GateError) as error:
         failure: dict[str, object] = {

@@ -178,9 +178,7 @@ def test_ledger_allows_transfer_then_one_optimized_launch_only(
     )
     assert persisted["launches"][0]["configuration"]["oscar_split_history"] is True
     assert persisted["ep_winner"]["coherency_receipt_path"] == str(coherency)
-    assert persisted["ep_winner"]["coherency_receipt_sha256"] == sha256_file(
-        coherency
-    )
+    assert persisted["ep_winner"]["coherency_receipt_sha256"] == sha256_file(coherency)
 
     with pytest.raises(
         ledger.LaunchLedgerError,

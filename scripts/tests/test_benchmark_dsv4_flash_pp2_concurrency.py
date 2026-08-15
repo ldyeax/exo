@@ -106,9 +106,7 @@ def oscar_worker(pp_rank: int, layer_ids: list[int]) -> dict[str, object]:
 def oscar_provenance() -> benchmark.OscarProvenance:
     return benchmark.OscarProvenance(
         admission_receipt_path="/tmp/oscar-admission.json",
-        admission_receipt_sha256=OSCAR_HASHES[
-            "dsv4_oscar_admission_receipt_sha256"
-        ],
+        admission_receipt_sha256=OSCAR_HASHES["dsv4_oscar_admission_receipt_sha256"],
         artifact_path="/tmp/oscar-calibration.pt",
         artifact_sha256=OSCAR_HASHES["dsv4_oscar_artifact_sha256"],
         admission_sha256=OSCAR_HASHES["dsv4_oscar_admission_sha256"],
@@ -620,9 +618,7 @@ def test_semantic_natural_eos_concurrency_receipt(
     assert server_contract["chunked_prefill_size"] == 1024
     assert server_contract["kt_num_gpu_experts"] == 28
     assert server_contract["dsv4_oscar_algorithm"] == "oscar-int2-asym-g64-v1"
-    oscar_workers = cast(
-        dict[str, Any], server_contract["oscar_pp_worker_contract"]
-    )
+    oscar_workers = cast(dict[str, Any], server_contract["oscar_pp_worker_contract"])
     assert oscar_workers["compressed_layer_union"] == list(range(2, 43))
     assert [
         worker["pp_rank"]
@@ -853,12 +849,8 @@ def test_server_contract_rejects_72_thread_oscar_transfer() -> None:
             expected_expert_plan_format="sglang_kt_hybrid_expert_shard_v1",
             expected_expert_plan_sha256="a" * 64,
             expected_cpuinfer_threads=56,
-            expected_oscar_artifact_sha256=OSCAR_HASHES[
-                "dsv4_oscar_artifact_sha256"
-            ],
-            expected_oscar_admission_sha256=OSCAR_HASHES[
-                "dsv4_oscar_admission_sha256"
-            ],
+            expected_oscar_artifact_sha256=OSCAR_HASHES["dsv4_oscar_artifact_sha256"],
+            expected_oscar_admission_sha256=OSCAR_HASHES["dsv4_oscar_admission_sha256"],
             expected_oscar_admission_receipt_sha256=OSCAR_HASHES[
                 "dsv4_oscar_admission_receipt_sha256"
             ],
@@ -957,9 +949,7 @@ def test_server_contract_requires_confirmed_cpu_tuple_on_pp_workers(
     issue_code: str,
 ) -> None:
     server_info = pp2_server_info()
-    workers = cast(
-        list[dict[str, Any]], server_info[f"{prefix}_worker_telemetry"]
-    )
+    workers = cast(list[dict[str, Any]], server_info[f"{prefix}_worker_telemetry"])
     if mutation == "identity":
         workers[1]["gpu_id"] = 0
     else:
@@ -1161,9 +1151,10 @@ def test_oscar_provenance_rehashes_artifact_and_canonical_admission(
     assert provenance.artifact_path == str(artifact)
     assert provenance.artifact_sha256 == artifact_sha256
     assert provenance.admission_sha256 == admission_sha256
-    assert provenance.admission_receipt_sha256 == hashlib.sha256(
-        receipt_path.read_bytes()
-    ).hexdigest()
+    assert (
+        provenance.admission_receipt_sha256
+        == hashlib.sha256(receipt_path.read_bytes()).hexdigest()
+    )
 
     artifact.write_bytes(b"tampered")
     with pytest.raises(ValueError, match="digest does not match admission"):
@@ -1246,10 +1237,7 @@ def test_parse_args_accepts_receipt_provenance_pair(tmp_path: Path) -> None:
     assert parsed.expected_pp_async_batch_depth == 1
     assert parsed.expected_cpuinfer_threads == 56
     assert parsed.oscar_admission_receipt == tmp_path / "admission.json"
-    assert (
-        parsed.launch_authorization_receipt
-        == tmp_path / "authorization.json"
-    )
+    assert parsed.launch_authorization_receipt == tmp_path / "authorization.json"
 
 
 def test_load_launch_authorization_proves_receipt_bound_oscar_tuple(
@@ -1315,9 +1303,10 @@ def test_load_launch_authorization_proves_receipt_bound_oscar_tuple(
     assert provenance.run_role == "transfer"
     assert provenance.ep_confirmation_receipt_sha256 == "8" * 64
     assert provenance.ep_coherency_receipt_sha256 == "6" * 64
-    assert provenance.authorization_receipt_sha256 == hashlib.sha256(
-        receipt.read_bytes()
-    ).hexdigest()
+    assert (
+        provenance.authorization_receipt_sha256
+        == hashlib.sha256(receipt.read_bytes()).hexdigest()
+    )
 
 
 @pytest.mark.parametrize(
@@ -1351,9 +1340,7 @@ def test_parse_args_requires_oscar_admission_receipt() -> None:
 
 def test_parse_args_requires_launch_authorization_receipt() -> None:
     with pytest.raises(SystemExit):
-        benchmark.parse_args(
-            ["--oscar-admission-receipt", "/tmp/oscar-admission.json"]
-        )
+        benchmark.parse_args(["--oscar-admission-receipt", "/tmp/oscar-admission.json"])
 
 
 def test_parse_args_rejects_72_cpuinfer_threads() -> None:

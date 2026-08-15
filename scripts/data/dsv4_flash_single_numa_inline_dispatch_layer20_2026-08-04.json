@@ -22,7 +22,7 @@
       "size_bytes": 9112792
     },
     "overlay_json_sha256": "077062a1c9778144ea4ebfb567a3ee3732f86b5f87bdae97c325a24d48e94e07",
-    "benchmark_script_sha256": "fcb3d9eb723c14ba5292c9e53c070244811c2f8a0ea083e28bb949972629e9f8",
+    "benchmark_script_sha256": "9aeb314c4e12a8c6321cdbfe414e9c5b34deab6d0f3f94937874cb0c5471762f",
     "g14_baseline_receipt_sha256": "e4bf83a681f658ef5aa039ac79dde899c5cf6f5bab20a2ebf3d48ce4d2469d23"
   },
   "checkpoint": {

@@ -1,0 +1,39 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "local-dsv4/deepseek-v4-flash",
+  "small_model": "local-dsv4/deepseek-v4-flash",
+  "enabled_providers": ["local-dsv4"],
+  "share": "disabled",
+  "provider": {
+    "local-dsv4": {
+      "name": "Local DeepSeek V4 Flash",
+      "npm": "@ai-sdk/openai-compatible",
+      "options": {
+        "baseURL": "http://127.0.0.1:30010/v1",
+        "timeout": false,
+        "headerTimeout": 300000,
+        "chunkTimeout": 300000
+      },
+      "models": {
+        "deepseek-v4-flash": {
+          "id": "deepseek-v4-flash",
+          "name": "DeepSeek V4 Flash (Local Oscar EP2)",
+          "reasoning": true,
+          "temperature": true,
+          "tool_call": true,
+          "interleaved": {
+            "field": "reasoning_content"
+          },
+          "limit": {
+            "context": 524288,
+            "output": 32768
+          },
+          "modalities": {
+            "input": ["text"],
+            "output": ["text"]
+          }
+        }
+      }
+    }
+  }
+}

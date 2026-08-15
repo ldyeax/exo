@@ -105,11 +105,10 @@ false | 0 | no | n)
   ;;
 esac
 
-selected_kt_experiment_overlays=$((
-  stage_kt_task_queue_pin_overlay +
-    stage_kt_persistent_counter_overlay +
-    stage_kt_cpu_optimized_overlay
-))
+selected_kt_experiment_overlays=$((\
+  stage_kt_task_queue_pin_overlay + \
+  stage_kt_persistent_counter_overlay + \
+  stage_kt_cpu_optimized_overlay))
 if ((selected_kt_experiment_overlays > 1)); then
   echo "the KT task-queue-pin, persistent-counter, and CPU-optimized overlays are mutually exclusive" >&2
   exit 2

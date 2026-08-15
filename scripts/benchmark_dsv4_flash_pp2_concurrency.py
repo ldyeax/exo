@@ -72,9 +72,7 @@ TARGET_LAYER_COUNT = 43
 TARGET_EP_SIZE = 1
 TARGET_COMPRESSED_LAYER_IDS = frozenset(range(2, TARGET_LAYER_COUNT))
 ADMITTED_CPUINFER_THREAD_COUNTS = frozenset({56})
-PP2_CPU_WORKER_IDENTITIES = frozenset(
-    {(0, 0, 0, 0, 0), (0, 1, 0, 0, 1)}
-)
+PP2_CPU_WORKER_IDENTITIES = frozenset({(0, 0, 0, 0, 0), (0, 1, 0, 0, 1)})
 OSCAR_STATIC_SERVER_INFO: dict[str, object] = {
     "dsv4_oscar_int2_kv_storage": True,
     "dsv4_oscar_algorithm": "oscar-int2-asym-g64-v1",
@@ -85,16 +83,10 @@ OSCAR_STATIC_SERVER_INFO: dict[str, object] = {
     "dsv4_c4_kv_bytes_per_token": 272,
     "dsv4_c128_kv_bytes_per_token": 272,
     "dsv4_oscar_c4_scorer": True,
-    "dsv4_oscar_c4_scorer_algorithm": (
-        "oscar-int2-c4-asym-c128-fp32-adjacent4-v1"
-    ),
+    "dsv4_oscar_c4_scorer_algorithm": ("oscar-int2-c4-asym-c128-fp32-adjacent4-v1"),
     "dsv4_oscar_masked_writer_execution": "device-uniform-live-mask-row-v1",
-    "dsv4_oscar_c4_masked_writer_execution": (
-        "device-uniform-live-mask-row-v1"
-    ),
-    "dsv4_oscar_c4_query_rotation_execution": (
-        "once-per-query-stable-workspace-v1"
-    ),
+    "dsv4_oscar_c4_masked_writer_execution": ("device-uniform-live-mask-row-v1"),
+    "dsv4_oscar_c4_query_rotation_execution": ("once-per-query-stable-workspace-v1"),
     "dsv4_c4_indexer_bytes_per_token": 40,
     "dsv4_int4_kv_storage": False,
     "dsv4_int4_c4_indexer_storage": False,
@@ -340,9 +332,7 @@ class LaunchAuthorizationProvenance:
             "authorization_receipt_sha256": self.authorization_receipt_sha256,
             "ordinal": self.ordinal,
             "run_role": self.run_role,
-            "ep_confirmation_receipt_sha256": (
-                self.ep_confirmation_receipt_sha256
-            ),
+            "ep_confirmation_receipt_sha256": (self.ep_confirmation_receipt_sha256),
             "ep_coherency_receipt_sha256": self.ep_coherency_receipt_sha256,
         }
 
@@ -569,9 +559,7 @@ def _validate_oscar_pp_worker_contract(
     expected_hashes = {
         "dsv4_oscar_artifact_sha256": expected_artifact_sha256,
         "dsv4_oscar_admission_sha256": expected_admission_sha256,
-        "dsv4_oscar_admission_receipt_sha256": (
-            expected_admission_receipt_sha256
-        ),
+        "dsv4_oscar_admission_receipt_sha256": (expected_admission_receipt_sha256),
     }
     for key, expected_value in expected_hashes.items():
         if expected_value is not None and server_info.get(key) != expected_value:
@@ -599,9 +587,7 @@ def _validate_oscar_pp_worker_contract(
                     f"oscar_pp_internal_state_{state_index}_worker_gather_malformed"
                 )
             else:
-                gathered_workers.extend(
-                    cast(list[dict[str, object]], raw_gathered)
-                )
+                gathered_workers.extend(cast(list[dict[str, object]], raw_gathered))
             continue
         raw_local_worker = raw_state.get("dsv4_oscar_worker_telemetry")
         if isinstance(raw_local_worker, dict):
@@ -668,11 +654,7 @@ def _validate_oscar_pp_worker_contract(
             and not isinstance(gpu_id, bool)
         ):
             worker_identities.add((pp_rank, tp_rank, gpu_id))
-        if (
-            not isinstance(pid, int)
-            or isinstance(pid, bool)
-            or pid <= 0
-        ):
+        if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
             issues.append(f"oscar_pp_worker_{index}_pid_invalid")
         else:
             pids.add(pid)
@@ -682,9 +664,7 @@ def _validate_oscar_pp_worker_contract(
                 issues.append(f"oscar_pp_worker_{index}_{key}_mismatch")
         for key, expected_value in OSCAR_SPLIT_HISTORY_SERVER_INFO.items():
             if worker.get(key) != expected_value:
-                issues.append(
-                    f"oscar_pp_worker_{index}_split_history_{key}_mismatch"
-                )
+                issues.append(f"oscar_pp_worker_{index}_split_history_{key}_mismatch")
         split_workspace_address = worker.get(
             "dsv4_oscar_int2_split_history_workspace_address"
         )
@@ -1113,9 +1093,7 @@ def validate_pp2_server_contract(
         server_info,
         expected_artifact_sha256=expected_oscar_artifact_sha256,
         expected_admission_sha256=expected_oscar_admission_sha256,
-        expected_admission_receipt_sha256=(
-            expected_oscar_admission_receipt_sha256
-        ),
+        expected_admission_receipt_sha256=(expected_oscar_admission_receipt_sha256),
         issues=issues,
     )
     confirmed_cpu_tuple = _validate_confirmed_cpu_tuple_telemetry(
@@ -1287,15 +1265,12 @@ def load_launch_authorization_provenance(
         or configuration.get("max_total_tokens") != 524_288
         or configuration.get("decode_cuda_graph_backend") != "full"
         or configuration.get("kv_cache_public_carrier") != "fp8_e4m3"
-        or configuration.get("physical_kv_cache_storage")
-        != "oscar-int2-asymmetric"
+        or configuration.get("physical_kv_cache_storage") != "oscar-int2-asymmetric"
         or configuration.get("oscar_split_history") is not True
         or configuration.get("oscar_split_history_execution")
         != "sm86-oscar-int2-split-history-fp32-online-v1"
         or configuration.get("oscar_split_history_split_map")
-        != OSCAR_SPLIT_HISTORY_SERVER_INFO[
-            "dsv4_oscar_int2_split_history_split_map"
-        ]
+        != OSCAR_SPLIT_HISTORY_SERVER_INFO["dsv4_oscar_int2_split_history_split_map"]
         or configuration.get("oscar_split_history_workspace_bytes_per_worker")
         != 4_210_688
         or configuration.get("oscar_split_history_worker_identities")
@@ -2660,14 +2635,10 @@ def run_benchmark(
         ),
         expected_cpuinfer_threads=config.expected_cpuinfer_threads,
         expected_oscar_artifact_sha256=(
-            oscar_provenance.artifact_sha256
-            if oscar_provenance is not None
-            else None
+            oscar_provenance.artifact_sha256 if oscar_provenance is not None else None
         ),
         expected_oscar_admission_sha256=(
-            oscar_provenance.admission_sha256
-            if oscar_provenance is not None
-            else None
+            oscar_provenance.admission_sha256 if oscar_provenance is not None else None
         ),
         expected_oscar_admission_receipt_sha256=(
             oscar_provenance.admission_receipt_sha256
@@ -2895,8 +2866,7 @@ def parse_args(arguments: Sequence[str] | None = None) -> BenchmarkArguments:
         type=Path,
         required=True,
         help=(
-            "absolute admitted OSCAR receipt to rehash and bind to both live PP "
-            "workers"
+            "absolute admitted OSCAR receipt to rehash and bind to both live PP workers"
         ),
     )
     parser.add_argument(
@@ -2935,9 +2905,7 @@ def parse_args(arguments: Sequence[str] | None = None) -> BenchmarkArguments:
         expected_pp_async_batch_depth=cast(int, parsed.expected_pp_async_batch_depth),
         expected_cpuinfer_threads=cast(int | None, parsed.expected_cpuinfer_threads),
         oscar_admission_receipt=cast(Path, parsed.oscar_admission_receipt),
-        launch_authorization_receipt=cast(
-            Path, parsed.launch_authorization_receipt
-        ),
+        launch_authorization_receipt=cast(Path, parsed.launch_authorization_receipt),
     )
 
 
@@ -2951,9 +2919,7 @@ def main() -> int:
             run_label=arguments.run_label,
             expert_plan=arguments.expert_plan,
         )
-        oscar_provenance = load_oscar_provenance(
-            arguments.oscar_admission_receipt
-        )
+        oscar_provenance = load_oscar_provenance(arguments.oscar_admission_receipt)
         launch_authorization = load_launch_authorization_provenance(
             arguments.launch_authorization_receipt
         )
@@ -3012,9 +2978,7 @@ def main() -> int:
         if oscar_provenance is not None:
             failure["oscar_provenance"] = oscar_provenance.safe_receipt()
         if launch_authorization is not None:
-            failure["launch_authorization"] = (
-                launch_authorization.safe_receipt()
-            )
+            failure["launch_authorization"] = launch_authorization.safe_receipt()
         print(json.dumps(failure, sort_keys=True))
         return 1
 

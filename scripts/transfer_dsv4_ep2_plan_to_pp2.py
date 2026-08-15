@@ -35,9 +35,7 @@ VARIABLE_PLAN_FORMAT: Final = "sglang_kt_hybrid_expert_shard_v2_variable"
 TRANSFER_FORMAT: Final = "dsv4_ep2_winner_to_pp2_ep1_transfer_v5"
 EP_CONFIRMATION_FORMAT: Final = "dsv4_candidate_campaign_result_v1"
 EP_HOTSPOT_RECEIPT_VERSION: Final = 2
-OSCAR_SPLIT_HISTORY_EXECUTION: Final = (
-    "sm86-oscar-int2-split-history-fp32-online-v1"
-)
+OSCAR_SPLIT_HISTORY_EXECUTION: Final = "sm86-oscar-int2-split-history-fp32-online-v1"
 OSCAR_SPLIT_HISTORY_SPLIT_MAP: Final = {
     "1": 16,
     "2": 16,
@@ -215,7 +213,9 @@ def _require_mapping(value: object, *, label: str) -> dict[str, object]:
     return cast(dict[str, object], value)
 
 
-def _load_confirmation_json(path: Path, *, label: str) -> tuple[Path, str, dict[str, object]]:
+def _load_confirmation_json(
+    path: Path, *, label: str
+) -> tuple[Path, str, dict[str, object]]:
     resolved = _resolve_confirmation_file(path)
     digest = sha256_file(resolved)
     try:
@@ -284,10 +284,8 @@ def _validate_ep_nvlink_traffic(value: object) -> None:
         )
     for link in range(4):
         if (
-            deltas[f"gpu0.link{link}.tx_kib"]
-            != deltas[f"gpu1.link{link}.rx_kib"]
-            or deltas[f"gpu1.link{link}.tx_kib"]
-            != deltas[f"gpu0.link{link}.rx_kib"]
+            deltas[f"gpu0.link{link}.tx_kib"] != deltas[f"gpu1.link{link}.rx_kib"]
+            or deltas[f"gpu1.link{link}.tx_kib"] != deltas[f"gpu0.link{link}.rx_kib"]
         ):
             raise PlanTransferError(
                 "final EP NVLink counter deltas are not reciprocal by link"
@@ -380,12 +378,8 @@ def _load_direct_ep_confirmation(
         "enable_p2p_check": True,
         "pre_warm_nccl": True,
         "dsv4_oscar_int2_split_history": True,
-        "dsv4_oscar_int2_split_history_execution": (
-            OSCAR_SPLIT_HISTORY_EXECUTION
-        ),
-        "dsv4_oscar_int2_split_history_split_map": (
-            OSCAR_SPLIT_HISTORY_SPLIT_MAP
-        ),
+        "dsv4_oscar_int2_split_history_execution": (OSCAR_SPLIT_HISTORY_EXECUTION),
+        "dsv4_oscar_int2_split_history_split_map": (OSCAR_SPLIT_HISTORY_SPLIT_MAP),
         "dsv4_oscar_int2_split_history_workspace_bytes": (
             OSCAR_SPLIT_HISTORY_WORKSPACE_BYTES
         ),
@@ -417,8 +411,7 @@ def _load_direct_ep_confirmation(
         or not isinstance(workspace_addresses, list)
         or len(workspace_addresses) != 2
         or any(
-            type(address) is not int or address <= 0
-            for address in workspace_addresses
+            type(address) is not int or address <= 0 for address in workspace_addresses
         )
     ):
         raise PlanTransferError(
@@ -456,7 +449,10 @@ def _load_direct_ep_confirmation(
     if not isinstance(raw_plan, dict):
         raise PlanTransferError("final EP hotspot plan is not a dictionary")
     raw_semantics = raw_plan.get("placement_semantics_sha256")
-    if not isinstance(raw_semantics, str) or SHA256_PATTERN.fullmatch(raw_semantics) is None:
+    if (
+        not isinstance(raw_semantics, str)
+        or SHA256_PATTERN.fullmatch(raw_semantics) is None
+    ):
         raise PlanTransferError(
             "final EP hotspot plan lacks placement semantics provenance"
         )
@@ -606,9 +602,7 @@ def load_ep_confirmation(
     )
     exact_oscar = {
         "dsv4_oscar_int2_kv_storage": True,
-        "dsv4_kv_storage_mode": (
-            "oscar_int2_asymmetric+protected_swa_bfloat16"
-        ),
+        "dsv4_kv_storage_mode": ("oscar_int2_asymmetric+protected_swa_bfloat16"),
         "dsv4_c4_kv_bytes_per_token": 272,
         "dsv4_c128_kv_bytes_per_token": 272,
         "dsv4_c4_indexer_bytes_per_token": 40,
@@ -616,7 +610,9 @@ def load_ep_confirmation(
         "dsv4_int4_c4_indexer_storage": False,
         "dsv4_sm86_c128_bf16_storage": False,
     }
-    if any(expected_server_info.get(key) != value for key, value in exact_oscar.items()):
+    if any(
+        expected_server_info.get(key) != value for key, value in exact_oscar.items()
+    ):
         raise PlanTransferError(
             "final EP confirmation does not prove physical Oscar INT2 storage"
         )
@@ -1162,9 +1158,7 @@ def _identity_document(
         "num_experts": NUM_EXPERTS,
     }
     if ep_confirmation is not None:
-        identity["source_ep_confirmation_receipt"] = str(
-            ep_confirmation.receipt_path
-        )
+        identity["source_ep_confirmation_receipt"] = str(ep_confirmation.receipt_path)
         identity["source_ep_confirmation_receipt_sha256"] = (
             ep_confirmation.receipt_sha256
         )
@@ -1179,9 +1173,7 @@ def _identity_document(
                 ep_confirmation.coherency_receipt_sha256
             )
         identity["qualified_native_artifact"] = str(QUALIFIED_NATIVE_ARTIFACT)
-        identity["qualified_native_artifact_sha256"] = (
-            QUALIFIED_NATIVE_ARTIFACT_SHA256
-        )
+        identity["qualified_native_artifact_sha256"] = QUALIFIED_NATIVE_ARTIFACT_SHA256
         identity["qualified_cpuinfer_threads"] = 56
         identity["qualified_worker_spin_us"] = 1000
         identity["qualified_task_queue_pin_first_core"] = True
@@ -1192,12 +1184,8 @@ def _identity_document(
         identity["kv_cache_public_carrier"] = "fp8_e4m3"
         identity["physical_kv_cache_storage"] = "oscar-int2-asymmetric"
         identity["oscar_split_history"] = True
-        identity["oscar_split_history_execution"] = (
-            OSCAR_SPLIT_HISTORY_EXECUTION
-        )
-        identity["oscar_split_history_split_map"] = (
-            OSCAR_SPLIT_HISTORY_SPLIT_MAP
-        )
+        identity["oscar_split_history_execution"] = OSCAR_SPLIT_HISTORY_EXECUTION
+        identity["oscar_split_history_split_map"] = OSCAR_SPLIT_HISTORY_SPLIT_MAP
         identity["oscar_split_history_workspace_bytes_per_worker"] = (
             OSCAR_SPLIT_HISTORY_WORKSPACE_BYTES
         )
@@ -1472,9 +1460,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
     try:
         output_path = stage_transferred_plan(
             source_ep2_plan=parsed.source_ep2_plan,
-            source_ep_confirmation_receipt=(
-                parsed.source_ep_confirmation_receipt
-            ),
+            source_ep_confirmation_receipt=(parsed.source_ep_confirmation_receipt),
             source_ep_coherency_receipt=parsed.source_ep_coherency_receipt,
             cache_root=parsed.cache_root,
             expected_target_gpu_experts_per_layer=(

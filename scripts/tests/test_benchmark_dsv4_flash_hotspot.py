@@ -234,6 +234,11 @@ def test_trace_summary_reports_cycles_tiers_and_stepwise_logit_evidence() -> Non
             "step_gpu_ms": 81.0,
             "draft_gpu_ms": 6.0,
             "target_verify_gpu_ms": 74.0,
+            "internal_gpu_ms": {
+                "target.attention_indexer.layer_02.c4_indexer": 1.25,
+                "target.attention_indexer.layer_03.c4_indexer": 0.75,
+                "target.routed_moe.layer_02.target": 4.0,
+            },
             "verify_tokens_graph_key": 6,
             "reqs": [
                 {
@@ -251,6 +256,11 @@ def test_trace_summary_reports_cycles_tiers_and_stepwise_logit_evidence() -> Non
             "step_gpu_ms": 83.0,
             "draft_gpu_ms": 7.0,
             "target_verify_gpu_ms": 76.0,
+            "internal_gpu_ms": {
+                "target.attention_indexer.layer_02.c4_indexer": 1.5,
+                "target.attention_indexer.layer_03.c4_indexer": 0.5,
+                "target.routed_moe.layer_02.target": 5.0,
+            },
             "verify_tokens_graph_key": 6,
             "reqs": [
                 {
@@ -269,12 +279,46 @@ def test_trace_summary_reports_cycles_tiers_and_stepwise_logit_evidence() -> Non
     assert summary["cycle_count"] == 2
     assert summary["committed_tokens"] == 8
     assert summary["mean_committed_tokens_per_cycle"] == 4.0
+    assert summary["committed_tokens_per_whole_gpu_cycle_second"] == 48.780488
+    assert summary["committed_tokens_per_whole_cpu_cycle_second"] == 48.192771
+    assert summary["whole_gpu_cycle_ms_total"] == 164.0
+    assert summary["whole_cpu_cycle_ms_total"] == 166.0
     assert summary["acceptance_distribution"] == {"2": 1, "6": 1}
     assert summary["verify_graph_key_distribution"] == {"6": 2}
     assert summary["target_verify_gpu_ms"]["mean"] == 75.0
+    assert summary["internal_gpu_ms_total"]["mean"] == 6.5
+    assert (
+        summary["internal_gpu_ms_by_category"]["target.attention_indexer"]["mean"]
+        == 2.0
+    )
+    assert summary["internal_gpu_ms_by_category"]["target.routed_moe"]["mean"] == 4.5
+    assert (
+        summary["internal_gpu_ms_by_range"][
+            "target.attention_indexer.layer_02.c4_indexer"
+        ]["mean"]
+        == 1.375
+    )
     assert summary["stepwise_greedy_comparison"][1]["match_rate"] == 0.5
     assert summary["full_block_counterfactual_tiers"]["2"]["committed_tokens"] == 4
     assert summary["full_block_counterfactual_tiers"]["6"]["committed_tokens"] == 8
+
+    aggregate = hotspot.summarize_whole_cycle_objective(
+        {
+            "first": {"trace": summary},
+            "second": {
+                "trace": {
+                    "committed_tokens": 4,
+                    "cycle_count": 1,
+                    "whole_gpu_cycle_ms_total": 80.0,
+                    "whole_cpu_cycle_ms_total": 82.0,
+                }
+            },
+        }
+    )
+    assert aggregate["committed_tokens"] == 12
+    assert aggregate["cycle_count"] == 3
+    assert aggregate["committed_tokens_per_whole_gpu_cycle_second"] == 49.180328
+    assert aggregate["committed_tokens_per_whole_cpu_cycle_second"] == 48.387097
 
 
 def test_attribution_keeps_prefill_compile_confound_explicit() -> None:
@@ -554,6 +598,54 @@ def test_server_contract_requires_graphs_524k_two_gpus_and_cpu_offload() -> None
         "speculative_num_draft_tokens": 6,
     }
     hotspot.validate_server_contract(valid)
+
+    candidate_valid = {
+        **valid,
+        "dsv4_fused_t5_moe_configured": True,
+        "dsv4_fused_t5_moe_all_workers_active": True,
+        "dsv4_fused_t5_moe_active_worker_count": 2,
+        "dsv4_oscar_fused_c4_pipeline_configured": True,
+        "dsv4_sm86_small_batch_gemm_worker_telemetry": [
+            {
+                "tp_rank": 0,
+                "fused_t5_moe_configured": True,
+                "fused_t5_moe_conversion_count": 14,
+                "fused_t5_moe_apply_count": 28,
+                "fused_t5_kt_routing_apply_count": 20,
+            },
+            {
+                "tp_rank": 1,
+                "fused_t5_moe_configured": True,
+                "fused_t5_moe_conversion_count": 14,
+                "fused_t5_moe_apply_count": 28,
+                "fused_t5_kt_routing_apply_count": 20,
+            },
+        ],
+    }
+    hotspot.validate_server_contract(
+        candidate_valid,
+        require_fused_t5_moe=True,
+        require_oscar_fused_c4_pipeline=True,
+    )
+
+    candidate_false_counter = {
+        **candidate_valid,
+        "dsv4_sm86_small_batch_gemm_worker_telemetry": [
+            {
+                **candidate_valid["dsv4_sm86_small_batch_gemm_worker_telemetry"][0],
+                "fused_t5_moe_apply_count": False,
+            },
+            candidate_valid["dsv4_sm86_small_batch_gemm_worker_telemetry"][1],
+        ],
+    }
+    with pytest.raises(
+        hotspot.HotspotBenchmarkError,
+        match="fused_t5_moe_worker_proof_incomplete",
+    ):
+        hotspot.validate_server_contract(
+            candidate_false_counter,
+            require_fused_t5_moe=True,
+        )
 
     split_valid = {
         **valid,

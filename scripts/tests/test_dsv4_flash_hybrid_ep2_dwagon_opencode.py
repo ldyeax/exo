@@ -344,10 +344,7 @@ def test_opencode_launcher_rejects_unadmitted_model_id(tmp_path: Path) -> None:
     result = run_launcher(environment, ("--launch",))
 
     assert result.returncode == 2
-    assert (
-        "requires DSV4_OSCAR_MODEL_ID=deepseek-ai/DeepSeek-V4-Flash"
-        in result.stderr
-    )
+    assert "requires DSV4_OSCAR_MODEL_ID=deepseek-ai/DeepSeek-V4-Flash" in result.stderr
     if invocation_log.exists():
         assert "-m sglang.launch_server" not in invocation_log.read_text(
             encoding="utf-8"
@@ -1262,8 +1259,7 @@ def test_opencode_launcher_rejects_invalid_task_queue_overlay_boolean(
 
     assert result.returncode == 2
     assert (
-        "DSV4_STAGE_KT_TASK_QUEUE_PIN_OVERLAY must be a boolean value"
-        in result.stderr
+        "DSV4_STAGE_KT_TASK_QUEUE_PIN_OVERLAY must be a boolean value" in result.stderr
     )
     assert not invocation_log.exists()
 
@@ -1278,8 +1274,7 @@ def test_opencode_launcher_rejects_invalid_cpu_optimized_overlay_boolean(
 
     assert result.returncode == 2
     assert (
-        "DSV4_STAGE_KT_CPU_OPTIMIZED_OVERLAY must be a boolean value"
-        in result.stderr
+        "DSV4_STAGE_KT_CPU_OPTIMIZED_OVERLAY must be a boolean value" in result.stderr
     )
     assert not invocation_log.exists()
 

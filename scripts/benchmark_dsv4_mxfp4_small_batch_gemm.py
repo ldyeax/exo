@@ -100,6 +100,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--iterations", type=int, default=80)
     parser.add_argument("--samples", type=int, default=5)
     parser.add_argument("--swiglu-limit", type=float, default=10.0)
+    parser.add_argument(
+        "--fused-t5-moe",
+        action="store_true",
+        help=(
+            "Benchmark the interleaved W13 fused-activation path. The flag "
+            "controls both weight conversion and execution so a mixed layout "
+            "cannot be measured accidentally."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--output", type=Path)
     parser.add_argument(
@@ -349,6 +358,7 @@ def main() -> int:
         raise ValueError("live route counts must be in [1, 3]")
 
     os.environ[v4_moe._SMALL_ROW_ROUTING_ENV] = "1"
+    os.environ[v4_moe._SM86_FUSED_T5_MOE_ENV] = "1" if args.fused_t5_moe else "0"
     # Apply the package's architecture patch before wrapping its flag chooser.
     v4_moe._patch_strided_mxfp()
     torch.manual_seed(args.seed)
@@ -409,6 +419,7 @@ def main() -> int:
                     num_experts=expert_count,
                     swiglu_limit=args.swiglu_limit,
                     caller_output=caller_output,
+                    fused_t5_moe=args.fused_t5_moe,
                 )
 
             references: dict[int, torch.Tensor] = {}
@@ -510,6 +521,7 @@ def main() -> int:
         "triton_version": __import__("triton").__version__,
         "seed": args.seed,
         "swiglu_limit": args.swiglu_limit,
+        "fused_t5_moe": args.fused_t5_moe,
         "expert_counts": expert_counts,
         "rows": rows_values,
         "live_routes_per_row": live_route_values,

@@ -145,6 +145,8 @@ class HotspotArguments:
     require_oscar_split_history: bool = False
     deterministic_repeat_count: int = 0
     deterministic_repeat_output_tokens: int = 128
+    require_fused_t5_moe: bool = False
+    require_oscar_fused_c4_pipeline: bool = False
 
 
 @dataclass(frozen=True)
@@ -335,6 +337,16 @@ def parse_args() -> HotspotArguments:
         ),
     )
     parser.add_argument(
+        "--require-fused-t5-moe",
+        action="store_true",
+        help="require rank-local conversion and execution proof on every TP worker",
+    )
+    parser.add_argument(
+        "--require-oscar-fused-c4-pipeline",
+        action="store_true",
+        help="require the selected hybrid <=top-k C4 scorer-elision path",
+    )
+    parser.add_argument(
         "--deterministic-repeat-count",
         type=int,
         default=0,
@@ -420,6 +432,8 @@ def parse_args() -> HotspotArguments:
         require_oscar_split_history=cast(bool, raw.require_oscar_split_history),
         deterministic_repeat_count=deterministic_repeat_count,
         deterministic_repeat_output_tokens=deterministic_repeat_output_tokens,
+        require_fused_t5_moe=cast(bool, raw.require_fused_t5_moe),
+        require_oscar_fused_c4_pipeline=cast(bool, raw.require_oscar_fused_c4_pipeline),
     )
 
 
@@ -645,10 +659,61 @@ def validate_oscar_split_history_workers(
     }
 
 
+def validate_fused_t5_moe_workers(
+    server_info: Mapping[str, object],
+) -> dict[str, object]:
+    """Return rank-local proof that every EP2 worker converted and ran fusion."""
+
+    raw_workers = server_info.get("dsv4_sm86_small_batch_gemm_worker_telemetry")
+    if not isinstance(raw_workers, list) or len(raw_workers) != 2:
+        raise HotspotBenchmarkError(
+            "fused T5 MoE telemetry must contain exactly two EP2 workers"
+        )
+    proof_by_rank: dict[int, dict[str, int]] = {}
+    for raw_worker in cast(list[object], raw_workers):
+        if not isinstance(raw_worker, dict):
+            raise HotspotBenchmarkError("fused T5 MoE worker telemetry is malformed")
+        worker = cast(dict[str, object], raw_worker)
+        rank = worker.get("tp_rank")
+        conversion_count = worker.get("fused_t5_moe_conversion_count")
+        apply_count = worker.get("fused_t5_moe_apply_count")
+        routing_count = worker.get("fused_t5_kt_routing_apply_count")
+        if (
+            type(rank) is not int
+            or cast(int, rank) not in (0, 1)
+            or worker.get("fused_t5_moe_configured") is not True
+            or type(conversion_count) is not int
+            or cast(int, conversion_count) <= 0
+            or type(apply_count) is not int
+            or cast(int, apply_count) <= 0
+            or type(routing_count) is not int
+            or cast(int, routing_count) <= 0
+            or cast(int, rank) in proof_by_rank
+        ):
+            raise HotspotBenchmarkError(
+                "fused T5 MoE worker did not prove conversion, execution, and "
+                "KT routing fusion"
+            )
+        proof_by_rank[cast(int, rank)] = {
+            "tp_rank": cast(int, rank),
+            "conversion_count": cast(int, conversion_count),
+            "apply_count": cast(int, apply_count),
+            "kt_routing_apply_count": cast(int, routing_count),
+        }
+    if set(proof_by_rank) != {0, 1}:
+        raise HotspotBenchmarkError("fused T5 MoE telemetry is missing an EP2 rank")
+    return {
+        "worker_count": 2,
+        "workers": [proof_by_rank[rank] for rank in (0, 1)],
+    }
+
+
 def validate_server_contract(
     server_info: Mapping[str, object],
     *,
     require_oscar_split_history: bool = False,
+    require_fused_t5_moe: bool = False,
+    require_oscar_fused_c4_pipeline: bool = False,
 ) -> None:
     """Fail closed on the 524K, two-GPU, CPU-offload production constraints."""
     issues: list[str] = []
@@ -762,6 +827,20 @@ def validate_server_contract(
             validate_oscar_split_history_workers(server_info)
         except HotspotBenchmarkError as error:
             issues.append(f"oscar_split_history_workers_invalid:{error}")
+    if require_fused_t5_moe:
+        if server_info.get("dsv4_fused_t5_moe_configured") is not True:
+            issues.append("fused_t5_moe_not_configured")
+        if server_info.get("dsv4_fused_t5_moe_all_workers_active") is not True:
+            issues.append("fused_t5_moe_not_active_on_all_workers")
+        try:
+            validate_fused_t5_moe_workers(server_info)
+        except HotspotBenchmarkError as error:
+            issues.append(f"fused_t5_moe_worker_proof_incomplete:{error}")
+    if (
+        require_oscar_fused_c4_pipeline
+        and server_info.get("dsv4_oscar_fused_c4_pipeline_configured") is not True
+    ):
+        issues.append("oscar_fused_c4_pipeline_not_configured")
     if (
         server_info.get("disable_cuda_graph") is True
         or server_info.get("disable_decode_cuda_graph") is True
@@ -1279,13 +1358,70 @@ def summarize_trace(
                 "committed_tokens": sum(commits),
             }
 
+    internal_by_range: dict[str, list[float]] = {}
+    internal_by_category: dict[str, list[float]] = {}
+    internal_totals: list[float] = []
+    for record in records:
+        raw_internal = record.get("internal_gpu_ms")
+        if not isinstance(raw_internal, dict):
+            continue
+        category_total: dict[str, float] = {}
+        record_total = 0.0
+        for raw_key, raw_value in cast(dict[object, object], raw_internal).items():
+            if (
+                not isinstance(raw_key, str)
+                or not isinstance(raw_value, (int, float))
+                or isinstance(raw_value, bool)
+            ):
+                continue
+            value = float(raw_value)
+            internal_by_range.setdefault(raw_key, []).append(value)
+            parts = raw_key.split(".")
+            category = ".".join(parts[:2]) if len(parts) >= 2 else raw_key
+            category_total[category] = category_total.get(category, 0.0) + value
+            record_total += value
+        for category, value in category_total.items():
+            internal_by_category.setdefault(category, []).append(value)
+        if raw_internal:
+            internal_totals.append(record_total)
+
+    whole_cycle_gpu_ms = [
+        float(value)
+        for record in records
+        if isinstance((value := record.get("step_gpu_ms")), (int, float))
+        and not isinstance(value, bool)
+        and float(value) > 0.0
+    ]
+    whole_cycle_cpu_ms = [
+        float(value)
+        for record in records
+        if isinstance((value := record.get("step_cpu_ms")), (int, float))
+        and not isinstance(value, bool)
+        and float(value) > 0.0
+    ]
+    committed_tokens = sum(acceptance)
+
+    def committed_tokens_per_second(cycle_ms: Sequence[float]) -> float | None:
+        elapsed_ms = sum(cycle_ms)
+        if not committed_tokens or elapsed_ms <= 0.0:
+            return None
+        return round(committed_tokens * 1_000.0 / elapsed_ms, 6)
+
     return {
         "cycle_count": len(records),
         "request_observation_count": len(req_details),
-        "committed_tokens": sum(acceptance),
+        "committed_tokens": committed_tokens,
         "mean_committed_tokens_per_cycle": round(statistics.fmean(acceptance), 6)
         if acceptance
         else None,
+        "committed_tokens_per_whole_gpu_cycle_second": (
+            committed_tokens_per_second(whole_cycle_gpu_ms)
+        ),
+        "committed_tokens_per_whole_cpu_cycle_second": (
+            committed_tokens_per_second(whole_cycle_cpu_ms)
+        ),
+        "whole_gpu_cycle_ms_total": round(sum(whole_cycle_gpu_ms), 6),
+        "whole_cpu_cycle_ms_total": round(sum(whole_cycle_cpu_ms), 6),
         "acceptance_distribution": {
             str(key): acceptance_distribution[key]
             for key in sorted(acceptance_distribution)
@@ -1309,6 +1445,15 @@ def summarize_trace(
         "target_verify_gpu_ms": _numeric_summary(
             record.get("target_verify_gpu_ms") for record in records
         ),
+        "internal_gpu_ms_total": _numeric_summary(internal_totals),
+        "internal_gpu_ms_by_category": {
+            key: _numeric_summary(internal_by_category[key])
+            for key in sorted(internal_by_category)
+        },
+        "internal_gpu_ms_by_range": {
+            key: _numeric_summary(internal_by_range[key])
+            for key in sorted(internal_by_range)
+        },
         "stepwise_greedy_comparison": stepwise,
         "full_block_counterfactual_tiers": counterfactual,
     }
@@ -1325,6 +1470,57 @@ def _mean_from_phase(
         return None
     mean = cast(dict[str, object], field).get("mean")
     return float(mean) if isinstance(mean, (int, float)) else None
+
+
+def summarize_whole_cycle_objective(
+    phases: Mapping[str, Mapping[str, object]],
+) -> dict[str, object]:
+    """Aggregate the speculative objective without averaging phase rates."""
+
+    committed_tokens = 0
+    cycle_count = 0
+    gpu_ms = 0.0
+    cpu_ms = 0.0
+    phase_count = 0
+    for phase in phases.values():
+        raw_trace = phase.get("trace")
+        if not isinstance(raw_trace, dict):
+            continue
+        trace = cast(dict[str, object], raw_trace)
+        committed = trace.get("committed_tokens")
+        cycles = trace.get("cycle_count")
+        phase_gpu_ms = trace.get("whole_gpu_cycle_ms_total")
+        phase_cpu_ms = trace.get("whole_cpu_cycle_ms_total")
+        if (
+            type(committed) is not int
+            or type(cycles) is not int
+            or not isinstance(phase_gpu_ms, (int, float))
+            or isinstance(phase_gpu_ms, bool)
+            or not isinstance(phase_cpu_ms, (int, float))
+            or isinstance(phase_cpu_ms, bool)
+        ):
+            continue
+        committed_tokens += cast(int, committed)
+        cycle_count += cast(int, cycles)
+        gpu_ms += float(phase_gpu_ms)
+        cpu_ms += float(phase_cpu_ms)
+        phase_count += 1
+
+    def rate(elapsed_ms: float) -> float | None:
+        if committed_tokens <= 0 or elapsed_ms <= 0.0:
+            return None
+        return round(committed_tokens * 1_000.0 / elapsed_ms, 6)
+
+    return {
+        "definition": "committed_tokens_divided_by_sum_of_whole_cycle_time",
+        "phase_count": phase_count,
+        "cycle_count": cycle_count,
+        "committed_tokens": committed_tokens,
+        "whole_gpu_cycle_ms": round(gpu_ms, 6),
+        "whole_cpu_cycle_ms": round(cpu_ms, 6),
+        "committed_tokens_per_whole_gpu_cycle_second": rate(gpu_ms),
+        "committed_tokens_per_whole_cpu_cycle_second": rate(cpu_ms),
+    }
 
 
 def _metric_from_phase(
@@ -1695,6 +1891,8 @@ def run_hotspot(
     validate_server_contract(
         initial_info,
         require_oscar_split_history=args.require_oscar_split_history,
+        require_fused_t5_moe=args.require_fused_t5_moe,
+        require_oscar_fused_c4_pipeline=(args.require_oscar_fused_c4_pipeline),
     )
     expert_plan_provenance = (
         validate_loaded_expert_plan(initial_info, args.expected_expert_plan)
@@ -1985,6 +2183,23 @@ def run_hotspot(
             "dsv4_oscar_int2_split_history": initial_info.get(
                 "dsv4_oscar_int2_split_history"
             ),
+            "dsv4_fused_t5_moe_configured": initial_info.get(
+                "dsv4_fused_t5_moe_configured"
+            ),
+            "dsv4_fused_t5_moe_all_workers_active": initial_info.get(
+                "dsv4_fused_t5_moe_all_workers_active"
+            ),
+            "dsv4_fused_t5_moe_active_worker_count": initial_info.get(
+                "dsv4_fused_t5_moe_active_worker_count"
+            ),
+            "dsv4_fused_t5_moe_workers": (
+                validate_fused_t5_moe_workers(initial_info)
+                if args.require_fused_t5_moe
+                else None
+            ),
+            "dsv4_oscar_fused_c4_pipeline_configured": initial_info.get(
+                "dsv4_oscar_fused_c4_pipeline_configured"
+            ),
             "dsv4_oscar_int2_split_history_execution": initial_info.get(
                 "dsv4_oscar_int2_split_history_execution"
             ),
@@ -2013,6 +2228,7 @@ def run_hotspot(
             ),
         },
         "phases": phases,
+        "whole_cycle_speculative_objective": summarize_whole_cycle_objective(phases),
         "repeat_trajectories": repeat_trajectories,
         "attribution": build_attribution(phases, initial_info),
         "receipt_limits": [
