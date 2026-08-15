@@ -1516,3 +1516,142 @@ about 10 ms of projections/norms and 7.6 ms of collectives. The two new fused
 ideas are retained as tested opt-ins but rejected as defaults because the
 model-scale receipts, not their microbenchmarks, regressed the whole-cycle
 objective.
+
+## 2026-08-14: prediction-acceptance audit
+
+### Interpret the current rate against the cap
+
+SGLang's logged `spec_accept_rate` is a strict generated-draft yield, not the
+fraction of the scheduled verify window that succeeded. For this launch,
+`speculative_num_draft_tokens=6`, so every round generates five draft tokens
+and one target bonus token. The implementation computes
+
+```text
+correct draft tokens / (verify rounds * 5)
+```
+
+while `spec_accept_length` includes the bonus token. Fixed verify length 4 also
+includes that bonus slot, so it can commit at most three correct drafts per
+round. The logged rate therefore has a hard ceiling of `3 / 5 = 0.60` even if
+every draft token that is allowed into the verify window is correct.
+
+Under that definition, a logged rate of 0.34--0.44 means approximately
+1.70--2.20 correct drafts and an acceptance length of 2.70--3.20 tokens per
+round. Relative to the three draft positions the fixed-4 policy can use, that
+is roughly **57--73% scheduled-window utilization**, not 34--44%. End-of-stream
+rounds can perturb the request-level identity slightly, but not the metric's
+meaning or ceiling.
+
+This also reconciles the local number with one useful informal comparison. An
+independent, patched 2x DGX Spark deployment reported unconditional
+per-position survival of `0.826/0.725/0.572/0.471/0.399`, which sums to a 0.599
+full-five-draft yield. If only its first three positions could be committed,
+the same data would appear as `(0.826 + 0.725 + 0.572) / 5 = 0.425` in the
+current strict logger. The report also measured 68.7% on code but only 33.7% on
+prose reasoning, confirming that traffic mix can move the headline more than a
+small kernel change.
+
+Future receipts must report all of these separately:
+
+1. generated-draft yield: correct drafts divided by all five generated drafts;
+2. scheduled-window utilization: correct drafts divided by the sum of
+   `verify_len - 1` over rounds;
+3. untrimmed block survival and per-position conditional survival from a
+   diagnostic `cap-accept` run;
+4. mean useful committed tokens per whole GPU cycle; and
+5. useful decode token/s, TTFT, and end-to-end latency.
+
+There is no universal 50% break-even threshold. Whether speculation pays is a
+hardware- and workload-specific comparison between target-only token time and
+the complete draft-plus-verify cycle. The missing paired experiment is planned
+in [`dsv4f_no_dspark.md`](dsv4f_no_dspark.md).
+
+### Longer verification was not the coherency failure
+
+The retracted 70+ token/s campaign combined three separate problems: the
+partial prefill graph wrote padded rows repeatedly into KV slot 0; the harness
+used repeated filler, forced 512 tokens with `ignore_eos`, hid the generated
+text, and lacked a semantic gate; and the campaign changed the checkpoint's
+trained block-5 geometry to block 6 or 8. Target verification normally protects
+token correctness, but it could not make that corrupted prefill state or the
+non-semantic benchmark into a valid performance result.
+
+The repaired semantic sweep has already tested verify lengths 2 through 6.
+Lengths 5 and 6 were coherent; they simply lost to length 4 on whole-cycle
+throughput by 4.7% and 11.3%, respectively. Thus increasing the current cap
+from 4 to 5 or 6 needs only a launcher change, graph/receipt recapture, and full
+qualification--not an architectural rewrite--but the existing evidence says
+not to do it. Six is the natural maximum for the checkpoint's trained block of
+five drafts plus one bonus. Going beyond six would require a trained wider
+drafter or a multi-block/chained-draft runtime, new confidence calibration, new
+graphs, and complete requalification. The old untrained block-size override is
+not an acceptable shortcut.
+
+### Ranked next experiments
+
+1. **Measure target-only break-even first.** Run the fail-closed A/B/A plan in
+   `dsv4f_no_dspark.md` after the live server is released. Keep Oscar,
+   TP2/EP2/PP1, g14-p28, graphs, cache, prompts, and sampling identical, and do
+   not spend the freed draft memory. Retain DSpark only for a repeatable useful
+   throughput win, provisionally at least 5%.
+2. **Capture representative acceptance traces.** Add per-position survival,
+   first-mismatch position, draft confidence, target top-1 margin, cap reason,
+   prompt class, and cache state to diagnostic-only receipts. Use cache-busted
+   OpenCode code, tool, and reasoning traces rather than filler. Run full-block
+   `cap-accept` diagnostics so fixed-4 does not hide positions four and five.
+3. **Calibrate the mechanism already designed for this problem.** Fit STS on
+   those traces, refresh the SPS cost table on the admitted Oscar topology, and
+   compare fixed-4 with confidence-scheduled compact verification. Optimize
+   useful whole-cycle token/s rather than the displayed acceptance percentage.
+   This can avoid verification waste but does not, by itself, make draft logits
+   more accurate.
+4. **Audit prediction quality before changing precision.** The loader already
+   fails closed on all 18 draft shared-expert tensors and every mapped `mtp.*`
+   destination, and graph/eager draft parity is exact. Preserve those gates and
+   add a reference trace that records the first draft/target disagreement. FP32
+   Markov already improved acceptance and remains selected; the earlier FP32 LM
+   head arm did not beat FP32-Markov-only, so do not repeat it without evidence
+   that BF16 head rounding changes target agreement.
+5. **Improve the drafter if raw yield remains the limiter.** Distill or fine
+   tune the DSpark sequential/Markov and confidence heads on target logits from
+   representative OpenCode traces, weighting later positions where survival
+   decays. This is the credible route to a materially higher five-position raw
+   yield; merely exposing more verification slots cannot improve predictions.
+6. **Test a separate prompt-lookup arm for code.** Repeated source context can
+   favor n-gram/prompt speculative decoding with much lower draft cost. Treat it
+   as a target-only-plus-prompt-lookup comparison, not as an assumed composition
+   with DSpark.
+
+Do not prioritize wider fixed verification, tree/top-k branching, more GPU
+experts, or the two rejected fused kernels. The current trace attributes about
+49--50 ms/cycle to target verification, with routed target MoE dominant; these
+changes add or enlarge precisely the expensive work, and the model-scale sweeps
+already regressed.
+
+No `fwuff` GPU experiment was run for this audit. That host cannot reproduce
+the admitted dwagon Oscar artifact, target placement, and TP2 topology, so a
+small throughput run would not answer the break-even question. It becomes
+useful only for a draft-only, bounded-memory trace replay after identical input
+IDs, predictor weights, and target-reference logits have been captured; such a
+run must preflight free memory and leave existing processes resident.
+
+Research basis:
+
+- [DSpark paper](https://arxiv.org/abs/2607.05147): semi-autoregressive draft
+  dependency modeling plus confidence-scheduled, load-aware verification based
+  on estimated prefix survival and engine cost.
+- [SpecDec++](https://arxiv.org/abs/2405.19715): a trained acceptance head and
+  threshold-based adaptive candidate length improved its tested workloads by
+  7.2--11.1% over fixed-length speculative decoding.
+- [SGLang's DSpark integration report](https://www.lmsys.org/blog/2026-07-06-dspark-sglang/):
+  compact ragged verification, STS, SPS cost fitting, `cap-accept`
+  observability, and the warning that dynamic trimming was mainly a
+  high-concurrency win in its initial measurements.
+- [Independent 2x DGX Spark field report](https://github.com/tonyd2wild/DeepSeek-v4-Flash-0731-DSpark-1M-NVFP4-KV-2x-DGX-Spark/blob/main/README.md):
+  fixing missing shared-expert weights raised acceptance from 25.7% to 60.2%,
+  while patched acceptance varied from 68.7% for code to 33.7% for prose
+  reasoning. This is diagnostic evidence, not a hardware-comparable benchmark.
+- [Original speculative-decoding paper](https://arxiv.org/abs/2211.17192):
+  target verification preserves the target distribution; speedup depends on
+  the cost and agreement of the approximation, not on an acceptance-rate rule
+  of thumb.
