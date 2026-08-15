@@ -2,10 +2,13 @@
 
 - Use DSpark.
 
-## Local modified inference sources
+## Historical OSDI26 source receipt
 
-The OSDI26 GLM-5.2 runtime sources are checked out inside this repository as
-nested local submodules:
+The commits below record the exact local source used by the original OSDI26
+campaign. They are replay receipts, not current development bases. New source
+work uses the authoritative public branches declared in `AGENTS.md` and the
+root `.gitmodules`; the old commit identities remain documented here so the
+measured runtime can be reconstructed exactly.
 
 - `vendor/ktransformers` is pinned to integration commit
   `45a3a797658140dcf8426cd3f2b2c6c969f8f5d8`. The code-bearing
@@ -16,9 +19,9 @@ nested local submodules:
   `720b40b2783b1a515134f4ab9fe820931cfbee36`, which contains all nine
   recorded SGLang patches.
 
-These are local-only submodules for now. Their URLs point to durable bare
-repositories under `/var/lib/exo/sources`; replace those URLs when remote
-forks are created.
+At the time of the campaign these were local-only submodules whose URLs pointed
+to durable bare repositories under `/var/lib/exo/sources`. The corresponding
+work has since been accumulated on the public authoritative forks.
 
 The KTransformers history adds the AMXINT4 expert runtime used by the hybrid
 path, fine-grained AMX decode dependencies, BF16 expert staging/export for SLP

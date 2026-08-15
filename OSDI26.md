@@ -350,6 +350,12 @@ viable production path until its first-chunk stall is resolved.
 
 ## 2026-07-25 implementation sprint
 
+This section is an immutable source/build/benchmark receipt for that sprint.
+Its uses of “current” and “now” refer to the 2026-07-25 campaign state, not the
+active development branches. New work starts from the authoritative fork
+branches declared in `AGENTS.md`; the exact revisions below remain unchanged
+for reproducibility.
+
 The first implementation and measurement pass is complete. The original
 measured source identities are KTransformers
 `d063aeb7a9c73db36aa87b9203c5eb440215bcd9` and its SGLang submodule

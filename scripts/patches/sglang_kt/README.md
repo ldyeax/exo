@@ -1,7 +1,10 @@
 # Exo SGLang-KTransformers source patches
 
-These mail patches make the GLM-4.7-Flash BF16 runtime source reproducible
-without relying on unpublished dependency forks.
+These mail patches are historical reconstruction artifacts for the original
+GLM-4.7-Flash BF16 integration. Their live, modernized content belongs on the
+authoritative SGLang branch `exo/dsv4-cumulative-0801` and KTransformers branch
+`exo/glm52-osdi26-patched`; do not use the patch results as alternative feature
+bases. The patches remain useful for reproducing the exact older source.
 
 Apply them with `scripts/prepare_sglang_kt_source.py`. The script verifies every
 base and result commit and applies patches in this order:

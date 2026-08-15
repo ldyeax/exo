@@ -2,6 +2,8 @@
 set -euo pipefail
 
 # Reproducible all-local Kimi K3 UD-IQ2_XXS launcher for dwagon.
+# This is a receipt-bound legacy binary replay. Build new llama.cpp work from
+# vendor/llama.cpp on the authoritative branch declared in AGENTS.md.
 # The default MoE-aware fit keeps routed experts on CPU and uses the two
 # RTX 3090s for dense tensors. Arguments after `--` are appended verbatim so
 # an observed fit failure can be retried with the documented fixed placement.

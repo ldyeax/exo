@@ -82,8 +82,12 @@ GLM_4_7_FLASH_TARGET_PROFILES: Final = frozenset(
     )
 )
 
+# These exact revisions are immutable runtime-admission receipts, not active
+# development branch tips. New source work uses the cumulative submodules
+# declared in AGENTS.md; changing an admission receipt requires new runtime and
+# model validation evidence.
 # KTransformers v0.6.3 is the first release with explicit GLM-5.2 support. Its
-# SGLang submodule pins the matching fork revision below.
+# SGLang submodule pins the matching validated revision below.
 SUPPORTED_KTRANSFORMERS_REVISION: Final = "ce7c3ddbe93f7ac1f992375eed54058bbc512646"
 SUPPORTED_SGLANG_REVISION: Final = "8b636f9008dbad58c0a8e481b03e794739e6c146"
 GLM_4_7_FLASH_KTRANSFORMERS_REVISION: Final = "f9ca69648421f5774215c4da9cf711dccf54f49e"

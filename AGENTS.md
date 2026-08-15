@@ -6,6 +6,25 @@ This file provides guidance to AI coding agents when working with code in this r
 
 exo is a distributed AI inference system that connects multiple devices into a cluster. It enables running large language models across multiple machines using MLX as the inference backend and zenoh for peer-to-peer networking.
 
+## Authoritative Inference Fork Branches
+
+There is one active, cumulative branch for each inference fork:
+
+- `ldyeax/exo_llama_cpp`: `exo/kimi-k3-cumulative`
+- `ldyeax/exo_sglang`: `exo/dsv4-cumulative-0801`
+- `ldyeax/exo_ktransformers`: `exo/glm52-osdi26-patched`
+
+Start new fork work from the tip of these branches and land generally useful
+work back on the same branch. Do not treat older model-, host-, experiment-, or
+date-specific branches as alternative feature bases. Historical commits and
+source revisions in benchmark reports are immutable receipts, not active
+development pins.
+
+The root submodules and KTransformers' nested inference submodules must remain
+on this cumulative graph. Gitlinks still record exact commits for reproducible
+clones, while the corresponding `.gitmodules` `branch` entries identify the
+moving authoritative branches.
+
 ## Build & Run Commands
 
 ```bash

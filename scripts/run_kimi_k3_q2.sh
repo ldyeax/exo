@@ -2,6 +2,8 @@
 set -euo pipefail
 
 # Reproducible Kimi K3 UD-Q2_K_XL launcher for:
+# This is a receipt-bound legacy binary replay. Build new llama.cpp work from
+# vendor/llama.cpp on the authoritative branch declared in AGENTS.md.
 #   dwagon: llama-server, two local RTX 3090s, interleaved host RAM
 #   fwuff:  llama.cpp RPC endpoint over the 100 Gb/s EDR IPoIB link; the
 #           target may use its CPU while K3 DSpark uses its otherwise-idle GPU

@@ -1,8 +1,12 @@
 # DeepSeek V4 Flash release-audit patch
 
-`0001-dsv4-flash-release-audit.patch` is a reproducible delta on top of the
-accumulated local SGLang DSpark tree whose pre-patch working snapshot was based
-on commit `6cc9352dfe6c5c013750e72b39c127870ef5b54f`.
+`0001-dsv4-flash-release-audit.patch` is a historical compatibility receipt,
+not an alternative development line. Its result tree is byte-for-byte the
+same as SGLang commit `40e43604a6fab6b14e4e2575a2c672b862711949`, an
+ancestor of the authoritative branch `exo/dsv4-cumulative-0801`. Apply it only
+when reconstructing the older local DSpark source whose pre-patch snapshot was
+based on commit `6cc9352dfe6c5c013750e72b39c127870ef5b54f`; new work
+must start from the cumulative branch.
 
 The patch contains only changes selected by the 2026-08-01 release audit:
 
@@ -29,8 +33,8 @@ Provenance:
   `/mnt/sanic/projects/deploy-dsv4-general-release`
 - remote tracked SGLang patch SHA256:
   `bb6b1e0dd0a699c5fbb540d7b7bc87cd53dfae1d276bfafc0770cd103816190b`
-- selected local patch SHA256: obtain with
-  `sha256sum scripts/patches/dsv4-flash/0001-dsv4-flash-release-audit.patch`
+- selected local patch SHA256:
+  `6f35e2e14cbc29d05332c239db9334cb77c4d9bccf9c233cb80c3f30e4652032`
 
 Verify an installed source tree without changing it:
 

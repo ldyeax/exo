@@ -157,7 +157,7 @@ files before writing an expert plan.
 
 The direct root SGLang dependency is now `vendor/sglang`, public branch
 `exo/dsv4-cumulative-0801`, commit
-`e2f179cb64714077f9d2ebe0d7ca5fd16923184c`. Its history combines:
+`0dfb8cbdaa314c2be75ee2d06ed955e1e8c5866e`. Its history combines:
 
 - the exact fwuff SM86 release tree imported on top of official SGLang;
 - the previously accumulated DSV4/DSpark branch;
@@ -219,7 +219,7 @@ enabled by the dwagon launch.
 ## Deferred experts
 
 KTransformers is now at public branch `exo/glm52-osdi26-patched`, commit
-`373539da61a45d1ceda56a783b8621d5a28bd551`.
+`cc0a797698d1e19766344c57c7756056fd706f3c`.
 
 The previous deferred-expert scheduler was incorrect: it placed a tail task in
 the following ring slot, allowed the current layer to return before the tail
@@ -459,18 +459,18 @@ All cumulative forks are public:
 | Repository | Branch / commit | Role |
 |---|---|---|
 | `https://github.com/ldyeax/exo` | `agent/linux-cuda-nccl` | root integration and launch handoff |
-| `https://github.com/ldyeax/exo_sglang` | `exo/dsv4-cumulative-0801` at `e2f179cb6`; historical `exo/dsv4-flash-0731` at `ad67dbbc0`; GLM bundle at `73e877ac5` | cumulative SGLang lines |
-| `https://github.com/ldyeax/exo_ktransformers` | `exo/glm52-osdi26-patched` at `373539da6` | cumulative KTransformers and deferred-expert fix |
-| `https://github.com/ldyeax/exo_llama_cpp` | `exo/kimi-k3-cumulative` at `651092c60` | cumulative llama.cpp/Kimi work |
+| `https://github.com/ldyeax/exo_sglang` | `exo/dsv4-cumulative-0801` at `0dfb8cbda` | authoritative cumulative SGLang line; historical DSV4, GLM bundle, and archive tips are ancestors |
+| `https://github.com/ldyeax/exo_ktransformers` | `exo/glm52-osdi26-patched` at `cc0a797` | authoritative cumulative KTransformers line and nested-fork integration |
+| `https://github.com/ldyeax/exo_llama_cpp` | `exo/kimi-k3-cumulative` at `0c2743950` | authoritative cumulative llama.cpp/Kimi line |
 
 Root exo directly tracks all three public forks. KTransformers' active and
 archived llama declarations also target `ldyeax/exo_llama_cpp`; the active
-commit is the same `651092c60` used by root exo, replacing the unrelated old
+commit is the same `0c2743950` used by root exo, replacing the unrelated old
 shallow snapshot. KTransformers' nested SGLang targets the public
-`ldyeax/exo_sglang` GLM-compatible branch. It is intentionally not repointed
-to the divergent DSV4 branch: their merge base predates both accumulated lines,
-and forcing the pointer would discard its GLM compatibility. Root exo carries
-the DSV4 cumulative branch directly instead.
+`ldyeax/exo_sglang` authoritative cumulative branch at the same commit used by
+root exo. The former `bundle/glm52-fwuff-sglang` tip and the four archived
+lines are retained as ancestors of that branch; their live GLM/KT behavior was
+ported onto the modern cumulative tree rather than left on competing pins.
 
 Unmodified pybind11 and custom FlashInfer dependencies continue to use their
 upstream repositories.

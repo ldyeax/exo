@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Apply Exo's exact SGLang-KTransformers integration commits."""
+"""Replay Exo's exact historical SGLang-KTransformers integration commits.
+
+This tool reconstructs an immutable validated-runtime receipt. New development
+and builds should use the cumulative submodule branches declared in AGENTS.md.
+"""
 
 from __future__ import annotations
 

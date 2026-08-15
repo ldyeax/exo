@@ -2115,9 +2115,15 @@ tensor placement in a launch command.
 
 ## 2026-08-01 cumulative publication
 
-The previously local llama.cpp stack is now committed and published publicly
+This section records the original August 1 publication. On 2026-08-14 the
+authoritative branches advanced to llama.cpp `0c2743950`, KTransformers
+`cc0a797`, and SGLang `0dfb8cbda`. Those tips accumulate the later Kimi vision,
+IQ2, shared-scheduler, modern GLM/KT, and runtime-cohort work; the older hashes
+below remain immutable build receipts.
+
+The previously local llama.cpp stack was committed and published publicly
 as [`ldyeax/exo_llama_cpp`](https://github.com/ldyeax/exo_llama_cpp), branch
-`exo/kimi-k3-cumulative`, commit `651092c60`. It accumulates the strict
+`exo/kimi-k3-cumulative`, initially at commit `651092c60`. It accumulated the strict
 local-file RPC loader, DSpark integration, K3 top-k/SiTU and weighted-reduction
 kernels, recurrent-state work, RPC tests, and the shared-backend fix described
 above. No upstream pull request or maintainer-facing automation was created.
@@ -2126,12 +2132,14 @@ The root repository now tracks that branch directly at `vendor/llama.cpp`, so
 the implementation is not hidden inside another project. KTransformers also
 tracks the same commit from its active llama submodule; its active and archived
 llama URL declarations now use the same fork and branch. The compatible
-KTransformers graph is published as
+KTransformers graph was initially published as
 [`ldyeax/exo_ktransformers`](https://github.com/ldyeax/exo_ktransformers),
 branch `exo/glm52-osdi26-patched`, commit `f38772417`. Its nested SGLang
-submodule continues to use
+submodule used
 [`ldyeax/exo_sglang`](https://github.com/ldyeax/exo_sglang), branch
-`bundle/glm52-fwuff-sglang`, commit `73e877ac5`.
+`bundle/glm52-fwuff-sglang`, commit `73e877ac5`. KTransformers now tracks the
+authoritative SGLang branch `exo/dsv4-cumulative-0801` at `0dfb8cbda`; the old
+bundle tip is preserved in that branch's ancestry.
 
 Modern ggml removed the task-phase structure and split conversion traits used
 by KTransformers' bundled llamafile 0.8.8 kernels. Compatibility is retained

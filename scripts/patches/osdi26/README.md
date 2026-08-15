@@ -1,7 +1,11 @@
 # OSDI26 GLM-5.2 hybrid-checkpoint patch stack
 
-This directory is the portable patch form of the source-pinned GLM-5.2
-hybrid W8A16 and MTP work. Apply the SGLang series in filename order to:
+This directory is the historical portable patch form of the GLM-5.2 hybrid
+W8A16 and MTP work. Its live, modernized content belongs on the authoritative
+SGLang branch `exo/dsv4-cumulative-0801` and KTransformers branch
+`exo/glm52-osdi26-patched`; do not use these recorded terminals as alternative
+feature bases. Apply the SGLang series in filename order only to reconstruct
+the original source result:
 
 `1218b2f8965b5a27c9d9004ff9324373414be322`
 
@@ -21,10 +25,10 @@ The outer series advances only the `third_party/sglang` gitlink. It therefore
 expects the corresponding SGLang commits or equivalent patched trees to be
 available in that submodule.
 
-## Local submodule checkout
+## Historical local checkout
 
-The fully integrated local checkout is now available inside the Exo
-repository at:
+The fully integrated checkout used for the original campaign was recorded
+inside the Exo repository at:
 
 - `vendor/ktransformers`, root gitlink
   `45a3a797658140dcf8426cd3f2b2c6c969f8f5d8`;
@@ -38,7 +42,7 @@ additional runtime code: it advances the nested SGLang gitlink from
 `720b40b2783b1a515134f4ab9fe820931cfbee36` and points that nested submodule
 at its durable local repository.
 
-For now the root and nested URLs are deliberately machine-local:
+At that time the root and nested URLs were deliberately machine-local:
 
 - `/var/lib/exo/sources/ktransformers-glm52-osdi26-patched.git`;
 - `/var/lib/exo/sources/sglang-glm52-osdi26-patched.git`.
@@ -52,8 +56,9 @@ git -c protocol.file.allow=always -C vendor/ktransformers \
   submodule update --init third_party/sglang
 ```
 
-Replace both URLs when durable remote forks are created. The patch files and
-hashes below remain the portable reconstruction path.
+The live work now resides on the authoritative public branches named above.
+The patch files and hashes below remain the portable historical reconstruction
+path.
 
 The SGLang stack:
 

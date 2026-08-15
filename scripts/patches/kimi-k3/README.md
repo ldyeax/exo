@@ -1,7 +1,10 @@
 # Kimi K3 llama.cpp patch set
 
-These patches preserve the tested, intentionally uncommitted Kimi K3 runtime
-experiments outside the temporary llama.cpp worktrees. They target base commit
+These patches are historical, portable reconstruction artifacts for the Kimi
+K3 runtime work. All of their live content is committed on the authoritative
+llama.cpp branch `exo/kimi-k3-cumulative`, currently at
+`0c2743950c8dc10fc80791ecd0727e51a14c7aad`; do not use this patch directory as
+an alternative feature base. The patches target base commit
 `a30437bc3a2a661d1e9aad71b1160d9ad9bbfec1`.
 
 Apply in filename order:
@@ -67,15 +70,18 @@ Apply in filename order:
    `a1d96ee3028789929ec91b4c2b28c0b07e9be0fed1afed9167ea9941068f62ca`;
    stable patch ID:
    `c07821423d02ddbf4f672bbfc1969e48cfea2e2d`. The complete stack
-   apply-checks cleanly and the modified CUDA/RPC objects compile, but the
-   timeboxed full link and live model-level validation remain outstanding.
+   apply-checks cleanly. The cumulative branch also passes the CPU/RPC/mtmd
+   build, the CUDA 13.1 SM86 build, the focused scheduler/RPC/mtmd CTests, the
+   12-test Kimi CUDA suite, and all 448 CPU backend operation-selection cases.
+   Full-size Kimi model and live MoonViT image inference remain outstanding.
 
 Patches `0001`, `0002*`, and `0003` apply to `d29a524e`; `0004` applies after
 `0003`, `0005` applies after the earlier kernel patches, and `0006` applies
 after `0005`; `0007` applies after `0006`, and `0008` applies after `0007`.
-The complete filename-ordered sequence has been apply-checked. Deploy `0004`
-through `0008` on both RPC clients and servers to select every specialization
-and scheduler fix consistently. These are experiments rather than a claim
-that every combination has completed a full-size K3 integration run. See
-`kimik3.md` for exact validation, performance results, limitations, and
-stable patch IDs.
+The complete filename-ordered sequence has been apply-checked. When
+reconstructing an old tree, apply `0004` through `0008` on both RPC clients and
+servers to select every specialization and scheduler fix consistently. Current
+deployments should build the cumulative branch directly. These are experiments
+rather than a claim that every combination has completed a full-size K3
+integration run. See `kimik3.md` for exact validation, performance results,
+limitations, and stable patch IDs.
