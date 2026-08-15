@@ -379,7 +379,7 @@ register int len;
 	  /* end of speedup code */
 
 #ifdef UTF8
-	  if (curr->w_encoding == UTF8)
+	  if (curr->w_encoding == UTF8 && !curr->w_inOSC)
 	    {
 	      c = FromUtf8(c, &curr->w_decodestate);
 	      if (c == -1)
@@ -466,7 +466,7 @@ register int len;
 	      /* special xterm hack: accept SetStatus sequence. Yucc! */
 	      /* allow ^E for title escapes */
 	      if (!(curr->w_StringType == OSC && c < ' ' && c != '\005'))
-		if (!curr->w_c1 || c != ('\\' ^ 0xc0))
+		if (!curr->w_c1 || c != ('\\' ^ 0xc0) || curr->w_inOSC)
 		  {
 		    StringChar(c);
 		    break;
@@ -1497,6 +1497,11 @@ static void
 StringStart(type)
 enum string_t type;
 {
+  if (type == OSC)
+    curr->w_inOSC = 1;
+  else
+    curr->w_inOSC = 0;
+
   curr->w_StringType = type;
   curr->w_stringp = curr->w_string;
   curr->w_state = ASTR;
@@ -1527,6 +1532,9 @@ StringEnd()
   /* There's two ways to terminate an OSC. If we've seen an ESC
    * then it's been ST otherwise it's BEL. */
   t = curr->w_state == STRESC ? "\033\\" : "\a";
+
+  curr->w_inOSC = 0;
+
 
   curr->w_state = LIT;
   *curr->w_stringp = '\0';

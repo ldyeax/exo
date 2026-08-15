@@ -729,6 +729,29 @@ int c;
 }
 
 
+static void
+AddStrRaw(str)
+char *str;
+{
+  char c;
+
+  while ((c = *str++))
+    AddChar(c);
+}
+
+static void
+AddStrRawn(str, n)
+char *str;
+int n;
+{
+  char c;
+
+  while ((c = *str++) && n-- > 0)
+    AddChar(c);
+  while (n-- > 0)
+    AddChar(' ');
+}
+
 /* Insert mode is a toggle on some terminals, so we need this hack:
  */
 void
@@ -2250,9 +2273,9 @@ char *str;
       AddCStr2(D_TS, 0);
       max = D_WS > 0 ? D_WS : (D_width - !D_CLP);
       if ((int)strlen(str) > max)
-	AddStrn(str, max);
+	AddStrRawn(str, max);
       else
-	AddStr(str);
+	AddStrRaw(str);
       AddCStr(D_FS);
       D_hstatus = 1;
     }
@@ -2962,7 +2985,7 @@ char *t;
   D_xtermosc[i] = 1;
   AddStr("\033]");
   AddStr(oscs[i][0]);
-  AddStr(s);
+  AddStrRaw(s);
   AddStr(t);
 }
 

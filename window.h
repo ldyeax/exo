@@ -236,6 +236,7 @@ struct win
   int	 w_silence;		/* silence status (Lloyd Zusman) */
   char	 w_vbwait;
   char	 w_norefresh;		/* dont redisplay when switching to that win */
+  int    w_inOSC;		/* parsing OSC now */
 #ifdef RXVT_OSC
   char	 w_xtermosc[5][2560];	/* special xterm/rxvt escapes */
 #endif
